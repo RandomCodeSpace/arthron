@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# arthron's own store, when it exists
+/.arthron/
+*.redb
+
+# Local scratch
+/tmp/
+/bench/corpora/
+.DS_Store
