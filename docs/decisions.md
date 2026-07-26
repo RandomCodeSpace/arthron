@@ -4,6 +4,33 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-26 — Name reserved on crates.io and npm
+
+**crates.io: published.** `arthron 0.0.0`, owner `aksOps`, MIT,
+https://crates.io/crates/arthron
+
+**npm: staged, blocked on auth.** `npm/` is ready; publishing needs an
+npmjs.org login this machine does not have.
+
+**Not an empty stub, deliberately.** crates.io policy forbids a crate that
+
+> exists only to reserve a name for a prolonged period of time (often called
+> "name squatting") without having any genuine functionality, purpose, or
+> significant development activity on the corresponding repository
+
+and the team may delete such crates *without prior notification*. So `0.0.0`
+ships the resolution contract itself — `Outcome` with its three variants and
+`resolution_rate` — which is the one type the whole design is built around, and
+the README states plainly that it is not usable software and should not be
+depended on. The public repository with a full design spec is the "genuine
+purpose and development activity" the policy asks for.
+
+**Note the irreversibility.** crates.io versions can be yanked but never
+deleted, and the name is held permanently. `arthron` on crates.io is now
+committed to.
+
+---
+
 ## 2026-07-26 — Name: `arthron`
 
 **ἄρθρον** · AR-thron · *joint*.

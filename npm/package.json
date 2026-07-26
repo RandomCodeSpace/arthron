@@ -1,0 +1,29 @@
+{
+  "name": "arthron",
+  "version": "0.0.0",
+  "description": "Local-first code intelligence. Resolves cross-file references into a verified graph and records what it cannot resolve instead of dropping it. Design phase - see the repository.",
+  "license": "MIT",
+  "homepage": "https://github.com/RandomCodeSpace/arthron#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RandomCodeSpace/arthron.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/RandomCodeSpace/arthron/issues"
+  },
+  "keywords": [
+    "code-analysis",
+    "call-graph",
+    "static-analysis",
+    "ast",
+    "codebase",
+    "code-intelligence"
+  ],
+  "files": [
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
