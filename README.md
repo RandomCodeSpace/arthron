@@ -8,9 +8,14 @@ A local-first code intelligence engine. It parses each file in isolation, then
 **resolves** the references between them into a verified graph — and tells you
 honestly which references it could not resolve.
 
-> **Status: design phase.** No implementation yet. The approved design lives in
-> [`docs/superpowers/specs/2026-07-26-arthron-design.md`](docs/superpowers/specs/2026-07-26-arthron-design.md).
+> **Status: design phase.** The engine is not implemented. The approved design
+> lives in [`docs/superpowers/specs/2026-07-26-arthron-design.md`](docs/superpowers/specs/2026-07-26-arthron-design.md).
 > Start there.
+>
+> The published `0.0.0` crate is not usable software. It ships the resolution
+> contract — [`Outcome`](src/lib.rs), its three variants, and the resolution-rate
+> calculation — and holds the name while the engine is built. Nothing depends on
+> it yet, and it should not be depended on.
 
 ---
 

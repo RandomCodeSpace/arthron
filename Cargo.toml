@@ -1,0 +1,17 @@
+[package]
+name = "arthron"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local-first code intelligence. Resolves cross-file references into a verified graph and records what it cannot resolve instead of dropping it. Design phase - see the repository."
+repository = "https://github.com/RandomCodeSpace/arthron"
+homepage = "https://github.com/RandomCodeSpace/arthron"
+readme = "README.md"
+license = "MIT"
+keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
+categories = ["development-tools"]
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "deny"
