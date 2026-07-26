@@ -1,4 +1,4 @@
-# arthron
+# @randomcodespace/arthron
 
 **This package is a placeholder. It contains no executable code and installing it does nothing.**
 
@@ -14,11 +14,22 @@ It is in the design phase. The approved design is public:
 
 The tool will ship as a native binary. npm is planned as one distribution
 channel — the same route [ast-grep](https://www.npmjs.com/package/@ast-grep/cli)
-takes, so that `npx arthron` works without a Rust toolchain. This package holds
-that name until there is a binary to put in it.
+takes, so `npx @randomcodespace/arthron` works without a Rust toolchain. This
+package holds that name until there is a binary to put in it.
 
 There is nothing to install yet. When there is, this README will be replaced by
 real usage documentation and the version will move off `0.0.0`.
+
+## Registry
+
+Published to **GitHub Packages**, not npmjs.org. Consuming it needs a scope
+mapping and a GitHub token with `read:packages`:
+
+```
+# .npmrc
+@randomcodespace:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
 
 ## Meanwhile
 

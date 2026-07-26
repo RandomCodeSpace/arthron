@@ -1,5 +1,5 @@
 {
-  "name": "arthron",
+  "name": "@randomcodespace/arthron",
   "version": "0.0.0",
   "description": "Local-first code intelligence. Resolves cross-file references into a verified graph and records what it cannot resolve instead of dropping it. Design phase - see the repository.",
   "license": "MIT",
@@ -25,5 +25,8 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   }
 }

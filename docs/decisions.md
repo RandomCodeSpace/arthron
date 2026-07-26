@@ -9,8 +9,22 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 **crates.io: published.** `arthron 0.0.0`, owner `aksOps`, MIT,
 https://crates.io/crates/arthron
 
-**npm: staged, blocked on auth.** `npm/` is ready; publishing needs an
-npmjs.org login this machine does not have.
+**npm: published to GitHub Packages, not npmjs.org.**
+`@randomcodespace/arthron@0.0.0`, linked to this repository,
+https://github.com/orgs/RandomCodeSpace/packages/npm/package/arthron
+
+Scoped to the org rather than taking the bare `arthron` name on the public
+registry. Two consequences worth knowing:
+
+- **Package visibility is `private`.** GitHub Packages defaults to it and there
+  is no REST endpoint to change it — it is a UI setting under the package's
+  settings. Fine for holding the name; needs flipping before public
+  distribution.
+- **`arthron` on npmjs.org is still unclaimed by us.** If `npx arthron` (bare,
+  unscoped) is ever wanted, that name is not reserved and someone else can take
+  it. `npx @randomcodespace/arthron` from GitHub Packages requires consumers to
+  configure a scope mapping and a token, which is friction npmjs.org would not
+  have.
 
 **Not an empty stub, deliberately.** crates.io policy forbids a crate that
 
