@@ -110,6 +110,7 @@ pub mod extract_go;
 pub mod model;
 pub mod resolve_go;
 pub mod sg;
+pub mod store;
 
 #[cfg(test)]
 mod tests {

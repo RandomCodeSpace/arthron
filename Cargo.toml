@@ -15,7 +15,12 @@ categories = ["development-tools"]
 ast-grep-config = "=0.44.1"
 ast-grep-core = "=0.44.1"
 ast-grep-language = "=0.44.1"
+bincode = "2"
 blake3 = "1"
+redb = "=4.1.0"
 
 [lints.rust]
 missing_docs = "deny"
+
+[dev-dependencies]
+tempfile = "3"
