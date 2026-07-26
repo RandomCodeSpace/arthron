@@ -108,6 +108,7 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
 
 pub mod extract_go;
 pub mod model;
+pub mod pipeline;
 pub mod resolve_go;
 pub mod sg;
 pub mod store;
