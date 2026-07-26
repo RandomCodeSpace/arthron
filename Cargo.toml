@@ -12,6 +12,9 @@ keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
 categories = ["development-tools"]
 
 [dependencies]
+ast-grep-config = "=0.44.1"
+ast-grep-core = "=0.44.1"
+ast-grep-language = "=0.44.1"
 blake3 = "1"
 
 [lints.rust]

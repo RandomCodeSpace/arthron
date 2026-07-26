@@ -107,6 +107,7 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
 }
 
 pub mod model;
+pub mod sg;
 
 #[cfg(test)]
 mod tests {
