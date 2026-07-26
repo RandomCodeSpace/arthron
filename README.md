@@ -73,11 +73,11 @@ must be predictable there, not just fast on a developer's laptop.
 
 ## Language coverage
 
-All 32 languages ast-grep supports get structural analysis. Full call-graph
-resolution ships for five to start:
+All 27 languages ast-grep's built-in parsers support get structural analysis.
+Full call-graph resolution ships for five to start:
 
 - **Tier 1** (definitions, references, call graph): Java, TypeScript, Python, Go, JavaScript
-- **Tier 2** (definitions and structure): the remaining 27
+- **Tier 2** (definitions and structure): the remaining 22
 
 Tier 2 is a real product surface, not a stub — you get symbols, imports and file
 structure. You do not get verified call edges, and the tool says so rather than

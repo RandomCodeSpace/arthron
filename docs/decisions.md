@@ -4,6 +4,180 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-26 — First milestone: walking skeleton, Go first
+
+**Decision:** the first milestone is a thin vertical slice through all five
+layers — ast-grep → extractor → resolver → store → `arthron scan` printing a
+per-language resolution rate. Definition of done: **a non-zero per-language
+resolution rate from a real repository, with every unresolved reference
+persisted and countable by reason.** Not high — non-zero and honest.
+
+**Language order:** Go, then Java, JavaScript, TypeScript, Python. Go because
+its resolution model is the cleanest — explicit import paths, package scoping,
+no overloads, no path aliasing — the only tier-1 language where a human can
+eyeball a package and predict the rate, so a bad number is attributable to the
+pipeline rather than the rules. JS and TS are expected to share one
+module-resolution core.
+
+**Corpus:** a vendored, pinned snapshot of `codeiq@6dd90b5` — 808 files,
+105k LOC, 3.2 MB of source. The exact code that measured 0%, so the
+before/after is direct. Vendoring resolves redistributability for Go; corpora
+for the other four tier-1 languages remain open.
+
+**Rejected:** extraction-breadth-first (rebuilds `codeiq`'s shape — broad
+extraction, no proof of linking) and resolver-first against hand-written
+fixtures (fixtures you author are fixtures you author to pass).
+
+---
+
+## 2026-07-26 — Extraction: in-process ast-grep crates; coverage corrected to 27
+
+**Decision:** link `ast-grep-core`, `ast-grep-language` and `ast-grep-config`
+in-process, behind a thin internal wrapper module. The wrapper exists because
+the Rust API is 0.x and not a stability-guaranteed surface — the blast radius
+of an ast-grep upgrade must be one file.
+
+**Correction:** the "32 languages" claim counted the CLI's language registry,
+which includes dynamically loaded grammars. `ast-grep-language`'s
+`builtin-parser` feature ships **27** grammars. Coverage is 27; tier 2 is the
+remaining 22. README and design doc corrected.
+
+**Rejected:** shelling out to the `ast-grep` CLI (breaks the single-binary
+promise, adds version drift and JSON ser/de on the hot path); raw `tree-sitter`
+(loses the YAML rule layer, hand-maintaining queries for 27 grammars);
+`ast-grep-dynamic` dylibs to keep the 32 figure (re-breaks single-binary).
+
+---
+
+## 2026-07-26 — Vocabulary: extractor, not detector
+
+**Decision:** the single-file layer is the **extractor**. `detector` is retired
+outside historical discussion of `codeiq` — a detector finds things and
+decides, which is exactly the authority this layer does not have. Canonical
+terms live in [`CONTEXT.md`](../CONTEXT.md).
+
+---
+
+## 2026-07-26 — Graph model: a node is a thing a reference can name
+
+**Decision:** nodes are definitions, modules/packages, and external packages —
+nothing else. Files are fields on definitions, not nodes. Locals never enter
+the graph (nothing outside their scope can name them). `contains`/`defines`
+edges do not exist. **An edge means exactly one thing: a reference resolved.**
+
+**Why:** ~16k of `codeiq`'s ~28k edges were containment bookkeeping
+(`contains` 13,232 + `defines` 2,991) — structural facts a struct field states
+for free, and the reason detectors had to hand-emit "anchor nodes" to satisfy
+the phantom-drop filter. With edge = resolution, edge count directly measures
+whether the tool works. `impact <path>` improves: look up the file's
+definitions, walk inbound resolved references, answer by symbol.
+
+**Rejected:** heterogeneous node/edge kinds (`codeiq`'s shape) and split
+file-graph + symbol-graph stores (two invalidation paths).
+
+---
+
+## 2026-07-26 — Identity: content-addressed 128-bit NodeId
+
+**Decision:** `NodeId = hash(language, canonical fully-qualified name)`,
+128-bit. Canonical-FQN construction is per-language resolver code (Go:
+`module/pkg.Ident`; Java will need signature or arity for overloads). Hash
+function choice deferred to dependency vetting.
+
+**Why:** one B-tree probe per resolution (miss = `Unresolved`, recorded);
+deterministic across machines and runs, so graphs are diffable and the CI
+cache artifact is portable; extraction parallelises with no ID coordination;
+edges become fixed-size PODs — which is what zerocopy was selected for.
+
+**Rejected:** store-assigned counter (second lookup, serialised inserts,
+machine-bound graphs); span-in-hash — a one-line edit at the top of a file
+would change every ID below it and cascade a whole-repo re-resolve, a
+plausible mechanism for `codeiq`'s 21.78s cold / 21.91s warm.
+
+---
+
+## 2026-07-26 — Symbol table lives in the store; cold is a special case of warm
+
+**Decision:** phase 1 writes definitions to redb; phase 2 resolves by probing
+redb. No in-memory symbol table, no separate incremental mode. **A cold index
+is a warm index whose changed set is every file** — one code path that cannot
+silently skip work, which is the failure `codeiq`'s separate incremental path
+had.
+
+**Arithmetic (not a new measurement):** at 5M LOC, 300k–1M references × one
+probe each against the measured 854,782 reads/s on 2 vCPU ≈ 0.4–1.2s of probe
+time inside a 30s cold budget.
+
+**Rejected:** in-memory map (unbounded structure under a hard 512 MB ceiling,
+plus a second implementation for incremental); hybrid (the least-exercised
+path in development becomes the most-run path in production).
+
+---
+
+## 2026-07-26 — Unresolved references: one row per (file, kind, raw_target)
+
+**Decision:** an unresolved reference is stored deduplicated per
+`(file, kind, raw_target)` with reason, occurrence count and first span.
+
+**Why:** a file is re-extractable — spans are derived data regenerable in
+microseconds by re-parsing one file; the resolution outcome required the
+whole-repo symbol table and is the expensive fact. Counts stay exact (the
+gate's denominator is never sampled), per-file queries stay direct, and
+distinct-target diagnostics ("`fmt.Println` unresolved in 800 files") survive.
+A generated file with 10,000 identical calls is one row, bounding the
+duplication blowup (design §3.3) structurally.
+
+**This narrows §2.2's original "the reference itself" wording** — amended in
+the design doc. Nothing is silently discarded and no count is approximated.
+
+**Rejected:** one row per site (~140 MB of reconstructible spans at 5M LOC);
+counts-only (says the rate is bad and nothing about why — where `codeiq` left
+off).
+
+---
+
+## 2026-07-26 — Invalidation: candidate-set inverted index
+
+**Decision:** resolution computes an ordered candidate-FQN list per reference;
+every reference is indexed under **every candidate hash it probed — misses
+included**. When a definition with hash H is added or removed, re-resolve
+exactly the references indexed under H. Additions, removals and shadowing are
+one mechanism: a reference that resolved via candidate #3 is also indexed
+under #1–2, so a later higher-priority definition correctly re-points it.
+
+Full re-resolve is retained as the **test oracle**: a mode that re-resolves
+everything and diffs against the incremental result — the check `codeiq` never
+had.
+
+**Why:** the same insight as `Unresolved`-as-data — a failed probe is
+information; recorded, it becomes the invalidation trigger. Cost is
+O(candidates × references) index entries, with candidates a small per-language
+constant (Go ~2–4).
+
+**Rejected:** full re-resolve in production (~0.4–1.2s per event kills the
+sub-millisecond watch inner loop); module-level coarse invalidation
+(over-invalidates importers, under-invalidates unresolved references unless
+the same bookkeeping returns through the back door).
+
+---
+
+## 2026-07-26 — Gate baselines ratchet only by commit
+
+**Decision:** per-language baseline rates are committed to the repository.
+`arthron gate` fails when a language drops below its baseline; the baseline
+moves upward only by a deliberate commit, never automatically.
+
+---
+
+## 2026-07-26 — Daemon owns the single writer
+
+**Decision:** the daemon holds redb's one write handle; watch-mode indexing
+goes through it. CLI queries and the MCP server read MVCC snapshots. This is
+the shape the stress test measured: 854,782 reads/s sustained against a
+continuous writer, worst read 13.65ms.
+
+---
+
 ## 2026-07-26 — Name reserved on crates.io and npm
 
 **crates.io: published.** `arthron 0.0.0`, owner `aksOps`, MIT,
