@@ -12,6 +12,7 @@ keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
 categories = ["development-tools"]
 
 [dependencies]
+blake3 = "1"
 
 [lints.rust]
 missing_docs = "deny"

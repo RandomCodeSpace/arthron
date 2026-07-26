@@ -106,6 +106,8 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
     Some(resolved as f64 / total as f64)
 }
 
+pub mod model;
+
 #[cfg(test)]
 mod tests {
     use super::*;
