@@ -17,6 +17,7 @@ ast-grep-core = "=0.44.1"
 ast-grep-language = "=0.44.1"
 bincode = "2"
 blake3 = "1"
+clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 redb = "=4.1.0"
 
