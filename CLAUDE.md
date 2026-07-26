@@ -10,8 +10,9 @@ Read these before doing anything in this repo:
 4. [`CONTEXT.md`](CONTEXT.md) — the project glossary. Use its terms; respect
    its `_Avoid_` lists.
 
-**Status:** design approved, no implementation yet. The next step is an
-implementation plan (`superpowers:writing-plans`), not code.
+**Status:** walking skeleton implemented — `arthron scan` prints a real Go
+resolution rate against `corpus/go/codeiq`. Next: gate command and baseline
+ratchet, then Java.
 
 ## Non-negotiables
 

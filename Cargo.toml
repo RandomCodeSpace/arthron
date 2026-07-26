@@ -10,6 +10,7 @@ readme = "README.md"
 license = "MIT"
 keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
 categories = ["development-tools"]
+exclude = ["corpus/"]
 
 [dependencies]
 ast-grep-config = "=0.44.1"
