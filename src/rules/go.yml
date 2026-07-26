@@ -1,0 +1,39 @@
+id: package
+language: go
+rule:
+  kind: package_clause
+---
+id: import
+language: go
+rule:
+  kind: import_spec
+---
+id: def-func
+language: go
+rule:
+  kind: function_declaration
+---
+id: def-method
+language: go
+rule:
+  kind: method_declaration
+---
+id: def-type
+language: go
+rule:
+  kind: type_spec
+---
+id: def-const
+language: go
+rule:
+  kind: const_spec
+---
+id: def-var
+language: go
+rule:
+  kind: var_spec
+---
+id: ref-call
+language: go
+rule:
+  kind: call_expression
