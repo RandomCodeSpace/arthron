@@ -57,6 +57,9 @@ use arthron::track_python::resolve::scan_python;
 const CORPUS: &str = "corpus/python/django";
 const BASELINE: &str = "baselines/python-django.toml";
 
+const FLASK: &str = "corpus/python/flask";
+const FLASK_BASELINE: &str = "baselines/python-flask.toml";
+
 #[test]
 fn the_python_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
@@ -165,6 +168,92 @@ fn the_python_track_drops_nothing_and_holds_its_baseline() {
         baseline.language,
         Lang::Python.name(),
         "{BASELINE} measures another language; rates are per language and never aggregated",
+    );
+    match evaluate(&baseline, &measured) {
+        GateVerdict::Pass { improved } => {
+            if improved {
+                println!("gate: pass — improved on the baseline; re-base to move the ratchet");
+            }
+        }
+        GateVerdict::Fail(failures) => {
+            let joined: Vec<String> = failures.iter().map(ToString::to_string).collect();
+            panic!("gate: FAIL\n  {}", joined.join("\n  "));
+        }
+        GateVerdict::Error(e) => panic!("gate: error — {e}"),
+    }
+}
+
+/// The second Python corpus, and the ratchet that holds it.
+///
+/// flask answers the one question the Python track exists to answer, from the
+/// other side: django is a **flat layout**, where the import name `django` is
+/// a top-level directory and a resolver that assumes `<root>/<package>` is
+/// right by accident; flask is a **`src/` layout**, where the importable
+/// package lives at `src/flask` and nothing named `flask` exists at the root.
+/// The path from `pyproject.toml` to the package has to be read, not guessed.
+///
+/// Its baseline is written by the product's own command, which since #10 takes
+/// `--language` and no longer hardcodes Go:
+///
+/// ```text
+/// arthron gate corpus/python/flask --language python \
+///     --baseline baselines/python-flask.toml --rebase --commit 22d9247
+/// ```
+///
+/// django's baseline above predates that and is still re-based through
+/// `ARTHRON_PYTHON_REBASE`; both files are the same format and are compared by
+/// the same [`evaluate`], so the difference is in how they are *written*, not
+/// in what holds them.
+#[test]
+fn the_flask_ratchet_holds() {
+    let corpus = Path::new(FLASK);
+    if !corpus.is_dir() {
+        println!("SKIP: no corpus at {FLASK} — see README");
+        return;
+    }
+
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let report = scan_python(corpus, &scratch.path().join("graph.redb")).expect("the corpus scans");
+    let tally = report
+        .per_lang
+        .get(&Lang::Python.code())
+        .cloned()
+        .unwrap_or_default();
+    let measured = Counts {
+        resolved: tally.resolved,
+        external: tally.external,
+        local_binding: tally.local_binding,
+        unresolved: tally.unresolved_total(),
+    };
+    println!(
+        "flask        resolved {:<8} external {:<8} local-binding {:<8} unresolved {:<8}",
+        measured.resolved, measured.external, measured.local_binding, measured.unresolved,
+    );
+    for (code, count) in &tally.unresolved {
+        println!("             {} {count}", reason_name(*code));
+    }
+
+    // The four buckets are a partition, so none of them may be the whole of
+    // it: a run where everything landed in one bucket accounts for every
+    // reference and still measures nothing.
+    assert!(measured.resolved > 0, "nothing linked at all");
+    assert!(measured.unresolved > 0, "no floor: every reason is empty");
+    assert!(
+        measured.external > 0,
+        "nothing reached outside the repository"
+    );
+
+    let text = std::fs::read_to_string(FLASK_BASELINE)
+        .unwrap_or_else(|e| panic!("reading {FLASK_BASELINE}: {e}"));
+    let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{FLASK_BASELINE}: {e}"));
+    assert_eq!(
+        baseline.language,
+        Lang::Python.name(),
+        "{FLASK_BASELINE} measures another language; rates are per language and never aggregated",
+    );
+    assert_eq!(
+        baseline.corpus, FLASK,
+        "{FLASK_BASELINE} was recorded from another corpus",
     );
     match evaluate(&baseline, &measured) {
         GateVerdict::Pass { improved } => {

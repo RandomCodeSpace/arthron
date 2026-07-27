@@ -1,0 +1,18 @@
+# arthron gate baseline — regenerate with:
+#   arthron gate corpus/java/gson --baseline <this file> --rebase --commit <sha>
+# Release build, cold store. Counts are measured, never estimated.
+#
+# `corpus` and `commit` are provenance: printed, never verified.
+# The rate is not stored — it is derived from `resolved` and
+# `unresolved` on both sides, so the comparison is exact integer
+# arithmetic and cannot disagree with its own counts.
+# `external` and `local_binding` sit outside both rate terms; any
+# drift in either fails the gate and must be re-based deliberately.
+format = 1
+corpus = "corpus/java/gson"
+commit = "3ff35d6"
+language = "java"
+resolved = 16074
+external = 18187
+local_binding = 957
+unresolved = 7215

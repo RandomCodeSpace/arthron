@@ -1,0 +1,105 @@
+name: Corpus gates
+
+# The resolution rate is the primary gate, so it has to run where a red check
+# blocks the merge. `cargo test` gates the same numbers, but skips whenever
+# corpus/ is absent — and it is absent in CI, because the corpus is private.
+# This job is the one place that fetches it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    # Named for the branch-protection context. Renaming it silently drops the
+    # required check on main.
+    name: corpus gates
+    runs-on: ubuntu-latest
+    # Eleven cold scans of real repositories. Generous, but bounded: a hung
+    # scan must not sit on a runner for the six-hour default.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # Before the corpus lands, so `**/Cargo.lock` matches this repository's
+      # lockfile and not one vendored under corpus/rust.
+      #
+      # A `gate-` prefix of its own: this job caches a release target/ and the
+      # CI job caches a debug one, and a shared key would have them evicting
+      # each other's build.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-gate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gate-
+
+      # Read-only deploy key on RandomCodeSpace/arthron-corpus. Nothing here
+      # can write to it, and the checkout is shallow.
+      - name: Check out the corpus
+        uses: actions/checkout@v5
+        with:
+          repository: RandomCodeSpace/arthron-corpus
+          ref: main
+          path: corpus
+          ssh-key: ${{ secrets.CORPUS_DEPLOY_KEY }}
+          persist-credentials: false
+
+      # Runners ship rustup, so no third-party toolchain action is needed.
+      - name: Pin toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      # Release: the baselines were measured against a release build, and a
+      # debug scan of commons-lang would not finish inside the timeout.
+      - name: Build
+        run: cargo build --release
+
+      # One step per corpus rather than a loop: a failure names the corpus
+      # that regressed in the step list, without reading the log. Every step
+      # fails the job on a nonzero exit — exit 1 is a regression, exit 2 means
+      # nothing was measured, and neither may be reported as a pass.
+      #
+      # The rate is per language and never aggregated, so each gate passes the
+      # one language its baseline records.
+      - name: Gate go / codeiq
+        run: ./target/release/arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
+
+      - name: Gate go / caddy
+        run: ./target/release/arthron gate corpus/go/caddy --language go --baseline baselines/go-caddy.toml
+
+      - name: Gate go / probes
+        run: ./target/release/arthron gate corpus/go/probes --language go --baseline baselines/go-probes.toml
+
+      - name: Gate java / commons-lang
+        run: ./target/release/arthron gate corpus/java/commons-lang --language java --baseline baselines/java-commons-lang.toml
+
+      - name: Gate java / gson
+        run: ./target/release/arthron gate corpus/java/gson --language java --baseline baselines/java-gson.toml
+
+      - name: Gate javascript / fastify
+        run: ./target/release/arthron gate corpus/javascript/fastify --language javascript --baseline baselines/javascript-fastify.toml
+
+      - name: Gate javascript / express
+        run: ./target/release/arthron gate corpus/javascript/express --language javascript --baseline baselines/javascript-express.toml
+
+      - name: Gate typescript / vue-core
+        run: ./target/release/arthron gate corpus/typescript/vue-core --language typescript --baseline baselines/typescript-vue-core.toml
+
+      - name: Gate typescript / zod
+        run: ./target/release/arthron gate corpus/typescript/zod --language typescript --baseline baselines/typescript-zod.toml
+
+      - name: Gate python / django
+        run: ./target/release/arthron gate corpus/python/django --language python --baseline baselines/python-django.toml
+
+      - name: Gate python / flask
+        run: ./target/release/arthron gate corpus/python/flask --language python --baseline baselines/python-flask.toml

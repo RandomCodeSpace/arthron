@@ -28,6 +28,19 @@ const BASELINE: &str = "baselines/java-commons-lang.toml";
 /// The pinned corpus revision, for the baseline's provenance line.
 const CORPUS_COMMIT: &str = "598dfc1";
 
+/// Every Java corpus and the baseline that holds it: `(corpus, baseline,
+/// pinned revision)`.
+///
+/// **Two corpora, two baselines**, for the reason Go has two: a gate against a
+/// single repository locks in a number rather than a capability. gson is loud
+/// exactly where commons-lang is quiet — generics threaded through
+/// `TypeAdapter<T>`, eleven overloads of `fromJson` in one file, and a JPMS
+/// `module-info.java` beside the pom, none of which commons-lang has.
+const CORPORA: &[(&str, &str, &str)] = &[
+    (CORPUS, BASELINE, CORPUS_COMMIT),
+    ("corpus/java/gson", "baselines/java-gson.toml", "3ff35d6"),
+];
+
 /// Whether the corpus has been cloned in.
 fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("src/main/java").is_dir() {
@@ -120,21 +133,44 @@ fn measure(corpus: &Path) -> Counts {
     }
 }
 
-#[test]
-fn the_ratchet_holds() {
-    let corpus = Path::new(CORPUS);
-    if !corpus_present(corpus) {
+fn assert_ratchet(corpus: &str, baseline_path: &str) {
+    let root = Path::new(corpus);
+    if !corpus_present(root) {
         return;
     }
-    let text = std::fs::read_to_string(BASELINE).expect("the baseline is committed");
-    let baseline = parse_baseline(&text).expect("the baseline parses");
-    assert_eq!(baseline.language, Lang::Java.name());
+    let text = std::fs::read_to_string(baseline_path)
+        .unwrap_or_else(|e| panic!("reading {baseline_path}: {e}"));
+    let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{baseline_path}: {e}"));
+    assert_eq!(
+        baseline.language,
+        Lang::Java.name(),
+        "{baseline_path} measures another language; rates are per language and never aggregated",
+    );
+    assert_eq!(
+        baseline.corpus, corpus,
+        "{baseline_path} was recorded from another corpus",
+    );
 
-    let measured = measure(corpus);
+    let measured = measure(root);
+    println!(
+        "{corpus}: resolved {} external {} local-binding {} unresolved {}",
+        measured.resolved, measured.external, measured.local_binding, measured.unresolved,
+    );
     match evaluate(&baseline, &measured) {
         GateVerdict::Pass { .. } => {}
-        other => panic!("{other:?}\nmeasured {measured:?}"),
+        other => panic!("{baseline_path}: {other:?}\nmeasured {measured:?}"),
     }
+}
+
+#[test]
+fn the_ratchet_holds() {
+    assert_ratchet(CORPUS, BASELINE);
+}
+
+#[test]
+fn the_gson_ratchet_holds() {
+    let (corpus, baseline, _) = CORPORA[1];
+    assert_ratchet(corpus, baseline);
 }
 
 /// The baseline is written by `arthron gate --rebase` and by nothing else.
@@ -148,25 +184,30 @@ fn the_ratchet_holds() {
 /// ```text
 /// arthron gate corpus/java/commons-lang --language java \
 ///     --baseline baselines/java-commons-lang.toml --rebase --commit 598dfc1
+/// arthron gate corpus/java/gson --language java \
+///     --baseline baselines/java-gson.toml --rebase --commit 3ff35d6
 /// ```
 #[test]
-fn the_baseline_names_the_corpus_this_test_measures() {
-    let text = std::fs::read_to_string(BASELINE).expect("the baseline is committed");
-    let baseline = parse_baseline(&text).expect("the baseline parses");
-    assert_eq!(baseline.corpus, CORPUS);
-    assert_eq!(baseline.commit, CORPUS_COMMIT);
-    assert_eq!(baseline.language, Lang::Java.name());
-    assert_eq!(baseline.format, FORMAT);
-    for value in [&baseline.corpus, &baseline.commit, &baseline.language] {
-        assert!(
-            is_renderable(value),
-            "provenance `{value}` cannot be written"
+fn every_java_baseline_names_the_corpus_it_measures() {
+    for (corpus, baseline_path, commit) in CORPORA {
+        let text = std::fs::read_to_string(baseline_path)
+            .unwrap_or_else(|e| panic!("reading {baseline_path}: {e}"));
+        let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{baseline_path}: {e}"));
+        assert_eq!(baseline.corpus, *corpus);
+        assert_eq!(baseline.commit, *commit);
+        assert_eq!(baseline.language, Lang::Java.name());
+        assert_eq!(baseline.format, FORMAT);
+        for value in [&baseline.corpus, &baseline.commit, &baseline.language] {
+            assert!(
+                is_renderable(value),
+                "provenance `{value}` cannot be written"
+            );
+        }
+        // The reader and the writer agree, which is what makes a rebased file
+        // readable by the gate that will compare against it.
+        assert_eq!(
+            parse_baseline(&render_baseline(&baseline)).expect("a rendered baseline parses"),
+            baseline,
         );
     }
-    // The reader and the writer agree, which is what makes a rebased file
-    // readable by the gate that will compare against it.
-    assert_eq!(
-        parse_baseline(&render_baseline(&baseline)).expect("a rendered baseline parses"),
-        baseline,
-    );
 }
