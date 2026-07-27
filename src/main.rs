@@ -11,6 +11,7 @@ use arthron::gate::{
 };
 use arthron::model::{Lang, reason_name};
 use arthron::pipeline::scan_repo;
+use arthron::registry::REGISTRY;
 use arthron::resolution_rate;
 use arthron::store::LangTally;
 
@@ -145,14 +146,33 @@ fn run_gate(
     rebase: bool,
     commit: Option<&str>,
 ) -> ExitCode {
+    // Only a language whose track is live can be gated, and both checks
+    // answer before anything is read. A registered-but-disabled track
+    // contributes no row, so its tally is zeros: letting the name through
+    // would spend a whole cold scan to arrive at a usage error that was
+    // already knowable, and `Lang::ALL` names far more languages than this
+    // build can measure.
+    let gateable: Vec<&str> = REGISTRY
+        .iter()
+        .filter(|t| t.is_enabled())
+        .flat_map(|t| t.langs)
+        .map(|l| l.name())
+        .collect();
     let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
-        let known: Vec<&str> = Lang::ALL.iter().map(|l| l.name()).collect();
         eprintln!(
             "arthron: unknown language `{language}`; one of: {}",
-            known.join(", ")
+            gateable.join(", ")
         );
         return ExitCode::from(EXIT_USAGE);
     };
+    if !gateable.contains(&lang.name()) {
+        eprintln!(
+            "arthron: language `{language}` is registered but its track is not live in \
+             this build, so there is nothing to gate; one of: {}",
+            gateable.join(", "),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
     // Read the baseline before scanning. A malformed file is a usage error,
     // and finding that out after a multi-minute scan helps nobody.
     let existing = match std::fs::read_to_string(baseline_path) {

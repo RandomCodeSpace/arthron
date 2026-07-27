@@ -21,8 +21,9 @@ fn write(root: &Path, rel: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-/// A module with one real Go package and one file per not-yet-live track,
-/// each naming things a live extractor would certainly have picked up.
+/// A module with one real Go package plus a file for each of the other live
+/// tracks and for three registered-but-disabled ones, each naming things a
+/// live extractor would certainly have picked up.
 fn mixed_tree(root: &Path) {
     write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
     write(
@@ -53,6 +54,12 @@ fn mixed_tree(root: &Path) {
         "export declare function hi(): void;\n",
     );
     write(root, "app/greet.py", "def hi():\n    hi()\n");
+    // Three of the registered-but-disabled tier-2 tracks, so that "a disabled
+    // track owns no file" is asserted against files that exist rather than
+    // against an empty tree.
+    write(root, "app/greet.rs", "pub fn hi() { hi(); }\n");
+    write(root, "app/greet.rb", "def hi\n  hi\nend\n");
+    write(root, "app/greet.cpp", "void hi() { hi(); }\n");
 }
 
 #[test]
@@ -60,7 +67,13 @@ fn registry_iteration_order_is_deterministic() {
     let once: Vec<&str> = REGISTRY.iter().map(|t| t.name).collect();
     let twice: Vec<&str> = REGISTRY.iter().map(|t| t.name).collect();
     assert_eq!(once, twice);
-    assert_eq!(once, ["go", "java", "ecma", "python"]);
+    assert_eq!(
+        once,
+        [
+            "go", "java", "ecma", "python", "cpp", "csharp", "kotlin", "swift", "ruby", "php",
+            "rust", "scala", "dart", "elixir", "haskell", "lua", "bash", "hcl",
+        ]
+    );
 
     // Every language is registered to exactly one track, so "which track
     // reads this file" has one answer rather than a precedence rule.
