@@ -2,7 +2,9 @@
 //!
 //! [`TRACK`] is registered with `scan: None`, so the driver runs nothing for
 //! Python and [`crate::registry::Track::owns_extension`] answers `false` for
-//! `py`. The seam exists; the work does not.
+//! `py`. The extractor exists; the resolver that would produce an
+//! [`crate::Outcome`] does not, and a track with no resolver has nothing to
+//! contribute to a scan.
 //!
 //! # Going live
 //!
@@ -10,28 +12,29 @@
 //! in `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track
 //! moves.
 //!
-//! 1. **Submodules, nested.** `mod extract;`, `mod resolve;` here resolve to
-//!    `src/track_python/extract.rs` and `src/track_python/resolve.rs`;
-//!    `lib.rs` already declares `track_python`.
-//! 2. **A [`crate::lang::Language`] impl**, say `PyLang`, with
-//!    `const LANG = Lang::Python`, `const DOMAIN = Domain::Python`,
-//!    `extensions()` returning [`Lang::extensions`] for `Lang::Python` rather
-//!    than a second list, `skip_dirs()` for virtual environments and caches
-//!    (`.venv`, `venv`, `__pycache__`, `.tox`), and the three associated
-//!    types. `Config` is where the import root lives: a package is a
-//!    directory, and which directory is the root is a project fact, so a
-//!    layout it cannot determine is
+//! 1. **Submodules, nested.** *Done*: [`extract`] and [`lang`] resolve to
+//!    `src/track_python/extract.rs` and `src/track_python/lang.rs`; a
+//!    `mod resolve;` here will resolve to `src/track_python/resolve.rs`.
+//! 2. **A [`crate::lang::Language`] impl.** *Done*: [`lang::PyLang`]. Its
+//!    `Scope` and `Config` are `()` until the resolver needs them.
+//!    `Config` is where the import root will live: a package is a directory,
+//!    and which directory is the root is a project fact, so a layout it
+//!    cannot determine is
 //!    [`crate::UnresolvedReason::ProjectLayoutUnknown`] and not a guess.
 //! 3. **An extractor** implementing [`crate::lang::Extractor`], parsing with
-//!    [`crate::sg::SourceTree::parse_python`]. It emits
-//!    [`crate::model::Definition`] and [`crate::model::Reference`] records and
-//!    **never an edge**.
+//!    [`crate::sg::SourceTree::parse_python`]. *Done*:
+//!    [`extract::PyExtractor`]. It emits [`crate::model::Definition`] and
+//!    [`crate::model::Reference`] records and **never an edge**.
 //! 4. **A resolver** implementing [`crate::lang::Resolver`]: the one place a
 //!    Python [`crate::Outcome`] is produced. Every reference ends `Resolved`,
 //!    `External`, or `Unresolved(reason)`; nothing is dropped. A name bound
 //!    by an assignment, parameter, comprehension, `with` or `except` clause
 //!    ends `Unresolved(LocalBinding)` — reported beside `External` and
-//!    excluded from both terms of the rate.
+//!    excluded from both terms of the rate. The extractor has already stated
+//!    that fact per reference in [`crate::model::Reference::locally_bound`];
+//!    turning it into an outcome is this step's job, not the extractor's,
+//!    because suppressing such a reference would delete it from the
+//!    denominator instead of reporting it.
 //! 5. **Honest reasons.** Python's floor is the largest of the four and is
 //!    supposed to be: `x.m()` where `x` has no annotation is
 //!    [`crate::UnresolvedReason::NeedsTypeInference`], a monkeypatch is
@@ -52,6 +55,31 @@
 //! Sharing the store with a live Go track is safe: a scan forgets only files
 //! carrying an extension the running track owns, and extension ownership is a
 //! partition (see [`Lang::for_extension`]).
+//!
+//! # What the extractor does not see yet
+//!
+//! Recorded here rather than left to be rediscovered, because each is a
+//! *known* under-count and none of them may be quietly closed by widening a
+//! bucket:
+//!
+//! - **Attribute reads.** `obj.x` that is not called is not a reference, so a
+//!   `@property` read is a missing edge rather than a wrong one (E-10). A
+//!   blanket read kind would multiply reference volume for modest gain.
+//! - **Module-level `for`, `with` and `except` targets** bind module globals
+//!   and are not emitted as definitions; only assignments, `def`, `class`,
+//!   imports, `__slots__` and `global` writes are. References to such a name
+//!   will miss honestly rather than resolve to nothing quietly.
+//! - **Framework string literals.** `mock.patch("pkg.mod.f")` (H-04) and
+//!   `importlib.import_module("a.b")` (B-19) name things literally, and a
+//!   framework rule — not the core extractor — is what turns them into
+//!   references. Until then they are ordinary calls, and the *variable*
+//!   forms must stay [`crate::UnresolvedReason::DynamicModuleSpecifier`],
+//!   never a guess.
+//! - **The annotation-to-name map.** Annotations are emitted as
+//!   [`crate::model::RefKind::TypeUse`] references, which is what makes
+//!   E-05's `def f(c: Client): c.send()` resolvable without inference, but
+//!   the per-block `name → annotated type` table those feed is the
+//!   resolver's scope and lands with it.
 
 use crate::model::Lang;
 use crate::registry::Track;
