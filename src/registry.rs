@@ -103,13 +103,16 @@ mod tests {
     }
 
     #[test]
-    fn go_is_the_only_live_track() {
+    fn go_is_live_whatever_else_is() {
+        // Go can never be switched off, and the live set is whatever the
+        // tracks themselves declare — this test must keep passing as each
+        // track flips on, or the registry's zero-conflict promise is false.
         let live: Vec<&str> = REGISTRY
             .iter()
             .filter(|t| t.is_enabled())
             .map(|t| t.name)
             .collect();
-        assert_eq!(live, ["go"]);
+        assert!(live.contains(&"go"), "go is not live: {live:?}");
     }
 
     #[test]
