@@ -287,7 +287,29 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// reachable under. Empty when a definition is reachable only by its FQN.
     fn index_keys(&self, cfg: &L::Config, fqn: &Fqn, def: &Definition) -> Vec<NodeId>;
 
+    /// Whether this definition is stored as a **package node** rather than
+    /// as a definition node.
+    ///
+    /// The two records differ in one accounting rule that has to be a
+    /// language's own call: a package node is not a *collision* when several
+    /// files declare it, because being reopened by every file under it is
+    /// what a package is, while a definition declared twice is two entities
+    /// and [`crate::store::Report::fqn_collisions`] must say so.
+    ///
+    /// The default answers `true` for every [`DefKind::Module`], which is
+    /// right wherever the module kind is used for namespaces alone. A
+    /// language that also files a *term* under it — Scala's `object`, which
+    /// is a container in the FQN grammar and a declaration in the graph —
+    /// overrides this and keeps the two apart, so that the collision count
+    /// keeps meaning what it says.
+    fn stores_as_package(&self, def: &Definition) -> bool {
+        def.kind == DefKind::Module
+    }
+
     /// Two definitions share an FQN: language semantics, or corruption?
+    ///
+    /// Asked only about a node [`Resolver::stores_as_package`] answered
+    /// `false` for: a package node carries no collision to explain.
     fn mergeable(&self, a: &Definition, b: &Definition) -> bool;
 
     /// Build the per-file scope. Runs after the definition phase and sees

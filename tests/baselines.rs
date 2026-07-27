@@ -4,14 +4,26 @@
 //! The ratchets themselves live beside the corpus acceptance for each track —
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
 //! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
-//! `tests/corpus_rust.rs`, `tests/swift_corpus.rs`, and `tests/probes.rs` for
+//! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
+//! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
 //! it, which looks exactly like a passing gate and is the absence of one.
 //!
-//! This file closes it. It reads no corpus and runs everywhere, including the
-//! CI job where `corpus/` is absent and every ratchet skips.
+//! This file closes half of it, and is worth reading for which half. It reads
+//! no corpus and runs everywhere, including the CI job where `corpus/` is
+//! absent and every ratchet skips — so it does catch a baseline that no test
+//! file names at all.
+//!
+//! What it does **not** catch is a baseline whose ratchet exists and never
+//! runs. Every file in the right-hand column below skips without a corpus,
+//! and the corpus is private, so `cargo test` in CI proves nothing about any
+//! of these numbers. The job that does is
+//! `.github/workflows/gate.yml`, which is the one place the corpus is
+//! fetched, and a `GATED` row here says nothing about whether a step there
+//! names the same baseline. Adding a baseline therefore takes **two** entries,
+//! not one, and only the first of them is checked below.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -22,6 +34,11 @@ use arthron::model::Lang;
 /// Every committed baseline, and the test file that compares a scan against
 /// it. Add a row here in the same commit that adds the baseline — the test
 /// below is what makes forgetting one fail.
+///
+/// A row here is *not* enforcement. The driver it names skips whenever
+/// `corpus/` is absent, which is every CI run; the step in
+/// `.github/workflows/gate.yml` is what makes the number block a merge. Both
+/// are required, and nothing here checks the second.
 const GATED: &[(&str, &str)] = &[
     ("baselines/go-codeiq.toml", "tests/corpus.rs"),
     ("baselines/go-caddy.toml", "tests/corpus.rs"),
@@ -40,6 +57,9 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/php-guzzle.toml", "tests/php_corpus.rs"),
     ("baselines/ruby-rack.toml", "tests/ruby_corpus.rs"),
     ("baselines/rust-ripgrep.toml", "tests/corpus_rust.rs"),
+    ("baselines/kotlin-okio.toml", "tests/kotlin_corpus.rs"),
+    ("baselines/scala-upickle.toml", "tests/scala_corpus.rs"),
+    ("baselines/csharp-serilog.toml", "tests/csharp_corpus.rs"),
     ("baselines/swift-alamofire.toml", "tests/swift_corpus.rs"),
 ];
 

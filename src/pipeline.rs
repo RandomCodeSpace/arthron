@@ -37,9 +37,27 @@ use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, node_id
 use crate::registry::REGISTRY;
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
-    DeclSite, DefBatch, FileDefs, FileRefs, FileSupers, NodePayload, NodeRecord, RefBatch, RefKey,
-    RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
+    DeclSite, DefBatch, FileDefs, FileError, FileRefs, FileSupers, NodePayload, NodeRecord,
+    RefBatch, RefKey, RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
 };
+
+/// Files a phase writes in one transaction.
+///
+/// Bounding the batch bounds one term of a scan's memory, not the scan's:
+/// what a batch holds, and the dirty pages redb holds for the transaction
+/// writing it, are both freed at the boundary instead of growing to the size
+/// of the event. Other structures beside it are still the corpus's — see
+/// [`scan`] — so peak RSS stays linear in the tree. Measured on the 2 vCPU
+/// reference hardware: 343 MB over a 1.79M-line Go corpus, 676 MB over that
+/// same corpus with its owned set doubled. The 512 MB ceiling is an envelope
+/// the reference corpus sits well inside, not a structural bound, and it is
+/// crossed somewhere near 1.5× that tree.
+///
+/// 500 because that is the measured shape of the trade: 500 files in one
+/// transaction against 216ms as 500 separate ones. Nothing about the graph
+/// depends on the number — a file's facts are applied in the same order at
+/// any batch size — only the memory and the transaction count do.
+const BATCH_FILES: usize = 500;
 
 /// One file this event re-reads, extracted.
 ///
@@ -116,6 +134,19 @@ struct RefAcc {
 /// the definition phase, and a file's supertypes are a function of its own
 /// bytes and that set, so a file this round wakes re-derives exactly the rows
 /// it already holds.
+///
+/// # Memory
+///
+/// Peak RSS is linear in the tree, not in the batch. What a cold scan holds
+/// at once is the changed set — every owned file, parsed — from the walk
+/// until phase 2 consumes it, and beside it, one phase at a time, the symbol
+/// table each phase probes, the FQN index the supertype phase reads, and the
+/// two definition maps the widening compares. Each of those is dropped where
+/// the phase that reads it ends, which is why they are dropped by name below
+/// rather than at the end of the function; the changed set spans them all,
+/// and it is the tree. The 512 MB ceiling is therefore an envelope measured
+/// against the reference corpus, not a property of this code — see
+/// [`BATCH_FILES`].
 pub fn scan<L: Language>(
     root: &Path,
     db_path: &Path,
@@ -123,7 +154,21 @@ pub fn scan<L: Language>(
     rs: &dyn Resolver<L>,
     filter: &FileFilter,
 ) -> Result<Report, String> {
-    let paths = source_files_with::<L>(root, filter)?;
+    // The walk's own failures start the list this scan will hand back: a
+    // directory it could not descend into is a file set it did not see, and
+    // that is the same class of fact as a file it could not read.
+    let (paths, walk_errors) = source_files_with::<L>(root, filter)?;
+    // Keyed by path so a file that fails twice — once on the walk, once when
+    // an event wakes it — is one entry and one count.
+    let mut file_errors: BTreeMap<String, String> = walk_errors
+        .into_iter()
+        .map(|e| (e.path, e.message))
+        .collect();
+    // The owned files this event could not read. A subset of `file_errors`,
+    // and not derivable from it: that map also carries directories the walk
+    // could not descend into and paths that are not UTF-8, neither of which
+    // is a file the store holds facts under.
+    let mut stale: BTreeSet<String> = BTreeSet::new();
     let mut index = FileIndex {
         files: Vec::with_capacity(paths.len()),
     };
@@ -146,7 +191,9 @@ pub fn scan<L: Language>(
             .filter(|file| claims::<L>(file))
             .collect();
         store.forget_files(&orphaned)?;
-        return store.report();
+        let mut report = store.report()?;
+        report.file_errors = named(file_errors);
+        return Ok(report);
     }
 
     let mut cfg = rs.config(root, &index).map_err(|e| e.message)?;
@@ -173,9 +220,24 @@ pub fn scan<L: Language>(
         if !rs.owns_file(&cfg, &rel) {
             continue; // governed by another project; not this scan's file
         }
-        let source = read_source(path, &rel)?;
-        let hash = *blake3::hash(source.as_bytes()).as_bytes();
+        // Recorded as reached *before* the read is attempted. A file whose
+        // bytes cannot be read is not a file that is gone, and leaving it out
+        // of `owned` would put it in the deleted set below — a `chmod 000`
+        // would silently forget every fact the file ever produced.
         owned.insert(rel.clone(), path.clone());
+        let source = match read_source(path, &rel) {
+            Ok(source) => source,
+            // Unreadable, or not UTF-8. Named and stepped over: the scan is a
+            // measurement of a tree, and one file the filesystem will not hand
+            // over is a fact about that tree rather than a reason to measure
+            // none of it.
+            Err(e) => {
+                stale.insert(rel.clone());
+                file_errors.insert(rel, e);
+                continue;
+            }
+        };
+        let hash = *blake3::hash(source.as_bytes()).as_bytes();
         if store.file_hash(&rel)? == Some(hash) {
             continue; // unchanged: not in this event's changed set
         }
@@ -186,6 +248,13 @@ pub fn scan<L: Language>(
             facts,
         });
     }
+
+    // Stepping over an unreadable file kept its facts; this is the other
+    // half of that trade. Written before the event's first fact rather than
+    // with the rest of it, so that a store error later in the scan cannot
+    // leave a file both stale and claiming to be current — see
+    // [`Store::forget_hashes`].
+    flush_stale(&store, &mut stale)?;
 
     // A file the store knows and this walk did not reach is gone: deleted,
     // renamed, or no longer owned because a nested manifest appeared above
@@ -239,23 +308,36 @@ pub fn scan<L: Language>(
     store.forget_files(&deleted)?;
 
     // Phase 1: definition and container nodes for the changed set.
+    //
+    // Written in batches of [`BATCH_FILES`] rather than one transaction over
+    // the event. The probe is read once, before the first batch commits, and
+    // every file in the phase is named against that one table — so which
+    // batch a file lands in decides nothing, and the graph a batched phase
+    // leaves is the graph a single transaction left.
     let probe = store.symbol_entries()?;
     // The definitions this event declared, by identity. Two of them under
     // one identity is the only case the language can be asked about.
     let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
     let mut def_batch = DefBatch {
-        files: Vec::with_capacity(changed.len()),
+        files: Vec::with_capacity(BATCH_FILES),
     };
+    // Every identity any batch flagged as doubly declared. Collected rather
+    // than believed: a batch judges the graph as it stands when it commits,
+    // and only the finished event can say which of them still stands — see
+    // [`Store::definition_collisions`].
+    let mut flagged: BTreeSet<NodeId> = BTreeSet::new();
+    // Accumulated a batch at a time for the same reason the batch is: this
+    // is what the event declares, and it has to outlive the records it was
+    // read from.
+    let mut declared_now: BTreeMap<NodeId, NodePayload> = BTreeMap::new();
     for file in &changed {
-        def_batch
-            .files
-            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        let defs = phase_one(rs, &cfg, file, &probe, &mut event_defs);
+        for (id, record) in &defs.nodes {
+            declared_now.insert(*id, record.payload());
+        }
+        def_batch.files.push(defs);
+        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
     }
-    let declared_now: BTreeMap<NodeId, NodePayload> = def_batch
-        .files
-        .iter()
-        .flat_map(|f| f.nodes.iter().map(|(id, rec)| (*id, rec.payload())))
-        .collect();
 
     // The identities this event started declaring, stopped declaring, or
     // changed the meaning of. The third case is not the same as the first
@@ -277,10 +359,13 @@ pub fn scan<L: Language>(
         .into_iter()
         .collect();
     let covered: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+    // A woken file that has become unreadable since the walk saw it keeps the
+    // halves the last event stored for it — stale, and named here, rather than
+    // taking the whole scan down with it.
     let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &covered, &owned)?
         .into_iter()
-        .map(|(rel, path)| scan_file(ex, &path, rel))
-        .collect::<Result<_, String>>()?;
+        .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
+        .collect();
     // Their definitions cannot have changed — their bytes did not — so this
     // re-asserts an ownership record identical to the one already stored,
     // and keeps every file this event writes phase-2 facts for covered by a
@@ -289,11 +374,22 @@ pub fn scan<L: Language>(
         def_batch
             .files
             .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
     }
+    flush_defs(&store, &mut def_batch, &mut flagged, 1)?;
+    drop(def_batch);
+    // Both halves of the comparison have done their work; `touched` is the
+    // whole of what the event kept from them.
+    drop(declared_before);
+    drop(declared_now);
 
-    let colliding = store.apply_defs(&def_batch)?;
+    let colliding = store.definition_collisions(&flagged)?;
     let merged = mergeable_count(rs, &colliding, &event_defs);
+    drop(event_defs);
 
+    // The phase-1 probe goes before the phase-2 one is read: holding two
+    // whole symbol tables at once buys nothing, and phase 1 is over.
+    drop(probe);
     // The container names phase 1 just wrote are part of the scope every file
     // is resolved against, so the config is refreshed before any scope is
     // built — by phase 1.5 as much as by phase 2.
@@ -322,24 +418,27 @@ pub fn scan<L: Language>(
                 .or_insert(record);
         }
         let fqns = store.definition_fqns()?;
+        // Batched like phase 1, and for the same reason. A file's supertype
+        // rows are a function of its own bytes and the definition table this
+        // phase never writes to, so a batch boundary moves no row.
         let mut super_batch = SuperBatch {
-            files: Vec::with_capacity(changed.len() + waking.len()),
+            files: Vec::with_capacity(BATCH_FILES),
         };
-        for file in changed.iter().chain(waking.iter()) {
-            super_batch
-                .files
-                .push(phase_supers(rs, &cfg, file, &probe, &fqns, links));
-        }
         let mut supers_now: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
-        for file in &super_batch.files {
-            for (id, record) in &file.types {
+        for file in changed.iter().chain(waking.iter()) {
+            let supers = phase_supers(rs, &cfg, file, &probe, &fqns, links);
+            for (id, record) in &supers.types {
                 supers_now
                     .entry(*id)
                     .and_modify(|held| held.merge(record.clone()))
                     .or_insert_with(|| record.clone());
             }
+            super_batch.files.push(supers);
+            flush_supers(&store, &mut super_batch, BATCH_FILES)?;
         }
-        store.apply_supers(&super_batch)?;
+        flush_supers(&store, &mut super_batch, 1)?;
+        drop(super_batch);
+        drop(fqns);
 
         // The same widening the definition phase performs, for the same
         // reason and with the same over-approximation: a type whose
@@ -363,8 +462,8 @@ pub fn scan<L: Language>(
         covered.extend(waking.iter().map(|f| f.rel_path.as_str()));
         roused = wake_files(&store, &moved, &covered, &owned)?
             .into_iter()
-            .map(|(rel, path)| scan_file(ex, &path, rel))
-            .collect::<Result<_, String>>()?;
+            .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
+            .collect();
         // Their phase-1 half is already stored and their bytes did not move,
         // so there is nothing to re-assert: only their references are stale.
         probe.supers = store.supertype_index()?;
@@ -372,17 +471,115 @@ pub fn scan<L: Language>(
 
     // Phase 2: resolve every reference in the changed set and in every file
     // this event woke, in either round.
+    //
+    // The files are *consumed* here, not borrowed. Phase 2 is the last thing
+    // that reads a file's extracted facts, and on a cold scan those facts are
+    // the largest thing the process holds — the whole tree, parsed. Dropping
+    // each file's as its half is built is what lets the batches be allocated
+    // out of the memory the facts are giving back, rather than beside it.
     let mut ref_batch = RefBatch {
-        files: Vec::with_capacity(changed.len() + waking.len() + roused.len()),
+        files: Vec::with_capacity(BATCH_FILES),
     };
-    for file in changed.iter().chain(waking.iter()).chain(roused.iter()) {
-        ref_batch.files.push(phase_two(rs, &cfg, file, &probe));
+    for file in changed.into_iter().chain(waking).chain(roused) {
+        let refs = phase_two(rs, &cfg, &file, &probe);
+        drop(file);
+        ref_batch.files.push(refs);
+        flush_refs(&store, &mut ref_batch, BATCH_FILES)?;
     }
-    store.apply_refs(&ref_batch)?;
+    flush_refs(&store, &mut ref_batch, 1)?;
+
+    // The files the two waking rounds could not read. Their halves are as
+    // stale as the walk's were, and for the same reason.
+    flush_stale(&store, &mut stale)?;
 
     let mut report = store.report()?;
     report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
+    report.file_errors = named(file_errors);
     Ok(report)
+}
+
+/// Read and extract one woken file, or record why it could not be.
+///
+/// A file this event woke and could not read keeps rows the event has just
+/// invalidated, so it goes in `stale` exactly as an unreadable file in the
+/// walk does.
+fn woken<L: Language>(
+    ex: &dyn Extractor<L>,
+    path: &Path,
+    rel: String,
+    file_errors: &mut BTreeMap<String, String>,
+    stale: &mut BTreeSet<String>,
+) -> Option<ScannedFile<L>> {
+    match scan_file(ex, path, rel.clone()) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            stale.insert(rel.clone());
+            file_errors.insert(rel, e);
+            None
+        }
+    }
+}
+
+/// Hand back the store's currency claim for every owned file this event
+/// could not read, and empty the set so a later call does not rewrite them.
+fn flush_stale(store: &Store, stale: &mut BTreeSet<String>) -> Result<(), String> {
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = std::mem::take(stale).into_iter().collect();
+    store.forget_hashes(&paths)
+}
+
+/// The accumulated failures, as the report carries them: sorted by path,
+/// one entry per file.
+fn named(errors: BTreeMap<String, String>) -> Vec<FileError> {
+    errors
+        .into_iter()
+        .map(|(path, message)| FileError { path, message })
+        .collect()
+}
+
+/// Commit a phase-1 batch and forget it, once it holds `limit` files.
+///
+/// `limit` is [`BATCH_FILES`] inside a loop and `1` after it, which is the
+/// "commit whatever is left" call: an empty batch is never written, because
+/// a transaction over no files is a transaction with nothing to say.
+///
+/// Clearing the batch is the point, not committing it. The batch and the
+/// dirty pages redb holds for it are the phase's whole memory, and both go
+/// back at this boundary.
+fn flush_defs(
+    store: &Store,
+    batch: &mut DefBatch,
+    flagged: &mut BTreeSet<NodeId>,
+    limit: usize,
+) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    flagged.extend(store.apply_defs(batch)?);
+    batch.files.clear();
+    Ok(())
+}
+
+/// [`flush_defs`], for the supertype phase.
+fn flush_supers(store: &Store, batch: &mut SuperBatch, limit: usize) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    store.apply_supers(batch)?;
+    batch.files.clear();
+    Ok(())
+}
+
+/// [`flush_defs`], for the reference phase.
+fn flush_refs(store: &Store, batch: &mut RefBatch, limit: usize) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    store.apply_refs(batch)?;
+    batch.files.clear();
+    Ok(())
 }
 
 /// The unchanged files holding a reference that probed one of `touched`.
@@ -466,7 +663,7 @@ fn phase_one<L: Language>(
             // hand the resolver a one-step cycle to detect at every probe.
             .filter(|t| *t != id)
             .collect();
-        let payload = if def.kind == DefKind::Module {
+        let payload = if rs.stores_as_package(def) {
             NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
         } else if targets.is_empty() {
             NodePayload::Definition(def.kind.code(), def.facets.bits())
@@ -676,6 +873,12 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
     let filter = config.filter(root)?;
     let mut report = None;
     let mut switched_off = false;
+    // Every live track walks the tree itself, so a directory none of them can
+    // descend into is found once per track. Merged by path: the report counts
+    // files it could not read, not attempts to read them. Only the last
+    // track's report is returned — see below — so without this merge a
+    // failure the Go walk found would be gone by the time Python finished.
+    let mut file_errors: BTreeMap<String, String> = BTreeMap::new();
     for track in REGISTRY {
         let Some(scan) = track.scan else {
             continue; // not live: owns no file, contributes nothing
@@ -684,20 +887,29 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
             switched_off = true;
             continue;
         }
-        report = Some(scan(root, db_path, &filter)?);
+        let measured = scan(root, db_path, &filter)?;
+        file_errors.extend(
+            measured
+                .file_errors
+                .iter()
+                .map(|e| (e.path.clone(), e.message.clone())),
+        );
+        report = Some(measured);
     }
     // Not a default-empty report: "no track is built into this binary" and
     // "every track found nothing" are different facts, and returning zeros
     // for the first would let a gate bless a build that measures nothing.
     // A config that switched every live track off is a third fact, and says
     // so rather than blaming the build.
-    report.ok_or_else(|| {
+    let mut report = report.ok_or_else(|| {
         if switched_off {
             format!("every live language track is switched off by {CONFIG_FILE}")
         } else {
             "no language track is enabled in this build".to_string()
         }
-    })
+    })?;
+    report.file_errors = named(file_errors);
+    Ok(report)
 }
 
 /// Whether a repo-relative path carries an extension this language owns.
@@ -844,7 +1056,16 @@ fn rel_path(root: &Path, path: &Path) -> Result<String, String> {
 /// A second copy of these rules in a test would drift, and the first thing it
 /// would hide is a file the scan silently never read.
 pub fn source_files<L: Language>(root: &Path) -> Result<Vec<PathBuf>, String> {
-    source_files_with::<L>(root, &FileFilter::none())
+    let (paths, errors) = source_files_with::<L>(root, &FileFilter::none())?;
+    // The assertion needs the file set the tree actually holds. A walk that
+    // could not read part of it did not produce that set, so this fails
+    // rather than quietly asserting completeness over a smaller tree — which
+    // is exactly the shape of bug the assertion exists to catch. A scan is
+    // the opposite trade and keeps going; see [`source_files_with`].
+    match errors.first() {
+        Some(first) => Err(format!("{}: {}", first.path, first.message)),
+        None => Ok(paths),
+    }
 }
 
 /// [`source_files`] under a repository's include/exclude globs.
@@ -862,13 +1083,41 @@ pub fn source_files<L: Language>(root: &Path) -> Result<Vec<PathBuf>, String> {
 pub fn source_files_with<L: Language>(
     root: &Path,
     filter: &FileFilter,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, Vec<FileError>), String> {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .overrides(filter.overrides())
         .build()
     {
-        let entry = entry.map_err(|e| e.to_string())?;
+        // A directory the walk may not descend into, a symlink loop, an entry
+        // that disappeared between the read and the stat: the walk names it
+        // and carries on. Returning here threw away every file already found
+        // — one unreadable directory made the whole repository unmeasurable
+        // and the report said nothing about which one.
+        let entry = match entry {
+            Ok(entry) => entry,
+            // The scanned root is not an entry the walk can step over: it is
+            // the tree. A root that does not exist, or that this process may
+            // not read, produced no file set at all, and a report of zeros
+            // over no file set is indistinguishable from a clean scan of an
+            // empty repository — the shape `scan_repo_with` refuses to
+            // return for exactly this reason. So this one failure is fatal
+            // and every failure beneath it is data.
+            Err(e) if at_root(root, &e) => {
+                // `walk_failure`'s message, not the error's: `ignore` prints
+                // the path inside it, and this line already opens with it.
+                return Err(format!(
+                    "{}: {}",
+                    root.display(),
+                    walk_failure(root, &e).message
+                ));
+            }
+            Err(e) => {
+                errors.push(walk_failure(root, &e));
+                continue;
+            }
+        };
         let path = entry.path();
         let owned = path
             .extension()
@@ -881,9 +1130,90 @@ pub fn source_files_with<L: Language>(
             let c = c.as_os_str();
             L::skip_dirs().iter().any(|dir| c == *dir)
         });
-        if !skipped {
-            out.push(path.to_path_buf());
+        if skipped {
+            continue;
         }
+        // A path the filesystem will not spell in UTF-8 cannot address facts
+        // in the store. Every fact is keyed by its file's repo-relative path,
+        // `rel_path` builds that key with `to_string_lossy`, and lossy
+        // conversion maps distinct byte sequences onto one string — `a\xFE.go`
+        // and `a\xFF.go` become the same key, and whichever is scanned second
+        // replaces the first's definitions, edges and rows outright. That is
+        // the never-drop rule broken by a filename, so the file is named here
+        // and not read, which loses one file's facts visibly instead of
+        // another's silently.
+        if rel.to_str().is_none() {
+            errors.push(FileError {
+                path: escaped(rel),
+                message: "the path is not valid UTF-8, so it cannot key this \
+                          file's facts apart from another's"
+                    .to_string(),
+            });
+            continue;
+        }
+        out.push(path.to_path_buf());
     }
-    Ok(out)
+    Ok((out, errors))
+}
+
+/// Whether a walk failure is about the scanned root itself rather than
+/// something under it.
+///
+/// Matched on the path the error carries, not on the spelling
+/// [`walk_failure`] gives it: that function also names the root for a failure
+/// that has no path of its own — a symbolic-link loop, a malformed ignore
+/// file — and those are failures *within* a tree the walk did reach.
+fn at_root(root: &Path, e: &ignore::Error) -> bool {
+    matches!(e, ignore::Error::WithPath { path, .. } if path == root)
+}
+
+/// A walk failure, split into the path it names and what it says.
+///
+/// `ignore::Error::WithPath` prints the path *inside* its message, and the
+/// report has a column for the path, so the outer layer is peeled rather than
+/// printed twice. That layer is what a directory the walk could not descend
+/// into arrives as. Anything else — a symbolic-link loop, a malformed ignore
+/// file — names the root and keeps its whole message, which already carries
+/// whatever paths it is about.
+fn walk_failure(root: &Path, e: &ignore::Error) -> FileError {
+    match e {
+        ignore::Error::WithPath { path, err } => FileError {
+            path: walk_path(root, path),
+            message: err.to_string(),
+        },
+        other => FileError {
+            path: ".".to_string(),
+            message: other.to_string(),
+        },
+    }
+}
+
+/// A path the report can print *and* tell from its neighbours, for a name
+/// that is not UTF-8.
+///
+/// `to_string_lossy` collapses every undecodable byte onto U+FFFD, so two such
+/// names print identically — which is the exact confusion the caller is
+/// reporting, and reporting it under one spelling would fold the two entries
+/// into one and undercount. Rust's `OsStr` debug spelling escapes the raw
+/// bytes instead (`util/lossy\xFE.go`), which is distinct per file and shows
+/// which byte is the problem. Only the quotes that spelling is wrapped in are
+/// dropped.
+fn escaped(path: &Path) -> String {
+    let shown = format!("{path:?}");
+    shown
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(shown.as_str())
+        .to_string()
+}
+
+/// A walked path as the report spells it: repo-relative when it lies under
+/// the scanned root, so it reads like every other path in the report, and the
+/// root itself as `.`.
+fn walk_path(root: &Path, path: &Path) -> String {
+    match rel_path(root, path) {
+        Ok(rel) if !rel.is_empty() => rel,
+        Ok(_) => ".".to_string(),
+        Err(_) => path.display().to_string(),
+    }
 }
