@@ -8,14 +8,14 @@
 //! The ratchet is the project's own, reused rather than reimplemented:
 //! [`arthron::gate::parse_baseline`] reads the same file format the Go
 //! baselines use and [`arthron::gate::evaluate`] performs the same exact
-//! integer comparison. It runs here rather than through `arthron gate` because
-//! that command measures `Lang::Go` and only `Lang::Go` — see this track's
-//! report for the two core gaps that keep Java off the CLI gate.
+//! integer comparison. It runs here *as well as* through `arthron gate
+//! --language java`, which since #10 measures a language other than Go —
+//! same file, same comparison, one from the suite and one from CI.
 
 use std::path::Path;
 
 use arthron::gate::{
-    Baseline, Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
+    Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
 };
 use arthron::model::{Lang, reason_name};
 use arthron::pipeline::source_files;
@@ -137,53 +137,36 @@ fn the_ratchet_holds() {
     }
 }
 
-/// Record the baseline the ratchet holds.
+/// The baseline is written by `arthron gate --rebase` and by nothing else.
 ///
-/// Ignored, because it *writes* the ratchet's own reference file; a rebase is
-/// a deliberate act, never a side effect of running the suite:
+/// There was a second writer here — an `#[ignore]`d test that measured the
+/// corpus and rendered the file itself — from when `arthron gate` could only
+/// measure Go. #10 gave the command `--language`, so the reason is gone and
+/// the risk is not: two writers can disagree, and the one that wrote the file
+/// would not be the one the gate compares with. The command is:
 ///
 /// ```text
-/// cargo test --release --test java_corpus -- --ignored --exact the_baseline_is_recorded
+/// arthron gate corpus/java/commons-lang --language java \
+///     --baseline baselines/java-commons-lang.toml --rebase --commit 598dfc1
 /// ```
-///
-/// It exists because `arthron gate --rebase` cannot record a Java baseline —
-/// see this track's report for the two core gaps. It is not a hand-edit: the
-/// counts come from [`measure`], the same scan the ratchet runs, and the file
-/// is rendered by the project's own [`render_baseline`], the writer the Go
-/// baselines already use.
 #[test]
-#[ignore = "writes the baseline; run deliberately after a measured change"]
-fn the_baseline_is_recorded() {
-    let corpus = Path::new(CORPUS);
-    assert!(corpus_present(corpus), "a rebase needs the corpus");
-
-    let counts = measure(corpus);
-    // The same refusal `arthron gate --rebase` makes: a baseline of all zeros
-    // looks as authoritative as a correct one and would bless anything.
-    assert!(counts.total() > 0, "this scan counted no references at all");
-
-    let baseline = Baseline {
-        format: FORMAT,
-        corpus: CORPUS.to_string(),
-        commit: CORPUS_COMMIT.to_string(),
-        language: Lang::Java.name().to_string(),
-        counts,
-    };
+fn the_baseline_names_the_corpus_this_test_measures() {
+    let text = std::fs::read_to_string(BASELINE).expect("the baseline is committed");
+    let baseline = parse_baseline(&text).expect("the baseline parses");
+    assert_eq!(baseline.corpus, CORPUS);
+    assert_eq!(baseline.commit, CORPUS_COMMIT);
+    assert_eq!(baseline.language, Lang::Java.name());
+    assert_eq!(baseline.format, FORMAT);
     for value in [&baseline.corpus, &baseline.commit, &baseline.language] {
         assert!(
             is_renderable(value),
             "provenance `{value}` cannot be written"
         );
     }
-
-    let text = render_baseline(&baseline);
-    // Read back through the reader before the file is trusted: a rendered
-    // baseline that does not parse to what it was rendered from is a file the
-    // gate would misread.
+    // The reader and the writer agree, which is what makes a rebased file
+    // readable by the gate that will compare against it.
     assert_eq!(
-        parse_baseline(&text).expect("the rendered baseline parses"),
+        parse_baseline(&render_baseline(&baseline)).expect("a rendered baseline parses"),
         baseline,
     );
-    std::fs::write(BASELINE, &text).expect("writing the baseline");
-    println!("wrote {BASELINE}\n{text}");
 }

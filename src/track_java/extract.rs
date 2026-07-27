@@ -29,7 +29,7 @@
 //! occurrence-ordered, so using it as a NodeId input would make inserting one
 //! anonymous class re-key every later one).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::lang::{Extractor, FileFacts};
@@ -179,6 +179,61 @@ pub struct TypeDecl {
     pub interfaces: Vec<Vec<String>>,
 }
 
+/// A type declaration the node rule erases: an anonymous class body (T-04),
+/// an enum constant's body (T-05), or a local class (T-03).
+///
+/// None of the three has a canonical name (§6.7), so none is a node, and
+/// [`enclosing_definition`] walks straight past it to reach a nameable edge
+/// source. That is right for the edge's *source* and wrong for everything
+/// else: §15.8.3's `this`, §15.11.2's `super` and §15.12.1's unqualified
+/// invocation all search the innermost enclosing type declaration, and these
+/// are type declarations. A resolver that reads the edge source back as "the
+/// type chain this site sits in" therefore starts one frame too far out and
+/// links a member of the anonymous class to a same-named member of the class
+/// around it — a wrong edge, not a lowered rate.
+///
+/// So the frame is recorded rather than erased twice. It is not a node and
+/// nothing here makes it one; what it carries is enough for the resolver to
+/// know that a name resolved *here* has no nameable target, and enough to
+/// reach the supertype the frame actually names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErasedType {
+    /// Byte offset the frame's body opens at.
+    pub start: u32,
+    /// Byte offset one past its close.
+    pub end: u32,
+    /// The supertype the frame names, as written and split on `.`.
+    ///
+    /// For `new Base(){…}` this is `Base` (§15.9.5); for an enum constant's
+    /// body it is the enum type (§8.9.3); for a local class it is its
+    /// `extends` clause. `None` when there is none to name, whose superclass
+    /// is then `java.lang.Object` (§8.1.4).
+    ///
+    /// One caveat stated rather than modelled: `new Iface(){…}` on an
+    /// *interface* extends `Object` and only implements `Iface`, and nothing
+    /// in one file distinguishes an interface from a class. `super.m()` in
+    /// that frame would have to name an `Object` member to compile at all, so
+    /// the difference is unreachable in a corpus that compiles.
+    pub superclass: Option<Vec<String>>,
+    /// Further supertypes whose members it inherits: a local class's
+    /// `implements` clause.
+    pub interfaces: Vec<Vec<String>>,
+    /// The member keys the frame declares itself — [`fqn::member_key`] for a
+    /// callable, the bare name for a field.
+    ///
+    /// A hit here is the whole point: it says the target of this reference is
+    /// a member of an unnameable type, so there is no honest edge and the
+    /// walk must not continue outward and find a same-named member on a type
+    /// the site is not in.
+    pub members: BTreeSet<String>,
+    /// The simple member names it declares, at any arity.
+    ///
+    /// §15.12.1 chooses the innermost enclosing type declaration of which the
+    /// method is a member *by name*; applicability is decided afterwards. So
+    /// the arity-free set is what says "the search stops in this frame".
+    pub member_names: BTreeSet<String>,
+}
+
 /// Per-file Java facts only the Java resolver reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JavaHeader {
@@ -203,6 +258,10 @@ pub struct JavaHeader {
     pub bindings: Vec<Binding>,
     /// Every type this file declares, in declaration order.
     pub types: Vec<TypeDecl>,
+    /// Every anonymous class body, enum-constant body and local class, in
+    /// declaration order — the type frames that are not nodes (T-03, T-04,
+    /// T-05) and which a reference inside still resolves against.
+    pub erased: Vec<ErasedType>,
     /// Every [`crate::track_java::fqn::overload_group`] two or more callables
     /// in this file compete for (M-01).
     ///
@@ -1050,11 +1109,24 @@ fn collect_bindings(node: &SgNode, out: &mut Vec<Binding>) {
                 return;
             };
             let (start, end) = extent(&owner);
+            // X-07: the *bound* is what a receiver of this type is looked up
+            // on (§4.4), and it is written right here. An unbounded parameter
+            // records `None` and erases to `Object` (§4.6) at resolution.
+            let bound = node
+                .children()
+                .find(|c| c.kind() == "type_bound")
+                .and_then(|b| {
+                    b.children()
+                        .filter(|c| c.is_named())
+                        .find_map(|c| head_of(&c))
+                })
+                .map(|head| name_segments(&head))
+                .filter(|segments| !segments.is_empty());
             push_binding(
                 out,
                 name.text().to_string(),
                 BindingKind::TypeParameter,
-                None,
+                bound,
                 start,
                 end,
             );
@@ -1325,6 +1397,114 @@ fn synthesize_members(node: &SgNode, owner: &[String], defs: &mut Vec<Definition
         }
         _ => {}
     }
+}
+
+/// The member keys and simple names a class body declares directly.
+///
+/// Direct members only: a type nested inside the frame is its own scope and
+/// its members are not members of the frame.
+fn frame_members(body: &SgNode) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut keys = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for member in body.children().filter(|c| c.is_named()) {
+        match &*member.kind() {
+            "method_declaration" | "annotation_type_element_declaration" => {
+                let Some(name) = member.field("name") else {
+                    continue;
+                };
+                let name = name.text().to_string();
+                let params = parameters_of(&member).unwrap_or(Params {
+                    count: 0,
+                    types: Vec::new(),
+                    varargs: false,
+                });
+                keys.insert(fqn::member_key(&name, params.count, params.varargs));
+                names.insert(name);
+            }
+            "field_declaration" | "constant_declaration" => {
+                for declarator in member.field_children("declarator") {
+                    let Some(name) = declarator.field("name") else {
+                        continue;
+                    };
+                    let name = name.text().to_string();
+                    keys.insert(name.clone());
+                    names.insert(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    (keys, names)
+}
+
+/// A declaration's `class_body`, however the grammar attaches it.
+///
+/// `class_declaration` and `enum_constant` name it with a `body` field;
+/// `object_creation_expression` does not name it at all, because its optional
+/// class body is an unnamed child. Reading only the field would find no
+/// anonymous class anywhere.
+fn class_body_of<'r>(node: &SgNode<'r>) -> Option<SgNode<'r>> {
+    node.field("body")
+        .filter(|b| b.kind() == "class_body")
+        .or_else(|| node.children().find(|c| c.kind() == "class_body"))
+}
+
+/// The enum type an enum constant's body is an anonymous subclass of (§8.9.3).
+fn enclosing_enum(node: &SgNode) -> Option<Vec<String>> {
+    node.ancestors()
+        .find(|a| a.kind() == "enum_declaration")
+        .and_then(|e| e.field("name"))
+        .map(|n| vec![n.text().to_string()])
+}
+
+/// The erased type frame this node declares, if it declares one (T-03..T-05).
+fn erased_frame(node: &SgNode) -> Option<ErasedType> {
+    let kind = node.kind();
+    let (body, superclass, interfaces) = if is_type_declaration(&kind) {
+        // Exactly the declarations `collect_definitions` declines to make
+        // nodes of: a local class, and any type declared inside something
+        // that is not nameable itself — a member type of an anonymous class
+        // is no more nameable than the class around it (§6.7).
+        if !is_local_type(node) && owner_chain(node).is_some() {
+            return None;
+        }
+        let mut superclass = None;
+        let mut interfaces = Vec::new();
+        for (role, head) in supertype_heads(node) {
+            let segments = name_segments(&head);
+            if segments.is_empty() {
+                continue;
+            }
+            match role {
+                SuperRole::Superclass => superclass = Some(segments),
+                SuperRole::Interface => interfaces.push(segments),
+            }
+        }
+        (class_body_of(node)?, superclass, interfaces)
+    } else {
+        // An anonymous class exists only when the creation site writes a
+        // body; `new Base()` without one declares no type at all.
+        let body = class_body_of(node)?;
+        let superclass = match &*kind {
+            "object_creation_expression" => {
+                let named = name_segments(&node.field("type")?);
+                (!named.is_empty()).then_some(named)
+            }
+            "enum_constant" => enclosing_enum(node),
+            _ => return None,
+        };
+        (body, superclass, Vec::new())
+    };
+    let range = body.range();
+    let (members, member_names) = frame_members(&body);
+    Some(ErasedType {
+        start: range.start as u32,
+        end: range.end as u32,
+        superclass,
+        interfaces,
+        members,
+        member_names,
+    })
 }
 
 /// Everything one node contributes to the file's definitions.
@@ -1754,6 +1934,23 @@ fn field_access_is_a_site(node: &SgNode) -> bool {
     }
 }
 
+/// Whether a node was recovered from inside a region tree-sitter could not
+/// parse.
+///
+/// tree-sitter is error-tolerant, which is what lets a file with one bad line
+/// still yield every reference on the other lines — but recovery also invents
+/// structure inside text that is not code. A fuzz-corpus string literal in
+/// commons-lang carries control bytes that break the literal, and recovery
+/// reads `$${.u` out of the wreckage as a `type_identifier`: one row, 405
+/// occurrences, `External("$$")`. A reference is defined as *a site in one
+/// file*, and there is no site here — the bytes are inside a string.
+///
+/// Ancestors only: an `ERROR` elsewhere in the file says nothing about a node
+/// that parsed.
+fn in_error_region(node: &SgNode) -> bool {
+    node.ancestors().any(|a| a.kind() == "ERROR")
+}
+
 /// Everything one node contributes to the file's references.
 fn collect_references(
     source: &str,
@@ -1762,6 +1959,9 @@ fn collect_references(
     inherit_heads: &HashSet<(usize, usize)>,
     refs: &mut Vec<Reference>,
 ) {
+    if in_error_region(node) {
+        return;
+    }
     match &*node.kind() {
         "method_invocation" => {
             let Some(name) = node.field("name") else {
@@ -2077,6 +2277,12 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<JavaLang> {
         collect_header(node, &mut header, &mut refs, &mut container_span);
         collect_bindings(node, &mut header.bindings);
         collect_definitions(node, &mut defs, &mut inherit_heads, &mut types);
+        // T-03..T-05: the frames `collect_definitions` declines to make nodes
+        // of, recorded so the resolver can tell "inside an unnameable type"
+        // from "inside the type around it".
+        if let Some(frame) = erased_frame(node) {
+            header.erased.push(frame);
+        }
     }
     header.types = types;
     header.overloaded = mark_overload_sets(&mut defs);
@@ -2370,7 +2576,9 @@ mod tests {
         );
         assert_eq!(binding(&f, "chained").declared_type, None);
         // All three are still locally bound: the fact is the binding, not the
-        // type. A missing type is `NeedsReceiverType`, which is honest.
+        // type. A missing type is `NeedsTypeInference` — `NeedsReceiverType`
+        // is the case where the type *is* stated and in the repository, which
+        // is a lookup rather than a reported failure.
         for raw in ["made.m", "cast.m", "chained.m"] {
             assert!(bound(&f, RefKind::Call, raw));
         }

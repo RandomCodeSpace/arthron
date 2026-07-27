@@ -31,9 +31,11 @@
 //! # Honest reasons
 //!
 //! Java's floor is real: a call on a receiver whose type is not stated in the
-//! file is [`crate::UnresolvedReason::NeedsReceiverType`] or
-//! [`crate::UnresolvedReason::NeedsTypeInference`], a member of an
-//! in-repository type that no indexed supertype declares is
+//! file is [`crate::UnresolvedReason::NeedsTypeInference`] — and never
+//! [`crate::UnresolvedReason::NeedsReceiverType`], whose definition is the
+//! opposite case, the one where the type *is* stated and *is* in the
+//! repository, which this resolver looks up rather than reports (X-02). A
+//! member of an in-repository type that no indexed supertype declares is
 //! [`crate::UnresolvedReason::UnindexedSupertype`], and a large such floor is
 //! the correct first measurement. None of it is to be moved into
 //! `LocalBinding` or `External`, both of which leave the rate's denominator

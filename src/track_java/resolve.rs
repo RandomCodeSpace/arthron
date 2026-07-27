@@ -39,7 +39,7 @@ use crate::lang::{
 };
 use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id};
 use crate::track_java::JavaLang;
-use crate::track_java::extract::{Binding, BindingKind, JavaHeader, TypeDecl};
+use crate::track_java::extract::{Binding, BindingKind, ErasedType, JavaHeader, TypeDecl};
 use crate::track_java::fqn;
 use crate::{Outcome, UnresolvedReason};
 
@@ -247,6 +247,9 @@ pub struct JavaScope {
     supers: HashMap<String, TypeDecl>,
     /// X-02's declared-type environment, with the extents §6.3 scopes it by.
     bindings: Vec<Binding>,
+    /// T-03..T-05's type frames that are not nodes, with the extents that say
+    /// which sites are inside them.
+    erased: Vec<ErasedType>,
 }
 
 impl JavaScope {
@@ -272,6 +275,62 @@ impl JavaScope {
             // Innermost wins: the latest region to open that still contains
             // the site is the one §6.4.1 shadows the others with.
             .max_by_key(|b| b.start)
+    }
+
+    /// The type parameter `name` names at `site`, if one is in scope (§4.4).
+    ///
+    /// A separate lookup from [`JavaScope::binding_at`] because §6.5.1 keeps
+    /// the two tables apart: a local called `T` does not make the type name
+    /// `T` a variable, and the reverse.
+    fn type_parameter_at(&self, name: &str, site: u32) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .filter(|b| {
+                b.name == name
+                    && b.start <= site
+                    && site < b.end
+                    && b.kind == BindingKind::TypeParameter
+            })
+            .max_by_key(|b| b.start)
+    }
+
+    /// The field `name` declared and visible at `site`.
+    ///
+    /// Narrower than [`JavaScope::binding_at`] on purpose: `this.f` names a
+    /// *field* (§15.8.3), and a local of the same name is a different
+    /// declaration that `this` cannot reach.
+    fn field_at(&self, name: &str, site: u32) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .filter(|b| {
+                b.name == name && b.start <= site && site < b.end && b.kind == BindingKind::Field
+            })
+            .max_by_key(|b| b.start)
+    }
+
+    /// The anonymous class body a creation site spanning `start..end` writes,
+    /// if it writes one (T-04).
+    ///
+    /// An `object_creation_expression` ends exactly where its class body
+    /// does, which is what picks out the frame belonging to *this* site
+    /// rather than one nested inside its arguments.
+    fn anonymous_body_at(&self, start: u32, end: u32) -> Option<&ErasedType> {
+        self.erased.iter().find(|f| f.end == end && f.start > start)
+    }
+
+    /// Every erased type frame containing `site`, innermost first.
+    ///
+    /// Innermost first because that is §15.12.1's own order: the search runs
+    /// from the innermost enclosing type declaration outward, and a frame
+    /// nested inside another opens later.
+    fn erased_at(&self, site: u32) -> Vec<&ErasedType> {
+        let mut frames: Vec<&ErasedType> = self
+            .erased
+            .iter()
+            .filter(|f| f.start <= site && site < f.end)
+            .collect();
+        frames.sort_by_key(|f| std::cmp::Reverse(f.start));
+        frames
     }
 }
 
@@ -302,6 +361,48 @@ enum Member {
     Ambiguous,
     /// No declaration, plus whether some supertype was out of reach (B-05).
     Missing { unindexed: bool },
+}
+
+/// Where a reference sits.
+///
+/// The two facts every name resolution needs about a site and neither of
+/// which is in the name: which nameable types lexically enclose it (§15.12.1
+/// walks them outward) and its byte offset, which is what decides which
+/// bindings (§6.3) and which erased type frames (T-03..T-05) contain it.
+#[derive(Debug, Clone, Copy)]
+struct Site<'a> {
+    /// The enclosing nameable type chain, outermost first.
+    types: &'a [String],
+    /// Byte offset of the reference.
+    at: u32,
+}
+
+/// Every declaration one *member name* reaches on a type (I-04, C-08).
+struct NameGroup {
+    /// Distinct declarations found, most specific key first.
+    found: Vec<NodeId>,
+    /// An overload-set marker was hit: two or more declarations share a key
+    /// and neither took it (M-01).
+    ambiguous: bool,
+    /// Some supertype was external or unindexed, so the set may be short.
+    unindexed: bool,
+}
+
+/// What a member lookup inside an erased type frame found (T-03..T-05).
+enum FrameMember {
+    /// The frame declares it itself. Real, and by design not a node — so
+    /// there is no honest edge, and in particular the search must not walk
+    /// outward and find a same-named member of a type the site is not in.
+    Own,
+    /// Found on a supertype the frame names, which *is* nameable.
+    Found(NodeId),
+    /// The supertype declares two or more at this arity.
+    Ambiguous,
+    /// Not found, plus whether the frame's supertypes were out of reach.
+    Missing {
+        /// Some supertype of the frame is external or unindexed.
+        unindexed: bool,
+    },
 }
 
 /// All Java linking decisions. Stateless: every fact rides on the
@@ -385,6 +486,12 @@ impl JavaResolver {
                 return Some(Owner::Failed(UnresolvedReason::AmbiguousName));
             }
         }
+        // Still tier 1: §8.5 makes a supertype's member type a member of the
+        // subtype, so `State` inside `class Sub extends Base` names
+        // `Base$State` with nothing written in this file but `extends`.
+        if let Some(owner) = self.inherited_type(cfg, scope, name, enclosing, p) {
+            return Some(owner);
+        }
         // Tier 2: single-type imports (§7.5.1), which shadow same-package and
         // on-demand declarations alike.
         if let Some(canonical) = scope.single_type.get(name) {
@@ -416,6 +523,79 @@ impl JavaResolver {
         }
         if is_java_lang(name) {
             return Some(Owner::Outside(JAVA_LANG_PACKAGE.to_string()));
+        }
+        None
+    }
+
+    /// A member type `name` inherited by one of the types enclosing the site
+    /// (§8.5, N-03 tier 1).
+    ///
+    /// The same closure [`JavaResolver::lookup`] walks for a member, walked
+    /// for a *nested type* instead — and reachable for the same reason and no
+    /// further: only a type this file declares states its own supertypes
+    /// (H-01), so the walk starts at an enclosing type and stops wherever the
+    /// names run out. Missing it sent every inherited `State` and `Builder`
+    /// to `NoMatchingDefinition`, which is the one bucket reserved for our
+    /// own bug.
+    fn inherited_type(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        name: &str,
+        enclosing: &[String],
+        p: &mut Probes<'_>,
+    ) -> Option<Owner> {
+        let mut seen: HashSet<String> = HashSet::new();
+        // Innermost first: a member type of the type the site sits in
+        // shadows a same-named one on a type further out (§6.4.1).
+        for depth in (1..=enclosing.len()).rev() {
+            let path = &enclosing[..depth];
+            // The enclosing type's *own* member types are `file_types`, which
+            // the caller has already asked — a type declared in this file is
+            // in it whatever its nesting. So the walk starts at the
+            // supertypes, and a type that names none costs no probe at all.
+            let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
+                continue;
+            };
+            let mut queue: Vec<(String, Option<Vec<String>>)> = Vec::new();
+            for segments in decl.superclass.iter().chain(decl.interfaces.iter()) {
+                if let Owner::InRepo { fqn, local } = self.canonical_type(cfg, scope, segments, p) {
+                    queue.push((fqn, local));
+                }
+            }
+            while let Some((type_fqn, local)) = queue.pop() {
+                if !seen.insert(type_fqn.clone()) {
+                    continue;
+                }
+                let nested = format!("{type_fqn}{}{name}", fqn::NEST);
+                if let Some(Entry::Definition {
+                    kind: DefKind::Type,
+                    ..
+                }) = p.get(&nested)
+                {
+                    return Some(Owner::InRepo {
+                        fqn: nested,
+                        local: local.map(|mut path| {
+                            path.push(name.to_string());
+                            path
+                        }),
+                    });
+                }
+                let Some(decl) = local
+                    .as_ref()
+                    .and_then(|path| scope.supers.get(&path.join(&fqn::NEST.to_string())))
+                else {
+                    continue;
+                };
+                let supers = decl.superclass.iter().chain(decl.interfaces.iter());
+                for segments in supers {
+                    if let Owner::InRepo { fqn, local } =
+                        self.canonical_type(cfg, scope, segments, p)
+                    {
+                        queue.push((fqn, local));
+                    }
+                }
+            }
         }
         None
     }
@@ -478,8 +658,25 @@ impl JavaResolver {
         if let Some(head) = self.simple_type(cfg, scope, &segments[0], &[], p) {
             return self.nest(head, &segments[1..], p);
         }
-        let qualifier = segments[..segments.len() - 1].join(".");
-        Owner::Outside(outside(&qualifier))
+        self.attribute(cfg, segments)
+    }
+
+    /// The owner a multi-segment name no probe placed is attributed to
+    /// (B-02, N-04).
+    ///
+    /// §6.5.5 makes the last segment a simple type name and its qualifier the
+    /// thing that names it, so the qualifier is the package — which is
+    /// exactly `External`'s payload. Unless the repository *declares* that
+    /// package: then the table's opinion about it is complete and the type is
+    /// absent from a package we indexed. Calling that `External` would let a
+    /// definition that should exist here leave both terms of the resolution
+    /// rate rather than being counted as the miss it is.
+    fn attribute(&self, cfg: &JavaConfig, segments: &[String]) -> Owner {
+        let package = segments[..segments.len() - 1].join(".");
+        if cfg.packages.contains(&package) {
+            return Owner::Failed(UnresolvedReason::NoMatchingDefinition);
+        }
+        Owner::Outside(outside(&package))
     }
 
     /// Extend a placed type through nested-type selections.
@@ -521,8 +718,7 @@ impl JavaResolver {
         cfg: &JavaConfig,
         scope: &JavaScope,
         segments: &[String],
-        site: u32,
-        enclosing: &[String],
+        site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> (Owner, usize) {
         if segments.is_empty() {
@@ -531,16 +727,16 @@ impl JavaResolver {
         // §6.4.2: a variable obscures a type, which obscures a package. X-02:
         // the declared type is written in this file, so this is a lookup and
         // not inference.
-        if let Some(binding) = scope.binding_at(&segments[0], site) {
+        if let Some(binding) = scope.binding_at(&segments[0], site.at) {
             let Some(declared) = binding.declared_type.clone() else {
                 // A lambda parameter, an unreadable `var` (X-03), an array or
                 // a primitive: the receiver is a name with no stated type.
                 return (Owner::Failed(UnresolvedReason::NeedsTypeInference), 1);
             };
-            let owner = self.canonical_type(cfg, scope, &declared, p);
+            let owner = self.declared_owner(cfg, scope, &declared, site.at, 0, p);
             return (owner, 1);
         }
-        if let Some(head) = self.simple_type(cfg, scope, &segments[0], enclosing, p) {
+        if let Some(head) = self.simple_type(cfg, scope, &segments[0], site.types, p) {
             let mut consumed = 1;
             let mut owner = head;
             // Greedy nesting: `Outer.Inner.staticCall` selects a type twice.
@@ -580,13 +776,178 @@ impl JavaResolver {
             // the type name itself is what could not be placed.
             return (Owner::Failed(self.simple_type_miss(cfg, scope)), 1);
         }
-        // §6.5.2's reclassification needs the symbol table and the table has
-        // no opinion. Naming this `NeedsTypeInference` would hide a case that
-        // needs no inference at all behind an honest-sounding label.
-        (
-            Owner::Failed(UnresolvedReason::AmbiguousName),
-            segments.len(),
-        )
+        // §6.5.2's reclassification asked the symbol table and the table had
+        // no opinion — which is an opinion: nothing in this qualifier is
+        // ours. That is the same conclusion `canonical_type` draws three
+        // lines from here for the identical name in type position, and the
+        // two positions disagreeing meant `java.util.Objects.requireNonNull`
+        // was `AmbiguousName` while `java.util.List` was `External`.
+        (self.attribute(cfg, segments), segments.len())
+    }
+
+    /// How many type-variable bounds are followed before giving up.
+    ///
+    /// `<A extends B, B extends C>` is legal and finite, and a bound may
+    /// name an earlier parameter — but nothing in one file guarantees the
+    /// chain is acyclic once recovery has been at the tree, so the walk is
+    /// bounded rather than trusting.
+    const BOUND_DEPTH: u32 = 8;
+
+    /// The owner a *declared type name* places to, with X-07's type-variable
+    /// rule applied.
+    ///
+    /// §4.4: a receiver whose declared type is a type variable is looked up
+    /// on the variable's bound, which is written in the same file. §4.6: an
+    /// unbounded one erases to `Object`, whose members are external. Without
+    /// this, `T value; value.tag();` is `NoMatchingDefinition` — the bucket
+    /// that is supposed to mean *our* bug — for a target that is one written
+    /// `extends` clause away.
+    fn declared_owner(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        declared: &[String],
+        site: u32,
+        depth: u32,
+        p: &mut Probes<'_>,
+    ) -> Owner {
+        if declared.len() == 1
+            && let Some(parameter) = scope.type_parameter_at(&declared[0], site)
+        {
+            let Some(bound) = parameter.declared_type.clone() else {
+                // §4.6: the erasure of an unbounded type variable is
+                // `Object`, which is never a definition of this repository.
+                return Owner::Outside(JAVA_LANG_PACKAGE.to_string());
+            };
+            if depth >= Self::BOUND_DEPTH {
+                return Owner::Failed(UnresolvedReason::NeedsTypeInference);
+            }
+            return self.declared_owner(cfg, scope, &bound, site, depth + 1, p);
+        }
+        self.canonical_type(cfg, scope, declared, p)
+    }
+
+    /// The greatest arity a *member-name* probe walks to.
+    ///
+    /// A method reference (C-08) and a single-static import (I-04) both name
+    /// a member name rather than one declaration: §15.13.1 chooses the
+    /// overload from the target functional-interface type and §7.5.3 imports
+    /// every member of that name at once, so neither site states an arity.
+    /// M-04's overload-set index would answer "which declarations carry this
+    /// name" in one probe; [`Resolver::index_keys`] is declared and never
+    /// driven, so the set is walked by arity instead and the walk has to
+    /// stop somewhere.
+    ///
+    /// Eight is not a language limit — §8.4.1 has none below the JVM's 255 —
+    /// and it is not where the answers stop either: commons-lang measures
+    /// identically at 2, 4, 6, 8 and 12, because a name imported statically
+    /// or written `Type::name` is a name someone types at a call site, and
+    /// those are short. Eight is the headroom over that measured plateau,
+    /// kept because one corpus is one corpus. Past the bound the outcome is
+    /// whatever the shorter set said — a missed resolution, never a wrong
+    /// edge.
+    const NAME_PROBE_ARITY: u32 = 8;
+
+    /// Every declaration of `name` this resolver can see on `owner` and the
+    /// supertypes it can read.
+    ///
+    /// A different question from [`JavaResolver::lookup`]'s, which is "which
+    /// declaration does *this site* name" and stops at the first hit because
+    /// the site's arity decides. Here there is no arity to decide with, so
+    /// the answer is the set, and its size is what separates "one target"
+    /// from "an overload set" from "nothing of that name".
+    fn name_members(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        owner: &Owner,
+        name: &str,
+        p: &mut Probes<'_>,
+    ) -> NameGroup {
+        let mut group = NameGroup {
+            found: Vec::new(),
+            ambiguous: false,
+            unindexed: false,
+        };
+        let (fqn_start, local_start) = match owner {
+            Owner::InRepo { fqn, local } => (fqn.clone(), local.clone()),
+            _ => {
+                group.unindexed = true;
+                return group;
+            }
+        };
+        let mut keys = vec![name.to_string()];
+        for argc in 0..=Self::NAME_PROBE_ARITY {
+            keys.push(fqn::arity_key(name, argc));
+            keys.push(fqn::varargs_key(name, argc));
+        }
+        // A key a subtype declares is the one that member *is* (§8.4.8.1's
+        // override), so the first type in the walk to declare it wins and the
+        // supertype's declaration is not a second member.
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<(String, Option<Vec<String>>)> = vec![(fqn_start, local_start)];
+        while let Some((type_fqn, local)) = queue.pop() {
+            if !seen.insert(type_fqn.clone()) {
+                continue;
+            }
+            for key in &keys {
+                if claimed.contains(key) {
+                    continue;
+                }
+                match p.get(&fqn::member_fqn(&type_fqn, key)) {
+                    Some(Entry::Definition {
+                        kind: DefKind::Alias,
+                        ..
+                    }) => {
+                        claimed.insert(key.clone());
+                        group.ambiguous = true;
+                    }
+                    Some(Entry::Definition { .. }) => {
+                        claimed.insert(key.clone());
+                        group
+                            .found
+                            .push(node_id(JavaLang::DOMAIN, &fqn::member_fqn(&type_fqn, key)));
+                    }
+                    _ => {}
+                }
+            }
+            let Some(path) = local else {
+                group.unindexed = true;
+                continue;
+            };
+            let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
+                group.unindexed = true;
+                continue;
+            };
+            if decl.superclass.is_none() {
+                group.unindexed = true;
+            }
+            let supers = decl.interfaces.iter().chain(decl.superclass.iter());
+            for segments in supers {
+                match self.canonical_type(cfg, scope, segments, p) {
+                    Owner::InRepo { fqn, local } => queue.push((fqn, local)),
+                    _ => group.unindexed = true,
+                }
+            }
+        }
+        group
+    }
+
+    /// The outcome a member-name group decides.
+    ///
+    /// One declaration is one target and resolves; two or more is the
+    /// discrimination `AmbiguousOverload` names; none is the same honest miss
+    /// any other member lookup reports.
+    fn select_name_group(&self, group: NameGroup) -> Outcome<NodeId, String> {
+        if group.ambiguous || group.found.len() > 1 {
+            return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
+        }
+        match group.found.into_iter().next() {
+            Some(id) => Outcome::Resolved(id),
+            None if group.unindexed => Outcome::Unresolved(UnresolvedReason::UnindexedSupertype),
+            None => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        }
     }
 
     /// The keys a member lookup probes, most specific first.
@@ -719,6 +1080,72 @@ impl JavaResolver {
         }
     }
 
+    /// Look a member up in an erased type frame: what it declares itself
+    /// first, then the supertypes it names (T-03..T-05).
+    ///
+    /// Its own declarations come first because they shadow, and because a hit
+    /// there is the finding this whole path exists for: the target is a real
+    /// member of a type with no canonical name (§6.7), so the honest answer
+    /// is that there is nothing to link to — never a same-named member of the
+    /// class the frame happens to sit in.
+    fn frame_lookup(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        frame: &ErasedType,
+        keys: &[String],
+        p: &mut Probes<'_>,
+    ) -> FrameMember {
+        if keys.iter().any(|key| frame.members.contains(key)) {
+            return FrameMember::Own;
+        }
+        // §8.1.4: no `extends` clause means `java.lang.Object`, which is
+        // never indexed — so the closure is incomplete before it starts.
+        let mut unindexed = frame.superclass.is_none();
+        let supers = frame.superclass.iter().chain(frame.interfaces.iter());
+        for segments in supers {
+            let owner = self.canonical_type(cfg, scope, segments, p);
+            if !matches!(owner, Owner::InRepo { .. }) {
+                unindexed = true;
+                continue;
+            }
+            match self.lookup(cfg, scope, &owner, keys, p) {
+                Member::Found(id) => return FrameMember::Found(id),
+                Member::Ambiguous => return FrameMember::Ambiguous,
+                Member::Missing { unindexed: more } => unindexed |= more,
+            }
+        }
+        FrameMember::Missing { unindexed }
+    }
+
+    /// The outcome of a lookup that ended inside an erased frame and may not
+    /// continue outward.
+    fn frame_outcome(
+        &self,
+        found: FrameMember,
+        name: &str,
+        argc: Option<u32>,
+        unindexed: bool,
+    ) -> Outcome<NodeId, String> {
+        match found {
+            // The same judgement the node rule already makes for the local
+            // class itself: by design not a node, policy-caused rather than a
+            // language-support failure, and reported beside `External`.
+            FrameMember::Own => Outcome::Unresolved(UnresolvedReason::LocalBinding),
+            FrameMember::Found(id) => Outcome::Resolved(id),
+            FrameMember::Ambiguous => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
+            FrameMember::Missing { unindexed: more } => {
+                if is_object_member(name, argc) {
+                    Outcome::External(JAVA_LANG_PACKAGE.to_string())
+                } else if unindexed || more {
+                    Outcome::Unresolved(UnresolvedReason::UnindexedSupertype)
+                } else {
+                    Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
+                }
+            }
+        }
+    }
+
     /// The type a reference sits inside, innermost last.
     fn enclosing_types(r: &Reference) -> Vec<String> {
         match &r.enclosing {
@@ -773,13 +1200,16 @@ impl JavaResolver {
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
         let enclosing = Self::enclosing_types(r);
-        let site = r.span.byte_start;
+        let site = Site {
+            types: &enclosing,
+            at: r.span.byte_start,
+        };
         let segments = &r.target.segments;
 
         // C-03: `this(…)` and `super(…)` name a constructor exactly, and
         // C-01's creation site names one on the type it wrote.
         if r.kind == RefKind::New {
-            return self.resolve_new(cfg, scope, r, &enclosing, p);
+            return self.resolve_new(cfg, scope, r, site, p);
         }
         let Some((name, qualifier)) = segments.split_last() else {
             return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition);
@@ -795,14 +1225,27 @@ impl JavaResolver {
                 return Outcome::Unresolved(UnresolvedReason::NeedsExpressionType);
             }
             TargetRoot::This { qualifier: outer } => {
-                let path = self.this_path(scope, outer, &enclosing);
+                // §15.8.3: an unqualified `this` denotes the innermost
+                // enclosing *instance*, and inside an anonymous or local
+                // class that is the frame's — never the class around it. It
+                // also never walks outward, which is what separates this from
+                // the unqualified-invocation path below.
+                if outer.is_empty()
+                    && qualifier.is_empty()
+                    && let Some(frame) = scope.erased_at(site.at).first()
+                {
+                    let keys = Self::member_keys(name, argc);
+                    let found = self.frame_lookup(cfg, scope, frame, &keys, p);
+                    return self.frame_outcome(found, name, argc, false);
+                }
+                let path = self.this_path(scope, outer, site.types);
                 match self.enclosing_owner(scope, &path, p) {
                     Some(owner) => owner,
                     None => return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
                 }
             }
             TargetRoot::Super { qualifier: outer } => {
-                match self.super_owner(cfg, scope, outer, &enclosing, p) {
+                match self.super_owner(cfg, scope, outer, site, p) {
                     Some(owner) => owner,
                     None => return Outcome::External(JAVA_LANG_PACKAGE.to_string()),
                 }
@@ -811,10 +1254,10 @@ impl JavaResolver {
                 // N-02: an unqualified invocation. §6.5.1 makes a bare
                 // `m(…)` a MethodName and nothing else, so no local can
                 // shadow it and the search is purely the enclosing chain.
-                return self.unqualified(cfg, scope, name, argc, &enclosing, p);
+                return self.unqualified(cfg, scope, name, argc, site, p);
             }
             TargetRoot::Name => {
-                let (owner, consumed) = self.qualifier(cfg, scope, qualifier, site, &enclosing, p);
+                let (owner, consumed) = self.qualifier(cfg, scope, qualifier, site, p);
                 if consumed < qualifier.len() {
                     return match owner {
                         Owner::Outside(package) => Outcome::External(package),
@@ -829,19 +1272,41 @@ impl JavaResolver {
                 owner
             }
         };
-        // A `this.a.m()` or `super.a.m()` chain selects a member first, whose
-        // type this resolver does not compute.
-        if !matches!(r.target.root, TargetRoot::Name) && qualifier.len() > 1 {
-            return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
-        }
-        if !matches!(r.target.root, TargetRoot::Name) && qualifier.len() == 1 {
-            return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
+        // A `this.f.m()` or `super.f.m()` chain selects a field first. Its
+        // declared type is written in this file whenever the field is (X-02),
+        // and `f.m()` one line away already reads it — so giving up here was
+        // reporting "the receiver is a name with no declared type" about a
+        // name whose type is on line 3.
+        if !matches!(r.target.root, TargetRoot::Name)
+            && let Some(field) = qualifier.first()
+        {
+            // Two selections deep the first one's *own* type would have to be
+            // computed, which is X-01's territory.
+            if qualifier.len() > 1 {
+                return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
+            }
+            let Some(declared) = scope
+                .field_at(field, site.at)
+                .and_then(|binding| binding.declared_type.clone())
+            else {
+                return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
+            };
+            let owner = self.declared_owner(cfg, scope, &declared, site.at, 0, p);
+            return self.select(cfg, scope, owner, name, argc, p);
         }
         if r.kind == RefKind::MethodRef {
+            // C-08 / X-05: the overload is chosen by the target
+            // functional-interface type (§15.13.1), which is not at this
+            // site — but a singleton needs no choosing, and reporting one as
+            // `AmbiguousOverload` says "we compared candidates and could not
+            // choose" about a set that was never looked at.
             return match owner {
                 Owner::Failed(reason) => Outcome::Unresolved(reason),
                 Owner::Outside(package) => Outcome::External(package),
-                Owner::InRepo { .. } => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
+                owner @ Owner::InRepo { .. } => {
+                    let group = self.name_members(cfg, scope, &owner, name, p);
+                    self.select_name_group(group)
+                }
             };
         }
         self.select(cfg, scope, owner, name, argc, p)
@@ -866,14 +1331,20 @@ impl JavaResolver {
 
     /// The type a `super` or `Iface.super` reference starts from (H-03).
     ///
-    /// `None` when the enclosing class declares no `extends` clause: its
-    /// superclass is `java.lang.Object` (§8.1.4), which is never indexed.
+    /// `None` when the class declares no `extends` clause: its superclass is
+    /// `java.lang.Object` (§8.1.4), which is never indexed.
+    ///
+    /// "The class" is the one *immediately* enclosing the site (§15.11.2), so
+    /// an erased frame containing the site answers before the named chain
+    /// does: `super.m()` inside `new Base(){…}` names a member of `Base`, and
+    /// reading the enclosing named class's `extends` clause there produces an
+    /// edge to a method on an unrelated type.
     fn super_owner(
         &self,
         cfg: &JavaConfig,
         scope: &JavaScope,
         outer: &[String],
-        enclosing: &[String],
+        site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> Option<Owner> {
         if !outer.is_empty() {
@@ -881,7 +1352,11 @@ impl JavaResolver {
             // no inference.
             return Some(self.canonical_type(cfg, scope, outer, p));
         }
-        let decl = scope.supers.get(&enclosing.join(&fqn::NEST.to_string()))?;
+        if let Some(frame) = scope.erased_at(site.at).first() {
+            let segments = frame.superclass.clone()?;
+            return Some(self.canonical_type(cfg, scope, &segments, p));
+        }
+        let decl = scope.supers.get(&site.types.join(&fqn::NEST.to_string()))?;
         let segments = decl.superclass.clone()?;
         Some(self.canonical_type(cfg, scope, &segments, p))
     }
@@ -893,11 +1368,44 @@ impl JavaResolver {
         scope: &JavaScope,
         name: &str,
         argc: Option<u32>,
-        enclosing: &[String],
+        site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
         let keys = Self::member_keys(name, argc);
+        let enclosing = site.types;
         let mut unindexed = enclosing.is_empty();
+        // 0: the erased type frames the site sits in, innermost first. They
+        // are type declarations §15.12.1 searches before anything lexically
+        // outside them, and they are not in `enclosing` because they are not
+        // nodes (T-03..T-05).
+        for frame in scope.erased_at(site.at) {
+            match self.frame_lookup(cfg, scope, frame, &keys, p) {
+                FrameMember::Own => {
+                    return Outcome::Unresolved(UnresolvedReason::LocalBinding);
+                }
+                FrameMember::Found(id) => return Outcome::Resolved(id),
+                FrameMember::Ambiguous => {
+                    return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
+                }
+                FrameMember::Missing { unindexed: more } => {
+                    unindexed |= more;
+                    // §15.12.1 picks the innermost enclosing type declaration
+                    // of which a method of that *name* is a member and stops
+                    // there; applicability is decided afterwards. So a frame
+                    // declaring the name at another arity still ends the
+                    // search, and walking outward past it would link to a
+                    // type this site is not in.
+                    if frame.member_names.contains(name) {
+                        return self.frame_outcome(
+                            FrameMember::Missing { unindexed: more },
+                            name,
+                            argc,
+                            unindexed,
+                        );
+                    }
+                }
+            }
+        }
         // 1 and 2: the innermost enclosing type and its supertype closure,
         // then each lexically enclosing type outward (§15.12.1).
         for depth in (1..=enclosing.len()).rev() {
@@ -956,18 +1464,25 @@ impl JavaResolver {
         cfg: &JavaConfig,
         scope: &JavaScope,
         r: &Reference,
-        enclosing: &[String],
+        site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
         let owner = match &r.target.root {
-            TargetRoot::This { .. } => match self.enclosing_owner(scope, enclosing, p) {
-                Some(owner) => owner,
-                None => return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
-            },
+            TargetRoot::This { .. } => {
+                // A local class's own constructor, which §6.7 gives no
+                // canonical name and this graph therefore no node.
+                if !scope.erased_at(site.at).is_empty() {
+                    return Outcome::Unresolved(UnresolvedReason::LocalBinding);
+                }
+                match self.enclosing_owner(scope, site.types, p) {
+                    Some(owner) => owner,
+                    None => return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+                }
+            }
             TargetRoot::Super { .. } => {
                 // §8.8.7: `super(…)` names the superclass's constructor, and
                 // a class with no `extends` clause extends `java.lang.Object`.
-                match self.super_owner(cfg, scope, &[], enclosing, p) {
+                match self.super_owner(cfg, scope, &[], site, p) {
                     Some(owner) => owner,
                     None => return Outcome::External(JAVA_LANG_PACKAGE.to_string()),
                 }
@@ -975,14 +1490,33 @@ impl JavaResolver {
             TargetRoot::Expr => return Outcome::Unresolved(UnresolvedReason::NeedsExpressionType),
             TargetRoot::Name => {
                 if r.target.segments.len() == 1 {
-                    self.simple_type(cfg, scope, &r.target.segments[0], enclosing, p)
+                    self.simple_type(cfg, scope, &r.target.segments[0], site.types, p)
                         .unwrap_or_else(|| Owner::Failed(self.simple_type_miss(cfg, scope)))
                 } else {
                     self.canonical_type(cfg, scope, &r.target.segments, p)
                 }
             }
         };
-        self.select(cfg, scope, owner, fqn::INIT, r.argc, p)
+        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
+        // C-05 / §15.9.5.1: `new Iface(){…}` declares an anonymous class that
+        // *implements* the interface and extends `Object`, so the constructor
+        // it invokes is `Object#<init>()`. Every in-repo class carries a
+        // constructor at this point — D-10 synthesizes §8.8.9's implicit one
+        // — so a creation site with a class body whose owner is in-repo and
+        // whose constructor is missing has named an interface.
+        if scope
+            .anonymous_body_at(r.span.byte_start, r.span.byte_end)
+            .is_some()
+            && matches!(
+                settled,
+                Outcome::Unresolved(
+                    UnresolvedReason::UnindexedSupertype | UnresolvedReason::NoMatchingDefinition
+                )
+            )
+        {
+            return Outcome::External(JAVA_LANG_PACKAGE.to_string());
+        }
+        settled
     }
 
     /// I-01 … I-08: every import form, plus a module directive.
@@ -1036,10 +1570,11 @@ impl JavaResolver {
         }
         // I-04 / §7.5.3: a single-static import names a *member name* on an
         // owner type — every overload of it, and possibly a field and a
-        // member type as well. One declaration, one name, several targets:
-        // the field is probed because it is the only one an arity-free key
-        // can name, and an overload set with no arity to discriminate on is
-        // exactly `AmbiguousOverload`'s second clause.
+        // member type as well. One declaration, one name, several targets, so
+        // the whole group is what decides: one member is one edge, several is
+        // `AmbiguousOverload`'s second clause, and none is the same honest
+        // miss any other member lookup reports. Probing only the bare name
+        // would have been the *field* key, which no method can ever take.
         let Some((member, owner_segments)) = segments.split_last() else {
             return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition);
         };
@@ -1049,17 +1584,8 @@ impl JavaResolver {
             Owner::Failed(reason) => return Outcome::Unresolved(reason.clone()),
             Owner::InRepo { .. } => {}
         }
-        match self.lookup(
-            cfg,
-            scope,
-            &owner,
-            std::slice::from_ref(&member.to_string()),
-            p,
-        ) {
-            Member::Found(id) => Outcome::Resolved(id),
-            Member::Ambiguous => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
-            Member::Missing { .. } => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
-        }
+        let group = self.name_members(cfg, scope, &owner, member, p);
+        self.select_name_group(group)
     }
 }
 
@@ -1072,6 +1598,7 @@ fn build_scope(cfg: &JavaConfig, file: &FileFacts<JavaLang>) -> JavaScope {
             header.module.as_deref(),
         ),
         bindings: header.bindings.clone(),
+        erased: header.erased.clone(),
         ..JavaScope::default()
     };
     let _ = cfg;
