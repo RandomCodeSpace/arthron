@@ -4,6 +4,86 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Seven adversarial-review findings, and two reserved characters
+
+An adversarial review of the phase-2 core produced seven findings. Each was
+reproduced by a test written before its fix; none was rebutted. Two corrupted
+the resolution rate directly, which is why the round is recorded here and not
+in commit messages alone.
+
+**A clause header does not bind its own right-hand side.** Go starts a
+declared identifier's scope at the end of its declaration, so `if x := x()`
+names the outer `x` on the right and the new one only in the body. The
+extractor read the whole clause as bound, moving real references into
+`LocalBinding` — excluded from *both* terms of the rate, so the bug raised
+the rate by deleting edges. The `statement_list` arm beside it already made
+the position check; the header arm did not.
+
+**A row key carries the extractor's binding verdict.** A block-local `x()`
+and the package-level `x()` after it agree on file, enclosing function, site
+text and arity, and resolve differently. One row carries one outcome, so they
+merged and both occurrences were attributed to whichever came first — while
+the resolved one still inserted its edge, leaving a `Resolved` edge whose row
+said `LocalBinding`. Count conservation never noticed: the totals summed, and
+only the rate moved.
+
+**`#` separates a container from its members; `!` marks an external test
+package.** A Go import path may carry a dot inside a path element
+(`gopkg.in/yaml.v3`, or any directory named `p.Foo`), so `{pkg}.{name}` gave
+the function `Foo` of package `example.com/m/p` and the package in directory
+`p.Foo` one identity and one node — the survivor a `Definition` carrying both
+files' declaration sites. `#` is forbidden in an import path and in an
+identifier alike, so a definition FQN carries exactly one and a container FQN
+carries none. *Rejected:* keeping `#test` for the external test package,
+because under the new grammar `{dir}#test` is exactly the FQN of a definition
+named `test`, and `func test()` is an ordinary unexported helper. *Rejected:*
+`:`, which would erode the invariant that no FQN contains one — the
+`external:` prefix rests on it. Two reserved characters, one job each.
+
+**The manifest is a scan input, so the store fences on a fingerprint of it.**
+`go.mod` has no extension the language owns and contributes no facts of its
+own, yet its module directive roots every FQN. Rewriting it renamed every
+node while no `.go` file's bytes moved, so the changed set came out empty and
+the store kept a graph no cold scan would build. A resolver now publishes a
+digest of what phase 0 read, and a different one wipes the store exactly as a
+schema change does. *Rejected:* folding the learned container names into the
+digest — the driver teaches those from the store as the scan runs, so the
+graph would be wiped on every scan.
+
+**Invalidation compares meaning, not only identity.** A package's node is its
+import path, which its directory decides, so rewriting a `package` clause
+moves no `NodeId` and still changes what every unaliased import of it binds.
+The touched set is now every identity whose payload differs on either side.
+Declaration sites stay out of that payload: they move on any edit above them
+and nothing resolves against them.
+
+**Both phases decide container identity with one set of names.** Phase 1 saw
+only what earlier scans stored and phase 2 what phase 1 had just written, and
+whether a file is an external test package is a question about exactly that
+difference. A directory whose production package is genuinely named
+`api_test` filed its in-package test under one namespace and sourced that
+file's edges at another.
+
+**A declaration site carries what its file declared.** Build-exclusive twins
+may declare one FQN as different kinds; the record kept the last writer's
+answer, and forgetting that file stranded the answer on the survivor. The
+record is re-derived from the sites that remain, first in `(file, line)`
+order — a function of the surviving set rather than of write order, which is
+what makes a warm store agree with a cold one. This is the per-site storage
+`merge_node` had already named as the fix and deferred.
+
+**The counts did not move.** Both corpora gate identically to the previous
+baseline — `go/codeiq` 84.8% (4467 / 6085 / 4276 / 799), `go/caddy` 62.4%
+(3006 / 9571 / 9425 / 1815), every column unchanged. Seven real bugs, and no
+triggering shape for any of them in either corpus, so the ratchet is
+untouched and the baselines are not re-based. A fix that moves no measurement
+is still a fix; a corpus that cannot see it is a gap in the corpus.
+
+Schema generation went to 5: the row key gained a field, declaration sites
+gained a payload, and every identity changed.
+
+---
+
 ## 2026-07-27 — The gate is a command with an exit code, and a baseline it cannot game
 
 `arthron gate <corpus> --baseline <file> [--db <path>] [--rebase]` scans a
