@@ -1,0 +1,47 @@
+# PHP extraction rules.
+#
+# One rule, not one per construct, for the reason `java.yml` gives: a rule per
+# node kind walks every file once per rule, while a single `any:` of kinds is
+# one pre-order traversal whose order is document order. The extractor needs
+# that order — a definition's namespace is the block it sits in, and the
+# blocks are matched by the same traversal.
+#
+# The list is an inventory of the grammar surface this extractor reads, and
+# nothing here decides what a node *means*: which symbol table a `use` clause
+# consults, and whether a `const` is a namespace constant or a class one, are
+# decided in Rust where the ancestor chain is available.
+#
+# Kinds deliberately absent, and each one is the tier-2 contract rather than
+# an omission — a tier-2 language that emitted them un-gated would claim
+# tier-1 coverage:
+#   function_call_expression, member_call_expression, scoped_call_expression
+#                             - call sites. Tier 2 links no call.
+#   object_creation_expression, named_type, qualified_name
+#                             - type uses. Tier 2 resolves no type.
+#   base_clause, class_interface_clause, enum_declaration_list's `implements`
+#                             - supertypes. Tier 2 emits no inheritance edge.
+#   use_declaration           - trait composition inside a class body. The
+#                               same keyword as an import and a different
+#                               node; it imports no name into the file.
+#   anonymous_function_use_clause
+#                             - a closure capturing an outer variable. The
+#                               third meaning of `use`, and not a reference.
+id: php-node
+language: php
+rule:
+  any:
+    # Containers (a file may declare several, or none).
+    - kind: namespace_definition
+    # Imports — the only reference kind this track emits.
+    - kind: namespace_use_declaration
+    # Type declarations.
+    - kind: class_declaration
+    - kind: interface_declaration
+    - kind: trait_declaration
+    - kind: enum_declaration
+    # Member and namespace-level declarations.
+    - kind: function_definition
+    - kind: method_declaration
+    - kind: property_declaration
+    - kind: const_declaration
+    - kind: enum_case
