@@ -18,7 +18,7 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Eleven cold scans of real repositories. Generous, but bounded: a hung
+    # Fourteen cold scans of real repositories. Generous, but bounded: a hung
     # scan must not sit on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
@@ -103,3 +103,12 @@ jobs:
 
       - name: Gate python / flask
         run: ./target/release/arthron gate corpus/python/flask --language python --baseline baselines/python-flask.toml
+
+      - name: Gate rust / ripgrep
+        run: ./target/release/arthron gate corpus/rust/ripgrep --language rust --baseline baselines/rust-ripgrep.toml
+
+      - name: Gate ruby / rack
+        run: ./target/release/arthron gate corpus/ruby/rack --language ruby --baseline baselines/ruby-rack.toml
+
+      - name: Gate php / guzzle
+        run: ./target/release/arthron gate corpus/php/guzzle --language php --baseline baselines/php-guzzle.toml
