@@ -3,7 +3,8 @@
 //!
 //! The ratchets themselves live beside the corpus acceptance for each track —
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
-//! `tests/corpus_python.rs`, `tests/php_corpus.rs`, and `tests/probes.rs` for
+//! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
+//! `tests/corpus_rust.rs`, and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -38,6 +39,7 @@ const GATED: &[(&str, &str)] = &[
     // imports.
     ("baselines/php-guzzle.toml", "tests/php_corpus.rs"),
     ("baselines/ruby-rack.toml", "tests/ruby_corpus.rs"),
+    ("baselines/rust-ripgrep.toml", "tests/corpus_rust.rs"),
 ];
 
 #[test]

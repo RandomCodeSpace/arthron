@@ -94,6 +94,11 @@ impl SourceTree {
         Self::parse(SupportLang::Php, source)
     }
 
+    /// Parse Rust source.
+    pub fn parse_rust(source: &str) -> Self {
+        Self::parse(SupportLang::Rust, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -231,6 +236,16 @@ rule:
             "id: t\nlanguage: ruby\nrule:\n  kind: module\n",
             "module",
             "Rack",
+        );
+    }
+
+    #[test]
+    fn parses_rust() {
+        one_match(
+            &SourceTree::parse_rust("fn hi() {}\n"),
+            "id: t\nlanguage: rust\nrule:\n  kind: function_item\n",
+            "function_item",
+            "hi",
         );
     }
 }

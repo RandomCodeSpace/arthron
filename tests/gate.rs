@@ -10,6 +10,8 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use arthron::registry::REGISTRY;
+
 fn write(root: &Path, rel: &str, content: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -173,6 +175,21 @@ fn a_registered_but_disabled_language_is_refused_before_the_scan() {
     // not live. Gating one of those can only ever fail, so it must fail
     // immediately: a name that validated and then scanned would spend a
     // whole cold run on a corpus before reporting a usage error.
+    //
+    // The language is read off the registry rather than written here, so a
+    // track going live retires it from this test instead of breaking it —
+    // which is the whole point of the registry's zero-conflict rule, and is
+    // exactly what caught this file when Rust went live.
+    let Some(disabled) = REGISTRY
+        .iter()
+        .filter(|t| !t.is_enabled())
+        .flat_map(|t| t.langs)
+        .map(|l| l.name())
+        .next()
+    else {
+        println!("SKIP: every registered track is live, so nothing can be refused");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
@@ -183,12 +200,15 @@ fn a_registered_but_disabled_language_is_refused_before_the_scan() {
         &root,
         &dir.path().join("b.toml"),
         &db,
-        &["--language", "rust", "--rebase"],
+        &["--language", disabled, "--rebase"],
     );
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("not live"), "stderr: {err}");
-    assert!(err.contains("rust"), "the error names the language: {err}");
+    assert!(
+        err.contains(disabled),
+        "the error names the language: {err}"
+    );
     assert!(
         err.contains("go"),
         "the error names what can be gated: {err}"
