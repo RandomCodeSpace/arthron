@@ -23,6 +23,22 @@
 //! two definitions, and picking one of them would be a guess — the same guess
 //! the resolver is forbidden from making. The caller is handed both.
 //!
+//! ## Rule 1 is a choice, so it is reported
+//!
+//! Rule 1 was written for an exact *FQN*, which no shorter name can be
+//! confused with. But a stored name need not be an FQN: Python records a
+//! third-party package under its bare name, so the graph holds a node called
+//! `sqlparse` — and `sqlparse` is also the suffix of every `mod#sqlparse`
+//! alias that imports it. Rule 1 still applies, and it must: without it the
+//! external node has no spelling that selects it. What it may not do is apply
+//! *silently*, because then a caller who meant the three in-repo aliases is
+//! handed one external node under `status: ok` and nothing says otherwise.
+//!
+//! So [`NameIndex::lookup`] returns both lists. [`Lookup::matches`] is the
+//! answer rule 1 gives; [`Lookup::shadowed`] is every node rule 2 would have
+//! returned, and every surface prints it. The choice is still made — it has
+//! to be — but it is now stated rather than assumed.
+//!
 //! # What the three verbs read
 //!
 //! - [`definition`] reads the node table: the record, and every site that
@@ -129,6 +145,23 @@ pub struct Impact {
     pub truncated: bool,
 }
 
+/// What a name selected, and what selecting it hid.
+///
+/// Two lists rather than one. `matches` is the answer; `shadowed` is every
+/// node the suffix rule would have returned had an exact match not won
+/// outright. It is empty whenever nothing was hidden — which is every lookup
+/// that had no exact match, and most of the ones that did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lookup {
+    /// The nodes this name selects: none, one, or several.
+    pub matches: Vec<Match>,
+    /// The suffix candidates an exact match hid, in the same stable order.
+    ///
+    /// Never overlaps `matches`: a suffix match is strictly longer than the
+    /// query, so the exactly-equal name cannot appear here.
+    pub shadowed: Vec<Match>,
+}
+
 /// Every node name in the graph, for name lookup.
 ///
 /// Built once and queried many times: the build reads the whole node table,
@@ -161,30 +194,42 @@ impl NameIndex {
         self.entries.is_empty()
     }
 
-    /// Every node this name selects, in stable order.
+    /// Every node this name selects, in stable order, and every one an exact
+    /// match hid.
     ///
     /// An exact name match wins outright and is never widened into a suffix
     /// search. With no exact match, every node whose name ends in the query
     /// at a separator boundary is returned — none, one, or several. See the
-    /// module header for why several is an answer.
-    pub fn lookup(&self, name: &str) -> Vec<Match> {
+    /// module header for why several is an answer, and why the widening rule
+    /// 1 declined to do is reported rather than dropped.
+    ///
+    /// One pass over the index, not two: the suffix candidates are collected
+    /// whether or not an exact match turns up, because until the pass is over
+    /// neither answer is known.
+    pub fn lookup(&self, name: &str) -> Lookup {
         if name.is_empty() {
-            return Vec::new();
+            return Lookup::default();
         }
-        let exact: Vec<Match> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.name == name)
-            .cloned()
-            .collect();
-        if !exact.is_empty() {
-            return exact;
+        let mut exact = Vec::new();
+        let mut suffix = Vec::new();
+        for entry in &self.entries {
+            if entry.name == name {
+                exact.push(entry.clone());
+            } else if ends_at_separator(&entry.name, name) {
+                suffix.push(entry.clone());
+            }
         }
-        self.entries
-            .iter()
-            .filter(|entry| ends_at_separator(&entry.name, name))
-            .cloned()
-            .collect()
+        if exact.is_empty() {
+            // Nothing was hidden: the suffix rule *is* the answer here.
+            return Lookup {
+                matches: suffix,
+                shadowed: Vec::new(),
+            };
+        }
+        Lookup {
+            matches: exact,
+            shadowed: suffix,
+        }
     }
 }
 

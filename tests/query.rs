@@ -84,7 +84,7 @@ fn a_full_fqn_selects_exactly_its_node() {
     let store = scanned(dir.path());
     let index = NameIndex::build(&store).expect("index builds");
 
-    let hits = index.lookup("example.com/app/util#Parse");
+    let hits = index.lookup("example.com/app/util#Parse").matches;
     assert_eq!(hits.len(), 1, "one FQN, one node: {hits:?}");
     assert_eq!(hits[0].id, go("example.com/app/util#Parse"));
     assert_eq!(hits[0].kind, NodeKind::Definition(DefKind::Function));
@@ -96,7 +96,7 @@ fn a_bare_suffix_selects_every_node_it_ends() {
     let store = scanned(dir.path());
     let index = NameIndex::build(&store).expect("index builds");
 
-    let hits = index.lookup("Parse");
+    let hits = index.lookup("Parse").matches;
     assert_eq!(hits.len(), 1, "only one definition ends in Parse: {hits:?}");
     assert_eq!(hits[0].name, "example.com/app/util#Parse");
 }
@@ -109,7 +109,7 @@ fn a_suffix_only_matches_at_a_separator() {
 
     // `arse` ends `Parse`, but not at a boundary: a suffix that starts
     // mid-identifier names nothing, and answering it would be a guess.
-    assert!(index.lookup("arse").is_empty());
+    assert!(index.lookup("arse").matches.is_empty());
 }
 
 #[test]
@@ -128,7 +128,12 @@ fn ambiguity_is_an_answer_and_not_an_error() {
     let store = ReadStore::open(&db).expect("the store opens read-only");
     let index = NameIndex::build(&store).expect("index builds");
 
-    let mut names: Vec<String> = index.lookup("Parse").into_iter().map(|m| m.name).collect();
+    let mut names: Vec<String> = index
+        .lookup("Parse")
+        .matches
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
     names.sort();
     assert_eq!(
         names,
@@ -140,9 +145,68 @@ fn ambiguity_is_an_answer_and_not_an_error() {
 
     // And the exact spelling of one of them still selects only that one: an
     // exact FQN is never widened into its own suffix search.
-    let exact = index.lookup("example.com/app/util#Parse");
+    let exact = index.lookup("example.com/app/util#Parse").matches;
     assert_eq!(exact.len(), 1);
     assert_eq!(exact[0].name, "example.com/app/util#Parse");
+}
+
+/// The shape rule 1 was not written for: an exact match that is not an FQN.
+///
+/// Python records a third-party package under its bare name, so `sqlparse` is
+/// itself a node — and every `import sqlparse` also declares an alias
+/// `<module>#sqlparse`, which the suffix rule matches. Rule 1 hands back the
+/// external node, and it must: nothing else spells it. What it may not do is
+/// drop the aliases without a word, because those are usually the ones a
+/// person asking about *this* repository meant.
+#[test]
+fn an_exact_match_reports_the_suffix_candidates_it_hides() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(
+        root,
+        "pyproject.toml",
+        "[project]\nname = \"fixture\"\ndependencies = [\n    \"sqlparse\",\n]\n",
+    );
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/mod.py",
+        "import sqlparse\n\n\ndef use(s):\n    return sqlparse.parse(s)\n",
+    );
+    let db = root.join("graph.redb");
+    scan_repo(root, &db).expect("the fixture scans");
+    let store = ReadStore::open(&db).expect("the store opens read-only");
+    let index = NameIndex::build(&store).expect("index builds");
+
+    let found = index.lookup("sqlparse");
+    assert_eq!(found.matches.len(), 1, "{:?}", found.matches);
+    assert_eq!(found.matches[0].name, "sqlparse");
+    assert_eq!(found.matches[0].kind, NodeKind::External);
+    let hidden: Vec<&str> = found.shadowed.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        hidden,
+        ["app.mod#sqlparse"],
+        "the in-repo alias the exact match hid has to be reported",
+    );
+}
+
+/// The ordinary lookup hides nothing, and says so.
+#[test]
+fn a_lookup_that_hid_nothing_reports_an_empty_shadow() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = scanned(dir.path());
+    let index = NameIndex::build(&store).expect("index builds");
+
+    // A suffix answer: every candidate is already in `matches`.
+    assert!(index.lookup("Parse").shadowed.is_empty());
+    // And an exact FQN no longer name is a suffix of.
+    assert!(
+        index
+            .lookup("example.com/app/util#Parse")
+            .shadowed
+            .is_empty()
+    );
 }
 
 #[test]
@@ -151,8 +215,11 @@ fn a_missing_name_selects_nothing() {
     let store = scanned(dir.path());
     let index = NameIndex::build(&store).expect("index builds");
 
-    assert!(index.lookup("NoSuchThing").is_empty());
-    assert!(index.lookup("").is_empty(), "the empty query names nothing");
+    assert!(index.lookup("NoSuchThing").matches.is_empty());
+    assert!(
+        index.lookup("").matches.is_empty(),
+        "the empty query names nothing"
+    );
 }
 
 #[test]
@@ -165,7 +232,7 @@ fn an_empty_store_answers_empty_rather_than_failing() {
 
     let store = ReadStore::open(&db).expect("an unscanned store still opens");
     let index = NameIndex::build(&store).expect("index builds over no nodes");
-    assert!(index.lookup("Parse").is_empty());
+    assert!(index.lookup("Parse").matches.is_empty());
 
     let id = go("example.com/app/util#Parse");
     assert_eq!(definition(&store, &id).expect("def query"), None);

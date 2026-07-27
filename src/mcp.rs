@@ -157,6 +157,105 @@ impl Verb {
     }
 }
 
+/// The longest frame this server will hold in memory, in bytes.
+///
+/// Reading a line with no bound makes the client's stdin an allocator: a frame
+/// with no newline in it is buffered whole, so 600 MB of anything — a binary
+/// file redirected into stdin, a client bug, a `name` argument built in a
+/// loop — becomes 600 MB of resident memory and breaches this project's hard
+/// ceiling of 512 MB RSS. There is no authentication on a stdio transport and
+/// there does not need to be; the bound is what makes that safe.
+///
+/// One MiB, because every message this server accepts is a control message —
+/// a path, a name, a depth — and the largest legitimate one is a few hundred
+/// bytes. A frame over the bound is discarded as it arrives rather than
+/// accumulated, so the peak stays flat no matter how long it is.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// How much buffer the frame reader keeps between messages.
+///
+/// A `Vec` that grew to hold a large frame keeps that capacity for the rest of
+/// the session, so one big message would pin the memory it needed forever.
+/// Anything past this is released once the frame is answered.
+const IDLE_FRAME_CAPACITY: usize = 64 * 1024;
+
+/// What one read off the transport produced.
+enum Frame {
+    /// A complete line, in the caller's buffer.
+    Line,
+    /// A line longer than [`MAX_FRAME_BYTES`]. Its bytes were consumed up to
+    /// and including the newline, so the *next* read starts on a real frame
+    /// boundary and the session stays in step.
+    Oversized,
+    /// End of input, the only thing that stops the loop.
+    Eof,
+}
+
+/// Read one newline-terminated frame, never buffering more than
+/// [`MAX_FRAME_BYTES`] of it.
+///
+/// `BufRead::read_until` cannot do this: it has no bound, and by the time it
+/// returns the memory is already committed. So the reader walks the buffered
+/// chunks itself, stops appending once the bound is passed, and keeps
+/// consuming until the newline — which is what turns an oversized frame into
+/// an answerable error rather than a desynchronised session.
+fn read_frame(input: &mut dyn BufRead, buf: &mut Vec<u8>) -> Result<Frame, String> {
+    buf.clear();
+    if buf.capacity() > IDLE_FRAME_CAPACITY {
+        buf.shrink_to(IDLE_FRAME_CAPACITY);
+    }
+    let mut oversized = false;
+    loop {
+        // The borrow on `input` has to end before `consume`, so the chunk is
+        // inspected and copied inside this block and only the counts escape.
+        let (newline, used) = {
+            let available = input
+                .fill_buf()
+                .map_err(|e| format!("reading stdin: {e}"))?;
+            if available.is_empty() {
+                // End of input. A frame with no trailing newline is still a
+                // frame — and still answerable — so what is in hand decides.
+                return Ok(if oversized {
+                    Frame::Oversized
+                } else if buf.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Line
+                });
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(at) => {
+                    if !oversized {
+                        buf.extend_from_slice(&available[..=at]);
+                    }
+                    (true, at + 1)
+                }
+                None => {
+                    if !oversized {
+                        buf.extend_from_slice(available);
+                    }
+                    (false, available.len())
+                }
+            }
+        };
+        input.consume(used);
+        if !oversized && buf.len() > MAX_FRAME_BYTES {
+            // Past the bound: drop what was kept and stop keeping more. The
+            // rest of the frame is still read, and thrown away as it arrives.
+            oversized = true;
+            buf.clear();
+            buf.shrink_to(IDLE_FRAME_CAPACITY);
+        }
+        if newline {
+            return Ok(if oversized {
+                Frame::Oversized
+            } else {
+                Frame::Line
+            });
+        }
+    }
+}
+
 /// The server: a graph to read, and a loop that answers questions about it.
 pub struct Server {
     /// The store the three query tools read. Fixed for the session, exactly
@@ -184,19 +283,23 @@ impl Server {
     pub fn run(&self, input: &mut dyn BufRead, output: &mut dyn Write) -> Result<(), String> {
         let mut line = Vec::new();
         loop {
-            line.clear();
-            let read = input
-                .read_until(b'\n', &mut line)
-                .map_err(|e| format!("reading stdin: {e}"))?;
-            if read == 0 {
-                return Ok(());
-            }
-            let response = match std::str::from_utf8(&line) {
-                Ok(text) => self.handle(text),
-                Err(e) => Some(error(
+            let response = match read_frame(input, &mut line)? {
+                Frame::Eof => return Ok(()),
+                Frame::Line => match std::str::from_utf8(&line) {
+                    Ok(text) => self.handle(text),
+                    Err(e) => Some(error(
+                        Value::Null,
+                        PARSE_ERROR,
+                        format!("the line is not valid UTF-8: {e}"),
+                    )),
+                },
+                Frame::Oversized => Some(error(
                     Value::Null,
                     PARSE_ERROR,
-                    format!("the line is not valid UTF-8: {e}"),
+                    format!(
+                        "the frame is longer than {MAX_FRAME_BYTES} bytes and was discarded \
+                         unread; one JSON-RPC message per line"
+                    ),
                 )),
             };
             if let Some(doc) = response {
@@ -358,15 +461,22 @@ impl Server {
     fn query(&self, verb: Verb, name: &str) -> Result<Value, String> {
         let store = ReadStore::open(&self.db)?;
         let index = NameIndex::build(&store)?;
-        let mut hits = index.lookup(name);
-        if hits.len() != 1 {
-            return Ok(if hits.is_empty() {
+        let mut found = index.lookup(name);
+        if found.matches.len() != 1 {
+            let empty = found.matches.is_empty();
+            let mut all = found.matches;
+            all.extend(found.shadowed);
+            return Ok(if empty {
                 json::query_no_match(verb.name(), name)
             } else {
-                json::query_ambiguous(verb.name(), name, &hits)
+                json::query_ambiguous(verb.name(), name, &all)
             });
         }
-        let node = hits.remove(0);
+        let node = found.matches.remove(0);
+        // The candidates the exact match won over travel with every answer:
+        // a model that reads `status: ok` and one node has been told the
+        // name had one reading, and that must be true.
+        let shadowed = found.shadowed;
         match verb {
             Verb::Def => {
                 let Some(def) = definition(&store, &node.id)? else {
@@ -374,15 +484,15 @@ impl Server {
                     // open, so this needs the file to have changed underneath.
                     return Err(format!("{}: the node vanished between reads", node.name));
                 };
-                Ok(json::query_definition(name, &def))
+                Ok(json::query_definition(name, &def, &shadowed))
             }
             Verb::Refs => {
                 let sites = references(&store, &node.id)?;
-                Ok(json::query_references(name, &node, &sites))
+                Ok(json::query_references(name, &node, &sites, &shadowed))
             }
             Verb::Impact(depth) => {
                 let found = impact(&store, &node.id, depth)?;
-                Ok(json::query_impact(name, &node, depth, &found))
+                Ok(json::query_impact(name, &node, depth, &found, &shadowed))
             }
         }
     }
@@ -405,7 +515,7 @@ fn scan(root: &Path, db: Option<&Path>) -> Result<Value, String> {
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     let report = scan_repo_with(root, &db_path, &config)?;
-    Ok(json::scan(&report))
+    Ok(json::scan(&report, &config))
 }
 
 /// A successful call: the document as text for a model, and again as

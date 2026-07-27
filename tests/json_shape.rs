@@ -20,6 +20,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+use arthron::config::Config;
 use arthron::gate::{Counts, GateFailure, GateVerdict, evaluate};
 use arthron::json::{self, GateOutput};
 use arthron::model::Lang;
@@ -44,6 +45,15 @@ fn report() -> Report {
     }
 }
 
+/// The `config` sub-document a repository with no `arthron.toml` produces.
+///
+/// All three keys are present and empty. "No settings" and "this build does
+/// not report settings" have to look different, because the second is what a
+/// baseline compared under different globs would look like.
+fn no_settings() -> Value {
+    json!({ "include": [], "exclude": [], "tracks": {} })
+}
+
 /// The `languages` sub-document [`report`] produces, quoted once and shared by
 /// the scan and gate literals — they are one contract, not two.
 fn languages() -> Value {
@@ -62,10 +72,11 @@ fn languages() -> Value {
 #[test]
 fn the_scan_document_is_exactly_this() {
     assert_eq!(
-        json::scan(&report()),
+        json::scan(&report(), &Config::default()),
         json!({
             "schema": 1,
             "command": "scan",
+            "config": no_settings(),
             "languages": languages(),
             "fqn_collisions": 1,
         }),
@@ -80,10 +91,11 @@ fn a_language_with_no_rows_has_no_entry() {
     // measurement nobody took.
     let empty = Report::default();
     assert_eq!(
-        json::scan(&empty),
+        json::scan(&empty, &Config::default()),
         json!({
             "schema": 1,
             "command": "scan",
+            "config": no_settings(),
             "languages": {},
             "fqn_collisions": 0,
         }),
@@ -102,6 +114,7 @@ fn baseline_counts() -> Counts {
 
 fn gate_output<'a>(
     report: &'a Report,
+    config: &'a Config,
     baseline: Counts,
     measured: Counts,
     verdict: Option<&'a GateVerdict>,
@@ -111,6 +124,7 @@ fn gate_output<'a>(
         baseline_path: "baselines/go-codeiq.toml",
         corpus: "corpus/go/codeiq",
         commit: "deadbeef",
+        config,
         report,
         baseline,
         measured,
@@ -121,10 +135,17 @@ fn gate_output<'a>(
 #[test]
 fn the_passing_gate_document_is_exactly_this() {
     let report = report();
+    let config = Config::default();
     let counts = baseline_counts();
     let verdict = GateVerdict::Pass { improved: false };
     assert_eq!(
-        json::gate(&gate_output(&report, counts, counts, Some(&verdict))),
+        json::gate(&gate_output(
+            &report,
+            &config,
+            counts,
+            counts,
+            Some(&verdict)
+        )),
         json!({
             "schema": 1,
             "command": "gate",
@@ -133,6 +154,7 @@ fn the_passing_gate_document_is_exactly_this() {
             "baseline_path": "baselines/go-codeiq.toml",
             "corpus": "corpus/go/codeiq",
             "commit": "deadbeef",
+            "config": no_settings(),
             "verdict": "pass",
             "improved": false,
             "failures": [],
@@ -152,6 +174,7 @@ fn the_passing_gate_document_is_exactly_this() {
 #[test]
 fn a_failing_gate_names_every_check_that_failed() {
     let report = report();
+    let config = Config::default();
     let was = baseline_counts();
     // One run that regressed the rate *and* drifted both excluded buckets:
     // three failures, and all three are in the document.
@@ -171,7 +194,7 @@ fn a_failing_gate_names_every_check_that_failed() {
         },
         &now,
     );
-    let doc = json::gate(&gate_output(&report, was, now, Some(&verdict)));
+    let doc = json::gate(&gate_output(&report, &config, was, now, Some(&verdict)));
 
     assert_eq!(doc["verdict"], json!("fail"));
     assert_eq!(doc["action"], json!("compare"));
@@ -213,8 +236,9 @@ fn a_failing_gate_names_every_check_that_failed() {
 #[test]
 fn a_rebase_says_it_rebased_and_reports_what_it_wrote() {
     let report = report();
+    let config = Config::default();
     let measured = baseline_counts();
-    let doc = json::gate(&gate_output(&report, measured, measured, None));
+    let doc = json::gate(&gate_output(&report, &config, measured, measured, None));
     assert_eq!(doc["action"], json!("rebase"));
     assert_eq!(doc["verdict"], json!("rebased"));
     assert_eq!(doc["failures"], json!([]));
@@ -229,6 +253,7 @@ fn a_comparison_that_could_not_be_made_is_neither_a_pass_nor_a_failure() {
     let verdict = GateVerdict::Error("baseline has nothing to measure".to_string());
     let doc = json::gate(&gate_output(
         &report,
+        &Config::default(),
         Counts::default(),
         baseline_counts(),
         Some(&verdict),
@@ -241,13 +266,14 @@ fn a_comparison_that_could_not_be_made_is_neither_a_pass_nor_a_failure() {
 #[test]
 fn every_gate_document_carries_the_same_keys_whatever_it_decided() {
     let report = report();
+    let config = Config::default();
     let counts = baseline_counts();
     let pass = GateVerdict::Pass { improved: true };
     let fail = GateVerdict::Fail(vec![GateFailure::ExternalDrift { was: 1, now: 2 }]);
     let error = GateVerdict::Error("nothing to measure".to_string());
     let mut key_sets = Vec::new();
     for verdict in [Some(&pass), Some(&fail), Some(&error), None] {
-        let doc = json::gate(&gate_output(&report, counts, counts, verdict));
+        let doc = json::gate(&gate_output(&report, &config, counts, counts, verdict));
         let keys: Vec<String> = doc.as_object().expect("object").keys().cloned().collect();
         key_sets.push(keys);
     }
@@ -265,6 +291,7 @@ fn every_gate_document_carries_the_same_keys_whatever_it_decided() {
             "baseline_path",
             "command",
             "commit",
+            "config",
             "corpus",
             "error",
             "failures",
@@ -323,7 +350,7 @@ fn scanned(dir: &Path) -> ReadStore {
 
 /// The one node a name selects, or a panic naming what it selected instead.
 fn one(index: &NameIndex, name: &str) -> arthron::query::Match {
-    let mut hits = index.lookup(name);
+    let mut hits = index.lookup(name).matches;
     assert_eq!(hits.len(), 1, "{name} selected {hits:?}");
     hits.remove(0)
 }
@@ -339,13 +366,14 @@ fn the_query_def_document_is_exactly_this() {
         .expect("the node is there");
 
     assert_eq!(
-        json::query_definition("Parse", &def),
+        json::query_definition("Parse", &def, &[]),
         json!({
             "schema": 1,
             "command": "query",
             "verb": "def",
             "query": "Parse",
             "status": "ok",
+            "shadowed": [],
             "fqn": "example.com/app/util#Parse",
             "kind": "function",
             "declarations": [{ "file": "util/util.go", "line": 3 }],
@@ -363,13 +391,14 @@ fn the_query_refs_document_is_exactly_this() {
     let sites = references(&store, &node.id).expect("the rows read");
 
     assert_eq!(
-        json::query_references("Parse", &node, &sites),
+        json::query_references("Parse", &node, &sites, &[]),
         json!({
             "schema": 1,
             "command": "query",
             "verb": "refs",
             "query": "Parse",
             "status": "ok",
+            "shadowed": [],
             "fqn": "example.com/app/util#Parse",
             "kind": "function",
             "rows": 1,
@@ -401,13 +430,14 @@ fn the_query_impact_document_is_exactly_this() {
     let found = impact(&store, &node.id, 3).expect("the closure walks");
 
     assert_eq!(
-        json::query_impact("Parse", &node, 3, &found),
+        json::query_impact("Parse", &node, 3, &found, &[]),
         json!({
             "schema": 1,
             "command": "query",
             "verb": "impact",
             "query": "Parse",
             "status": "ok",
+            "shadowed": [],
             "fqn": "example.com/app/util#Parse",
             "kind": "function",
             "depth": 3,
@@ -454,7 +484,7 @@ fn the_ambiguous_document_lists_every_candidate() {
     scan_repo(dir.path(), &db).expect("the second package scans");
     let store = ReadStore::open(&db).expect("the store opens read-only");
     let index = NameIndex::build(&store).expect("index builds");
-    let hits = index.lookup("Parse");
+    let hits = index.lookup("Parse").matches;
     assert_eq!(hits.len(), 2, "{hits:?}");
 
     assert_eq!(
@@ -477,7 +507,7 @@ fn the_ambiguous_document_lists_every_candidate() {
 fn a_document_renders_the_same_way_twice() {
     // Key order is the serializer's, not a hash map's: two runs over one store
     // must print byte-identical documents or a diff in CI is noise.
-    let doc = json::scan(&report());
+    let doc = json::scan(&report(), &Config::default());
     let once = json::render(&doc).expect("renders");
     let twice = json::render(&doc).expect("renders");
     assert_eq!(once, twice);
@@ -510,12 +540,19 @@ fn every_field_a_document_carries_is_named_in_the_help() {
     let sites = references(&store, &node.id).expect("the rows read");
     let found = impact(&store, &node.id, 3).expect("the closure walks");
 
+    let config = Config::default();
     let documents = [
-        json::scan(&report),
-        json::gate(&gate_output(&report, counts, counts, Some(&verdict))),
-        json::query_definition("Parse", &def),
-        json::query_references("Parse", &node, &sites),
-        json::query_impact("Parse", &node, 3, &found),
+        json::scan(&report, &config),
+        json::gate(&gate_output(
+            &report,
+            &config,
+            counts,
+            counts,
+            Some(&verdict),
+        )),
+        json::query_definition("Parse", &def, &[]),
+        json::query_references("Parse", &node, &sites, &[]),
+        json::query_impact("Parse", &node, 3, &found, &[]),
         json::query_no_match("def", "Nothing"),
         json::query_ambiguous("def", "Parse", std::slice::from_ref(&node)),
     ];

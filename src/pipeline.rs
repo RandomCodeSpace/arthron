@@ -850,9 +850,15 @@ pub fn source_files<L: Language>(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// [`source_files`] under a repository's include/exclude globs.
 ///
 /// The globs go into the walk rather than filtering its output, so an
-/// excluded directory is pruned instead of descended into and thrown away —
-/// and so `include` can name a subtree without the walk reading the rest of
-/// the repository to decide it does not want it.
+/// excluded directory is pruned instead of descended into and thrown away.
+///
+/// `include` does not prune. A whitelist-only override in the `ignore` crate
+/// is applied to files alone — a directory that matches nothing is still
+/// descended — so `include = ["src/**"]` walks `node_modules` and rejects its
+/// files one at a time. It decides what is *read*, never what is *walked*.
+/// Pruning a subtree out of the walk is what `exclude` is for, and the two
+/// compose: naming a subtree with `include` and excluding the expensive
+/// directories is faster than `include` alone.
 pub fn source_files_with<L: Language>(
     root: &Path,
     filter: &FileFilter,

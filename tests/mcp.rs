@@ -363,3 +363,64 @@ fn the_help_names_every_tool_and_its_arguments() {
     assert!(help.contains("stdin"), "{help}");
     assert!(help.contains("socket"), "{help}");
 }
+
+/// A frame with no newline in it is bounded, answered, and resynchronised.
+///
+/// `read_until` has no size cap, so an unterminated frame is buffered whole:
+/// 600 MB in becomes 590 MB resident, which breaches this project's hard
+/// ceiling of 512 MB RSS, and a multi-gigabyte one ends the process. Nothing
+/// authenticates a stdio client — a binary file redirected into stdin reaches
+/// this — so the bound is what makes the transport safe rather than a trust
+/// assumption about the caller.
+///
+/// The assertion is behavioural, and it is the one that matters for framing:
+/// the oversized frame is answered with a parse error, and the *next* frame is
+/// still understood. A server that stopped mid-frame would desynchronise.
+#[test]
+fn an_oversized_frame_is_refused_and_the_session_stays_in_step() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+
+    let mut lines = String::new();
+    // Comfortably over `mcp::MAX_FRAME_BYTES`, and with no newline until the
+    // very end: the whole thing is one frame.
+    lines.push_str(&"x".repeat(3 * 1024 * 1024));
+    lines.push('\n');
+    lines.push_str("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n");
+
+    let replies = raw_session(dir.path(), &lines);
+    assert_eq!(replies.len(), 2, "{replies:#?}");
+    assert_eq!(replies[0]["error"]["code"], -32700);
+    assert_eq!(replies[0]["id"], Value::Null);
+    assert!(
+        replies[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("longer than")),
+        "the error has to say what was wrong: {:#?}",
+        replies[0],
+    );
+    // The frame after it is a normal message again.
+    assert_eq!(replies[1]["id"], 7);
+    assert!(replies[1]["result"].is_object(), "{:#?}", replies[1]);
+}
+
+/// A frame just under the bound is not touched by it.
+#[test]
+fn a_large_but_legal_frame_is_answered_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+
+    // A `name` long enough to be a real message and short enough to be legal.
+    let name = "N".repeat(512 * 1024);
+    let message = json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": { "name": "query_def", "arguments": { "name": name } },
+    });
+    let replies = raw_session(dir.path(), &format!("{message}\n"));
+    assert_eq!(replies.len(), 1, "{replies:#?}");
+    assert_eq!(replies[0]["id"], 9);
+    // The frame reached dispatch: the reply is a JSON-RPC *result*, whatever
+    // the tool then made of it, and not the `-32700` a refused frame gets.
+    assert!(replies[0]["result"].is_object(), "{:#?}", replies[0]);
+    assert!(replies[0].get("error").is_none(), "{:#?}", replies[0]);
+}

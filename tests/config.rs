@@ -78,7 +78,7 @@ fn names(root: &Path, db: &Path, config: &Config) -> Vec<String> {
         "com.acme#Tool",
     ]
     .into_iter()
-    .filter(|fqn| !index.lookup(fqn).is_empty())
+    .filter(|fqn| !index.lookup(fqn).matches.is_empty())
     .map(str::to_string)
     .collect()
 }

@@ -27,6 +27,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::config::Config;
 use crate::gate::{Counts, GateFailure, GateVerdict};
 use crate::model::{Lang, RefKind, reason_name};
 use crate::query::{Definition, Impact, Match, NodeKind, RefSite};
@@ -40,11 +41,13 @@ use crate::store::{Report, StoredOutcome};
 /// ignores unknown keys keeps working.
 pub const SCHEMA: u32 = 1;
 
-/// The `scan` document: what the store now holds, per language.
-pub fn scan(report: &Report) -> Value {
+/// The `scan` document: what the store now holds, per language, and under
+/// which file set it was measured.
+pub fn scan(report: &Report, config: &Config) -> Value {
     json!({
         "schema": SCHEMA,
         "command": "scan",
+        "config": settings(config),
         "languages": languages(report),
         "fqn_collisions": report.fqn_collisions,
     })
@@ -61,6 +64,9 @@ pub struct GateOutput<'a> {
     pub corpus: &'a str,
     /// The commit the baseline records. Provenance, never verified.
     pub commit: &'a str,
+    /// The scanned root's own settings, as the run read them. Provenance for
+    /// the *file set* the measured side was taken over.
+    pub config: &'a Config,
     /// The whole store's per-language tallies from this run's scan.
     pub report: &'a Report,
     /// The counts being compared against — for a re-base, the counts just
@@ -94,6 +100,7 @@ pub fn gate(out: &GateOutput<'_>) -> Value {
         "baseline_path": out.baseline_path,
         "corpus": out.corpus,
         "commit": out.commit,
+        "config": settings(out.config),
         "verdict": verdict,
         "improved": improved,
         "failures": failures,
@@ -106,8 +113,9 @@ pub fn gate(out: &GateOutput<'_>) -> Value {
 }
 
 /// The `query def` document.
-pub fn query_definition(query: &str, def: &Definition) -> Value {
+pub fn query_definition(query: &str, def: &Definition, shadowed: &[Match]) -> Value {
     let mut doc = envelope("def", query, "ok");
+    doc.insert("shadowed".to_string(), nodes(shadowed));
     doc.insert("fqn".to_string(), json!(def.node.name));
     doc.insert("kind".to_string(), json!(kind_name(def.node.kind)));
     doc.insert(
@@ -127,9 +135,15 @@ pub fn query_definition(query: &str, def: &Definition) -> Value {
 }
 
 /// The `query refs` document.
-pub fn query_references(query: &str, selected: &Match, sites: &[RefSite]) -> Value {
+pub fn query_references(
+    query: &str,
+    selected: &Match,
+    sites: &[RefSite],
+    shadowed: &[Match],
+) -> Value {
     let occurrences: u64 = sites.iter().map(|s| u64::from(s.count)).sum();
     let mut doc = envelope("refs", query, "ok");
+    doc.insert("shadowed".to_string(), nodes(shadowed));
     doc.insert("fqn".to_string(), json!(selected.name));
     doc.insert("kind".to_string(), json!(kind_name(selected.kind)));
     doc.insert("rows".to_string(), json!(sites.len()));
@@ -142,9 +156,16 @@ pub fn query_references(query: &str, selected: &Match, sites: &[RefSite]) -> Val
 }
 
 /// The `query impact` document.
-pub fn query_impact(query: &str, selected: &Match, depth: u32, found: &Impact) -> Value {
+pub fn query_impact(
+    query: &str,
+    selected: &Match,
+    depth: u32,
+    found: &Impact,
+    shadowed: &[Match],
+) -> Value {
     let total: usize = found.layers.iter().map(Vec::len).sum();
     let mut doc = envelope("impact", query, "ok");
+    doc.insert("shadowed".to_string(), nodes(shadowed));
     doc.insert("fqn".to_string(), json!(selected.name));
     doc.insert("kind".to_string(), json!(kind_name(selected.kind)));
     doc.insert("depth".to_string(), json!(depth));
@@ -225,13 +246,16 @@ pub const HELP: &str = concat!(
     "    external            occurrences linked outside the repository\n",
     "    local_binding       occurrences a local, parameter or receiver binds\n",
     "    unresolved          occurrences not linked, across every reason\n",
-    "    unresolved_reasons  reason name -> count\n",
+    "    unresolved_reasons  reason name -> count; a stored code this build\n",
+    "                        has no name for is `unknown-<code>`\n",
     "    rate                resolved / (resolved + unresolved), or null when\n",
     "                        there is nothing to measure\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
+    "  config           the settings this run read, which decide the file set\n",
+    "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
     "gate\n",
-    "  schema, command (\"gate\"), languages, fqn_collisions  as for scan\n",
+    "  schema, command (\"gate\"), languages, fqn_collisions, config  as for scan\n",
     "  action           \"compare\" or \"rebase\"\n",
     "  language         the one language this gate measured\n",
     "  baseline_path    the baseline file read or written\n",
@@ -252,11 +276,18 @@ pub const HELP: &str = concat!(
     "  matches          [{ fqn, kind }] when status is not \"ok\"; empty for\n",
     "                   no_match\n",
     "  fqn, kind        the selected node, when status is \"ok\"\n",
+    "  shadowed         [{ fqn, kind }] when status is \"ok\": the nodes the\n",
+    "                   name also ends, which an exact match won over. Empty\n",
+    "                   for almost every query; a non-empty list means the\n",
+    "                   answer is one reading of the name and these are the\n",
+    "                   others, reachable by spelling more of the name.\n",
     "  def:    declarations [{ file, line }], aliases [{ fqn, kind }]\n",
     "  refs:   rows, occurrences, references [{ file, line, kind, enclosing,\n",
     "          raw_target, count, language, outcome }] where outcome is\n",
-    "          { status, package, reason } and status is resolved, external\n",
-    "          or unresolved\n",
+    "          { status, package, reason }. `refs` selects the rows that\n",
+    "          resolved to the named node, so status is always \"resolved\"\n",
+    "          here and package and reason are always null; the three-way\n",
+    "          shape is the store's own and is emitted unabridged.\n",
     "  impact: depth, total, truncated, layers [{ depth, nodes }]\n",
     "\n",
     "A stored code this build has no variant for is null, never guessed at.\n",
@@ -316,6 +347,32 @@ fn node(m: &Match) -> Value {
     json!({ "fqn": m.name, "kind": kind_name(m.kind) })
 }
 
+/// A list of nodes, wherever a document names several.
+fn nodes(list: &[Match]) -> Value {
+    Value::Array(list.iter().map(node).collect())
+}
+
+/// What the scanned root's `arthron.toml` said, as provenance.
+///
+/// A measurement means nothing without the file set it was taken over, and
+/// `include`, `exclude` and `[tracks]` are what decide that set. A gate
+/// document already carries `corpus` and `commit`; without these three, a
+/// baseline recorded under one configuration and compared under another
+/// compares two different repositories and no document can show it. The
+/// dangerous shape is partial under-match: excluding the files a language
+/// resolves worst makes the rate *improve* and the gate pass.
+///
+/// All three keys are always present — empty lists and an empty table for a
+/// repository with no configuration file — so a reader never has to tell
+/// "unset" from "this build did not report it".
+fn settings(config: &Config) -> Value {
+    json!({
+        "include": config.include,
+        "exclude": config.exclude,
+        "tracks": config.tracks,
+    })
+}
+
 /// A node kind, as a document spells it.
 fn kind_name(kind: NodeKind) -> &'static str {
     match kind {
@@ -352,7 +409,17 @@ fn languages(report: &Report) -> Value {
         let unresolved = tally.unresolved_total();
         let mut reasons = Map::new();
         for (reason, count) in &tally.unresolved {
-            reasons.insert(reason_name(*reason).to_string(), json!(count));
+            // A code with no variant becomes `unknown-<code>`, the same shape
+            // an unknown language code takes above, and never the bare word
+            // `Unknown`: two such codes would collide on one key and the
+            // second count would silently replace the first. A map key cannot
+            // be null, so the rule "never guess" is kept by carrying the code
+            // itself rather than by inventing a name for it.
+            let name = match crate::model::reason_from_code(*reason) {
+                Some(_) => reason_name(*reason).to_string(),
+                None => format!("unknown-{reason}"),
+            };
+            reasons.insert(name, json!(count));
         }
         out.insert(
             name,
@@ -400,6 +467,34 @@ mod tests {
                 "reason": "NeedsTypeInference",
             }),
         );
+    }
+
+    #[test]
+    fn two_unnamed_reason_codes_do_not_collide_on_one_key() {
+        // A store written by a later build can hold reason codes this one has
+        // no variant for. Naming them all `Unknown` makes them one map key,
+        // and the second count silently replaces the first — a *lost*
+        // measurement, in the one document that exists to carry measurements.
+        let report = Report {
+            per_lang: std::collections::BTreeMap::from([(
+                Lang::Go.code(),
+                crate::store::LangTally {
+                    resolved: 0,
+                    external: 0,
+                    local_binding: 0,
+                    unresolved: std::collections::BTreeMap::from([(200, 3), (201, 5)]),
+                },
+            )]),
+            fqn_collisions: 0,
+        };
+        let reasons = &languages(&report)["go"]["unresolved_reasons"];
+        assert_eq!(
+            reasons,
+            &json!({ "unknown-200": 3, "unknown-201": 5 }),
+            "{reasons}",
+        );
+        // And the total still counts both, so the entry and the sum agree.
+        assert_eq!(languages(&report)["go"]["unresolved"], json!(8));
     }
 
     #[test]

@@ -324,3 +324,119 @@ fn the_help_documents_the_schema_and_the_config_file() {
         assert!(help.contains("[tracks]"), "{command}: {help}");
     }
 }
+
+/// Every measurement document says which file set it was taken over.
+///
+/// `corpus` and `commit` are provenance for *where* a baseline came from;
+/// `include`, `exclude` and `[tracks]` are provenance for *what was counted*,
+/// and without them a baseline recorded under one configuration and compared
+/// under another compares two different repositories with nothing to show it.
+/// The dangerous shape is partial under-match: excluding the files a language
+/// resolves worst makes the rate improve and the gate pass.
+#[test]
+fn scan_json_records_the_settings_the_counts_were_taken_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned(dir.path());
+    write(
+        dir.path(),
+        "arthron.toml",
+        "include = [\"util/**\", \"server/**\"]\nexclude = [\"**/vendor/**\"]\n\n[tracks]\njava = false\n",
+    );
+
+    let out = arthron(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--json",
+    ]);
+    let (doc, code) = json(&out);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        doc["config"],
+        serde_json::json!({
+            "include": ["util/**", "server/**"],
+            "exclude": ["**/vendor/**"],
+            "tracks": { "java": false },
+        }),
+        "{doc}",
+    );
+}
+
+/// A repository with no configuration file still carries the keys, empty.
+#[test]
+fn a_repository_with_no_config_says_so_rather_than_omitting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let db = dir.path().join("graph.redb");
+    let out = arthron(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--json",
+    ]);
+    let (doc, code) = json(&out);
+    assert_eq!(code, 0);
+    assert_eq!(
+        doc["config"],
+        serde_json::json!({ "include": [], "exclude": [], "tracks": {} }),
+        "{doc}",
+    );
+}
+
+/// A whitelist that matches no file is said out loud.
+///
+/// `include = ["src"]` matches the directory and no file under it, so the scan
+/// reads nothing and reports a clean run: rate `n/a`, exit 0, and
+/// `"languages": {}` — the same document an empty repository produces. `gate`
+/// already refuses a zero denominator; this is the `scan` half of that guard.
+#[test]
+fn an_include_that_matched_nothing_is_a_warning_and_not_a_clean_run() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    // A bare directory name: the trap, spelled exactly as somebody would.
+    write(dir.path(), "arthron.toml", "include = [\"util\"]\n");
+    let db = dir.path().join("graph.redb");
+
+    let out = arthron(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--json",
+    ]);
+    let (doc, code) = json(&out);
+    // Still an answer and still exit 0: measuring nothing is a legitimate
+    // fact about an empty tree, and this cannot tell the two apart.
+    assert_eq!(code, 0);
+    assert_eq!(doc["languages"], serde_json::json!({}), "{doc}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`include`"), "{stderr}");
+    assert!(
+        stderr.contains("src/**"),
+        "the fix is in the message: {stderr}"
+    );
+    // And the document itself carries the globs, so a dashboard can tell
+    // "your config is wrong" from "no data".
+    assert_eq!(doc["config"]["include"], serde_json::json!(["util"]));
+}
+
+/// A whitelist that matches files says nothing.
+#[test]
+fn an_include_that_matched_files_warns_about_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    write(dir.path(), "arthron.toml", "include = [\"**/*.go\"]\n");
+    let db = dir.path().join("graph.redb");
+
+    let out = arthron(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("`include`"), "{stderr}");
+}
