@@ -27,18 +27,36 @@ outcome.
 The result of resolving one reference: `Resolved`, `External`, or `Unresolved`
 with a reason. There is no way to express "dropped".
 
+**LocalBinding**:
+The outcome of a reference that names a local — a parameter, local variable,
+or receiver. Locals are not nodes, so this outcome is caused by policy, not by
+a resolver gap; it is reported beside `External` and excluded from both terms
+of the resolution rate.
+_Avoid_: unresolved local
+
 **Node**:
 A thing a reference can name — a definition, a module/package, or an external
 package. Files and locals are not nodes.
 _Avoid_: file node, anchor node
+
+**Domain**:
+The identity space a node's id is hashed in. Languages that share one
+reference space share a domain — JavaScript and TypeScript are one domain, so
+a `.ts` import can name a `.js` definition.
+_Avoid_: language (as an identity input)
 
 **Edge**:
 A reference that resolved. Nothing else creates an edge.
 _Avoid_: contains, defines (as edge kinds)
 
 **Candidate**:
-One fully-qualified name a reference might resolve to, in scope-priority order.
-Every candidate probed — hit or miss — is recorded.
+One index key a reference might resolve through, probed in scope-priority
+order. A key may name a node directly or stand for one under another shape
+(an alias, an overload set). Every probe — hit or miss — is recorded.
+
+**Alias**:
+An index key that names a node under another name — an export alias or a
+re-export. An alias is an entry pointing at a node, not a node itself.
 
 **Resolution rate**:
 `Resolved / (Resolved + Unresolved)` for one language. Never aggregated across
