@@ -59,8 +59,8 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
         .expect("the corpus has references to measure");
 
     println!(
-        "resolved {} external {} unresolved {}",
-        go.resolved, go.external, unresolved
+        "resolved {} external {} local-binding {} unresolved {}",
+        go.resolved, go.external, go.local_binding, unresolved
     );
     for (code, count) in &go.unresolved {
         println!("  {}: {count}", reason_name(*code));
@@ -81,10 +81,15 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
 fn every_corpus_reference_has_exactly_one_stored_outcome() {
     // "The resolver never drops" is the project's central claim, and a rate
     // is no evidence for it: silently discarding the references it cannot
-    // link would *raise* the rate. The three outcome columns partition the
+    // link would *raise* the rate. The reported columns partition the
     // extracted references, so their sum is the reference count — exactly.
     // Under-counting is a dropped reference; over-counting is one reference
     // reported as two outcomes. Both break the contract.
+    //
+    // `local_binding` is one of the columns even though it is outside both
+    // terms of the rate: it is excluded from the *measurement*, never from
+    // the *accounting*. Leaving it out here is precisely how moving
+    // references into it could look like an improvement.
     let corpus = Path::new("corpus/go/codeiq");
     if !corpus_present(corpus) {
         return;
@@ -93,17 +98,18 @@ fn every_corpus_reference_has_exactly_one_stored_outcome() {
     let report = scan_go(corpus, &dir.path().join("graph.redb")).expect("scan");
     let go = &report.per_lang[&Lang::Go.code()];
 
-    let stored = go.resolved + go.external + go.unresolved_total();
+    let stored = go.resolved + go.external + go.local_binding + go.unresolved_total();
     let extracted = extracted_reference_count(corpus);
     println!("stored outcomes {stored}, extracted references {extracted}");
     assert_eq!(
         stored,
         extracted,
-        "resolved {} + external {} + unresolved {} must equal the {extracted} \
-         references the extractor found — every reference gets exactly one \
-         stored outcome",
+        "resolved {} + external {} + local-binding {} + unresolved {} must \
+         equal the {extracted} references the extractor found — every \
+         reference gets exactly one stored outcome",
         go.resolved,
         go.external,
+        go.local_binding,
         go.unresolved_total(),
     );
 }

@@ -183,15 +183,18 @@ pub fn dir_package_name<'a>(names: &'a HashMap<String, String>, pkg_path: &'a st
         .map_or_else(|| import_binding(pkg_path), String::as_str)
 }
 
-/// Whether a declared package name marks an *external test package*.
+/// Whether a file declares an *external test package*.
 ///
 /// `package foo_test` in the directory of package `foo` is a second package
-/// sharing one directory — Go's only such case. `dir_pkg_name` is the name
-/// that directory's package is known to use, and the comparison is what
-/// keeps a directory whose package genuinely is called `foo_test` out of
-/// this: there the declared name is the directory's own name.
-pub fn is_external_test_package(declared: &str, dir_pkg_name: &str) -> bool {
-    declared.ends_with("_test") && declared != dir_pkg_name
+/// sharing one directory — Go's only such case. Two facts decide it, not
+/// one. The file must *be* a test file: `package foo_test` in a
+/// non-`_test.go` file is not an external test package at all, because the
+/// Go toolchain rejects that directory outright, so the suffix alone was
+/// never the rule. And the declared name must differ from the name that
+/// directory's package uses, which is what keeps a directory whose package
+/// genuinely is called `foo_test` out of this.
+pub fn is_external_test_package(rel_path: &str, declared: &str, dir_pkg_name: &str) -> bool {
+    rel_path.ends_with("_test.go") && declared.ends_with("_test") && declared != dir_pkg_name
 }
 
 /// The import path a file's definitions and same-package candidates live
@@ -200,24 +203,24 @@ pub fn is_external_test_package(declared: &str, dir_pkg_name: &str) -> bool {
 /// An external test package may not be imported by anything, and its
 /// definitions must not sit in the production package's namespace, where a
 /// same-package candidate from a production file would wrongly hit one. It
-/// gets `{dir_pkg_path}_test` — its own package, with its own node. It
+/// gets `{dir_pkg_path}#test` — its own package, with its own node. It
 /// reaches the package under test the ordinary way, through the explicit
 /// import it has to write anyway.
 ///
-/// One ambiguity survives, knowingly: a directory literally named `foo_test`
-/// next to the external test package of `foo` claims the same path, so their
-/// definitions share a namespace. Go permits that pair and neither package is
-/// importable, so no import can be misread — but a same-package candidate
-/// could cross between them. Recorded rather than papered over; a separator
-/// no import path can contain would cost every FQN its readability.
+/// The separator is `#`, which the Go module-path grammar forbids in an
+/// import path, so `{dir}#test` is an identity no real directory can claim.
+/// A `_test` suffix could: a directory literally named `foo_test` beside the
+/// external test package of `foo` used to share one namespace with it, and a
+/// same-package candidate could cross between the two.
 pub fn package_path_for_file(
+    rel_path: &str,
     dir_pkg_path: &str,
     declared: Option<&str>,
     dir_pkg_name: &str,
 ) -> String {
     match declared {
-        Some(name) if is_external_test_package(name, dir_pkg_name) => {
-            format!("{dir_pkg_path}_test")
+        Some(name) if is_external_test_package(rel_path, name, dir_pkg_name) => {
+            format!("{dir_pkg_path}#test")
         }
         _ => dir_pkg_path.to_string(),
     }
@@ -292,7 +295,12 @@ impl GoResolver {
         };
         let dir_pkg = self.package_path(cfg, rel_dir);
         let dir_name = dir_package_name(&cfg.package_names, &dir_pkg);
-        package_path_for_file(&dir_pkg, header.package.as_deref(), dir_name)
+        package_path_for_file(
+            &header.rel_path,
+            &dir_pkg,
+            header.package.as_deref(),
+            dir_name,
+        )
     }
 
     fn is_internal(&self, cfg: &GoModule, import_path: &str) -> bool {
@@ -550,6 +558,21 @@ impl Resolver<GoLang> for GoResolver {
         r: &Reference,
         probe: &dyn SymbolProbe,
     ) -> Resolution {
+        // Checked before any candidate is generated. A name some enclosing
+        // block binds is not a node by design, so linking it would emit a
+        // wrong edge — strictly worse than an unresolved reference, because
+        // a miss is counted and a wrong edge is not.
+        //
+        // Empty candidates are contract-legal here and only here: the
+        // verdict is decidable from one file, so no definition edit anywhere
+        // can change it, and indexing it under a key would only wake it for
+        // edits that cannot matter.
+        if r.locally_bound {
+            return Resolution {
+                outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
+                candidates: vec![],
+            };
+        }
         match r.kind {
             RefKind::Import => self.resolve_import(cfg, &r.raw_target, probe),
             _ => self.resolve_call(cfg, r, scope, probe),
@@ -768,25 +791,76 @@ mod tests {
     fn an_external_test_package_is_a_package_of_its_own() {
         // `package graph_test` in the directory of package `graph`.
         assert_eq!(
-            package_path_for_file("example.com/app/graph", Some("graph_test"), "graph"),
-            "example.com/app/graph_test"
+            package_path_for_file(
+                "graph/graph_ext_test.go",
+                "example.com/app/graph",
+                Some("graph_test"),
+                "graph"
+            ),
+            "example.com/app/graph#test"
         );
         // An in-package test file is the production package.
         assert_eq!(
-            package_path_for_file("example.com/app/graph", Some("graph"), "graph"),
+            package_path_for_file(
+                "graph/graph_test.go",
+                "example.com/app/graph",
+                Some("graph"),
+                "graph"
+            ),
             "example.com/app/graph"
         );
         // A directory whose package genuinely is called `foo_test` is not a
         // test package: the name it declares is the name it uses.
         assert_eq!(
-            package_path_for_file("example.com/app/foo_test", Some("foo_test"), "foo_test"),
+            package_path_for_file(
+                "foo_test/x_test.go",
+                "example.com/app/foo_test",
+                Some("foo_test"),
+                "foo_test"
+            ),
             "example.com/app/foo_test"
         );
         // No package clause parsed: the directory's package path stands.
         assert_eq!(
-            package_path_for_file("example.com/app/graph", None, "graph"),
+            package_path_for_file("graph/graph.go", "example.com/app/graph", None, "graph"),
             "example.com/app/graph"
         );
+    }
+
+    #[test]
+    fn an_external_test_package_needs_a_test_file() {
+        // `package foo_test` in a non-`_test.go` file is not a Go external
+        // test package — the toolchain rejects that directory outright — so
+        // the suffix alone was never the rule.
+        assert!(!is_external_test_package("x/foo.go", "foo_test", "foo"));
+        assert!(is_external_test_package("x/foo_test.go", "foo_test", "foo"));
+        assert!(
+            !is_external_test_package("x/foo_test.go", "foo", "foo"),
+            "an in-package test file stays in the production namespace",
+        );
+    }
+
+    #[test]
+    fn the_test_package_identity_cannot_collide_with_a_directory() {
+        // `#` is forbidden in a Go module path, so `{dir}#test` is an
+        // identity no real directory can claim. With a `_test` suffix the
+        // external test package of `graph` and a sibling directory named
+        // `graph_test` shared one namespace.
+        let external = package_path_for_file(
+            "graph/graph_ext_test.go",
+            "example.com/app/graph",
+            Some("graph_test"),
+            "graph",
+        );
+        let sibling = package_path_for_file(
+            "graph_test/x.go",
+            "example.com/app/graph_test",
+            Some("graph_test"),
+            "graph_test",
+        );
+        assert_eq!(external, "example.com/app/graph#test");
+        assert_eq!(sibling, "example.com/app/graph_test");
+        assert_ne!(external, sibling);
     }
 
     #[test]
@@ -1038,6 +1112,39 @@ mod tests {
             &t,
         );
         assert_eq!(this.outcome, inference);
+    }
+
+    #[test]
+    fn a_locally_bound_reference_is_local_binding_with_no_candidates() {
+        // The same site twice: the extractor's file-local verdict is the
+        // only difference, and it is what stops a wrong edge being emitted.
+        let r = GoResolver;
+        let cfg = module();
+        let helper = node_id(Domain::Go, "example.com/app/server.helper");
+        let mut table = HashSet::new();
+        table.insert(helper);
+        let s = scope();
+
+        let free = call(named(&["helper"]));
+        assert_eq!(
+            Resolver::resolve(&r, &cfg, &s, &free, &table).outcome,
+            Outcome::Resolved(helper),
+        );
+
+        let bound = Reference {
+            locally_bound: true,
+            ..call(named(&["helper"]))
+        };
+        let res = Resolver::resolve(&r, &cfg, &s, &bound, &table);
+        assert_eq!(
+            res.outcome,
+            Outcome::Unresolved(UnresolvedReason::LocalBinding)
+        );
+        assert!(
+            res.candidates.is_empty(),
+            "a local binding is decidable from one file, so no definition \
+             edit anywhere can change it and nothing is probed",
+        );
     }
 
     #[test]

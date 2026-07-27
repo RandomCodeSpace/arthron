@@ -50,11 +50,13 @@ fn fixture(root: &std::path::Path) {
         concat!(
             "package server\n\n",
             "import (\n\t\"fmt\"\n\t\"example.com/app/util\"\n)\n\n",
+            "var pool Conn\n\n",
             "func Serve(conn Conn) {\n",
             "\tfmt.Println(util.Parse(\"x\"))\n", // fmt → External, util.Parse → Resolved
             "\thelper()\n",                       // → Resolved (same package)
             "\tmissing()\n",                      // → NoMatchingDefinition
-            "\tconn.Close()\n",                   // → NeedsTypeInference
+            "\tconn.Close()\n",                   // parameter → LocalBinding
+            "\tpool.Close()\n",                   // package-level → NeedsTypeInference
             "}\n\n",
             "func helper() {}\n\n",
             "type Conn struct{}\n",
@@ -73,9 +75,12 @@ fn scan_reports_honest_per_language_counts() {
 
     // Calls: util.Parse + helper resolved. Imports: example.com/app/util
     // resolved. fmt import + fmt.Println external. missing() unresolved
-    // (NoMatchingDefinition), conn.Close() unresolved (NeedsTypeInference).
+    // (NoMatchingDefinition), pool.Close() unresolved (NeedsTypeInference).
+    // conn.Close() names a parameter, so it is a local binding — reported,
+    // and outside both terms of the rate.
     assert_eq!(go.resolved, 3);
     assert_eq!(go.external, 2);
+    assert_eq!(go.local_binding, 1);
     assert_eq!(
         go.unresolved[&reason_code(&UnresolvedReason::NoMatchingDefinition)],
         1
@@ -83,6 +88,11 @@ fn scan_reports_honest_per_language_counts() {
     assert_eq!(
         go.unresolved[&reason_code(&UnresolvedReason::NeedsTypeInference)],
         1
+    );
+    assert!(
+        !go.unresolved
+            .contains_key(&reason_code(&UnresolvedReason::LocalBinding)),
+        "a local binding never enters the unresolved map",
     );
     let rate = arthron::resolution_rate(go.resolved, go.unresolved_total()).unwrap();
     assert!((rate - 0.6).abs() < 1e-9);
@@ -95,12 +105,17 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
     // so they must sum to the reference count exactly. Over-counting is as
     // much a failure as dropping — one reference, one outcome.
     //
+    // `local_binding` is one of the columns even though it is outside both
+    // terms of the rate: excluded from the measurement, never from the
+    // accounting. Leaving it out here is exactly how moving references into
+    // it could pass for an improvement.
+    //
     // Hand-counted for `fixture`:
     //   util/util.go      0 imports, 0 calls
     //   server/server.go  2 imports ("fmt", "example.com/app/util")
-    //                     5 calls   (fmt.Println, util.Parse, helper,
-    //                                missing, conn.Close)
-    const EXPECTED_REFERENCES: u64 = 7;
+    //                     6 calls   (fmt.Println, util.Parse, helper,
+    //                                missing, conn.Close, pool.Close)
+    const EXPECTED_REFERENCES: u64 = 8;
 
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
@@ -108,12 +123,13 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
     let go = &report.per_lang[&Lang::Go.code()];
 
     assert_eq!(
-        go.resolved + go.external + go.unresolved_total(),
+        go.resolved + go.external + go.local_binding + go.unresolved_total(),
         EXPECTED_REFERENCES,
-        "resolved {} + external {} + unresolved {} must account for every \
-         reference in the fixture, once each",
+        "resolved {} + external {} + local-binding {} + unresolved {} must \
+         account for every reference in the fixture, once each",
         go.resolved,
         go.external,
+        go.local_binding,
         go.unresolved_total(),
     );
 }
@@ -132,6 +148,7 @@ fn an_external_reference_gets_a_node_and_an_edge() {
     let tally = &report.per_lang[&Lang::Go.code()];
     assert_eq!(tally.resolved, 3);
     assert_eq!(tally.external, 2);
+    assert_eq!(tally.local_binding, 1);
     assert_eq!(tally.unresolved_total(), 2);
 
     let store = Store::open(&db).expect("reopen");
@@ -171,6 +188,95 @@ fn an_external_reference_gets_a_node_and_an_edge() {
     assert_ne!(go("external:std:fmt"), go("std:fmt"));
     assert_eq!(node(&store, "std:fmt"), None);
     assert_eq!(node(&store, "fmt"), None);
+}
+
+#[test]
+fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
+    // The receiver `h` shadows `import h "net/http"` for the whole of
+    // `Handle`, so `h.reset()` names a local. Linking it to the import is a
+    // wrong edge, and a wrong edge is strictly worse than an unresolved
+    // reference: the miss would have been counted, the wrong edge is not.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(
+        root,
+        "server/server.go",
+        concat!(
+            "package server\n\n",
+            "import h \"net/http\"\n\n",
+            "type Handler struct{}\n\n",
+            "func (h *Handler) Handle() {\n",
+            "\th.reset()\n",
+            "}\n\n",
+            "func Serve() {\n",
+            "\th.ListenAndServe(\"\", nil)\n",
+            "}\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+
+    let report = scan_go(root, &db).expect("scan succeeds");
+    let store = Store::open(&db).expect("reopen");
+    assert!(
+        !links(
+            &store,
+            "example.com/app/server.Handler.Handle",
+            "external:net/http",
+            RefKind::Call,
+        ),
+        "the receiver shadows the import: this edge is a lie",
+    );
+    // One function away the same `h` really is the import, and that edge
+    // must survive — the fix is a binding rule, not a blanket suppression.
+    assert!(links(
+        &store,
+        "example.com/app/server.Serve",
+        "external:net/http",
+        RefKind::Call,
+    ));
+
+    // The reference is reported, not deleted: one local binding, on its own
+    // line, and both terms of the rate are untouched by it.
+    let tally = &report.per_lang[&Lang::Go.code()];
+    assert_eq!(tally.local_binding, 1);
+    assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
+    assert_eq!(tally.resolved, 0);
+    assert_eq!(tally.external, 2, "the import and the genuine `h` use");
+}
+
+#[test]
+fn local_binding_is_outside_both_rate_terms() {
+    // One resolved, one unresolved, three local bindings: the rate is
+    // exactly one half, because the local bindings are in neither term.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(
+        root,
+        "app/a.go",
+        concat!(
+            "package app\n\n",
+            "func helper() {}\n\n",
+            "func Run(cb func(), other func()) {\n",
+            "\thelper()\n",  // resolved
+            "\tmissing()\n", // NoMatchingDefinition
+            "\tcb()\n",      // parameter
+            "\tother()\n",   // parameter
+            "\tinner := cb\n",
+            "\tinner()\n", // local
+            "}\n",
+        ),
+    );
+
+    let report = scan_go(root, &root.join("graph.redb")).expect("scan succeeds");
+    let tally = &report.per_lang[&Lang::Go.code()];
+    assert_eq!(tally.resolved, 1);
+    assert_eq!(tally.external, 0);
+    assert_eq!(tally.local_binding, 3);
+    assert_eq!(tally.unresolved_total(), 1, "{:?}", tally.unresolved);
+    let rate = arthron::resolution_rate(tally.resolved, tally.unresolved_total()).unwrap();
+    assert!((rate - 0.5).abs() < 1e-9, "rate {rate}");
 }
 
 #[test]
@@ -288,13 +394,20 @@ fn an_external_test_package_gets_its_own_namespace() {
     assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
 
     let store = Store::open(&db).expect("reopen");
-    assert!(node(&store, "example.com/app/graph_test.helperT").is_some());
+    // `#` is forbidden in a Go module path, so `{dir}#test` is an identity
+    // no real directory can claim — a sibling directory named `graph_test`
+    // used to share this namespace.
+    assert!(node(&store, "example.com/app/graph#test.helperT").is_some());
+    assert!(
+        node(&store, "example.com/app/graph_test.helperT").is_none(),
+        "a directory named `graph_test` may exist; this namespace is not it"
+    );
     assert!(
         node(&store, "example.com/app/graph.helperT").is_none(),
         "a test-file definition must not land in the production namespace"
     );
     assert!(
-        node(&store, "example.com/app/graph_test.Run").is_some(),
+        node(&store, "example.com/app/graph#test.Run").is_some(),
         "every definition in the test file is namespaced, not just some"
     );
     // The production definition keeps its own FQN, and the test package
@@ -302,13 +415,40 @@ fn an_external_test_package_gets_its_own_namespace() {
     assert!(node(&store, "example.com/app/graph.Build").is_some());
     assert!(calls(
         &store,
-        "example.com/app/graph_test.Run",
+        "example.com/app/graph#test.Run",
         "example.com/app/graph.Build",
     ));
     assert!(calls(
         &store,
-        "example.com/app/graph_test.Run",
-        "example.com/app/graph_test.helperT",
+        "example.com/app/graph#test.Run",
+        "example.com/app/graph#test.helperT",
+    ));
+}
+
+#[test]
+fn an_in_package_test_file_stays_in_the_production_namespace() {
+    // `package graph` in `graph_test.go` is an in-package test: same
+    // package, same namespace. Only a declared name that differs from the
+    // directory's own — in a file that really is a test file — splits off.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(root, "graph/graph.go", "package graph\n\nfunc Build() {}\n");
+    write(
+        root,
+        "graph/graph_test.go",
+        "package graph\n\nfunc TestBuild() {\n\tBuild()\n}\n",
+    );
+    let db = root.join("graph.redb");
+
+    scan_go(root, &db).expect("scan succeeds");
+    let store = Store::open(&db).expect("reopen");
+    assert!(node(&store, "example.com/app/graph.TestBuild").is_some());
+    assert!(node(&store, "example.com/app/graph#test.TestBuild").is_none());
+    assert!(calls(
+        &store,
+        "example.com/app/graph.TestBuild",
+        "example.com/app/graph.Build",
     ));
 }
 

@@ -72,9 +72,14 @@ fn print_report(report: &arthron::store::Report) {
             Some(r) => format!("{:.1}%", r * 100.0),
             None => "n/a (nothing to measure)".to_string(),
         };
+        // `local-binding` gets its own column rather than a share of
+        // `unresolved`: it is policy-caused — locals are not nodes by
+        // design — so it is neither a linking success nor a language-support
+        // failure, and it sits outside both terms of the rate.
         println!(
-            "{lang:<12} resolved {:<8} external {:<8} unresolved {:<8} rate {rate}",
-            tally.resolved, tally.external, unresolved
+            "{lang:<12} resolved {:<8} external {:<8} local-binding {:<8} \
+             unresolved {:<8} rate {rate}",
+            tally.resolved, tally.external, tally.local_binding, unresolved
         );
         for (code, count) in &tally.unresolved {
             println!("             {} {count}", reason_name(*code));

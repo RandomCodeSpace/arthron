@@ -4,6 +4,74 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Go binding environments: the false-edge fix, measured
+
+The shadowing bug the road-to-27 entry described is closed. The extractor now
+computes one file-local fact per reference — *some enclosing binder binds the
+root of this target* — and the resolver turns it into `LocalBinding`, reported
+on its own line beside `External` and outside both terms of the rate.
+
+**The extractor states the fact; the resolver owns the outcome.** A `bool` is
+all that crosses the boundary, because every Go binder for a value name is
+decidable from one file's AST: parameters, named results and receivers bind
+the whole body; block, case and select statements bind from the end of their
+declaration to the end of their scope; `if`, `for`, `switch` and `select`
+headers bind their clause. `_` declares nothing, `=` in a range clause assigns
+rather than declares, and package level is not a binding environment at all.
+*Rejected:* suppressing these references in the extractor (a drop, and the one
+way to improve a rate without improving anything — it removes a category from
+the denominator by deleting it); a `RefTarget::Local` variant (only the *root*
+of `x.y.z()` is bound, and the member path is irrelevant to that).
+
+**Measured, both corpora, release build, cold store.** Conservation was
+checked first: `resolved + external + local-binding + unresolved` equals the
+extracted reference count exactly, so nothing was dropped on the way.
+
+| Corpus | | resolved | external | local-binding | unresolved | rate |
+|---|---|---|---|---|---|---|
+| Go, 15,627 refs | before | 4467 | 6085 | — | 5075 | 46.8% |
+| | after | 4467 | 6085 | 4276 | 799 | 84.8% |
+| Go, 23,817 refs | before | 3006 | 9583 | — | 11228 | 21.1% |
+| | after | 3006 | 9571 | 9425 | 1815 | 62.4% |
+
+**Every moved reference is accounted for by category.** On the first corpus:
+`NoMatchingDefinition` −128 and `NeedsTypeInference` −4148, summing to the
+4276 local bindings, with `resolved` and `external` **unchanged**. On the
+second: `NeedsTypeInference` −9133, `NoMatchingDefinition` −280 and
+`external` −12, summing to 9425, with `resolved` unchanged. The 12 that left
+`external` are the wrong edges the fix targets, and each was located in the
+source: a `log := …` shadowing `import log`, a parameter `hash hash.Hash`
+shadowing `import hash`, a named result `uuid` shadowing the `uuid` package, a
+`var time time.Time` shadowing `import time`, and eight more of the same
+shape. **Zero resolved references moved on either corpus** — the check that
+matters, because an over-wide binder would delete real edges while *raising*
+the rate, and the primary gate would reward it.
+
+**The rate rise is not a resolution improvement and must not be read as one.**
+It is a denominator that shrank by 4,276 and 9,413 references respectively.
+The gate that lands next fails on any `local-binding` drift for exactly this
+reason.
+
+**An external test package is `{dir}#test`, not `{dir}_test`.** `#` is
+forbidden in a Go module path, so the identity is one no real directory can
+claim; a directory literally named `foo_test` beside the external test package
+of `foo` previously shared its namespace, and a same-package candidate could
+cross between them. Classification also now requires the file to *be* a test
+file: `package foo_test` in a non-`_test.go` file is not an external test
+package, because the toolchain rejects that directory outright, so the suffix
+alone was never the rule.
+*Rejected:* a separate `Domain` for Go test packages — a domain is a
+language's identity space, and minting one per package flavour would make
+every probe between production and test code impossible, which is the opposite
+of what an external test package needs, since it imports the package under
+test.
+
+**Known and not fixed here:** a file named exactly `_test.go` is ignored by
+the Go toolchain and is not ignored by this walk. Fixing it changes the file
+set, which changes the denominator, so it belongs to its own commit.
+
+---
+
 ## 2026-07-27 — The road to 27 languages: core refactor first, ratified interface, staged corpora, frozen-core fanout
 
 Five language case studies (Java, JavaScript, TypeScript, Python, and a Go

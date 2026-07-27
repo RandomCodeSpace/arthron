@@ -131,9 +131,21 @@ impl<Id, Package> Outcome<Id, Package> {
 
 /// The share of in-repository references that were actually linked.
 ///
-/// `resolved / (resolved + unresolved)`. External references are excluded from
-/// both terms — they are neither a success nor a failure of in-repository
-/// linking.
+/// `resolved / (resolved + unresolved)`. Two categories are excluded from
+/// **both** terms, because neither is a success or a failure of
+/// in-repository linking:
+///
+/// - `External` — a link to a dependency outside the repository.
+/// - [`UnresolvedReason::LocalBinding`] — a reference to a name some
+///   enclosing block binds. Locals are not nodes by design, so this bucket
+///   is policy-caused rather than a gap in language support. It is reported
+///   on its own line beside `External` and never counted as unresolved;
+///   folding it into the denominator would fill the gate with a category
+///   nothing can ever fix.
+///
+/// Excluding a category from both terms is also how a rate can rise without
+/// anything improving, which is why the gate tracks the `LocalBinding` and
+/// `External` counts themselves and fails on drift in either.
 ///
 /// Returns `None` when there is nothing to measure, because a rate of zero and
 /// the absence of any reference at all are different facts and collapsing them

@@ -23,8 +23,9 @@ use redb::{
     TableDefinition,
 };
 
+use crate::UnresolvedReason;
 use crate::lang::Entry;
-use crate::model::{DefFacets, DefKind, NodeId};
+use crate::model::{DefFacets, DefKind, NodeId, reason_code};
 
 /// On-disk schema generation.
 ///
@@ -312,7 +313,17 @@ pub struct LangTally {
     pub resolved: u64,
     /// Occurrences linked outside the repo (excluded from the rate).
     pub external: u64,
-    /// Occurrences unresolved, keyed by reason code.
+    /// Occurrences whose target is bound by a local, parameter, named
+    /// result or receiver.
+    ///
+    /// Policy-caused, not a language-support failure: locals are not nodes
+    /// by design. Reported on its own line beside [`LangTally::external`]
+    /// and excluded from **both** terms of the resolution rate. It never
+    /// enters [`LangTally::unresolved`], so [`LangTally::unresolved_total`]
+    /// excludes it structurally rather than by remembering to subtract.
+    pub local_binding: u64,
+    /// Occurrences unresolved, keyed by reason code. Never holds
+    /// [`UnresolvedReason::LocalBinding`].
     pub unresolved: BTreeMap<u8, u64>,
 }
 
@@ -718,6 +729,7 @@ impl Store {
     pub fn report(&self) -> Result<Report, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let mut report = Report::default();
+        let local_binding = reason_code(&UnresolvedReason::LocalBinding);
         let refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
         for entry in refs.iter().map_err(|e| e.to_string())? {
             let (_, value) = entry.map_err(|e| e.to_string())?;
@@ -726,6 +738,12 @@ impl Store {
             match record.outcome {
                 StoredOutcome::Resolved(_) => tally.resolved += u64::from(record.count),
                 StoredOutcome::External(_) => tally.external += u64::from(record.count),
+                // The wire keeps the three-variant contract intact:
+                // `LocalBinding` rides inside `Unresolved(6)` and is split
+                // out here, onto its own line, never into the reason map.
+                StoredOutcome::Unresolved(reason) if reason == local_binding => {
+                    tally.local_binding += u64::from(record.count);
+                }
                 StoredOutcome::Unresolved(reason) => {
                     *tally.unresolved.entry(reason).or_default() += u64::from(record.count);
                 }
@@ -1008,6 +1026,44 @@ mod tests {
         assert_eq!(
             crate::resolution_rate(go.resolved, go.unresolved_total()),
             Some(0.6)
+        );
+    }
+
+    #[test]
+    fn a_local_binding_is_reported_beside_external_not_inside_unresolved() {
+        // Structural exclusion, not arithmetic: code 6 never enters the
+        // reason map, so `unresolved_total` cannot accidentally include it
+        // and the rate cannot be gamed by growing the bucket.
+        let (_dir, store) = open_temp();
+        let def = node_id(Domain::Go, "m/pkg.Foo");
+        let rec = |outcome, count| RefRecord {
+            outcome,
+            count,
+            first_line: 1,
+            lang: Lang::Go.code(),
+        };
+        let local = reason_code(&UnresolvedReason::LocalBinding);
+        let refs = RefBatch {
+            files: vec![FileRefs {
+                path: "a.go".into(),
+                hash: [0u8; 32],
+                rows: vec![
+                    (key("a.go", "Foo"), rec(StoredOutcome::Resolved(def), 1)),
+                    (key("a.go", "missing"), rec(StoredOutcome::Unresolved(4), 1)),
+                    (key("a.go", "cb"), rec(StoredOutcome::Unresolved(local), 3)),
+                ],
+                ..FileRefs::default()
+            }],
+        };
+        store.apply_refs(&refs).expect("apply refs");
+        let go = &store.report().expect("report").per_lang[&Lang::Go.code()];
+        assert_eq!(go.local_binding, 3);
+        assert_eq!(go.unresolved_total(), 1);
+        assert!(!go.unresolved.contains_key(&local));
+        assert_eq!(
+            crate::resolution_rate(go.resolved, go.unresolved_total()),
+            Some(0.5),
+            "three local bindings leave both terms of the rate alone",
         );
     }
 
