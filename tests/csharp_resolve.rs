@@ -100,7 +100,7 @@ fn a_namespace_this_repository_does_not_declare_is_another_assemblys() {
 fn a_repository_that_declares_a_polyfill_namespace_does_not_claim_the_rest_of_it() {
     // The corpus's own shape: `src/Serilog/Util/TimeProvider.cs` declares
     // `namespace System;` under `#if !NET8_0_OR_GREATER`. A prefix-claim rule
-    // would call every one of the corpus's 31 `System.*` imports an
+    // would call every one of the corpus's 33 `System.*` imports an
     // in-repository miss. This is the test that says it does not.
     assert_eq!(
         outcomes("using System.Diagnostics;\n", &["System"]),
@@ -120,6 +120,9 @@ fn a_using_of_a_namespace_only_implied_by_a_declaration_resolves() {
     assert_eq!(
         names,
         [
+            // The global namespace every file begins in, then the declaration
+            // and the two it implies.
+            "",
             "Serilog.Settings.KeyValuePairs",
             "Serilog.Settings",
             "Serilog"
@@ -131,6 +134,95 @@ fn a_using_of_a_namespace_only_implied_by_a_declaration_resolves() {
             "using Serilog.Settings".to_string(),
             Outcome::Resolved(id("Serilog.Settings")),
         )],
+    );
+}
+
+#[test]
+fn a_using_of_a_nested_namespace_block_is_ours_and_not_another_assemblys() {
+    // The classification that hurts most when the extractor gets a namespace
+    // name wrong: `External` sits outside both terms of the rate, so a name
+    // this repository declares and the resolver could not find would raise no
+    // miss and cost no rate. `namespace Alpha { namespace Beta { … } }`
+    // declares `Alpha.Beta`, and this is what says so end to end.
+    assert_eq!(
+        outcomes("using Alpha.Beta;\n", &["Alpha.Beta"]),
+        [(
+            "using Alpha.Beta".to_string(),
+            Outcome::Resolved(id("Alpha.Beta")),
+        )],
+    );
+    let facts = extract(
+        "src/Outer.cs",
+        "namespace Alpha\n{\n    namespace Beta\n    {\n        class Widget {}\n    }\n}\n",
+    );
+    let widget = facts
+        .defs
+        .iter()
+        .find(|d| d.name == "Widget")
+        .expect("the nested type is extracted");
+    assert_eq!(fqn_of(widget), Some("Alpha.Beta#Widget".to_string()));
+}
+
+#[test]
+fn an_alias_to_a_generic_type_reaches_the_declaration_in_this_repository() {
+    // `class Box<T>` is stored as ``Ns#Box`1``. An import segment that
+    // dropped the arity would probe `Ns#Box` and miss a type named as plainly
+    // as C# can name one.
+    assert_eq!(
+        outcomes("using B = Ns.Box<int>;\n", &["Ns#Box`1"]),
+        [(
+            "using B = Ns.Box`1".to_string(),
+            Outcome::Resolved(id("Ns#Box`1")),
+        )],
+    );
+    assert_eq!(
+        fqn_of(&def(
+            DefKind::Type,
+            "Box",
+            &["Ns"],
+            Some(Params {
+                count: 1,
+                varargs: false,
+                types: Vec::new(),
+            }),
+        )),
+        Some("Ns#Box`1".to_string()),
+        "the key the alias probes is the key the declaration is filed under",
+    );
+}
+
+#[test]
+fn a_one_segment_static_using_is_our_own_miss_whatever_else_the_repository_holds() {
+    // Rule 5 reads `using static Math;` as a type in the global namespace,
+    // which every C# repository has — so the miss is `NoMatchingDefinition`,
+    // the answer that counts *against* the rate, and never `External`, which
+    // would launder it out of both terms.
+    //
+    // The reason this is a fixture and not a remark: the global namespace
+    // used to be minted only by a file that declared no namespace of its own,
+    // so this very line was `External` in a repository where every file
+    // declared one and a miss in a repository with a single `GlobalUsings.cs`
+    // beside it. A table holding the global namespace is now what every C#
+    // scan produces, so only one of the two answers is reachable.
+    assert_eq!(
+        outcomes("using static Math;\n", &[""]),
+        [(
+            "using static Math".to_string(),
+            Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        )],
+    );
+    // And the extractor puts `""` in the table for a file that declares a
+    // namespace, which is the case that used to answer `External`.
+    let facts = extract(
+        "src/A.cs",
+        "using static Math;\nnamespace Ns;\nclass Inner {}\n",
+    );
+    assert!(
+        facts
+            .defs
+            .iter()
+            .any(|d| d.kind == DefKind::Module && d.name.is_empty()),
+        "the global namespace is not declared by a file that declares another",
     );
 }
 

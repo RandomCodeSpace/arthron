@@ -91,8 +91,11 @@ const FILES_WITH_NO_IMPORT: usize = 169;
 ///
 /// `Module` counts every namespace declaration **and every namespace one
 /// implies** — `namespace Serilog.Core.Sinks.Batching;` declares four — plus
-/// the global namespace of each file that declares none. It is a count of
-/// declarations, not of namespaces; [`PACKAGES`] is the count of namespaces.
+/// the global namespace, once per file. All 193 of them: C# has no syntax for
+/// declaring the global namespace, so it is not something a file opts into,
+/// and every compilation unit begins in it (461 + 193 = 654). It is a count of
+/// declarations, not of namespaces; [`PACKAGES`] is the count of namespaces,
+/// and it does not move — the 193 merge to the one node they name.
 const DEFS: &[(DefKind, u64)] = &[
     (DefKind::Function, 0),
     (DefKind::Method, 1203),
@@ -101,7 +104,7 @@ const DEFS: &[(DefKind, u64)] = &[
     (DefKind::Const, 56),
     (DefKind::Field, 205),
     (DefKind::Property, 146),
-    (DefKind::Module, 466),
+    (DefKind::Module, 654),
 ];
 
 /// Definition nodes the store holds after merging, by kind.
@@ -204,8 +207,9 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
         "src/Serilog/Settings/KeyValuePairs/KeyValuePairSettings.cs",
         15,
     ),
-    // The global namespace: a container with no name, declared by each of the
-    // five files that declare no namespace at all.
+    // The global namespace: a container with no name, and the one container
+    // every file has — including the 188 that declare a namespace of their
+    // own, whose `namespace` declaration is itself a member of it.
     ("", NodeKind::Package, "src/Serilog/GlobalUsings.cs", 1),
     // `Guard.cs` declares `namespace JetBrains.Annotations { … }` and then a
     // type *beside* the block, which lands in the global namespace — so one

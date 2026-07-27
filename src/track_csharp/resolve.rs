@@ -69,6 +69,16 @@
 //!   quietly moved references from `Resolved` to `External` would raise the
 //!   rate and fail the build in the same breath.
 //!
+//! What neither of those catches is a name this track spelled wrong *before*
+//! the baseline was recorded: a namespace this repository declares, probed
+//! under a key the extractor never minted, is `External` on the first run and
+//! on every run after it. So the burden sits on the extractor building the
+//! namespace set exactly, and on fixtures rather than on the rate — which is
+//! why `namespace A { namespace B { … } }` is composed into `A.B` rather than
+//! read off one field, why `namespace A.B.C;` implies `A.B` and `A` through
+//! [`crate::track_csharp::lang::implied_namespaces`], and why both have a
+//! fixture in `tests/csharp_extract.rs` and one in `tests/csharp_resolve.rs`.
+//!
 //! # Known limits, recorded rather than left to be rediscovered
 //!
 //! - **A nested type under rule 5.** `using static A.B.C.D` where `A.B` is
@@ -78,11 +88,21 @@
 //!   `using static` of a nested type; a corpus that has one is what would
 //!   earn the finer rule.
 //! - **A one-segment type-shaped target** — `using static Math;` — reads its
-//!   container as the global namespace, which any file declaring no namespace
-//!   declares, so a miss is `NoMatchingDefinition` rather than `External`.
-//!   That is the conservative direction on purpose: where a rule cannot tell
-//!   the two apart, the answer that counts *against* the rate is the one that
-//!   cannot launder a miss. The corpus contains no such directive.
+//!   container as the global namespace, which every C# file has and every C#
+//!   scan therefore holds (see [`crate::track_csharp::extract`]), so a miss is
+//!   `NoMatchingDefinition` rather than `External`. That is the conservative
+//!   direction on purpose: where a rule cannot tell the two apart, the answer
+//!   that counts *against* the rate is the one that cannot launder a miss.
+//!
+//!   It is also the *same* direction in every repository. It was not always:
+//!   while the global namespace was minted only by a file that declared no
+//!   namespace of its own, this line read `External` in a repository where
+//!   every file declared one and `NoMatchingDefinition` in the same
+//!   repository with a single `GlobalUsings.cs` added beside it. One source
+//!   line classified two ways by an unrelated file is not a rule, and the
+//!   global namespace's existence is a fact about C# rather than about what
+//!   some other file happened to write. The corpus contains no such
+//!   directive; `tests/csharp_resolve.rs` is what holds this.
 //! - **Assembly boundaries are not modelled.** A namespace is one identity
 //!   across the whole repository, which is what C# says — a namespace is not
 //!   owned by an assembly. Whether the *project* a file belongs to references

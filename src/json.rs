@@ -269,7 +269,8 @@ pub const HELP: &str = concat!(
     "  verdict          \"pass\", \"fail\", \"error\" or \"rebased\"\n",
     "  improved         true when a pass beat its baseline\n",
     "  failures         [{ check, message }]; check is one of rate_regressed,\n",
-    "                   local_binding_drift, external_drift\n",
+    "                   denominator_shrank, local_binding_drift,\n",
+    "                   external_drift\n",
     "  error            why the comparison could not be made, else null\n",
     "  baseline         { resolved, external, local_binding, unresolved }\n",
     "  measured         the same four counts, from this run\n",
@@ -519,6 +520,7 @@ mod tests {
             .check(),
             GateFailure::LocalBindingDrift { was: 0, now: 1 }.check(),
             GateFailure::ExternalDrift { was: 0, now: 1 }.check(),
+            GateFailure::DenominatorShrank { was: 1, now: 0 }.check(),
         ];
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "{names:?}");

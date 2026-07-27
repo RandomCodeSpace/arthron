@@ -49,8 +49,8 @@
 //! # What the numbers look like, and why
 //!
 //! - **The denominator is small on purpose.** C# 10's `global using` and the
-//!   SDK's implicit usings mean a file usually imports nothing: 168 of the
-//!   corpus's 193 files carry no `using` at all, and 65 of its 88 directives
+//!   SDK's implicit usings mean a file usually imports nothing: 169 of the
+//!   corpus's 193 files carry no `using` at all, and 65 of its 89 directives
 //!   sit in three `GlobalUsings.cs` files. That is what C# looks like, not
 //!   what this extractor missed — and the definition census beside the rate
 //!   is what checks the other half of tier 2's deliverable.

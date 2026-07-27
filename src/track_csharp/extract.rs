@@ -64,8 +64,12 @@
 //! - **An alias to a type *expression*** — `using X = int[];`,
 //!   `using X = (int, string);` — names no declared entity, so it produces no
 //!   reference. An alias to a *generic* name does: `using X = List<int>;`
-//!   names `List`, and its type arguments are type uses tier 2 does not
-//!   resolve. The corpus contains neither shape.
+//!   names ``List`1`` — the open type, spelled with the arity .NET files the
+//!   declaration under, so an in-repository `class Box<T>` is reachable
+//!   through one. Its type *arguments* are type uses tier 2 does not resolve,
+//!   and only their number is read. The corpus contains neither shape, so the
+//!   fixtures in `tests/csharp_extract.rs` and `tests/csharp_resolve.rs` are
+//!   what hold this.
 
 use std::sync::OnceLock;
 
@@ -122,7 +126,7 @@ pub struct ImportSpec {
     /// A fact about scope, not about the target, so it changes nothing this
     /// resolver decides: what a `global using` *binds* matters only to the
     /// expression-level references tier 2 does not emit. Carried because it
-    /// is the reason 168 of the corpus's 193 files name no import at all,
+    /// is the reason 169 of the corpus's 193 files name no import at all,
     /// and a reader of the tally needs to be able to see that.
     pub global: bool,
     /// Where the directive sits. The whole clause, so the key is unique.
@@ -170,24 +174,62 @@ impl Blocks {
         Blocks { spans }
     }
 
-    /// The namespace a byte offset sits in. The global namespace — `""` — is
-    /// the answer for a file that declares none, for the code above a
-    /// file-scoped declaration, and for the code beside a braced one.
+    /// The namespace a byte offset sits in: the **innermost** declaration
+    /// whose block contains it, which is what C# says when one braced
+    /// declaration nests inside another. Chosen by block width rather than by
+    /// position in the match list, so the answer cannot depend on the order
+    /// the rules happened to report two declarations in.
+    ///
+    /// The global namespace — `""` — is the answer for a file that declares
+    /// none, for the code above a file-scoped declaration, and for the code
+    /// beside a braced one.
     fn at(&self, byte: u32) -> &str {
         self.spans
             .iter()
-            .rev()
-            .find(|(start, end, _)| *start <= byte && byte < *end)
+            .filter(|(start, end, _)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end, _)| end - start)
             .map_or("", |(_, _, name)| name.as_str())
     }
 }
 
-/// The name a namespace declaration states. `""` when the grammar recovered
-/// one without a name.
+/// Every namespace declaration kind. C# writes a namespace two ways and
+/// allows only one of the two per file, but a braced declaration may nest
+/// inside another braced one.
+const NAMESPACE_KINDS: [&str; 2] = ["namespace_declaration", "file_scoped_namespace_declaration"];
+
+/// The full name a namespace declaration states, composed with every
+/// namespace declaration enclosing it.
+///
+/// `namespace Alpha { namespace Beta { … } }` is C#'s other spelling of
+/// `namespace Alpha.Beta`, and the two have to reach one identity. Reading
+/// only the `name` field would declare a namespace `Beta` this repository
+/// does not have, file `Widget` under it as `Beta#Widget`, and leave
+/// `using Alpha.Beta;` — a namespace this repository *does* declare — looking
+/// like somebody else's assembly.
+///
+/// That last part is why this is not a cosmetic difference:
+/// [`crate::track_csharp::resolve`] answers a namespace it cannot find with
+/// `External`, which sits outside **both** terms of the resolution rate, so a
+/// resolver bug caused by a name this module got wrong would leave the rate
+/// untouched rather than counting against it.
+/// [`crate::track_csharp::lang::implied_namespaces`] closes the same hole for
+/// the dotted spelling; this closes it for the nested one.
+///
+/// A step the grammar recovered without a name contributes nothing rather
+/// than an empty segment, so an artefact above a named block cannot mint
+/// `.Beta`. `""` — the global namespace — is what a chain with no readable
+/// name at all states.
 fn namespace_name(node: &SgNode) -> String {
-    node.field("name")
-        .map(|n| n.text().to_string())
-        .unwrap_or_default()
+    let mut parts: Vec<String> = node
+        .ancestors()
+        .filter(|a| NAMESPACE_KINDS.contains(&&*a.kind()))
+        .filter_map(|a| a.field("name"))
+        .map(|name| name.text().to_string())
+        .collect();
+    parts.reverse();
+    parts.extend(node.field("name").map(|name| name.text().to_string()));
+    parts.retain(|part| !part.is_empty());
+    parts.join(".")
 }
 
 /// The type declarations enclosing a node, outermost first, each name
@@ -226,6 +268,26 @@ fn type_arity(node: &SgNode) -> usize {
         .map(|list| {
             list.children()
                 .filter(|c| c.kind() == "type_parameter")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// How many type arguments a `generic_name` writes — the arity of the type it
+/// names. `Box<int>` writes one, `Dictionary<string, int>` two.
+///
+/// The list's children are counted with its own punctuation removed, rather
+/// than filtered for one node kind: a type argument is spelled with whatever
+/// node its type needs — `identifier`, `qualified_name`, `predefined_type`,
+/// `nullable_type`, `array_type`, a nested `generic_name` — and there is no
+/// single kind to look for. An unbound `List<>` writes none and is arity 0
+/// here; it is legal only inside `typeof`, which tier 2 does not read.
+fn type_argument_count(node: &SgNode) -> usize {
+    node.children()
+        .find(|c| c.kind() == "type_argument_list")
+        .map(|list| {
+            list.children()
+                .filter(|c| !matches!(&*c.kind(), "<" | ">" | "," | "comment"))
                 .count()
         })
         .unwrap_or(0)
@@ -418,27 +480,49 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<CsLang> {
     let mut defs: Vec<Definition> = Vec::new();
     let mut refs: Vec<Reference> = Vec::new();
 
-    // A file that declares no namespace still has a container: the global
-    // one. Emitting it is what keeps such a file's definitions reachable from
-    // a container node and what gives a reference in it an edge source — the
-    // three `GlobalUsings.cs` files carry 65 of the corpus's 88 imports and
-    // declare no namespace at all.
+    // Every file has the global namespace above it, so every file emits it —
+    // not only the ones that declare no other. C# has no syntax for declaring
+    // the global namespace at all: it is the scope a compilation unit begins
+    // in, and a file writing `namespace N;` puts that very declaration in it.
+    // (This is where C# parts company with `track_php`, whose global
+    // namespace *is* writable as `namespace { … }` and so is a thing a file
+    // either opts into or does not.)
+    //
+    // Minting it unconditionally is what keeps two claims true. A definition
+    // at file scope beside a braced `namespace N { … }` has an owner
+    // container that exists — the container is what a tier-2 track delivers,
+    // and one that names a node nobody declared is a dangling frame. And a
+    // one-segment type-shaped miss — `using static Math;` — probes the global
+    // namespace, hits, and is classified `NoMatchingDefinition`, the answer
+    // that counts *against* the rate; had the container's existence depended
+    // on some unrelated file in the repository declaring no namespace, one
+    // source line would have been `External` in one repository and a miss in
+    // another (see the `resolve` module docs, rule 5).
+    //
+    // The three `GlobalUsings.cs` files, which carry 65 of the corpus's 89
+    // imports, declare no namespace at all and so were already reaching it by
+    // the narrower rule; what changes is every other file.
+    //
+    // `header.namespaces` still lists only what the file *declares*, and so
+    // carries the empty string only for a file that declares nothing else:
+    // the global namespace is not declared, and a header that claimed
+    // otherwise would be stating a keyword that is not in the file.
     if namespace_decls.is_empty() {
         header.namespaces.push(String::new());
-        defs.push(cs_def(
-            DefKind::Module,
-            String::new(),
-            Vec::new(),
-            DeclSpace::Namespace,
-            DefFacets::default(),
-            None,
-            Span {
-                byte_start: 0,
-                byte_end: source_len,
-                line: 1,
-            },
-        ));
     }
+    defs.push(cs_def(
+        DefKind::Module,
+        String::new(),
+        Vec::new(),
+        DeclSpace::Namespace,
+        DefFacets::default(),
+        None,
+        Span {
+            byte_start: 0,
+            byte_end: source_len,
+            line: 1,
+        },
+    ));
 
     for (_, node) in &matches {
         let span = span_of(node);
@@ -796,15 +880,21 @@ fn import(node: &SgNode, span: Span) -> Option<ImportSpec> {
 
 /// The segments of a dotted name, or `None` when the node is not one.
 ///
-/// A `generic_name` contributes its own identifier and nothing else: its type
-/// arguments are type uses, and tier 2 resolves no type.
+/// A `generic_name` contributes its own identifier **carrying its arity** and
+/// nothing else: `List<int>` is a segment ``List`1``. Its type arguments are
+/// type uses and tier 2 resolves no type, but how *many* of them stand there
+/// is not a type — it is part of the name .NET files the declaration under,
+/// and part of the name [`crate::track_csharp::lang::type_fqn`] builds from
+/// `class List<T>`. Dropping it would spell a key ``List`` that no declared
+/// generic type can ever match, so `using X = Ns.Box<int>;` could not reach
+/// an in-repository ``Ns#Box`1`` however plainly it names it.
 fn name_segments(node: &SgNode) -> Option<Vec<String>> {
     match &*node.kind() {
         "identifier" => Some(vec![node.text().to_string()]),
         "generic_name" => node
             .children()
             .find(|c| c.kind() == "identifier")
-            .map(|c| vec![c.text().to_string()]),
+            .map(|c| vec![arity_name(&c.text(), type_argument_count(node))]),
         "qualified_name" => {
             let mut out = Vec::new();
             for child in node.children() {

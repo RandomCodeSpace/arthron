@@ -56,6 +56,10 @@ fn a_file_scoped_namespace_owns_everything_after_it() {
     assert_eq!(
         defs("namespace Serilog.Core;\n\nclass Logger {}\n"),
         [
+            // The global namespace, which every C# file begins in and none
+            // declares — including this one, whose `namespace` declaration is
+            // itself a member of it.
+            (DefKind::Module, String::new(), String::new()),
             // The namespace as written, then the one it implies. `namespace
             // A.B;` declares `A` too — C# spells nested namespaces this way
             // — so `using Serilog;` names something this file created.
@@ -81,6 +85,10 @@ fn a_braced_namespace_owns_only_its_own_block() {
     assert_eq!(
         out,
         [
+            // The global namespace is emitted here too, and this file is why
+            // it has to be: `Guard` below has it as its owner container, and a
+            // frame naming a node nobody declared is a dangling one.
+            (DefKind::Module, String::new(), String::new()),
             (
                 DefKind::Module,
                 String::new(),
@@ -98,6 +106,71 @@ fn a_braced_namespace_owns_only_its_own_block() {
 }
 
 #[test]
+fn a_nested_namespace_block_is_the_dotted_name_it_is_shorthand_for() {
+    // C#'s other spelling of `namespace Alpha.Beta`. Reading only the `name`
+    // field would declare a namespace `Beta` no repository has, file `Widget`
+    // under it, and leave `using Alpha.Beta;` — a name this repository *does*
+    // declare — classified `External`, which sits outside both terms of the
+    // resolution rate. A resolver bug that lands there costs nothing.
+    let out = defs(concat!(
+        "namespace Alpha\n{\n",
+        "    namespace Beta\n    {\n",
+        "        public class Widget { public void Go() {} }\n",
+        "    }\n}\n",
+    ));
+    assert_eq!(
+        out,
+        [
+            (DefKind::Module, String::new(), String::new()),
+            (DefKind::Module, String::new(), "Alpha".to_string()),
+            (DefKind::Module, String::new(), "Alpha.Beta".to_string()),
+            // The nested block implies its own parent exactly as the dotted
+            // spelling does; both declarations merge onto the one `Alpha`.
+            (DefKind::Module, String::new(), "Alpha".to_string()),
+            (
+                DefKind::Type,
+                "Alpha.Beta".to_string(),
+                "Widget".to_string()
+            ),
+            (
+                DefKind::Method,
+                "Alpha.Beta/Widget".to_string(),
+                "Go".to_string()
+            ),
+        ],
+    );
+    let facts = extract(
+        "src/F.cs",
+        "namespace Alpha\n{\n    namespace Beta\n    {\n    }\n}\n",
+    );
+    assert_eq!(facts.header.namespaces, ["Alpha", "Alpha.Beta"]);
+}
+
+#[test]
+fn a_sibling_block_beside_a_nested_one_is_not_swallowed_by_it() {
+    // The composition reads *enclosing* declarations, not preceding ones, and
+    // `Blocks::at` answers with the innermost block containing a byte rather
+    // than the last one the rules reported — so neither `Gamma` nor the type
+    // in it inherits anything from the block above.
+    let out = defs(concat!(
+        "namespace Alpha\n{\n    namespace Beta\n    {\n        class In {}\n    }\n}\n",
+        "namespace Gamma\n{\n    class Out {}\n}\n",
+    ));
+    let types: Vec<(String, String)> = out
+        .into_iter()
+        .filter(|(k, _, _)| *k == DefKind::Type)
+        .map(|(_, owner, name)| (owner, name))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("Alpha.Beta".to_string(), "In".to_string()),
+            ("Gamma".to_string(), "Out".to_string()),
+        ],
+    );
+}
+
+#[test]
 fn a_file_that_declares_no_namespace_lands_in_the_global_one() {
     let facts = extract("src/GlobalUsings.cs", "global using System.Text;\n");
     // One module, and its name is the empty string: the global namespace is
@@ -106,6 +179,38 @@ fn a_file_that_declares_no_namespace_lands_in_the_global_one() {
     assert_eq!(
         facts.defs.iter().map(|d| d.kind).collect::<Vec<_>>(),
         [DefKind::Module],
+    );
+}
+
+#[test]
+fn an_alias_to_a_generic_name_carries_the_arity_its_declaration_is_filed_under() {
+    // `class Box<T>` is filed as ``Ns#Box`1``, so a segment spelling a bare
+    // `Box` names a key no declared generic type can ever match. How many
+    // type arguments stand there is not a type — it is part of the name.
+    assert_eq!(
+        forms("using B = Ns.Box<int>;\n"),
+        [(
+            ImportForm::Alias {
+                alias: "B".to_string(),
+                target: segs(&["Ns", "Box`1"]),
+            },
+            false,
+        )],
+    );
+    assert_eq!(
+        forms("using D = Ns.Map<string, int>;\n"),
+        [(
+            ImportForm::Alias {
+                alias: "D".to_string(),
+                target: segs(&["Ns", "Map`2"]),
+            },
+            false,
+        )],
+    );
+    // A generic step *inside* a qualified name spells the metadata path too.
+    assert_eq!(
+        forms("using static Ns.Outer<T>.Inner;\n"),
+        [(ImportForm::Static(segs(&["Ns", "Outer`1", "Inner"])), false)],
     );
 }
 
@@ -230,10 +335,14 @@ fn a_member_whose_enclosing_type_the_parser_lost_is_not_invented() {
     }
     source.push_str("}\n");
     let out = defs(&source);
-    // The namespace still parses, and nothing below it does.
+    // The namespace still parses, and nothing below it does. (The global
+    // namespace above it is emitted for every file, artefact or not.)
     assert_eq!(
         out,
-        [(DefKind::Module, String::new(), "N".to_string())],
+        [
+            (DefKind::Module, String::new(), String::new()),
+            (DefKind::Module, String::new(), "N".to_string()),
+        ],
         "a lost owner was invented",
     );
     // Two of them is inside the budget, and then both arms declare.

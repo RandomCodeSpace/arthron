@@ -118,6 +118,10 @@ pub fn arity_name(name: &str, arity: usize) -> String {
 /// file spells on its own would be classified as living outside the
 /// repository — an `External` for a name this repository does in fact
 /// declare, which is the one misclassification that raises a rate for free.
+///
+/// This handles the *dotted* spelling only. C# writes the same nesting with
+/// braces, and `crate::track_csharp::extract`'s `namespace_name` composes
+/// that one before it ever reaches here.
 pub fn implied_namespaces(name: &str) -> Vec<String> {
     let segments: Vec<&str> = name.split('.').collect();
     (1..segments.len())
