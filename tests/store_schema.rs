@@ -181,7 +181,7 @@ fn a_manifest_fingerprint_fences_the_store() {
     let store = open(&dir.path().join("graph.redb"));
 
     assert!(
-        store.fence_config(b"module-a").expect("fence"),
+        store.fence_config(Lang::Go, b"module-a").expect("fence"),
         "the first fingerprint a store sees is a change",
     );
     store
@@ -192,7 +192,7 @@ fn a_manifest_fingerprint_fences_the_store() {
     assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
 
     assert!(
-        !store.fence_config(b"module-a").expect("fence"),
+        !store.fence_config(Lang::Go, b"module-a").expect("fence"),
         "the same fingerprint is not an event",
     );
     assert_eq!(
@@ -202,7 +202,7 @@ fn a_manifest_fingerprint_fences_the_store() {
     );
 
     assert!(
-        store.fence_config(b"module-b").expect("fence"),
+        store.fence_config(Lang::Go, b"module-b").expect("fence"),
         "a different manifest describes a different project",
     );
     assert!(store.known_files().unwrap().is_empty());
@@ -552,4 +552,70 @@ fn an_edge_two_files_produce_survives_one_of_them_being_forgotten() {
     assert!(!snapshot.edges.contains(&shared), "nothing produces it now");
     assert!(snapshot.edges.is_empty());
     assert!(!store.has_edge(&shared.0, &shared.1, shared.2).unwrap());
+}
+
+#[test]
+fn one_languages_fence_does_not_wipe_anothers_rows() {
+    // Two live languages share one store, and a language's manifest says
+    // nothing about the other's graph. The global fence made every second
+    // language's scan wipe the first's rows — the exact bug this pins.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+
+    assert!(store.fence_config(Lang::Go, b"module-a").expect("fence"));
+    store
+        .apply_refs(&RefBatch {
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
+        })
+        .expect("apply refs");
+
+    // A manifest-less language fences with an empty digest: no opinion,
+    // nothing invalidated, nothing stored.
+    assert!(
+        !store.fence_config(Lang::Java, b"").expect("fence"),
+        "an empty digest is no opinion",
+    );
+    assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
+
+    // Even a manifest-bearing second language wipes only its own files.
+    assert!(
+        store
+            .fence_config(Lang::Java, b"pom-digest")
+            .expect("fence")
+    );
+    assert_eq!(
+        store.known_files().unwrap(),
+        ["pkg/b.go"],
+        "Java's fence forgot Go's rows",
+    );
+    assert!(
+        !store.fence_config(Lang::Go, b"module-a").expect("fence"),
+        "Go's own fingerprint survived Java's fence",
+    );
+}
+
+#[test]
+fn a_stale_fence_forgets_only_that_languages_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+
+    assert!(store.fence_config(Lang::Go, b"module-a").expect("fence"));
+    store
+        .apply_refs(&RefBatch {
+            files: vec![
+                refs_of("pkg/b.go", "Foo", go("m/pkg#Foo")),
+                refs_of("src/A.java", "Foo", go("j/pkg#Foo")),
+            ],
+        })
+        .expect("apply refs");
+
+    assert!(
+        store.fence_config(Lang::Go, b"module-b").expect("fence"),
+        "a different manifest describes a different project",
+    );
+    assert_eq!(
+        store.known_files().unwrap(),
+        ["src/A.java"],
+        "the Go fence reached beyond Go's own files",
+    );
 }
