@@ -64,11 +64,28 @@ pub struct RubyProject {
 }
 
 impl RubyProject {
-    /// The package name a specifier's first segment names, when the project
-    /// declares it as a dependency.
+    /// The gem a specifier names, when the project declares it.
+    ///
+    /// Longest declared prefix first, with `/` written as `-`, because that
+    /// is how a gem's name and its require path relate:
+    /// `minitest/global_expectations/autorun` is shipped by
+    /// `minitest-global_expectations`, not by `minitest`, and both are
+    /// declared. A first-segment answer would classify the reference
+    /// correctly and still name the wrong package on the node the reference
+    /// points at.
+    ///
+    /// Which prefixes are tried is bounded by what the project declares, so
+    /// this widens no bucket: a specifier whose every prefix is undeclared is
+    /// `UnknownPackage` exactly as before.
     pub fn declared_gem(&self, spec: &str) -> Option<&str> {
-        let head = spec.split('/').next().unwrap_or(spec);
-        self.dependencies.get(head).map(String::as_str)
+        let segments: Vec<&str> = spec.split('/').collect();
+        for take in (1..=segments.len()).rev() {
+            let name = segments[..take].join("-");
+            if let Some(gem) = self.dependencies.get(name.as_str()) {
+                return Some(gem);
+            }
+        }
+        None
     }
 
     /// A stable fingerprint of everything phase 0 read.
@@ -96,8 +113,8 @@ impl RubyProject {
 ///
 /// Never fails on a repository that declares nothing: a Ruby tree with no
 /// gemspec is an ordinary shape — a script directory, an application — and
-/// the honest default is `lib` when it exists plus the root itself, which is
-/// what a script run from the repository sees.
+/// the default is `lib` when it exists, falling back to the repository root
+/// only when nothing else is a load root at all.
 pub fn layout(root: &Path) -> Result<RubyProject, LayoutError> {
     let mut gemspecs: Vec<String> = Vec::new();
     let mut roots: Vec<String> = Vec::new();
@@ -146,9 +163,12 @@ pub fn layout(root: &Path) -> Result<RubyProject, LayoutError> {
                 push_root(&mut roots, (*default).to_string());
             }
         }
-        // A repository that declares no gem is run from its own root.
-        push_root(&mut roots, String::new());
     }
+    // Only when nothing else is a load root: a flat script directory has one
+    // anchor and it is itself. Behind `lib` it would be a second root Ruby
+    // does not have — `$LOAD_PATH` has not carried the working directory
+    // since 1.9 — and every repo-relative path in the tree would become
+    // probeable, resolving requires the interpreter would refuse.
     if roots.is_empty() {
         push_root(&mut roots, String::new());
     }
@@ -289,17 +309,30 @@ mod tests {
     }
 
     #[test]
-    fn the_first_segment_of_a_specifier_is_the_gem_it_names() {
+    fn the_longest_declared_prefix_of_a_specifier_names_the_gem() {
         let cfg = RubyProject {
             load_roots: vec!["lib".to_string()],
-            dependencies: ["minitest".to_string()].into_iter().collect(),
+            dependencies: [
+                "minitest".to_string(),
+                "minitest-global_expectations".to_string(),
+            ]
+            .into_iter()
+            .collect(),
             gemspecs: vec!["x.gemspec".to_string()],
         };
+        // Both are declared and both are prefixes; the file really is shipped
+        // by the longer one.
         assert_eq!(
             cfg.declared_gem("minitest/global_expectations/autorun"),
-            Some("minitest"),
+            Some("minitest-global_expectations"),
         );
+        // The first segment still answers when it is the only declared
+        // prefix.
+        assert_eq!(cfg.declared_gem("minitest/autorun"), Some("minitest"));
+        // And an undeclared name is still undeclared: no prefix of it was
+        // declared either, so nothing moved out of `UnknownPackage`.
         assert_eq!(cfg.declared_gem("time"), None);
+        assert_eq!(cfg.declared_gem("global_expectations/minitest"), None);
     }
 
     #[test]
@@ -324,12 +357,25 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_with_no_gemspec_falls_back_to_lib_and_the_root() {
+    fn a_tree_with_no_gemspec_gets_lib_and_not_the_root_behind_it() {
+        // The root behind `lib` would make every repo-relative path in the
+        // tree probeable, so `require 'foo/bar'` would resolve to
+        // `foo/bar.rb` anywhere — a file Ruby itself would not find, since
+        // `$LOAD_PATH` has not held the working directory since 1.9.
         let dir = tempfile::tempdir().expect("scratch");
         std::fs::create_dir(dir.path().join("lib")).expect("lib");
         let cfg = layout(dir.path()).expect("a tree with no manifest still has a layout");
-        assert_eq!(cfg.load_roots, ["lib", ""]);
+        assert_eq!(cfg.load_roots, ["lib"]);
         assert!(cfg.gemspecs.is_empty());
+    }
+
+    #[test]
+    fn a_flat_script_directory_is_its_own_load_root() {
+        // Nothing else is one, and a tree with no load root at all would
+        // resolve no `require` in it. This is the floor, not a second root.
+        let dir = tempfile::tempdir().expect("scratch");
+        let cfg = layout(dir.path()).expect("layout");
+        assert_eq!(cfg.load_roots, [""]);
     }
 
     #[test]

@@ -190,8 +190,29 @@ fn an_autoload_names_the_file_its_second_argument_spells() {
         got,
         [(
             ImportForm::LoadPath("rack/builder".to_string()),
-            "autoload \"rack/builder\"".to_string(),
+            "autoload :Builder, \"rack/builder\"".to_string(),
         )],
+    );
+}
+
+#[test]
+fn two_autoloads_of_one_file_are_two_sites_and_not_one_row() {
+    // `raw_target` is the literal text at the site and a row is keyed on it,
+    // so dropping the constant would key both of these on `autoload
+    // "rack/recursive"` — one row, at the first line, with the second
+    // declaration nowhere in the output. rack writes exactly this pair.
+    let got = imports(
+        "lib/rack.rb",
+        "module Rack\n  autoload :ForwardRequest, \"rack/recursive\"\n  \
+         autoload :Recursive, \"rack/recursive\"\nend\n",
+    );
+    let raws: Vec<&str> = got.iter().map(|(_, raw)| raw.as_str()).collect();
+    assert_eq!(
+        raws,
+        [
+            "autoload :ForwardRequest, \"rack/recursive\"",
+            "autoload :Recursive, \"rack/recursive\"",
+        ],
     );
 }
 
@@ -244,13 +265,41 @@ fn an_autoload_inside_a_module_sources_at_that_module() {
 }
 
 #[test]
-fn a_require_with_a_receiver_is_not_this_extractors_import() {
-    // A recorded under-count, asserted so it cannot change silently: only a
-    // receiverless `require` is read, so `Kernel.require` contributes no
-    // reference rather than a guessed one.
-    let facts = extract("lib/app.rb", "Kernel.require 'time'\n");
-    assert!(facts.refs.is_empty(), "{:?}", facts.refs);
-    assert!(facts.header.imports.is_empty());
+fn kernel_require_is_the_same_import_spelled_out() {
+    // `require` is `Kernel`'s own method, so `Kernel.require 'time'` is the
+    // receiverless site written in full. Dropping it would be an import the
+    // resolver never sees — and dropping a require can only *raise* the rate,
+    // which is the one direction a shortfall must never take.
+    let got = imports("lib/app.rb", "Kernel.require 'time'\n");
+    assert_eq!(
+        got,
+        [(
+            ImportForm::LoadPath("time".to_string()),
+            "Kernel.require 'time'".to_string(),
+        )],
+    );
+}
+
+#[test]
+fn any_other_receiver_is_not_this_extractors_import() {
+    // A recorded under-count, asserted so it cannot change silently: a
+    // receiver that is not `Kernel` names a runtime value or another module's
+    // own `autoload`, and neither is guessed at.
+    for source in ["obj.require 'time'\n", "Foo.autoload :Bar, 'foo/bar'\n"] {
+        let facts = extract("lib/app.rb", source);
+        assert!(facts.refs.is_empty(), "{source}: {:?}", facts.refs);
+        assert!(facts.header.imports.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn a_receiver_does_not_turn_a_call_into_a_declaration() {
+    // `attr_reader` declares on the enclosing module; `C.attr_reader` is a
+    // call on something else, and the receiver allowlist that lets
+    // `Kernel.require` through must not let this through with it.
+    let facts = extract("lib/app.rb", "class C\n  Kernel.attr_reader :env\nend\n");
+    let names: Vec<&str> = facts.defs.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["app", "C"], "{names:?}");
 }
 
 #[test]
@@ -261,6 +310,9 @@ fn no_call_or_type_reference_is_emitted_at_tier_two() {
         "lib/app.rb",
         "require 'time'\nclass C < Base\n  include Helpers\n  def m\n    helper(1)\n  end\nend\n",
     );
+    // Length first: without it this passes on an empty list, which is what a
+    // test naming the tier-2 contract must never do.
+    assert_eq!(facts.refs.len(), 1, "{:?}", facts.refs);
     for r in &facts.refs {
         assert_eq!(r.kind, RefKind::Import, "{:?}", r.raw_target);
     }

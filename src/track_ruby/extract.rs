@@ -18,9 +18,12 @@
 //! Each is a known shortfall, written down rather than left to be
 //! rediscovered, and none may be closed by widening a bucket:
 //!
-//! - **A qualified `Kernel.require`.** Only a receiverless call is read. The
-//!   allowlist a receiver would need (`Kernel`, `Object`, `self`, and a
-//!   module reopening itself) is guesswork until a corpus shows one.
+//! - **A module's own `autoload`.** `Foo.autoload :Bar, "path"` names a file
+//!   on the load path exactly as the receiverless form does, but its receiver
+//!   may be any constant and reading one would mean deciding which receivers
+//!   are `Kernel` in disguise. Only `Kernel` itself is read — it *is* the
+//!   receiverless form, spelled out — and every other receiver contributes no
+//!   reference rather than a guessed one.
 //! - **`alias`, `alias_method` and `define_method`.** All three declare a
 //!   real method; the last takes its name from an expression, and the first
 //!   two would need the definition they forward to.
@@ -471,10 +474,28 @@ fn constant_assignment(facts: &mut FileFacts<RubyLang>, node: &SgNode) {
     ));
 }
 
-/// A receiverless call: the three that import, and the three that declare.
+/// `Kernel`, spelled either way: the one receiver an import may carry.
+///
+/// `Kernel.require 'time'` is the same site as `require 'time'` — `require`
+/// is `Kernel`'s own method, and the qualified form names it explicitly. Any
+/// other receiver is a runtime value or another module's `autoload`, and
+/// neither is this extractor's import.
+fn is_kernel(node: &SgNode) -> bool {
+    matches!(&*node.kind(), "constant" | "scope_resolution")
+        && node.text().trim_start_matches("::") == "Kernel"
+}
+
+/// A call this extractor reads: the three that import, and the three that
+/// declare.
 fn call(facts: &mut FileFacts<RubyLang>, node: &SgNode) {
-    if node.field("receiver").is_some() {
-        return; // a recorded under-count; see the module header
+    // A declaring call is receiverless by construction: `attr_reader` writes
+    // on the enclosing module, and `C.attr_reader` is not a shape this reads.
+    // An importing call may name `Kernel` and nothing else.
+    let receiver = node.field("receiver");
+    if let Some(r) = &receiver
+        && !is_kernel(r)
+    {
+        return;
     }
     let Some(method) = node.field("method") else {
         return;
@@ -484,24 +505,30 @@ fn call(facts: &mut FileFacts<RubyLang>, node: &SgNode) {
     }
     let args = arg_nodes(node);
     match &*method.text() {
-        "require" => import(facts, node, args.first(), false),
-        "require_relative" => import(facts, node, args.first(), true),
+        "require" => import(facts, node, &args, 0, false),
+        "require_relative" => import(facts, node, &args, 0, true),
         // `autoload :Const, "path"`: the constant is the binding, the string
         // is the file, and the string is what resolves.
-        "autoload" => import(facts, node, args.get(1), false),
-        "attr_reader" | "attr_writer" | "attr_accessor" => attributes(facts, node, &args),
+        "autoload" => import(facts, node, &args, 1, false),
+        "attr_reader" | "attr_writer" | "attr_accessor" if receiver.is_none() => {
+            attributes(facts, node, &args)
+        }
         _ => {}
     }
 }
 
 /// One `require`, `require_relative` or `autoload` clause and its reference.
+///
+/// `at` is which argument spells the file: the first for `require` and
+/// `require_relative`, the second for `autoload`.
 fn import(
     facts: &mut FileFacts<RubyLang>,
     call: &SgNode,
-    specifier: Option<&SgNode>,
+    args: &[SgNode],
+    at: usize,
     relative: bool,
 ) {
-    let Some(specifier) = specifier else {
+    let Some(specifier) = args.get(at) else {
         return; // `require` with no argument is not an import site
     };
     let span = span_of(call);
@@ -511,10 +538,21 @@ fn import(
         (Some(path), false) => ImportForm::LoadPath(path.clone()),
         (None, _) => ImportForm::Dynamic,
     };
+    // The literal text at the site, which is what a `RefKey` is keyed on and
+    // what a query prints back. Every argument, not just the one that
+    // resolves: `autoload :ForwardRequest, "rack/recursive"` and `autoload
+    // :Recursive, "rack/recursive"` name one file from two lines, and a key
+    // built from the file alone would merge them into a single row and lose
+    // the second site.
     let method = call
         .field("method")
         .map(|m| m.text().to_string())
         .unwrap_or_default();
+    let written = match call.field("receiver") {
+        Some(r) => format!("{}.{method}", r.text()),
+        None => method,
+    };
+    let spelled: Vec<String> = args.iter().map(|a| a.text().to_string()).collect();
     let target = match &literal {
         Some(path) => RefTarget {
             root: TargetRoot::Name,
@@ -531,7 +569,7 @@ fn import(
     facts.refs.push(Reference {
         kind: RefKind::Import,
         space: DeclSpace::Namespace,
-        raw_target: format!("{method} {}", specifier.text()),
+        raw_target: format!("{written} {}", spelled.join(", ")),
         target,
         // Tier 2 emits no expression-level reference, so nothing here can
         // name a local: `LocalBinding` does not apply to this track.
