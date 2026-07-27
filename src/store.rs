@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -100,6 +100,15 @@ pub enum NodeRecord {
         fqn: String,
         /// [`crate::model::DefKind`] code.
         kind: u8,
+        /// What this identity forwards to, when it is an alias — a re-export,
+        /// an export rename, a module-level import binding. Empty for every
+        /// ordinary definition, and empty too for an alias key that stands
+        /// for a *set* without forwarding, which is how Java spells an
+        /// overload key.
+        ///
+        /// Re-derived from the declaration sites by [`resettle`], never
+        /// written directly, so forgetting a file forgets its targets.
+        targets: Vec<NodeId>,
         /// Every site declaring it, sorted by `(file, line)`.
         declarations: Vec<DeclSite>,
     },
@@ -144,12 +153,25 @@ pub enum NodePayload {
     Package(Option<String>),
     /// A dependency outside the repository, by its package string.
     External(String),
+    /// An alias, by its [`crate::model::DefKind`] code and what it forwards
+    /// to.
+    ///
+    /// The targets ride the *site* and not only the record because
+    /// [`resettle`] re-derives a record from the sites that survive: an alias
+    /// whose declaring file is forgotten must lose its targets with it, and a
+    /// record-only field would strand them. Changing where an alias points is
+    /// also a change of meaning under a stable identity, which is exactly
+    /// what this type exists to wake probers on.
+    Alias(u8, Vec<NodeId>),
 }
 
 impl NodeRecord {
     /// The part of this record a resolver's answer can depend on.
     pub fn payload(&self) -> NodePayload {
         match self {
+            NodeRecord::Definition { kind, targets, .. } if !targets.is_empty() => {
+                NodePayload::Alias(*kind, targets.clone())
+            }
             NodeRecord::Definition { kind, .. } => NodePayload::Definition(*kind),
             NodeRecord::Package { name, .. } => NodePayload::Package(name.clone()),
             NodeRecord::External { package, .. } => NodePayload::External(package.clone()),
@@ -756,6 +778,14 @@ impl Store {
     /// Facets are not stored — no shared code branches on them and no
     /// resolver has yet needed one out of the graph — so every definition
     /// answers with the empty set rather than a guess.
+    ///
+    /// A definition carrying alias targets answers as an alias rather than as
+    /// a definition, because that is what it *is*: the kind says only that a
+    /// re-export was written, and the targets say what it names. One target
+    /// is an [`Entry::Alias`], several an [`Entry::Set`], and none leaves the
+    /// definition speaking for itself — which is how an alias key that
+    /// forwards to nothing, such as Java's overload key, keeps its old
+    /// answer.
     pub fn symbol_entries(&self) -> Result<HashMap<NodeId, Entry>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
@@ -764,6 +794,15 @@ impl Store {
             let (key, value) = entry.map_err(|e| e.to_string())?;
             let record: NodeRecord = decode(value.value())?;
             let typed = match record {
+                // An alias forwarding to exactly one identity is an
+                // `Entry::Alias`; to several, an `Entry::Set` — a star export
+                // taken from four modules is a name set, not a single
+                // forward, and the resolver has to see the difference to tell
+                // a genuine ambiguity from a chain it can walk.
+                NodeRecord::Definition { targets, .. } if targets.len() == 1 => {
+                    Entry::Alias { target: targets[0] }
+                }
+                NodeRecord::Definition { targets, .. } if targets.len() > 1 => Entry::Set(targets),
                 NodeRecord::Definition { kind, .. } => Entry::Definition {
                     kind: DefKind::from_code(kind)
                         .ok_or_else(|| format!("stored node kind {kind} has no variant"))?,
@@ -1032,13 +1071,30 @@ fn write_owned<T: Encode>(
 fn resettle(record: &mut NodeRecord) {
     let sites = record.declarations().to_vec();
     match record {
-        NodeRecord::Definition { kind, .. } => {
+        NodeRecord::Definition { kind, targets, .. } => {
             if let Some(k) = sites.iter().find_map(|s| match s.payload {
                 NodePayload::Definition(k) => Some(k),
+                NodePayload::Alias(k, _) => Some(k),
                 _ => None,
             }) {
                 *kind = k;
             }
+            // Every surviving site's targets, in site order. A union and not
+            // a first-wins pick: two files may legitimately declare one alias
+            // key — that is what a star export re-exported from two places
+            // is — and dropping either would make the walk miss a name the
+            // corpus really does export.
+            let mut merged: Vec<NodeId> = Vec::new();
+            for site in &sites {
+                if let NodePayload::Alias(_, ts) = &site.payload {
+                    for t in ts {
+                        if !merged.contains(t) {
+                            merged.push(*t);
+                        }
+                    }
+                }
+            }
+            *targets = merged;
         }
         NodeRecord::Package { name, .. } => {
             *name = sites.iter().find_map(|s| match &s.payload {
@@ -1238,6 +1294,7 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#Foo".into(),
                         kind: 0,
+                        targets: Vec::new(),
                         declarations: vec![site("pkg/a.go", 3)],
                     },
                 )],
@@ -1382,6 +1439,7 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#plat".into(),
                         kind: 0,
+                        targets: Vec::new(),
                         declarations: vec![site(path, line)],
                     },
                 ),

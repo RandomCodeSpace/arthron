@@ -42,6 +42,7 @@ fn definition(fqn: &str, file: &str, line: u32) -> (NodeId, NodeRecord) {
         NodeRecord::Definition {
             fqn: fqn.to_string(),
             kind: 0,
+            targets: Vec::new(),
             declarations: vec![site(file, line)],
         },
     )

@@ -535,6 +535,7 @@ pub fn reason_code(r: &UnresolvedReason) -> u8 {
         UnresolvedReason::AmbiguousOverload => 15,
         UnresolvedReason::AmbiguousName => 16,
         UnresolvedReason::ProjectLayoutUnknown => 17,
+        UnresolvedReason::AliasCycle => 18,
     }
 }
 
@@ -559,6 +560,7 @@ pub fn reason_from_code(c: u8) -> Option<UnresolvedReason> {
         15 => UnresolvedReason::AmbiguousOverload,
         16 => UnresolvedReason::AmbiguousName,
         17 => UnresolvedReason::ProjectLayoutUnknown,
+        18 => UnresolvedReason::AliasCycle,
         _ => return None,
     })
 }
@@ -584,6 +586,7 @@ pub fn reason_name(c: u8) -> &'static str {
         15 => "AmbiguousOverload",
         16 => "AmbiguousName",
         17 => "ProjectLayoutUnknown",
+        18 => "AliasCycle",
         _ => "Unknown",
     }
 }
@@ -704,13 +707,13 @@ mod tests {
 
     #[test]
     fn reason_codes_round_trip() {
-        for c in 0u8..=17 {
+        for c in 0u8..=18 {
             let r = reason_from_code(c).expect("code maps to a variant");
             assert_eq!(reason_code(&r), c);
             assert_ne!(reason_name(c), "Unknown");
         }
-        assert_eq!(reason_from_code(18), None);
-        assert_eq!(reason_name(18), "Unknown");
+        assert_eq!(reason_from_code(19), None);
+        assert_eq!(reason_name(19), "Unknown");
     }
 
     #[test]

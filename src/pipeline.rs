@@ -330,10 +330,20 @@ fn phase_one<L: Language>(
         let id = node_id(L::DOMAIN, fqn.as_str());
         // An empty name means "this file does not say", which is not the
         // same as naming the empty string.
+        let targets: Vec<NodeId> = rs
+            .def_alias_targets(cfg, &file.facts.header, def, probe)
+            .iter()
+            .map(|t| node_id(L::DOMAIN, t.as_str()))
+            // A self-referential alias is not a forward, and storing it would
+            // hand the resolver a one-step cycle to detect at every probe.
+            .filter(|t| *t != id)
+            .collect();
         let payload = if def.kind == DefKind::Module {
             NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
-        } else {
+        } else if targets.is_empty() {
             NodePayload::Definition(def.kind.code())
+        } else {
+            NodePayload::Alias(def.kind.code(), targets.clone())
         };
         let declarations = vec![DeclSite {
             file: file.rel_path.clone(),
@@ -349,6 +359,7 @@ fn phase_one<L: Language>(
             _ => NodeRecord::Definition {
                 fqn: fqn.into_string(),
                 kind: def.kind.code(),
+                targets,
                 declarations,
             },
         };

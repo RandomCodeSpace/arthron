@@ -115,13 +115,24 @@ pub enum Entry {
     Container,
     /// A dependency outside this repository.
     External,
-    /// An alias: the identity forwards to another.
+    /// An alias: the identity forwards to exactly one other.
+    ///
+    /// A re-export, an export rename, a module-level import binding. The
+    /// alias is still a node — a reference really does name it, and the
+    /// barrel's own outgoing edge starts there — so a resolver that cannot
+    /// follow the forward may answer with the alias itself and still be
+    /// telling the truth.
     Alias {
         /// What it forwards to.
         target: NodeId,
     },
-    /// An index key standing for a set of definitions — an overload set, a
-    /// star-export name set.
+    /// An index key standing for several identities: an overload set, or the
+    /// modules a star export forwards.
+    ///
+    /// The members are not all definitions. `export * from './a'` puts a
+    /// *module* here, because the names it supplies are a fact about that
+    /// module rather than about the key — the resolver re-enters it and looks
+    /// the name up there.
     Set(Vec<NodeId>),
 }
 
@@ -211,6 +222,28 @@ pub trait Resolver<L: Language>: Send + Sync {
         def: &Definition,
         probe: &dyn SymbolProbe,
     ) -> Option<Fqn>;
+
+    /// What this definition forwards to, when it is an alias.
+    ///
+    /// Runs in the definition phase, beside [`Resolver::def_fqn`] and with
+    /// the same inputs, because an alias's target is part of what the
+    /// identity *means* and the symbol table has to carry it before any
+    /// reference is resolved against it. That is also why the answer is an
+    /// [`Fqn`] and not an edge: the extractor emitted only raw text — a
+    /// specifier and a name — and turning raw text into an identity is the
+    /// resolver's job in either phase.
+    ///
+    /// Empty for every ordinary definition, and empty too for an alias key
+    /// that stands for a set without forwarding to it.
+    fn def_alias_targets(
+        &self,
+        _cfg: &L::Config,
+        _header: &L::Header,
+        _def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        Vec::new()
+    }
 
     /// Extra keys in the [`NodeId`] keyspace this definition must be
     /// reachable under. Empty when a definition is reachable only by its FQN.

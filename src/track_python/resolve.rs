@@ -51,7 +51,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use crate::lang::{FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe};
+use crate::lang::{
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+};
 use crate::model::{
     DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, RefTarget, Reference, TargetRoot,
     node_id,
@@ -66,6 +68,12 @@ use crate::track_python::stdlib::{
     BUILTINS_PACKAGE, is_builtin, is_object_member, is_stdlib, stdlib_package,
 };
 use crate::{Outcome, UnresolvedReason};
+
+/// How far a façade's alias chain is followed.
+///
+/// Python re-export façades nest a few deep at most; the ceiling exists so a
+/// circular import graph terminates rather than looping.
+const MAX_ALIAS_HOPS: usize = 16;
 
 /// How deep the base-class walk goes before giving up.
 ///
@@ -180,11 +188,11 @@ impl PyResolver {
     /// means either the source is broken or the inferred layout is wrong. The
     /// honest outcome is `ProjectLayoutUnknown` — arthron's own inference —
     /// and not `NoMatchingDefinition`, which would blame a definition.
-    fn anchor(scope: &PyScope, level: u8, module: &[String]) -> Option<String> {
+    fn anchor(package: Option<&str>, level: u8, module: &[String]) -> Option<String> {
         let mut base: Vec<String> = if level == 0 {
             Vec::new()
         } else {
-            let package = scope.package.as_ref()?;
+            let package = package?;
             if package.is_empty() {
                 return None; // §5.4.2: relative import beyond top-level
             }
@@ -217,11 +225,57 @@ impl PyResolver {
                 continue; // already read; reading it twice would double-count
             }
             probed.push(id);
-            if probe.probe(&id).is_some() {
-                return Some(id);
+            match probe.probe(&id) {
+                // B-12: a re-export façade. The alias is a real declaration
+                // site, but the definition behind it is the better edge.
+                Some(Entry::Alias { target }) => {
+                    return Some(Self::follow_alias(probe, id, target, probed));
+                }
+                Some(_) => return Some(id),
+                None => {}
             }
         }
         None
+    }
+
+    /// Walk a façade's alias chain to the definition at its end.
+    ///
+    /// Returns a node in every case, never a failure, and that is the point:
+    /// `pkg.Foo` created by `from .core import Foo` is a genuine attribute of
+    /// `pkg` at runtime, so the façade's own alias is always a truthful
+    /// answer. A chain that dead-ends or loops falls back to the last alias
+    /// it stood on rather than reporting a miss — which is why this stage
+    /// cannot move Python's rate, only the precision of its edges.
+    ///
+    /// (EcmaScript decides the cycle case the other way, because there an
+    /// unresolvable `ResolveExport` really does mean the name does not exist.)
+    fn follow_alias(
+        probe: &dyn SymbolProbe,
+        from: NodeId,
+        target: NodeId,
+        probed: &mut Vec<NodeId>,
+    ) -> NodeId {
+        let mut anchor = from;
+        let mut current = target;
+        let mut seen: Vec<NodeId> = vec![from];
+        for _ in 0..MAX_ALIAS_HOPS {
+            if seen.contains(&current) {
+                return anchor;
+            }
+            seen.push(current);
+            if !probed.contains(&current) {
+                probed.push(current);
+            }
+            match probe.probe(&current) {
+                Some(Entry::Alias { target }) => {
+                    anchor = current;
+                    current = target;
+                }
+                Some(_) => return current,
+                None => return anchor,
+            }
+        }
+        anchor
     }
 
     /// Ordered candidates for a dotted path anchored at a module.
@@ -684,7 +738,7 @@ impl PyResolver {
                 name,
                 ..
             } => {
-                let Some(base) = Self::anchor(scope, *level, module) else {
+                let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                     return unresolved(UnresolvedReason::ProjectLayoutUnknown); // B-08
                 };
                 // §7.11, verbatim: "check if the imported module has an
@@ -721,7 +775,7 @@ impl PyResolver {
                 resolution(outcome, probed)
             }
             ImportForm::Star { level, module } => {
-                let Some(base) = Self::anchor(scope, *level, module) else {
+                let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                     return unresolved(UnresolvedReason::ProjectLayoutUnknown);
                 };
                 let candidates = cfg.module_fqns(&scope.root, &base);
@@ -1081,6 +1135,64 @@ impl Resolver<PyLang> for PyResolver {
         Some(Fqn::new(format!("{module}#{member}")))
     }
 
+    /// B-12: what a module-level `from` import binds, as an identity.
+    ///
+    /// `pkg/__init__.py` doing `from .core import Foo` makes `pkg.Foo` a real
+    /// declaration site — the extractor already emits it as a
+    /// [`DefKind::Alias`] definition — and this is the hop that says *what it
+    /// is*, so a reference to `pkg.Foo` reaches `pkg.core#Foo` rather than
+    /// stopping at the façade.
+    ///
+    /// Only the `from` form contributes. `import a.b` binds a *module*, and
+    /// whether the name after the last dot is a module or a member of one is
+    /// a question only a probe settles — the definition phase has no probe
+    /// worth the name on a cold scan. Guessing `base#name` is safe precisely
+    /// because it degrades well: if the name is a submodule, no node carries
+    /// that identity and the walk falls back to the façade's own alias, which
+    /// is the answer this resolver already gave.
+    fn def_alias_targets(
+        &self,
+        cfg: &PyProject,
+        header: &PyHeader,
+        def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        if def.kind != DefKind::Alias || !def.owner.is_empty() || def.name.is_empty() {
+            return Vec::new();
+        }
+        // `__package__`, by the same rule `scope` uses (B-07/PEP 366), so a
+        // relative import anchors identically in both phases.
+        let package = match cfg.place(&header.rel_path) {
+            ModPlace::Rooted { dotted, .. } => Some(if header.is_package {
+                dotted
+            } else {
+                dotted
+                    .rsplit_once('.')
+                    .map_or_else(String::new, |(p, _)| p.to_string())
+            }),
+            ModPlace::Loose { .. } => None,
+        };
+        for spec in &header.imports {
+            if !spec.at_module || spec.bound_name() != Some(def.name.as_str()) {
+                continue;
+            }
+            let ImportForm::From {
+                level,
+                module,
+                name,
+                ..
+            } = &spec.form
+            else {
+                continue;
+            };
+            let Some(base) = Self::anchor(package.as_deref(), *level, module) else {
+                continue; // B-08: reaches past the top level; nothing to name
+            };
+            return vec![Fqn::new(format!("{base}#{name}"))];
+        }
+        Vec::new()
+    }
+
     fn index_keys(&self, _cfg: &PyProject, _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
         // Python reaches every definition by its FQN alone. J9's member-name
         // index — which would let a zero-candidate `NeedsTypeInference` row
@@ -1195,7 +1307,7 @@ impl Resolver<PyLang> for PyResolver {
                     name,
                     alias,
                 } => {
-                    let Some(base) = Self::anchor(&scope, *level, module) else {
+                    let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                         continue;
                     };
                     let bound = alias.clone().unwrap_or_else(|| name.clone());
@@ -1208,10 +1320,12 @@ impl Resolver<PyLang> for PyResolver {
                         },
                     );
                 }
-                ImportForm::Star { level, module } => match Self::anchor(&scope, *level, module) {
-                    Some(base) => scope.stars.push(base),
-                    None => scope.star_unanchored = true,
-                },
+                ImportForm::Star { level, module } => {
+                    match Self::anchor(scope.package.as_deref(), *level, module) {
+                        Some(base) => scope.stars.push(base),
+                        None => scope.star_unanchored = true,
+                    }
+                }
             }
         }
 

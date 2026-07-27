@@ -211,26 +211,36 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
     );
 
     // --- B2/B10: a renamed export through a barrel. `parseInput` is a name
-    // no file declares; it exists because `index.ts` exports it.
+    // no file declares; it exists because `index.ts` exports it. The alias is
+    // still a node — it has to be, or the barrel's own outgoing edge would
+    // start nowhere — but the *edge from `main`* runs past it to the
+    // definition, which is what makes a call graph through a barrel usable.
     assert_eq!(
         row(&table, main, "parseInput", run),
-        "resolved packages/core/src/index.ts#value:parseInput",
+        "resolved packages/core/src/parse.ts#value:parse",
     );
     // --- B3/F2: the local name of a default import is unrelated to the
-    // definition's name, so the binding table is the only way back.
+    // definition's name, so the binding table is the only way back. Two
+    // aliases stand between the two: `index.ts` re-exports `default as
+    // format`, and `format.ts`'s `default` is itself an alias for the
+    // declaration's own name. Following both is what makes B3's point
+    // reachable — the declaration really is called `reallyFormat`.
     assert_eq!(
         row(&table, main, "format", run),
-        "resolved packages/core/src/index.ts#value:format",
+        "resolved packages/core/src/format.ts#value:reallyFormat",
     );
     // --- B1: a direct named import needs no alias.
     assert!(
         outcomes(&table, main, "parse", run)
             .contains(&"resolved packages/core/src/parse.ts#value:parse"),
     );
-    // --- F4: a namespace import, then a name through its export map.
+    // --- F4: a namespace import, then a name through its export map. The
+    // name is reached through the namespace rather than through a binding,
+    // and it lands on the same definition either way — a member of a
+    // namespace and a direct import of it are one identity, not two.
     assert_eq!(
         row(&table, main, "core.parseInput", run),
-        "resolved packages/core/src/index.ts#value:parseInput",
+        "resolved packages/core/src/parse.ts#value:parse",
     );
 
     // --- The barrel's own edges: each alias reaches the terminal definition.
@@ -251,7 +261,9 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
             "./format.js",
             "packages/core/src/index.ts#value:format"
         ),
-        "resolved packages/core/src/format.ts#value:default",
+        // `default` is itself an alias for the declaration it was written on,
+        // so the barrel's own edge runs through it to the function.
+        "resolved packages/core/src/format.ts#value:reallyFormat",
     );
 
     // --- F6: `this.m()` against the lexically enclosing class. A decision,
@@ -280,12 +292,17 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
 
     // --- The honest failures, one per case study line.
     //
-    // B5: `index.ts` carries a bare `export *`, so its export set is a fixed
-    // point over the module graph that this build does not compute. Saying
-    // `NoMatchingDefinition` would claim the lookup table was complete.
+    // B5: `index.ts` carries a bare `export *`, and its target — `shapes.ts`
+    // — is in the repository, so the star *is* enumerable now: the walk
+    // entered it, listed what it exports, and `nothingHere` is not there.
+    // That makes `NoMatchingDefinition` the true statement and
+    // `WildcardImport` the false one, which is the reverse of what it was
+    // before the store carried alias targets. `WildcardImport` is not gone —
+    // it is reserved for a star this build genuinely cannot enumerate, such
+    // as a CommonJS spread or a target outside the repository.
     assert_eq!(
         row(&table, main, "core.nothingHere", run),
-        "unresolved WildcardImport",
+        "unresolved NoMatchingDefinition",
     );
     // A1–A14: the specifier is a literal and resolved to no file.
     assert_eq!(
@@ -406,10 +423,12 @@ fn a_commonjs_tree_resolves_its_four_require_shapes() {
         row(&table, "index.js", "parse", main),
         "resolved lib/util/index.js#value:parse",
     );
-    // C3/F8: `module.exports = Parser`, constructed with `new`.
+    // C3/F8: `module.exports = Parser`, constructed with `new`. The module's
+    // `default` is an alias for the local `Parser` it was assigned from, and
+    // following it puts the edge on the class rather than on the export slot.
     assert_eq!(
         row(&table, "index.js", "Parser", main),
-        "resolved lib/parser.js#value:default",
+        "resolved lib/parser.js#value:Parser",
     );
     // A13: a builtin is `External`, never `Unresolved`.
     assert_eq!(

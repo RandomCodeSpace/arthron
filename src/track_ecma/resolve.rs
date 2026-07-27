@@ -52,16 +52,35 @@
 //!    segment ([`SPACE_TAG_TYPE`], [`SPACE_TAG_NS`]) that no identifier can
 //!    spell.
 //!
-//! # What is *not* implemented, and why the reasons stay honest
+//! # Export aliases, and why the reasons stay honest
 //!
-//! A bare `export * from './x'` cannot be followed: its export set is ES
-//! `GetExportedNames`, a fixed point over the module graph, and the core
-//! declares [`Resolver::link_kinds`] for exactly that phase but never calls
-//! it. So a star re-export contributes one marker node ([`STAR_EXPORT`]) and a
-//! name that misses in a module carrying one is
-//! [`UnresolvedReason::WildcardImport`] — the reason's own definition. It is
-//! *not* reported as [`UnresolvedReason::AmbiguousExport`], which would claim
-//! we enumerated two sources and found them to disagree; we enumerated none.
+//! A re-export is an alias: an index key naming a node under another name.
+//! [`Resolver::def_alias_targets`] turns the extractor's raw text — a
+//! specifier and an imported name — into the identity it forwards to, in the
+//! definition phase, so the symbol table carries the forward before any
+//! reference probes it. `lookup_in_module` then walks those forwards instead
+//! of stopping on the first alias it meets, which is what makes an edge
+//! through a barrel land on the definition rather than on the barrel.
+//!
+//! A bare `export * from './x'` is the same mechanism with the target being a
+//! *module*: its name set is ES `GetExportedNames`, a fixed point over the
+//! module graph, so the walk re-enters each starred module and looks the name
+//! up there. The walk is bounded ([`MAX_ALIAS_HOPS`]) and carries a visited
+//! set, because the module graph may legally contain a cycle and a resolver
+//! that hangs is worse than one that misses.
+//!
+//! The reasons stay pinned to what the walk actually established:
+//!
+//! - [`UnresolvedReason::AmbiguousExport`] — two star targets supplied the
+//!   name from different definitions. We enumerated both and they disagree.
+//! - [`UnresolvedReason::NoMatchingDefinition`] — every target was
+//!   enumerated and none has the name. The table really was complete.
+//! - [`UnresolvedReason::WildcardImport`] — a star this build could not
+//!   enumerate: a CommonJS spread (C9), or a target outside the repository.
+//!   The set is genuinely unknown, which is what the reason has always meant.
+//! - [`UnresolvedReason::AliasCycle`] — the walk re-entered a key or ran past
+//!   the hop ceiling. It stopped *itself*, so blaming the corpus for a
+//!   missing definition would be a lie.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,6 +106,17 @@ use crate::{Outcome, UnresolvedReason};
 /// unbounded in principle and three deep in practice; exceeding it reports
 /// [`UnresolvedReason::UnindexedSupertype`] rather than looping.
 const MAX_SUPER_HOPS: usize = 4;
+
+/// How far an export-alias walk follows re-exports and star chains.
+///
+/// A barrel chain in a real monorepo is two or three hops — `vue` stars
+/// `runtime-dom` stars `runtime-core` — and this sits well above that. The
+/// ceiling exists so a pathological or cyclic module graph terminates with
+/// [`UnresolvedReason::AliasCycle`] instead of running forever; the cycle
+/// guard catches the common case, and this catches a chain that is merely
+/// absurd. Both report the same reason because both mean the same thing: the
+/// walk stopped itself, and the table was never enumerated.
+const MAX_ALIAS_HOPS: usize = 16;
 
 /// The property every instance member of a class lives on.
 ///
@@ -186,6 +216,29 @@ pub struct ResolvedModule {
     pub target: ModuleTarget,
     /// Every module identity probed, in probe order, hits and misses alike.
     pub candidates: Vec<NodeId>,
+}
+
+/// The bookkeeping one alias walk carries.
+///
+/// Two lists, because a module reached twice means two different things. On
+/// the *current path* it is a cycle: the walk must stop and say so, or it
+/// never ends. On a *sibling* path it is a diamond — two barrels
+/// re-exporting one module, which is ordinary — and it already contributed
+/// whatever it had, so reporting it as a cycle would put a false reason on a
+/// perfectly normal module graph.
+struct Walk<'a> {
+    /// Which declaration table every probe reads. Invariant: the reference's
+    /// space does not change because the walk crossed a module.
+    space: DeclSpace,
+    /// The member path being looked up, likewise invariant — each module the
+    /// walk enters is asked for the same name.
+    segments: &'a [String],
+    /// Every identity probed, in probe order, hits and misses alike.
+    candidates: Vec<NodeId>,
+    /// Modules on the current path, pushed on entry and popped on exit.
+    path: Vec<NodeId>,
+    /// Modules some earlier branch already walked.
+    explored: Vec<NodeId>,
 }
 
 /// One local name an import introduced, with the module it reads from.
@@ -407,6 +460,7 @@ impl EcmaResolver {
     /// a qualified name.
     fn lookup_in_module(
         &self,
+        cfg: &EcmaConfig,
         module: &ResolvedModule,
         space: DeclSpace,
         segments: &[String],
@@ -416,62 +470,200 @@ impl EcmaResolver {
             ModuleTarget::Internal(path) => path,
             _ => return self.module_outcome(module),
         };
-        let mut candidates = module.candidates.clone();
+        let mut walk = Walk {
+            space,
+            segments,
+            candidates: module.candidates.clone(),
+            // The module the walk starts in is already on the path: `a`
+            // starring `b` starring `a` has to end, and it ends here.
+            path: vec![module_id(path)],
+            explored: Vec::new(),
+        };
+        let outcome = self.lookup_exported(cfg, path, probe, &mut walk, 0);
+        Resolution {
+            outcome,
+            candidates: walk.candidates,
+        }
+    }
+
+    /// One module's export table, followed through whatever aliases it holds.
+    ///
+    /// The three probes are ordered as they always were — whole path, head,
+    /// star — and each may now land on an alias, which is followed instead of
+    /// being reported as the answer. Every probe is still recorded, hit or
+    /// miss, including the ones taken inside a followed module.
+    fn lookup_exported(
+        &self,
+        cfg: &EcmaConfig,
+        path: &str,
+        probe: &dyn SymbolProbe,
+        walk: &mut Walk,
+        depth: usize,
+    ) -> Outcome<NodeId, String> {
+        let (space, segments) = (walk.space, walk.segments);
         if segments.is_empty() {
-            return Resolution {
-                outcome: Outcome::Resolved(module_id(path)),
-                candidates,
-            };
+            return Outcome::Resolved(module_id(path));
+        }
+        if depth >= MAX_ALIAS_HOPS {
+            return Outcome::Unresolved(UnresolvedReason::AliasCycle);
         }
         // The whole path first: a namespace member (`A.B.C.f`) and a static
         // member (`C.m`) are both one identity, not a lookup plus a walk.
         let full = member_id(path, space, segments);
-        candidates.push(full);
-        if probe.probe(&full).is_some() {
-            return Resolution {
-                outcome: Outcome::Resolved(full),
-                candidates,
-            };
+        walk.candidates.push(full);
+        match probe.probe(&full) {
+            Some(Entry::Alias { target }) => {
+                return self.follow_alias(full, target, probe, walk);
+            }
+            Some(Entry::Set(_)) => return Outcome::Unresolved(UnresolvedReason::AmbiguousExport),
+            Some(_) => return Outcome::Resolved(full),
+            None => {}
         }
         // The head alone: whether the *exported name* exists decides whether
         // this is "the module has no such export" or "the export exists and
         // its member needs a type".
         let head = member_id(path, space, &segments[..1]);
         let head_entry = if segments.len() > 1 {
-            candidates.push(head);
+            walk.candidates.push(head);
             probe.probe(&head)
         } else {
             None
         };
-        let outcome = match head_entry {
+        match head_entry {
             Some(Entry::Definition {
                 kind: DefKind::Module | DefKind::Type,
                 ..
-            }) => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
-            Some(_) => Outcome::Unresolved(UnresolvedReason::NeedsTypeInference),
-            None => {
-                // B5/B11: the module carries a star re-export whose name set
-                // is a fixed point over the module graph. Saying
-                // `NoMatchingDefinition` would claim the lookup table was
-                // complete, and it was not.
-                let star = member_id(path, space, &[STAR_EXPORT.to_string()]);
-                candidates.push(star);
-                if probe.probe(&star).is_some() {
-                    Outcome::Unresolved(UnresolvedReason::WildcardImport)
-                } else {
-                    Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
-                }
+            }) => return Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+            // An alias head with members left to walk needs the target's
+            // *type*, exactly as any other head does: the member path
+            // continues past an identity this walk can name but not open.
+            Some(_) => return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference),
+            None => {}
+        }
+        // B5/B11: the module carries a star re-export. Its targets are known,
+        // so the name set can be enumerated by re-entering them.
+        let star = member_id(path, space, &[STAR_EXPORT.to_string()]);
+        walk.candidates.push(star);
+        match probe.probe(&star) {
+            Some(Entry::Alias { target }) => self.walk_stars(cfg, &[target], probe, walk, depth),
+            Some(Entry::Set(targets)) => self.walk_stars(cfg, &targets, probe, walk, depth),
+            // A star marker forwarding nothing this build can name: a
+            // CommonJS spread (C9), or a star from outside the repository.
+            // The set is still un-enumerable, which is what the reason says.
+            Some(_) => Outcome::Unresolved(UnresolvedReason::WildcardImport),
+            None => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        }
+    }
+
+    /// Walk an alias chain to the definition at its end.
+    ///
+    /// `from` is the alias node itself. If the chain dead-ends — a re-export
+    /// of a name the target module does not declare — that alias is the
+    /// answer: it is a real node, the reference really does name it, and
+    /// reporting the site unresolved would lose an edge the graph has.
+    /// A *cycle* is different: nothing at the end exists to fall back to, and
+    /// the walk says so.
+    ///
+    /// The chain is linear, so its own `seen` list is enough and the walk's
+    /// shared path is left alone — an alias followed here must not make a
+    /// module look visited to a sibling star branch.
+    fn follow_alias(
+        &self,
+        from: NodeId,
+        target: NodeId,
+        probe: &dyn SymbolProbe,
+        walk: &mut Walk,
+    ) -> Outcome<NodeId, String> {
+        let mut anchor = from;
+        let mut current = target;
+        let mut seen: Vec<NodeId> = vec![from];
+        for _ in 0..MAX_ALIAS_HOPS {
+            if seen.contains(&current) {
+                return Outcome::Unresolved(UnresolvedReason::AliasCycle);
             }
-        };
-        Resolution {
-            outcome,
-            candidates,
+            seen.push(current);
+            walk.candidates.push(current);
+            match probe.probe(&current) {
+                Some(Entry::Alias { target }) => {
+                    anchor = current;
+                    current = target;
+                }
+                // One name forwarded to several identities is the ambiguity
+                // the reason is for.
+                Some(Entry::Set(_)) => {
+                    return Outcome::Unresolved(UnresolvedReason::AmbiguousExport);
+                }
+                Some(_) => return Outcome::Resolved(current),
+                None => return Outcome::Resolved(anchor),
+            }
+        }
+        Outcome::Unresolved(UnresolvedReason::AliasCycle)
+    }
+
+    /// Look one name up in every module a star export forwards.
+    ///
+    /// This is ES `ResolveExport`'s star case, bounded: one answer resolves,
+    /// two different answers are the ambiguity `AmbiguousExport` names, and
+    /// none — with every target enumerated — is an honest
+    /// `NoMatchingDefinition`. `WildcardImport` survives for the case that
+    /// still deserves it: a target this build could not enumerate.
+    fn walk_stars(
+        &self,
+        cfg: &EcmaConfig,
+        targets: &[NodeId],
+        probe: &dyn SymbolProbe,
+        walk: &mut Walk,
+        depth: usize,
+    ) -> Outcome<NodeId, String> {
+        let mut found: Option<NodeId> = None;
+        let mut unenumerable = false;
+        let mut cycle = false;
+        for target in targets {
+            if walk.path.contains(target) {
+                cycle = true; // on the current path: a genuine loop
+                continue;
+            }
+            if walk.explored.contains(target) {
+                // A diamond, not a loop. It contributed what it had the first
+                // time it was walked, and `found` already holds it.
+                continue;
+            }
+            let Some(path) = cfg.module_paths.get(target).cloned() else {
+                // A module the store holds no path for — not scanned, or
+                // scanned by another track. Its names cannot be listed.
+                unenumerable = true;
+                continue;
+            };
+            walk.path.push(*target);
+            let outcome = self.lookup_exported(cfg, &path, probe, walk, depth + 1);
+            walk.path.pop();
+            walk.explored.push(*target);
+            match outcome {
+                Outcome::Resolved(id) => match found {
+                    // Two stars reaching one definition is one answer, not a
+                    // disagreement.
+                    Some(prev) if prev != id => {
+                        return Outcome::Unresolved(UnresolvedReason::AmbiguousExport);
+                    }
+                    _ => found = Some(id),
+                },
+                Outcome::Unresolved(UnresolvedReason::AliasCycle) => cycle = true,
+                Outcome::Unresolved(UnresolvedReason::WildcardImport) => unenumerable = true,
+                _ => {}
+            }
+        }
+        match found {
+            Some(id) => Outcome::Resolved(id),
+            None if cycle => Outcome::Unresolved(UnresolvedReason::AliasCycle),
+            None if unenumerable => Outcome::Unresolved(UnresolvedReason::WildcardImport),
+            None => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
         }
     }
 
     /// A reference whose root is a plain name.
     fn resolve_named(
         &self,
+        cfg: &EcmaConfig,
         scope: &EcmaScope,
         r: &Reference,
         probe: &dyn SymbolProbe,
@@ -524,13 +716,18 @@ impl EcmaResolver {
             // under ESM interop — not the module object. Only when nothing is
             // exported under `default` is the module itself the answer.
             if path.is_empty() && binding.imported == ImportedName::Whole {
-                let whole =
-                    self.lookup_in_module(&binding.module, space, &["default".to_string()], probe);
+                let whole = self.lookup_in_module(
+                    cfg,
+                    &binding.module,
+                    space,
+                    &["default".to_string()],
+                    probe,
+                );
                 if matches!(whole.outcome, Outcome::Resolved(_) | Outcome::External(_)) {
                     return whole;
                 }
             }
-            return self.lookup_in_module(&binding.module, space, &path, probe);
+            return self.lookup_in_module(cfg, &binding.module, space, &path, probe);
         }
 
         // 2. This module's own declarations. E2: a non-exported module-level
@@ -720,6 +917,7 @@ impl EcmaResolver {
     /// build did not index, and says so.
     fn resolve_super(
         &self,
+        cfg: &EcmaConfig,
         scope: &EcmaScope,
         r: &Reference,
         probe: &dyn SymbolProbe,
@@ -758,7 +956,7 @@ impl EcmaResolver {
                 path.push(PROTOTYPE.to_string());
             }
             path.extend_from_slice(&r.target.segments);
-            let mut res = self.lookup_in_module(&binding.module, r.space, &path, probe);
+            let mut res = self.lookup_in_module(cfg, &binding.module, r.space, &path, probe);
             candidates.append(&mut res.candidates);
             return match res.outcome {
                 Outcome::Resolved(id) => Resolution {
@@ -793,7 +991,7 @@ impl EcmaResolver {
         match r.target.segments.get(1) {
             // B7: a named re-export names one thing in the requested module.
             Some(name) => {
-                self.lookup_in_module(&module, r.space, std::slice::from_ref(name), probe)
+                self.lookup_in_module(cfg, &module, r.space, std::slice::from_ref(name), probe)
             }
             // B5/B6: a star names the module itself.
             None => self.module_outcome(&module),
@@ -843,9 +1041,9 @@ impl EcmaResolver {
             }
             RefKind::Export => self.resolve_export(cfg, header, r, probe),
             _ => match &r.target.root {
-                TargetRoot::Name => self.resolve_named(scope, r, probe),
+                TargetRoot::Name => self.resolve_named(cfg, scope, r, probe),
                 TargetRoot::This { .. } => self.resolve_this(scope, r, probe),
-                TargetRoot::Super { .. } => self.resolve_super(scope, r, probe),
+                TargetRoot::Super { .. } => self.resolve_super(cfg, scope, r, probe),
                 // F5: `obj[name]()`, `f().m()`. The operand is an expression,
                 // and its type is what would be needed.
                 TargetRoot::Expr => unresolved(UnresolvedReason::NeedsExpressionType),
@@ -869,6 +1067,128 @@ impl EcmaResolver {
         let mut segments: Vec<String> = rest.to_vec();
         segments.push(def.name.clone());
         Some(Fqn::new(member_fqn(&header.rel_path, space, &segments)))
+    }
+
+    /// The module a specifier names, decided without the symbol table.
+    ///
+    /// `resolve_module` settles its candidate list by *probing*, and the
+    /// definition phase runs against a probe that predates the event — on a
+    /// cold scan, an empty one — so it would call every specifier a miss.
+    /// The filesystem is the oracle instead, which is the same one the walk
+    /// used to decide what to scan.
+    ///
+    /// A candidate that exists on disk but was not scanned yields a target
+    /// no node carries, and the walk falls back to the alias itself, so the
+    /// disagreement costs an edge's precision and never its honesty.
+    fn alias_module(&self, cfg: &EcmaConfig, header: &EcmaHeader, spec: &str) -> Option<String> {
+        let kind = self.module_kind(cfg, header);
+        match specifier::resolve(cfg, &header.rel_path, spec, kind, self.dialect) {
+            Spec::Candidates { paths, .. } => {
+                paths.into_iter().find(|p| cfg.root.join(p).is_file())
+            }
+            Spec::External(_) | Spec::Unresolved(_) => None,
+        }
+    }
+
+    /// What an export alias forwards to.
+    ///
+    /// The extractor emitted the alias node from an [`ExportEntry`] and kept
+    /// the entry's raw text — a specifier and an imported name — without
+    /// linking either. This is where that raw text becomes an identity, in
+    /// the same phase and from the same inputs as the alias's own FQN, so the
+    /// symbol table carries the forward before any reference probes it.
+    ///
+    /// A star entry contributes the *module* it forwards, because its name
+    /// set is not a fact about this file; the walk in `lookup_in_module`
+    /// re-enters that module and looks the name up there. Every other entry
+    /// contributes the single identity it names.
+    fn alias_targets(&self, cfg: &EcmaConfig, header: &EcmaHeader, def: &Definition) -> Vec<Fqn> {
+        // Only a module-level export alias forwards. A nested one is a member
+        // of something, and members are not re-exported.
+        if def.kind != DefKind::Alias || !def.owner.is_empty() || def.name.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<Fqn> = Vec::new();
+        let mut push = |fqn: Fqn| {
+            if !out.iter().any(|f| f.as_str() == fqn.as_str()) {
+                out.push(fqn);
+            }
+        };
+        let is_star = def.name == STAR_EXPORT;
+        for entry in &header.exports {
+            if entry.space != def.space {
+                continue;
+            }
+            match &entry.export_name {
+                // The bare star, and the CommonJS spread that stands for it.
+                // A spread carries no specifier and forwards nothing this
+                // build can name, so it contributes no target and the node
+                // stays a bare marker — which keeps `WildcardImport` true for
+                // exactly the case that still cannot be enumerated.
+                None => {
+                    if !is_star {
+                        continue;
+                    }
+                    let Some(spec) = entry.module_request.as_deref() else {
+                        continue;
+                    };
+                    if let Some(path) = self.alias_module(cfg, header, spec) {
+                        push(Fqn::new(escape_path(&path)));
+                    }
+                }
+                Some(name) => {
+                    if is_star || name != &def.name {
+                        continue;
+                    }
+                    match entry.module_request.as_deref() {
+                        // A re-export: the target lives in another module.
+                        Some(spec) => {
+                            let Some(path) = self.alias_module(cfg, header, spec) else {
+                                // External or unresolvable. Storing nothing
+                                // leaves the existing module-level answer to
+                                // speak, which is already the honest one.
+                                continue;
+                            };
+                            match &entry.import_name {
+                                Some(ImportedName::Named(imported)) => push(Fqn::new(member_fqn(
+                                    &path,
+                                    entry.space,
+                                    std::slice::from_ref(imported),
+                                ))),
+                                // B2: the module's `default`, never a local
+                                // name chosen at the import site.
+                                Some(ImportedName::Default) => push(Fqn::new(member_fqn(
+                                    &path,
+                                    entry.space,
+                                    &["default".to_string()],
+                                ))),
+                                // `export * as ns from './m'` names the
+                                // module object itself.
+                                Some(
+                                    ImportedName::Namespace
+                                    | ImportedName::Whole
+                                    | ImportedName::All,
+                                ) => push(Fqn::new(escape_path(&path))),
+                                None => {}
+                            }
+                        }
+                        // A local export under another name: `export { p as
+                        // parse }`, `export default foo`. The target is this
+                        // module's own declaration.
+                        None => {
+                            if let Some(local) = &entry.local_name {
+                                push(Fqn::new(member_fqn(
+                                    &header.rel_path,
+                                    entry.space,
+                                    std::slice::from_ref(local),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -931,10 +1251,25 @@ macro_rules! ecma_resolver_impl {
 
             fn learn_containers(
                 &self,
-                _cfg: &mut EcmaConfig,
-                _names: &std::collections::HashMap<String, String>,
+                cfg: &mut EcmaConfig,
+                names: &std::collections::HashMap<String, String>,
             ) {
-                // Nothing to learn: see `declared_container`.
+                // No container *name* is learned here — see
+                // `declared_container`, a module's name is its path and no
+                // file decides another's. What is learned is the inverse of
+                // the module keyspace: identity back to path.
+                //
+                // Following `export *` needs it. The star's targets are
+                // stored as module identities, and re-entering one to look a
+                // name up in it needs that module's path, which no hash can
+                // give back. The driver refreshes this between the phases, so
+                // a cold scan sees every module phase 1 has just written.
+                cfg.module_paths = names
+                    .iter()
+                    .map(|(import_path, name)| {
+                        (node_id(Domain::EcmaScript, import_path), name.clone())
+                    })
+                    .collect();
             }
 
             fn owns_file(&self, _cfg: &EcmaConfig, rel_path: &str) -> bool {
@@ -950,6 +1285,16 @@ macro_rules! ecma_resolver_impl {
                 _probe: &dyn SymbolProbe,
             ) -> Option<Fqn> {
                 self.fqn(header, owner, def)
+            }
+
+            fn def_alias_targets(
+                &self,
+                cfg: &EcmaConfig,
+                header: &EcmaHeader,
+                def: &Definition,
+                _probe: &dyn SymbolProbe,
+            ) -> Vec<Fqn> {
+                self.alias_targets(cfg, header, def)
             }
 
             fn index_keys(&self, _cfg: &EcmaConfig, _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
@@ -988,13 +1333,17 @@ macro_rules! ecma_resolver_impl {
             }
 
             fn link_kinds(&self) -> &'static [RefKind] {
-                // `RefKind::Export` belongs here: ES `GetExportedNames` is a
-                // fixed point over the module graph and a star chain needs one
-                // pass per hop. The driver never reads this list, so the fixed
-                // point does not run and a name that only a star supplies is
-                // reported `WildcardImport` — the reason's own definition —
-                // rather than guessed at. Declaring the kinds anyway would
-                // claim a phase that does not happen.
+                // Still empty, and the driver still never reads it — but the
+                // star chain no longer needs it to. `GetExportedNames` is a
+                // fixed point over the module graph, and rather than a global
+                // pass per hop, each lookup walks the chain it actually needs
+                // (`lookup_exported`) from targets the definition phase
+                // already resolved. The walk is bounded and cycle-guarded, so
+                // it terminates where a fixed point would have converged.
+                //
+                // What remains genuinely un-enumerable — a CommonJS spread, a
+                // star from outside the repository — keeps `WildcardImport`,
+                // which is the reason's own definition.
                 &[]
             }
 

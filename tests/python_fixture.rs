@@ -467,3 +467,51 @@ fn going_live_leaves_go_alone() {
         "Python reports a line of its own",
     );
 }
+
+/// B-12, one hop further than the façade.
+///
+/// `pkg/__init__.py` doing `from .core import Foo` makes `pkg.Foo` a real
+/// declaration site — an attribute of `pkg` at runtime — and the store now
+/// carries what that site forwards to. A reference to `pkg.Foo` therefore
+/// lands on the class in `pkg/core.py` rather than stopping at the façade,
+/// which is the difference between a call graph that crosses a package
+/// boundary and one that stops at its front door.
+#[test]
+fn a_reexport_facade_reaches_the_definition_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pkg/__init__.py", "from .core import Foo\n");
+    write(root, "pkg/core.py", "class Foo:\n    pass\n");
+    write(root, "app.py", "from pkg import Foo\n\nFoo()\n");
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app.py", RefKind::Call, "Foo"),
+        resolved("pkg.core#Foo"),
+        "the alias `pkg#Foo` forwards, and the edge follows it",
+    );
+}
+
+/// Two façades that import from each other terminate, and terminate on a
+/// node. A Python re-export cycle is a real (if pathological) import graph,
+/// not a reason to drop a reference or to hang.
+#[test]
+fn a_facade_cycle_terminates_on_a_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pkg/__init__.py", "from .core import Foo\n");
+    write(root, "pkg/core.py", "from pkg import Foo\n");
+    write(root, "app.py", "from pkg import Foo\n\nFoo()\n");
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    match outcome(&rows, "app.py", RefKind::Call, "Foo") {
+        StoredOutcome::Resolved(_) => {}
+        other => panic!("a façade cycle must still name a node, got {other:?}"),
+    }
+}
