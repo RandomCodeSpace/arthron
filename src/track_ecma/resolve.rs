@@ -1333,8 +1333,10 @@ macro_rules! ecma_resolver_impl {
             }
 
             fn link_kinds(&self) -> &'static [RefKind] {
-                // Still empty, and the driver still never reads it — but the
-                // star chain no longer needs it to. `GetExportedNames` is a
+                // Still empty, and the driver now does read it: an empty list
+                // means it runs no supertype phase over this track, which is
+                // the right answer twice over. The star chain does not need
+                // one — `GetExportedNames` is a
                 // fixed point over the module graph, and rather than a global
                 // pass per hop, each lookup walks the chain it actually needs
                 // (`lookup_exported`) from targets the definition phase
@@ -1344,6 +1346,13 @@ macro_rules! ecma_resolver_impl {
                 // What remains genuinely un-enumerable — a CommonJS spread, a
                 // star from outside the repository — keeps `WildcardImport`,
                 // which is the reason's own definition.
+                //
+                // `extends` is the other candidate and is deliberately absent:
+                // `walk_members` already reads a class's heritage clause out
+                // of the file being resolved, and vue-core measures five
+                // `UnindexedSupertype` occurrences in total. Declaring the kind
+                // would buy a phase for five references and a rewrite of that
+                // walk; it is a migration to make when the number says so.
                 &[]
             }
 

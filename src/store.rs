@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -61,6 +61,13 @@ const CANDIDATES: MultimapTableDefinition<&[u8; 16], (&str, &[u8])> =
 const FILES: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("files");
 const DEF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("def_owned");
 const REF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("ref_owned");
+/// File → the supertypes each type it declares was placed at.
+///
+/// Keyed by file, like every other half, because that is what makes it
+/// replaceable: a file re-scanned states its hierarchy afresh, and a file
+/// forgotten takes its rows with it. Two files declaring one identity — legal
+/// under a source-set twin — both keep their row and the reader merges them.
+const SUPERS: TableDefinition<&str, &[u8]> = TableDefinition::new("supers");
 
 type NodeTable<'txn> = redb::Table<'txn, &'static [u8; 16], &'static [u8]>;
 type RefTable<'txn> = redb::Table<'txn, (&'static str, &'static [u8]), &'static [u8]>;
@@ -360,6 +367,54 @@ pub struct FileDefs {
     pub nodes: Vec<(NodeId, NodeRecord)>,
 }
 
+/// One type's direct supertypes, as the supertype phase placed them.
+///
+/// The storage mirror of [`crate::lang::Supertypes`], and the reason it is a
+/// record rather than a bare list: "declares nothing above it" and "declares
+/// something this scan could not place" are different facts about the same
+/// empty list, and a resolver reading them as one either invents a complete
+/// closure or refuses to believe one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub struct SuperRecord {
+    /// FQNs of the supertypes that resolved to a definition in this
+    /// repository, in declaration order.
+    pub supers: Vec<String>,
+    /// Whether every supertype the type declares is in `supers`.
+    pub complete: bool,
+}
+
+impl SuperRecord {
+    /// Fold another file's row for the same identity into this one.
+    ///
+    /// Union rather than overwrite, and `complete` is an *and*: a source-set
+    /// twin that names a base the other does not still names it, and a row
+    /// that was short stays short however many files agree with the rest.
+    pub fn merge(&mut self, other: SuperRecord) {
+        for fqn in other.supers {
+            if !self.supers.contains(&fqn) {
+                self.supers.push(fqn);
+            }
+        }
+        self.complete &= other.complete;
+    }
+}
+
+/// Everything the supertype phase writes, one entry per file.
+#[derive(Debug, Clone, Default)]
+pub struct SuperBatch {
+    /// One entry per file the event covers.
+    pub files: Vec<FileSupers>,
+}
+
+/// One file's supertype half.
+#[derive(Debug, Clone, Default)]
+pub struct FileSupers {
+    /// Repo-relative path.
+    pub path: String,
+    /// One row per type the file declares, by identity.
+    pub types: Vec<(NodeId, SuperRecord)>,
+}
+
 /// Everything phase 2 writes, one entry per file, applied in one transaction.
 #[derive(Debug, Clone, Default)]
 pub struct RefBatch {
@@ -461,6 +516,8 @@ pub struct Snapshot {
     pub edges: BTreeSet<(NodeId, NodeId, u8)>,
     /// The candidate index: probed identity → the rows that probed it.
     pub candidates: BTreeMap<NodeId, BTreeSet<RefKey>>,
+    /// The supertype half, by the file that declared it.
+    pub supers: BTreeMap<String, Vec<(NodeId, SuperRecord)>>,
 }
 
 /// Handle on the on-disk graph.
@@ -611,6 +668,105 @@ impl Store {
         Ok(colliding)
     }
 
+    /// Replace the supertype half of every file in the batch, in one
+    /// transaction.
+    ///
+    /// A file with no types to state is *removed* rather than written empty:
+    /// most files declare no type at all, and a row per file would be a table
+    /// the size of the tree carrying nothing. Removal is also what keeps a
+    /// warm store byte-identical to a cold one, which the snapshot oracle
+    /// compares.
+    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            for file in &batch.files {
+                if file.types.is_empty() {
+                    supers
+                        .remove(file.path.as_str())
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+                let mut rows = file.types.clone();
+                rows.sort_by_key(|row| row.0);
+                let bytes = encode(&rows)?;
+                supers
+                    .insert(file.path.as_str(), bytes.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// The whole supertype relation, merged across the files that state it.
+    ///
+    /// The map a resolver probes through [`crate::lang::SymbolProbe`]. Two
+    /// files declaring one identity contribute both their supertypes, and the
+    /// merged row is complete only if both were — the same conservatism the
+    /// per-file record uses, applied where the rows meet.
+    pub fn supertype_index(&self) -> Result<HashMap<NodeId, SuperRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        let mut out: HashMap<NodeId, SuperRecord> = HashMap::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            let rows: Vec<(NodeId, SuperRecord)> = decode(value.value())?;
+            for (id, record) in rows {
+                let merged = merge_supers(out.remove(&id), record);
+                out.insert(id, merged);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The supertype rows these files state, merged, as they stand right now.
+    ///
+    /// Read before the supertype phase writes and again after, and compared:
+    /// a type whose supertypes moved changes what every member lookup below
+    /// it can reach, under an identity that never moved at all. That is the
+    /// same invalidation [`Store::declared_nodes`] performs for a definition's
+    /// payload, asked about the other half of what an identity means.
+    pub fn declared_supers(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<NodeId, SuperRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        let mut out: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
+        for path in paths {
+            let Some(guard) = table.get(path.as_str()).map_err(|e| e.to_string())? else {
+                continue;
+            };
+            let rows: Vec<(NodeId, SuperRecord)> = decode(guard.value())?;
+            for (id, record) in rows {
+                let merged = merge_supers(out.remove(&id), record);
+                out.insert(id, merged);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every definition's canonical name, by identity.
+    ///
+    /// The supertype phase resolves a base-class reference to a `NodeId` and
+    /// has to write down a *name*: a member key is built from the owning
+    /// type's FQN, and a 128-bit hash cannot be turned back into one. Only
+    /// definitions are here — a base that placed at a package or an external
+    /// node is not a type this graph can walk into, and leaving it out is what
+    /// makes the row's `complete` flag false rather than a dangling name.
+    pub fn definition_fqns(&self) -> Result<HashMap<NodeId, String>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = HashMap::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            if let NodeRecord::Definition { fqn, .. } = decode(value.value())? {
+                out.insert(*key.value(), fqn);
+            }
+        }
+        Ok(out)
+    }
+
     /// Replace the phase-2 half of every file in the batch, in one
     /// transaction, and record each file's content hash.
     pub fn apply_refs(&self, batch: &RefBatch) -> Result<(), String> {
@@ -686,6 +842,7 @@ impl Store {
             let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
             let mut def_owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut ref_owned = txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+            let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
             for path in paths {
                 forget_ref_half(
                     &mut nodes, &mut refs, &mut edges, &mut rev, &mut cands, &ref_owned, path,
@@ -697,6 +854,7 @@ impl Store {
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
+                supers.remove(path.as_str()).map_err(|e| e.to_string())?;
                 files.remove(path.as_str()).map_err(|e| e.to_string())?;
             }
         }
@@ -906,6 +1064,7 @@ impl Store {
             rows: BTreeMap::new(),
             edges: BTreeSet::new(),
             candidates: BTreeMap::new(),
+            supers: BTreeMap::new(),
         };
         let files = txn.open_table(FILES).map_err(|e| e.to_string())?;
         for entry in files.iter().map_err(|e| e.to_string())? {
@@ -945,6 +1104,13 @@ impl Store {
                 rows.insert(RefKey::join(file, encoded)?);
             }
             snapshot.candidates.insert(*key.value(), rows);
+        }
+        let supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        for entry in supers.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            snapshot
+                .supers
+                .insert(key.value().to_string(), decode(value.value())?);
         }
         Ok(snapshot)
     }
@@ -1001,6 +1167,7 @@ fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.delete_table(FILES).map_err(|e| e.to_string())?;
     txn.delete_table(DEF_OWNED).map_err(|e| e.to_string())?;
     txn.delete_table(REF_OWNED).map_err(|e| e.to_string())?;
+    txn.delete_table(SUPERS).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1015,6 +1182,7 @@ fn create_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.open_table(FILES).map_err(|e| e.to_string())?;
     txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
     txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+    txn.open_table(SUPERS).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1026,6 +1194,15 @@ fn decode<T: Decode<()>>(bytes: &[u8]) -> Result<T, String> {
     let (value, _) = bincode::decode_from_slice(bytes, config::standard())
         .map_err(|e: bincode::error::DecodeError| e.to_string())?;
     Ok(value)
+}
+
+/// Fold one file's supertype row into whatever another file already said.
+fn merge_supers(existing: Option<SuperRecord>, incoming: SuperRecord) -> SuperRecord {
+    let Some(mut held) = existing else {
+        return incoming;
+    };
+    held.merge(incoming);
+    held
 }
 
 fn read_node<T: ReadableTable<&'static [u8; 16], &'static [u8]>>(

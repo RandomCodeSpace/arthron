@@ -22,20 +22,27 @@
 //!   that lands on the alias reports `AmbiguousOverload`; one that misses has
 //!   found "not declared on this type" and may walk on. See
 //!   [`crate::track_java::fqn`].
-//! * **No supertype-closure phase (H-01).** `link_kinds` is likewise never
-//!   driven, and nothing in the store enumerates a type's supertypes — the
-//!   probe answers one identity at a time. So the closure is walked *only for
-//!   types the file being resolved declares*, where `extends`/`implements` are
-//!   a single-file fact ([`TypeDecl`]). Everything beyond that is
-//!   [`UnresolvedReason::UnindexedSupertype`], which is B-05's own reason and
-//!   is expected to be a large, honest floor rather than a rate to be gamed
-//!   down.
+//! * **The supertype closure is two facts, not one (H-01).** For a type the
+//!   file being resolved declares, `extends`/`implements` are a single-file
+//!   fact ([`TypeDecl`]) and the walk reads them straight off the scope. For
+//!   every other type they come from the driver's supertype phase, which
+//!   resolved that file's `Inherit` references before any member reference ran
+//!   and left the relation in the store — [`JavaResolver::lookup`] walks it
+//!   one hop at a time, so a member declared three files above a receiver is
+//!   found.
+//!
+//!   What stays is genuinely unreachable rather than merely unbuilt: §4.3.2
+//!   puts `java.lang.Object` above every class and no scan of a repository
+//!   indexes it, so a member found nowhere in the closure is still
+//!   [`UnresolvedReason::UnindexedSupertype`] — B-05's own reason, and an
+//!   honest floor rather than a rate to be gamed down.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::lang::{
-    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, Supertypes,
+    SymbolProbe,
 };
 use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id};
 use crate::track_java::JavaLang;
@@ -198,6 +205,19 @@ impl Probes<'_> {
         let id = node_id(JavaLang::DOMAIN, fqn);
         self.seen.push(id);
         self.table.probe(&id)
+    }
+
+    /// Ask the table what a type sits under, recording the *type's* identity.
+    ///
+    /// Recorded through the same log as any other lookup, and that is the
+    /// whole reason this method exists rather than a direct call: what a type
+    /// extends is part of what its identity means, so a reference that read it
+    /// has to be woken when it changes — exactly as one that read a
+    /// definition's kind is.
+    fn supers(&mut self, fqn: &str) -> Option<Supertypes> {
+        let id = node_id(JavaLang::DOMAIN, fqn);
+        self.seen.push(id);
+        self.table.supertypes(&id)
     }
 }
 
@@ -848,6 +868,41 @@ impl JavaResolver {
     /// edge.
     const NAME_PROBE_ARITY: u32 = 8;
 
+    /// The most types one member lookup walks before it gives up.
+    ///
+    /// The `seen` set already makes the walk terminate; this bounds what it
+    /// *costs*, which a cycle guard does not: a hierarchy is as wide as the
+    /// corpus makes it and every reference pays for the whole of it. A walk
+    /// cut here is a short walk, so it reports exactly what an unreadable
+    /// supertype reports — never a wrong edge, and never `NoMatchingDefinition`
+    /// on a search that did not finish. Sixty-four is far above commons-lang's
+    /// deepest closure and cheap to raise if a corpus ever reaches it.
+    const MAX_SUPERTYPES: usize = 64;
+
+    /// The supertypes the store holds for a type this file does not declare,
+    /// as walk entries.
+    ///
+    /// Entered with no nesting path: their own supertypes come from the same
+    /// relation and never from this file, which is the whole difference
+    /// between a closure and a single hop.
+    ///
+    /// Reversed, because the caller's queue is a stack and the relation is in
+    /// declaration order. §8.1.4 puts `extends` before `implements`, so the
+    /// first entry is the superclass, and §8.4.8 has a superclass method beat
+    /// a superinterface's default — reversing here is what pops it first, the
+    /// same order the in-file walk builds by pushing the superclass last.
+    fn indexed_supers(type_fqn: &str, p: &mut Probes<'_>) -> Vec<(String, Option<Vec<String>>)> {
+        let Some(supers) = p.supers(type_fqn) else {
+            return Vec::new();
+        };
+        supers
+            .fqns
+            .into_iter()
+            .rev()
+            .map(|fqn| (fqn.into_string(), None))
+            .collect()
+    }
+
     /// Every declaration of `name` this resolver can see on `owner` and the
     /// supertypes it can read.
     ///
@@ -912,8 +967,13 @@ impl JavaResolver {
                     _ => {}
                 }
             }
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                group.unindexed = true;
+                break;
+            }
             let Some(path) = local else {
                 group.unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
                 continue;
             };
             let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
@@ -1012,11 +1072,16 @@ impl JavaResolver {
                     _ => {}
                 }
             }
-            // Only a type this file declares states its own supertypes. For
-            // anything else the closure is unreachable — the probe answers
-            // one identity at a time and nothing enumerates.
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                unindexed = true;
+                break;
+            }
+            // A type this file declares states its own supertypes; for any
+            // other, the supertype phase placed them and this walks on
+            // through what it placed (H-01).
             let Some(path) = local else {
                 unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
                 continue;
             };
             let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
@@ -1763,12 +1828,18 @@ impl Resolver<JavaLang> for JavaResolver {
         build_scope(cfg, file)
     }
 
-    /// Empty, and not because Java has nothing to drive to a fixed point:
-    /// H-01's supertype closure is exactly that, and the driver never calls
-    /// this. The in-file closure in [`JavaResolver::lookup`] is what stands
-    /// in, and `UnindexedSupertype` is what the rest honestly costs.
+    /// H-01: `extends` and `implements`. The driver resolves these before any
+    /// member reference, and [`JavaResolver::lookup`] walks the relation it
+    /// leaves — so a member declared three files above the receiver's type is
+    /// reachable, where before it was one probe and a floor.
+    ///
+    /// One kind and not two: a `permits` clause names *subtypes*, and the
+    /// extractor already emits those as plain type uses (see
+    /// `supertype_heads`). Were they `Inherit`, this phase would walk member
+    /// lookup *down* the hierarchy into declarations the receiver's type does
+    /// not have.
     fn link_kinds(&self) -> &'static [RefKind] {
-        &[]
+        &[RefKind::Inherit]
     }
 
     fn resolve(

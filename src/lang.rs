@@ -136,10 +136,48 @@ pub enum Entry {
     Set(Vec<NodeId>),
 }
 
+/// What one type declares as its direct supertypes, as the supertype phase
+/// placed them.
+///
+/// Direct and not transitive on purpose. A resolver that walks the relation
+/// one hop at a time reads the identity of every type on the way, and those
+/// reads land in the candidate index — which is what makes an edit to a base
+/// class three levels up wake the member reference that depended on it. A
+/// pre-computed closure would answer in one read and leave the intermediate
+/// types unrecorded, so an incremental scan would stop matching a cold one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supertypes {
+    /// The supertypes that resolved to a definition in this repository, in
+    /// the order the type declared them.
+    pub fqns: Vec<Fqn>,
+    /// Whether every supertype the type declares is in [`Supertypes::fqns`].
+    ///
+    /// `false` when one was external, unresolved, or not a definition. The
+    /// closure below this type is then short, and a resolver that reports a
+    /// miss under it must say so rather than claim the name is absent.
+    pub complete: bool,
+}
+
 /// The resolver's view of the symbol table: one lookup per candidate.
 pub trait SymbolProbe {
     /// What the graph holds under this identity, if anything.
     fn probe(&self, id: &NodeId) -> Option<Entry>;
+
+    /// The direct supertypes of a type identity.
+    ///
+    /// `None` when this scan holds no supertype fact for the identity: it is
+    /// not a type, or the language declares no [`Resolver::link_kinds`] and
+    /// the driver therefore ran no supertype phase over it. A type that
+    /// declares no supertype at all answers `Some` with an empty, complete
+    /// list — "nothing above it" and "nothing known about it" are different
+    /// facts, and a resolver that confuses them either invents a complete
+    /// closure or refuses to believe one.
+    ///
+    /// Defaulted so a table that carries no such fact — the plain symbol map
+    /// a unit test hands a resolver — is still a [`SymbolProbe`].
+    fn supertypes(&self, _id: &NodeId) -> Option<Supertypes> {
+        None
+    }
 }
 
 /// A membership-only probe: a set knows presence, not kind.
@@ -256,8 +294,23 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// the probe, because import binding is not per-file derivable.
     fn scope(&self, cfg: &L::Config, file: &FileFacts<L>, probe: &dyn SymbolProbe) -> L::Scope;
 
-    /// Reference kinds that must be driven to a fixed point before ordinary
-    /// resolution. Empty when none are.
+    /// Reference kinds the driver resolves *before* ordinary resolution, to
+    /// build the supertype relation every member lookup then reads. Empty
+    /// when the language has none.
+    ///
+    /// The driver runs this phase between the definition phase and the
+    /// reference phase, once, against definitions alone. That is deliberate
+    /// and not a shortcut: a base-class name is placed by the definition
+    /// table, so the relation cannot depend on itself and no fixed point is
+    /// needed. Where a base name *would* need the closure to be placed, the
+    /// phase misses it and marks the type's [`Supertypes::complete`] false —
+    /// an under-approximation that says so, which is the honest shape for a
+    /// bound.
+    ///
+    /// Only a reference whose nearest nameable encloser is the *subtype*
+    /// contributes: the driver files the resolved target under the same
+    /// identity [`Resolver::def_fqn`] gave that encloser, so the relation and
+    /// the node it hangs on cannot drift apart.
     fn link_kinds(&self) -> &'static [RefKind];
 
     /// The only place an [`Outcome`] is produced. Never drops.

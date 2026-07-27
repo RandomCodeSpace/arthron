@@ -36,8 +36,9 @@
 //! opposite case, the one where the type *is* stated and *is* in the
 //! repository, which this resolver looks up rather than reports (X-02). A
 //! member of an in-repository type that no indexed supertype declares is
-//! [`crate::UnresolvedReason::UnindexedSupertype`], and a large such floor is
-//! the correct first measurement. None of it is to be moved into
+//! [`crate::UnresolvedReason::UnindexedSupertype`] — a floor that the driver's
+//! supertype phase lowered a long way and cannot remove, because §4.3.2 puts
+//! `java.lang.Object` above every class and nothing indexes it. None of it is to be moved into
 //! `LocalBinding` or `External`, both of which leave the rate's denominator
 //! and would raise the number without linking anything.
 //!

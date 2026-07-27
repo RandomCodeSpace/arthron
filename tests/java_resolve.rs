@@ -492,6 +492,249 @@ public class UseIface {
     assert_eq!(scan.one("Iface", RefKind::New), "EXTERNAL jdk:java.lang");
 }
 
+/// The three-level hierarchy the cross-file supertype cases are measured in.
+///
+/// One type per file on purpose: `extends` is the only fact a file states
+/// about its own supertypes, so a hierarchy that fits in one compilation unit
+/// is resolvable without a supertype phase at all and proves nothing about
+/// one.
+fn tower_tree() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "com/acme/Top.java",
+            r#"package com.acme;
+public class Top {
+    public String top() { return "t"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Mid.java",
+            r#"package com.acme;
+public class Mid extends Top {
+    public String mid() { return "m"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Low.java",
+            r#"package com.acme;
+public class Low extends Mid {
+    public String low() { return "l"; }
+}
+"#,
+        ),
+    ]
+}
+
+/// H-01: a member declared two files above the receiver's type resolves.
+#[test]
+fn a_member_two_levels_up_a_cross_file_hierarchy_resolves() {
+    let mut files = tower_tree();
+    files.push((
+        "com/acme/UseTower.java",
+        r#"package com.acme;
+public class UseTower {
+    void go(Low l) {
+        l.low();
+        l.mid();
+        l.top();
+    }
+}
+"#,
+    ));
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("l.low", RefKind::Call),
+        "RESOLVED com.acme#Low.low/0"
+    );
+    assert_eq!(
+        scan.one("l.mid", RefKind::Call),
+        "RESOLVED com.acme#Mid.mid/0"
+    );
+    assert_eq!(
+        scan.one("l.top", RefKind::Call),
+        "RESOLVED com.acme#Top.top/0"
+    );
+}
+
+/// The closure adds targets; it never invents them. A name no type in the
+/// hierarchy declares is still a miss, and still `UnindexedSupertype` —
+/// `java.lang.Object` sits above every chain and is never indexed, so the
+/// closure is short whatever this scan reads.
+#[test]
+fn a_member_no_type_in_the_hierarchy_declares_is_still_unindexed() {
+    let mut files = tower_tree();
+    files.push((
+        "com/acme/UseAbsent.java",
+        r#"package com.acme;
+public class UseAbsent {
+    void go(Low l) {
+        l.absent();
+    }
+}
+"#,
+    ));
+    let scan = scan(&files);
+    assert_eq!(scan.one("l.absent", RefKind::Call), "UnindexedSupertype");
+}
+
+/// An interface's method, declared in a third file, reached through the class
+/// that implements it — and a cycle in the hierarchy terminates.
+#[test]
+fn an_interface_method_resolves_and_a_cyclic_hierarchy_terminates() {
+    let scan = scan(&[
+        (
+            "com/acme/Runner.java",
+            r#"package com.acme;
+public interface Runner {
+    void run();
+    default String describe() { return "runner"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Job.java",
+            r#"package com.acme;
+public class Job implements Runner {
+    public void run() { }
+}
+"#,
+        ),
+        // Illegal Java, and the resolver still has to terminate on it: a
+        // cycle in the store is a cycle whatever the compiler would say.
+        (
+            "com/acme/Loop.java",
+            r#"package com.acme;
+public class Loop extends Knot {
+}
+"#,
+        ),
+        (
+            "com/acme/Knot.java",
+            r#"package com.acme;
+public class Knot extends Loop {
+}
+"#,
+        ),
+        (
+            "com/acme/UseRunner.java",
+            r#"package com.acme;
+public class UseRunner {
+    void go(Job j, Loop k) {
+        j.describe();
+        k.spin();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("j.describe", RefKind::Call),
+        "RESOLVED com.acme#Runner.describe/0",
+    );
+    assert_eq!(scan.one("k.spin", RefKind::Call), "UnindexedSupertype");
+}
+
+/// §8.4.8.1: a superclass method beats a superinterface's default, and the
+/// closure has to preserve that order across a file boundary.
+///
+/// The relation is stored in declaration order — §8.1.4 writes `extends`
+/// before `implements` — and the walk is a stack, so getting this wrong is a
+/// silent wrong edge to the interface rather than a lowered rate.
+#[test]
+fn a_superclass_method_beats_a_superinterface_default_across_files() {
+    let scan = scan(&[
+        (
+            "com/acme/Chatty.java",
+            r#"package com.acme;
+public interface Chatty {
+    default String speak() { return "iface"; }
+}
+"#,
+        ),
+        (
+            "com/acme/BaseSpeak.java",
+            r#"package com.acme;
+public class BaseSpeak {
+    public String speak() { return "class"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Both.java",
+            r#"package com.acme;
+public class Both extends BaseSpeak implements Chatty {
+}
+"#,
+        ),
+        (
+            "com/acme/UseBoth.java",
+            r#"package com.acme;
+public class UseBoth {
+    void go(Both b) {
+        b.speak();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("b.speak", RefKind::Call),
+        "RESOLVED com.acme#BaseSpeak.speak/0",
+    );
+}
+
+/// An in-repository override of an `Object` member is an edge, not a link to
+/// the JDK.
+///
+/// `is_object_member` answers for the member a search *failed* to find, and
+/// before the closure that search stopped at the receiver's own type — so a
+/// `toString` two files up was reported `External("jdk:java.lang")` and left
+/// both terms of the rate. Now the search finds it, and the reference is
+/// resolved: the movement is into the rate, never out of it.
+#[test]
+fn an_object_member_overridden_in_the_repository_resolves_rather_than_externalises() {
+    let scan = scan(&[
+        (
+            "com/acme/Named.java",
+            r#"package com.acme;
+public class Named {
+    public String toString() { return "named"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Sub.java",
+            r#"package com.acme;
+public class Sub extends Named {
+}
+"#,
+        ),
+        (
+            "com/acme/UseNamed.java",
+            r#"package com.acme;
+public class UseNamed {
+    void go(Sub s, Object o) {
+        s.toString();
+        o.hashCode();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("s.toString", RefKind::Call),
+        "RESOLVED com.acme#Named.toString/0",
+    );
+    // The other direction is untouched: nothing in this repository declares
+    // `hashCode` on `Object`, so it stays the JDK's.
+    assert_eq!(
+        scan.one("o.hashCode", RefKind::Call),
+        "EXTERNAL jdk:java.lang",
+    );
+}
+
 /// A `type_identifier` tree-sitter recovered from inside an `ERROR` region is
 /// not a reference to anything.
 ///

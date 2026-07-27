@@ -173,6 +173,16 @@ struct Walk {
     external: Option<String>,
     /// Modules whose namespace was searched, for the PEP 562 probe.
     searched_modules: Vec<String>,
+    /// Type identities whose supertype relation this walk read.
+    ///
+    /// Reads like any other, and they belong in the invalidation index for
+    /// the same reason: what a class inherits from decides which candidates
+    /// exist below it, so an edit to a `class C(B)` line three modules away
+    /// changes this reference's answer under an identity that never moved.
+    /// Kept apart from `probed` rather than pushed into it, because
+    /// `probe_in_order` reads that list as "already asked, do not ask again"
+    /// and a class identity can also be a candidate in its own right.
+    consulted: Vec<NodeId>,
 }
 
 impl PyResolver {
@@ -305,18 +315,22 @@ impl PyResolver {
     /// Ordered candidates for a member below a class, own class first and then
     /// its bases in declaration order (E-01, E-14).
     ///
-    /// The MRO is walked only as far as the graph can be read: bases declared
-    /// in this file are expanded transitively, and a base declared elsewhere
-    /// gets exactly one probe, because a probe answers "does this identity
-    /// exist" and not "what are its bases". That shortfall is recorded as
-    /// [`Walk::unindexed_supertype`] rather than smoothed over — see the core
-    /// gap noted on [`Resolver::link_kinds`] below.
+    /// The MRO is walked as far as the graph can be read, which is now both
+    /// sides of a file boundary: bases declared in this file are expanded from
+    /// [`PyScope::bases`], and a base declared elsewhere is expanded from the
+    /// supertype relation the driver's phase 1.5 left in the store (see
+    /// [`Resolver::link_kinds`] below). What remains unreadable — a base that
+    /// resolved outside the repository, or to no definition at all — is
+    /// recorded as [`Walk::unindexed_supertype`] rather than smoothed over,
+    /// because a chain that is short and a chain that is complete give the
+    /// same empty answer and only one of them means the name is absent.
     // Recursive: the four trailing parameters are this walk's own state, and
     // threading them reads better than a struct that would exist only here.
     #[allow(clippy::too_many_arguments)]
     fn class_member_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         class_fqn: &str,
         member: &[String],
         out: &mut Vec<String>,
@@ -332,8 +346,35 @@ impl PyResolver {
             .strip_prefix(&scope.module)
             .and_then(|rest| rest.strip_prefix('#'))
         else {
-            // Declared in another file: its own bases are not readable here.
-            walk.unindexed_supertype = true;
+            // Declared in another file: its bases are the driver's to state,
+            // and reading them here is a read of *this class's* identity —
+            // recorded, so that rewriting its `class C(B)` line wakes this
+            // reference.
+            let id = node_id(Domain::Python, class_fqn);
+            walk.consulted.push(id);
+            let Some(supers) = probe.supertypes(&id) else {
+                // No supertype fact at all: not a class this scan indexed.
+                walk.unindexed_supertype = true;
+                return;
+            };
+            // A base that resolved outside the repository leaves the chain
+            // short, and `object` is not a node either way — but a class that
+            // states no base at all *is* fully enumerated, exactly as one
+            // declared in this file with no `bases` entry is.
+            walk.unindexed_supertype |= !supers.complete;
+            for base in supers.fqns {
+                Self::class_member_candidates(
+                    cfg,
+                    scope,
+                    probe,
+                    base.as_str(),
+                    member,
+                    out,
+                    walk,
+                    seen,
+                    depth + 1,
+                );
+            }
             return;
         };
         if !scope.classes.contains(owner) {
@@ -352,8 +393,16 @@ impl PyResolver {
             }
             let mut base_fqns = Vec::new();
             let mut base_walk = Walk::default();
-            Self::name_candidates(cfg, scope, &base.segments, &mut base_fqns, &mut base_walk);
+            Self::name_candidates(
+                cfg,
+                scope,
+                probe,
+                &base.segments,
+                &mut base_fqns,
+                &mut base_walk,
+            );
             walk.unindexed_supertype |= base_walk.unindexed_supertype;
+            walk.consulted.append(&mut base_walk.consulted);
             if base_fqns.is_empty() {
                 walk.unindexed_supertype = true;
             }
@@ -361,6 +410,7 @@ impl PyResolver {
                 Self::class_member_candidates(
                     cfg,
                     scope,
+                    probe,
                     base_fqn,
                     member,
                     out,
@@ -384,6 +434,7 @@ impl PyResolver {
     fn name_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         segments: &[String],
         out: &mut Vec<String>,
         walk: &mut Walk,
@@ -403,7 +454,7 @@ impl PyResolver {
                         } else {
                             let mut seen = HashSet::new();
                             Self::class_member_candidates(
-                                cfg, scope, &base, rest, out, walk, &mut seen, 0,
+                                cfg, scope, probe, &base, rest, out, walk, &mut seen, 0,
                             );
                         }
                     }
@@ -424,7 +475,7 @@ impl PyResolver {
                             } else {
                                 let mut seen = HashSet::new();
                                 Self::class_member_candidates(
-                                    cfg, scope, &base, rest, out, walk, &mut seen, 0,
+                                    cfg, scope, probe, &base, rest, out, walk, &mut seen, 0,
                                 );
                             }
                         }
@@ -495,6 +546,7 @@ impl PyResolver {
     fn annotation_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         r: &Reference,
         segments: &[String],
         out: &mut Vec<String>,
@@ -513,10 +565,11 @@ impl PyResolver {
         };
         let mut type_fqns = Vec::new();
         let mut type_walk = Walk::default();
-        Self::name_candidates(cfg, scope, type_path, &mut type_fqns, &mut type_walk);
+        Self::name_candidates(cfg, scope, probe, type_path, &mut type_fqns, &mut type_walk);
         if walk.external.is_none() {
             walk.external = type_walk.external;
         }
+        walk.consulted.append(&mut type_walk.consulted);
         // A module is not a type: only the definition half of the candidate
         // list can host a member.
         for type_fqn in type_fqns.iter().filter(|f| f.contains('#')) {
@@ -525,6 +578,7 @@ impl PyResolver {
             Self::class_member_candidates(
                 cfg,
                 scope,
+                probe,
                 type_fqn,
                 &segments[1..],
                 out,
@@ -833,6 +887,7 @@ impl PyResolver {
         Self::class_member_candidates(
             cfg,
             scope,
+            probe,
             &class_fqn,
             segments,
             &mut candidates,
@@ -842,12 +897,16 @@ impl PyResolver {
         );
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
-            return resolution(Outcome::Resolved(id), probed);
+            return with_walk(Outcome::Resolved(id), &walk, probed);
         }
         // E-12: a class defining `__getattr__` can serve any attribute.
         let fallback = vec![format!("{class_fqn}.__getattr__")];
         if Self::probe_in_order(probe, &fallback, &mut probed).is_some() {
-            return resolution(Outcome::Unresolved(UnresolvedReason::Generated), probed);
+            return with_walk(
+                Outcome::Unresolved(UnresolvedReason::Generated),
+                &walk,
+                probed,
+            );
         }
         let outcome = Outcome::Unresolved(if walk.unindexed_supertype {
             // A supertype whose own bases are unreadable from here: a fixable
@@ -863,7 +922,7 @@ impl PyResolver {
         } else {
             UnresolvedReason::NoMatchingDefinition
         });
-        resolution(outcome, probed)
+        with_walk(outcome, &walk, probed)
     }
 
     /// `super().m()` (E-03).
@@ -924,13 +983,22 @@ impl PyResolver {
             }
             let mut base_fqns = Vec::new();
             let mut base_walk = Walk::default();
-            Self::name_candidates(cfg, scope, &base.segments, &mut base_fqns, &mut base_walk);
+            Self::name_candidates(
+                cfg,
+                scope,
+                probe,
+                &base.segments,
+                &mut base_fqns,
+                &mut base_walk,
+            );
             walk.unindexed_supertype |= base_walk.unindexed_supertype;
+            walk.consulted.append(&mut base_walk.consulted);
             for base_fqn in base_fqns.iter().filter(|f| f.contains('#')) {
                 let mut seen = HashSet::new();
                 Self::class_member_candidates(
                     cfg,
                     scope,
+                    probe,
                     base_fqn,
                     segments,
                     &mut candidates,
@@ -942,7 +1010,7 @@ impl PyResolver {
         }
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
-            return resolution(Outcome::Resolved(id), probed);
+            return with_walk(Outcome::Resolved(id), &walk, probed);
         }
         let outcome = Outcome::Unresolved(if bases.len() > 1 {
             UnresolvedReason::DynamicDispatch
@@ -951,7 +1019,7 @@ impl PyResolver {
         } else {
             UnresolvedReason::NoMatchingDefinition
         });
-        resolution(outcome, probed)
+        with_walk(outcome, &walk, probed)
     }
 
     /// A name-rooted reference: the ordinary case, and most of the volume.
@@ -982,12 +1050,12 @@ impl PyResolver {
         let mut candidates = Vec::new();
         let mut walk = Walk::default();
         if !r.locally_bound {
-            Self::name_candidates(cfg, scope, segments, &mut candidates, &mut walk);
+            Self::name_candidates(cfg, scope, probe, segments, &mut candidates, &mut walk);
         }
-        Self::annotation_candidates(cfg, scope, r, segments, &mut candidates, &mut walk);
+        Self::annotation_candidates(cfg, scope, probe, r, segments, &mut candidates, &mut walk);
         let mut probed = Vec::new();
         match Self::probe_in_order(probe, &candidates, &mut probed) {
-            Some(id) => resolution(Outcome::Resolved(id), probed),
+            Some(id) => with_walk(Outcome::Resolved(id), &walk, probed),
             None => {
                 let outcome = Self::miss(
                     cfg,
@@ -998,7 +1066,7 @@ impl PyResolver {
                     probe,
                     &mut probed,
                 );
-                resolution(outcome, probed)
+                with_walk(outcome, &walk, probed)
             }
         }
     }
@@ -1025,6 +1093,21 @@ fn unresolved(reason: UnresolvedReason) -> Resolution {
         outcome: Outcome::Unresolved(reason),
         candidates: Vec::new(),
     }
+}
+
+/// Close a candidate walk: whatever it consulted is part of what it read.
+///
+/// Appended after the probing rather than before it, because
+/// `probe_in_order` treats an identity already in the list as one it must not
+/// ask about twice — and a class identity is both something this walk
+/// consulted and something a candidate list can legitimately contain.
+fn with_walk(outcome: Outcome<NodeId, String>, walk: &Walk, mut probed: Vec<NodeId>) -> Resolution {
+    for id in &walk.consulted {
+        if !probed.contains(id) {
+            probed.push(*id);
+        }
+    }
+    resolution(outcome, probed)
 }
 
 fn resolution(outcome: Outcome<NodeId, String>, candidates: Vec<NodeId>) -> Resolution {
@@ -1374,14 +1457,15 @@ impl Resolver<PyLang> for PyResolver {
     fn link_kinds(&self) -> &'static [RefKind] {
         // F3: `self.m()` resolves against the enclosing class's MRO, which
         // needs the base-class references *resolved first*, and bases live in
-        // other files. Python is therefore not stratifiable into two phases.
+        // other files. Python is therefore not stratifiable into two phases,
+        // and the driver runs this one between them: every `class C(B)` in the
+        // event is resolved against definitions alone, and the relation it
+        // leaves is what `class_member_candidates` walks when it reaches a
+        // class this file does not declare.
         //
-        // The driver does not call this method today, so declaring it changes
-        // nothing on its own — it states the requirement so the gap is a
-        // recorded fact rather than a silent one. Until the driver drives it,
-        // `class_member_candidates` expands bases declared in *this* file
-        // transitively and gives a base declared elsewhere exactly one probe,
-        // recording the shortfall as `UnindexedSupertype`.
+        // A base that placed outside the repository, or at no definition, is
+        // still the floor it always was — the row records that it is short and
+        // the miss below it stays `UnindexedSupertype`.
         &[RefKind::Inherit]
     }
 
