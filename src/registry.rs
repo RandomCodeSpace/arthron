@@ -84,6 +84,25 @@ pub static REGISTRY: &[Track] = &[
     crate::track_java::TRACK,
     crate::track_ecma::TRACK,
     crate::track_python::TRACK,
+    // The ratified tier-2 tracks, in ratified order: the full tier-2 set
+    // (C++ through Scala), then the best-effort set (Dart through HCL).
+    // Every one carries `scan: None`, so listing them here adds no read, no
+    // row and no report line — it only fixes their place in the order, so
+    // that the commit bringing one up is confined to that track's own file.
+    crate::track_cpp::TRACK,
+    crate::track_csharp::TRACK,
+    crate::track_kotlin::TRACK,
+    crate::track_swift::TRACK,
+    crate::track_ruby::TRACK,
+    crate::track_php::TRACK,
+    crate::track_rust::TRACK,
+    crate::track_scala::TRACK,
+    crate::track_dart::TRACK,
+    crate::track_elixir::TRACK,
+    crate::track_haskell::TRACK,
+    crate::track_lua::TRACK,
+    crate::track_bash::TRACK,
+    crate::track_hcl::TRACK,
 ];
 
 #[cfg(test)]
@@ -95,7 +114,13 @@ mod tests {
     #[test]
     fn iteration_order_is_deterministic_and_follows_lang_all() {
         let names: Vec<&str> = REGISTRY.iter().map(|t| t.name).collect();
-        assert_eq!(names, ["go", "java", "ecma", "python"]);
+        assert_eq!(
+            names,
+            [
+                "go", "java", "ecma", "python", "cpp", "csharp", "kotlin", "swift", "ruby", "php",
+                "rust", "scala", "dart", "elixir", "haskell", "lua", "bash", "hcl",
+            ]
+        );
         // Iterating again yields the same sequence: `REGISTRY` is a static
         // slice, not a set or a map whose order an implementation may choose.
         let again: Vec<&str> = REGISTRY.iter().map(|t| t.name).collect();

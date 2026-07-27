@@ -18,6 +18,7 @@ use arthron::query::{
     DEFAULT_IMPACT_DEPTH, Impact, Match, NameIndex, NodeKind, RefSite, definition, impact,
     references,
 };
+use arthron::registry::REGISTRY;
 use arthron::resolution_rate;
 use arthron::store::{LangTally, ReadStore, StoredOutcome};
 
@@ -412,14 +413,33 @@ fn run_gate(
     commit: Option<&str>,
     as_json: bool,
 ) -> ExitCode {
+    // Only a language whose track is live can be gated, and both checks
+    // answer before anything is read. A registered-but-disabled track
+    // contributes no row, so its tally is zeros: letting the name through
+    // would spend a whole cold scan to arrive at a usage error that was
+    // already knowable, and `Lang::ALL` names far more languages than this
+    // build can measure.
+    let gateable: Vec<&str> = REGISTRY
+        .iter()
+        .filter(|t| t.is_enabled())
+        .flat_map(|t| t.langs)
+        .map(|l| l.name())
+        .collect();
     let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
-        let known: Vec<&str> = Lang::ALL.iter().map(|l| l.name()).collect();
         eprintln!(
             "arthron: unknown language `{language}`; one of: {}",
-            known.join(", ")
+            gateable.join(", ")
         );
         return ExitCode::from(EXIT_USAGE);
     };
+    if !gateable.contains(&lang.name()) {
+        eprintln!(
+            "arthron: language `{language}` is registered but its track is not live in \
+             this build, so there is nothing to gate; one of: {}",
+            gateable.join(", "),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
     // The corpus's own config decides the file set and which tracks run, so
     // the gate measures what a scan of the same tree measures. Its `db` key is
     // not read: see the command's help.

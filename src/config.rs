@@ -298,8 +298,8 @@ mod tests {
 
     #[test]
     fn an_unknown_track_is_refused_by_name() {
-        let e = Config::parse("[tracks]\nrust = false\n").expect_err("refused");
-        assert!(e.contains("unknown key `tracks.rust`"), "{e}");
+        let e = Config::parse("[tracks]\nfortran = false\n").expect_err("refused");
+        assert!(e.contains("unknown key `tracks.fortran`"), "{e}");
         assert!(e.contains("go"), "the message lists the real tracks: {e}");
     }
 

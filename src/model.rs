@@ -29,6 +29,45 @@ pub enum Domain {
     EcmaScript = 2,
     /// Python.
     Python = 3,
+    // The ratified tier-2 languages, registered ahead of their tracks. Each
+    // takes its **own** identity space. A domain is shared only where one
+    // language's resolver has to find another language's declarations, and no
+    // tier-2 resolver exists yet to do so — so Kotlin and Scala are
+    // deliberately *not* folded into `Jvm` here. Putting them there would
+    // commit Java's FQN grammar to answering for their declarations, which is
+    // a decision for whichever of those tracks lands second, not for a
+    // registration that reads no files.
+    /// C++ — and C, when it lands on the same track. Named for the family
+    /// rather than the language because a `.h` header is named by both, so
+    /// one identity space is the only arrangement in which each can find the
+    /// other's declarations.
+    Cxx = 4,
+    /// C#.
+    CSharp = 5,
+    /// Kotlin.
+    Kotlin = 6,
+    /// Swift.
+    Swift = 7,
+    /// Ruby.
+    Ruby = 8,
+    /// PHP.
+    Php = 9,
+    /// Rust.
+    Rust = 10,
+    /// Scala.
+    Scala = 11,
+    /// Dart.
+    Dart = 12,
+    /// Elixir.
+    Elixir = 13,
+    /// Haskell.
+    Haskell = 14,
+    /// Lua.
+    Lua = 15,
+    /// The shell family, Bash first.
+    Shell = 16,
+    /// HCL, the HashiCorp configuration language.
+    Hcl = 17,
 }
 
 impl Domain {
@@ -59,7 +98,10 @@ pub fn node_id(domain: Domain, fqn: &str) -> NodeId {
 ///
 /// Codes 0–4 are the committed language order and are storage bytes: `Go = 0`,
 /// `Java = 1`, `JavaScript = 2`, `TypeScript = 3`, `Python = 4`. Appending is
-/// the only permitted change; nothing here is ever renumbered.
+/// the only permitted change; nothing here is ever renumbered. Codes 5–18 are
+/// the ratified tier-2 languages, appended in their ratified order and
+/// registered ahead of the tracks that will implement them — a variant here
+/// is a name and a storage byte, not a claim that anything scans it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {
     /// The Go programming language.
@@ -74,6 +116,39 @@ pub enum Lang {
     TypeScript,
     /// The Python programming language.
     Python,
+    // The ratified tier-2 languages: the full tier-2 set first (C++ through
+    // Scala), then the best-effort set (Dart through HCL). Every one of them
+    // has a grammar in the pinned ast-grep build; a language without one is
+    // not registered here. They are listed now so that bringing one up edits
+    // only that track's own module — see [`crate::registry`].
+    /// C++. C is not this variant; it rides the same track later.
+    Cpp,
+    /// C#.
+    CSharp,
+    /// Kotlin.
+    Kotlin,
+    /// Swift.
+    Swift,
+    /// Ruby.
+    Ruby,
+    /// PHP.
+    Php,
+    /// The Rust programming language.
+    Rust,
+    /// Scala.
+    Scala,
+    /// Dart.
+    Dart,
+    /// Elixir.
+    Elixir,
+    /// Haskell.
+    Haskell,
+    /// Lua.
+    Lua,
+    /// Bash.
+    Bash,
+    /// HCL, the HashiCorp configuration language.
+    Hcl,
 }
 
 impl Lang {
@@ -86,6 +161,20 @@ impl Lang {
         Lang::JavaScript,
         Lang::TypeScript,
         Lang::Python,
+        Lang::Cpp,
+        Lang::CSharp,
+        Lang::Kotlin,
+        Lang::Swift,
+        Lang::Ruby,
+        Lang::Php,
+        Lang::Rust,
+        Lang::Scala,
+        Lang::Dart,
+        Lang::Elixir,
+        Lang::Haskell,
+        Lang::Lua,
+        Lang::Bash,
+        Lang::Hcl,
     ];
 
     /// Stable one-byte code used in reporting and storage. Never renumber.
@@ -96,6 +185,20 @@ impl Lang {
             Lang::JavaScript => 2,
             Lang::TypeScript => 3,
             Lang::Python => 4,
+            Lang::Cpp => 5,
+            Lang::CSharp => 6,
+            Lang::Kotlin => 7,
+            Lang::Swift => 8,
+            Lang::Ruby => 9,
+            Lang::Php => 10,
+            Lang::Rust => 11,
+            Lang::Scala => 12,
+            Lang::Dart => 13,
+            Lang::Elixir => 14,
+            Lang::Haskell => 15,
+            Lang::Lua => 16,
+            Lang::Bash => 17,
+            Lang::Hcl => 18,
         }
     }
 
@@ -107,6 +210,20 @@ impl Lang {
             Lang::JavaScript => "javascript",
             Lang::TypeScript => "typescript",
             Lang::Python => "python",
+            Lang::Cpp => "cpp",
+            Lang::CSharp => "csharp",
+            Lang::Kotlin => "kotlin",
+            Lang::Swift => "swift",
+            Lang::Ruby => "ruby",
+            Lang::Php => "php",
+            Lang::Rust => "rust",
+            Lang::Scala => "scala",
+            Lang::Dart => "dart",
+            Lang::Elixir => "elixir",
+            Lang::Haskell => "haskell",
+            Lang::Lua => "lua",
+            Lang::Bash => "bash",
+            Lang::Hcl => "hcl",
         }
     }
 
@@ -118,6 +235,20 @@ impl Lang {
             2 => Some(Lang::JavaScript),
             3 => Some(Lang::TypeScript),
             4 => Some(Lang::Python),
+            5 => Some(Lang::Cpp),
+            6 => Some(Lang::CSharp),
+            7 => Some(Lang::Kotlin),
+            8 => Some(Lang::Swift),
+            9 => Some(Lang::Ruby),
+            10 => Some(Lang::Php),
+            11 => Some(Lang::Rust),
+            12 => Some(Lang::Scala),
+            13 => Some(Lang::Dart),
+            14 => Some(Lang::Elixir),
+            15 => Some(Lang::Haskell),
+            16 => Some(Lang::Lua),
+            17 => Some(Lang::Bash),
+            18 => Some(Lang::Hcl),
             _ => None,
         }
     }
@@ -129,6 +260,20 @@ impl Lang {
             Lang::Java => Domain::Jvm,
             Lang::JavaScript | Lang::TypeScript => Domain::EcmaScript,
             Lang::Python => Domain::Python,
+            Lang::Cpp => Domain::Cxx,
+            Lang::CSharp => Domain::CSharp,
+            Lang::Kotlin => Domain::Kotlin,
+            Lang::Swift => Domain::Swift,
+            Lang::Ruby => Domain::Ruby,
+            Lang::Php => Domain::Php,
+            Lang::Rust => Domain::Rust,
+            Lang::Scala => Domain::Scala,
+            Lang::Dart => Domain::Dart,
+            Lang::Elixir => Domain::Elixir,
+            Lang::Haskell => Domain::Haskell,
+            Lang::Lua => Domain::Lua,
+            Lang::Bash => Domain::Shell,
+            Lang::Hcl => Domain::Hcl,
         }
     }
 
@@ -137,6 +282,18 @@ impl Lang {
     /// Ownership is a partition: exactly one language owns any extension, so
     /// a walk never has to ask which of two claimants meant it. That is what
     /// keeps [`Lang::for_extension`] a function rather than a policy.
+    ///
+    /// A language's claim here is committed ahead of its track. While the
+    /// track is disabled it owns no file at all
+    /// ([`crate::registry::Track::owns_extension`]), so a tier-2 entry
+    /// changes nothing a scan reads; the go-live wave finalizes the list.
+    ///
+    /// The partition is committed; the tier-2 lists are not yet complete.
+    /// Each holds a minimal claim — `.hcl` and `.tfvars`, `.sbt`, `.zsh` and
+    /// the like are left unclaimed rather than assigned elsewhere — because
+    /// widening a disabled language's list changes nothing a scan reads, and
+    /// that track's go-live commit is the first point at which anyone has
+    /// parsed the files and can say the claim holds.
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             Lang::Go => &["go"],
@@ -144,6 +301,39 @@ impl Lang {
             Lang::JavaScript => &["js", "mjs", "cjs"],
             Lang::TypeScript => &["ts"],
             Lang::Python => &["py"],
+            // Deliberately **not** `c`, and for exactly the same reason
+            // not `h`. Measured against the pinned grammar: a K&R-style
+            // definition — valid C, not valid C++ — parses cleanly under
+            // the C grammar and yields an error node under the C++ one, so
+            // the two really are different languages here and a `.c` file
+            // read on this track is read as the wrong one. `.h` is the C
+            // header extension before it is anything else and carries that
+            // same hazard, so this list stops at the spellings only C++
+            // uses. Both ride this track later under C's own decision —
+            // which is also when [`Domain::Cxx`] starts carrying two
+            // languages, and why the domain is named for the family.
+            Lang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            Lang::CSharp => &["cs"],
+            Lang::Kotlin => &["kt", "kts"],
+            Lang::Swift => &["swift"],
+            Lang::Ruby => &["rb"],
+            Lang::Php => &["php"],
+            Lang::Rust => &["rs"],
+            Lang::Scala => &["scala", "sc"],
+            Lang::Dart => &["dart"],
+            Lang::Elixir => &["ex", "exs"],
+            Lang::Haskell => &["hs"],
+            Lang::Lua => &["lua"],
+            // Not `bats`: the shell grammar does not reject a `.bats`
+            // file, it misreads one. Measured against the pinned grammar, a
+            // `@test "name" { ... }` block parses with zero error nodes, but
+            // the `@test` header and the closing brace each come out as an
+            // ordinary `command` — where a real shell function comes out as
+            // one `function_definition`. Claiming the extension would hand
+            // the walk a file that parses into records for things it does
+            // not declare, which is worse than not reading it.
+            Lang::Bash => &["sh", "bash"],
+            Lang::Hcl => &["tf"],
         }
     }
 
@@ -686,6 +876,45 @@ mod tests {
     }
 
     #[test]
+    fn every_tier_two_language_has_its_own_identity_space() {
+        // One domain per registered language family. `Cxx` is the only one
+        // written to take a second language — C, later, on the same track —
+        // and no tier-2 language shares a space with a tier-1 one: Kotlin and
+        // Scala are not in `Jvm`, because nothing resolves across the two and
+        // a shared space would commit Java's FQN grammar to their names.
+        let pairs = [
+            (Lang::Cpp, Domain::Cxx),
+            (Lang::CSharp, Domain::CSharp),
+            (Lang::Kotlin, Domain::Kotlin),
+            (Lang::Swift, Domain::Swift),
+            (Lang::Ruby, Domain::Ruby),
+            (Lang::Php, Domain::Php),
+            (Lang::Rust, Domain::Rust),
+            (Lang::Scala, Domain::Scala),
+            (Lang::Dart, Domain::Dart),
+            (Lang::Elixir, Domain::Elixir),
+            (Lang::Haskell, Domain::Haskell),
+            (Lang::Lua, Domain::Lua),
+            (Lang::Bash, Domain::Shell),
+            (Lang::Hcl, Domain::Hcl),
+        ];
+        for (lang, domain) in pairs {
+            assert_eq!(lang.domain(), domain, "{} moved domain", lang.name());
+        }
+        // Domain codes are hash inputs, so they are append-only too: the four
+        // tier-1 spaces keep 0–3 and the tier-2 ones start above them.
+        assert_eq!(Domain::Go.code(), 0);
+        assert_eq!(Domain::Jvm.code(), 1);
+        assert_eq!(Domain::EcmaScript.code(), 2);
+        assert_eq!(Domain::Python.code(), 3);
+        // Exactly `4..=17`, in that order: contiguous, no tier-1 code
+        // reused, and — the sequence being strictly increasing — every code
+        // distinct, which is what says no two languages share a domain.
+        let codes: Vec<u8> = pairs.iter().map(|(_, d)| d.code()).collect();
+        assert_eq!(codes, (4u8..=17).collect::<Vec<u8>>());
+    }
+
+    #[test]
     fn language_codes_are_the_committed_order_and_round_trip() {
         // Storage bytes. Appending is the only permitted change; a
         // renumbering re-keys every stored row silently.
@@ -694,11 +923,30 @@ mod tests {
         assert_eq!(Lang::JavaScript.code(), 2);
         assert_eq!(Lang::TypeScript.code(), 3);
         assert_eq!(Lang::Python.code(), 4);
+        // The ratified tier-2 order, appended above them and equally frozen.
+        assert_eq!(Lang::Cpp.code(), 5);
+        assert_eq!(Lang::CSharp.code(), 6);
+        assert_eq!(Lang::Kotlin.code(), 7);
+        assert_eq!(Lang::Swift.code(), 8);
+        assert_eq!(Lang::Ruby.code(), 9);
+        assert_eq!(Lang::Php.code(), 10);
+        assert_eq!(Lang::Rust.code(), 11);
+        assert_eq!(Lang::Scala.code(), 12);
+        assert_eq!(Lang::Dart.code(), 13);
+        assert_eq!(Lang::Elixir.code(), 14);
+        assert_eq!(Lang::Haskell.code(), 15);
+        assert_eq!(Lang::Lua.code(), 16);
+        assert_eq!(Lang::Bash.code(), 17);
+        assert_eq!(Lang::Hcl.code(), 18);
         for lang in Lang::ALL {
             assert_eq!(Lang::from_code(lang.code()), Some(*lang));
         }
-        assert_eq!(Lang::ALL.len(), 5);
-        assert_eq!(Lang::from_code(5), None);
+        // `ALL` is in code order and has no gaps, so the registry walking it
+        // walks every storage byte exactly once.
+        let codes: Vec<u8> = Lang::ALL.iter().map(|l| l.code()).collect();
+        assert_eq!(codes, (0u8..=18).collect::<Vec<u8>>());
+        assert_eq!(Lang::ALL.len(), 19);
+        assert_eq!(Lang::from_code(19), None);
     }
 
     #[test]
@@ -734,8 +982,16 @@ mod tests {
         }
         assert_eq!(Lang::for_extension("ts"), Some(Lang::TypeScript));
         assert_eq!(Lang::for_extension("py"), Some(Lang::Python));
-        // Unclaimed: nobody owns it, and `None` says so rather than guessing.
-        assert_eq!(Lang::for_extension("rs"), None);
+        assert_eq!(Lang::for_extension("rs"), Some(Lang::Rust));
+        // Unclaimed, and each on purpose. `.c` and `.h` are C, not C++:
+        // read on the `Cpp` track either would be read under the wrong
+        // grammar, so both wait for C's own decision. `.bats` is not shell:
+        // the shell grammar parses it without complaint and misreads it,
+        // which yields wrong records rather than none. `None` says so in
+        // every case rather than handing the file to a near-miss claimant.
+        assert_eq!(Lang::for_extension("c"), None);
+        assert_eq!(Lang::for_extension("h"), None);
+        assert_eq!(Lang::for_extension("bats"), None);
         assert_eq!(Lang::for_extension(""), None);
         // A `.d.ts` file's extension *is* `ts`; the `.d` is part of the stem.
         assert_eq!(
