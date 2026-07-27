@@ -1,15 +1,17 @@
 //! Python's [`Language`] impl: the constants the track is reported under and
 //! the three types only Python's own layers may read.
 //!
-//! `Scope` and `Config` are `()` until the resolver lands. That is a claim,
-//! not a placeholder: stage 1 is the extractor, and an extractor is handed one
-//! path and one source string, so nothing here has a scope or a project layout
-//! to read yet. Naming the fields before the resolver needs them would be
-//! guessing at a shape that phase 0 has not been written to fill.
+//! All three are now filled. [`PyHeader`] is what one file states about
+//! itself, [`PyScope`] is what the resolver reads that file's references
+//! against, and [`PyProject`] is the layout — which directories are packages,
+//! which are import roots, what the project declares as a dependency. The
+//! core moves all three and inspects none of them.
 
 use crate::lang::Language;
 use crate::model::{Domain, Lang};
 use crate::track_python::extract::PyHeader;
+use crate::track_python::project::PyProject;
+use crate::track_python::resolve::PyScope;
 
 /// The Python language. Stateless; only its associated types carry anything.
 pub struct PyLang;
@@ -33,8 +35,8 @@ impl Language for PyLang {
     }
 
     type Header = PyHeader;
-    type Scope = ();
-    type Config = ();
+    type Scope = PyScope;
+    type Config = PyProject;
 }
 
 #[cfg(test)]

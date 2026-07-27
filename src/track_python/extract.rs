@@ -57,6 +57,14 @@ pub enum ImportForm {
 pub struct ImportSpec {
     /// What the clause binds.
     pub form: ImportForm,
+    /// Whether the clause sits at module level, so what it binds is a module
+    /// global and an attribute of the module.
+    ///
+    /// A function-local `import` binds a local (§4.2.1, B-18): the reference
+    /// is still real and still resolves, but the name it binds must not enter
+    /// the module's binding table, or a same-named module-level use elsewhere
+    /// in the file would resolve through it.
+    pub at_module: bool,
     /// Where the clause sits.
     pub span: Span,
 }
@@ -120,6 +128,52 @@ impl ImportSpec {
     }
 }
 
+/// A name and the type its annotation reads (E-05).
+///
+/// Not a reference and not a definition: it is the *association* between a
+/// bound name and the type named beside it, which neither record can carry.
+/// Reading it is what makes `def f(c: Client): c.send()` resolvable with no
+/// type inference at all, and it is why such a site must never be filed under
+/// [`crate::UnresolvedReason::NeedsTypeInference`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnotatedName {
+    /// The nearest nameable enclosing definition's path, outermost first;
+    /// empty at module level. The same path
+    /// [`crate::model::Reference::enclosing`] carries, so a reference and the
+    /// annotation that types its root agree on which block they are in.
+    pub scope: Vec<String>,
+    /// The annotated name, mangled exactly as a reference to it would be.
+    pub name: String,
+    /// The annotation's dotted type path, as written. Only a plain name, a
+    /// dotted name, or a string forward reference is recorded: `Optional[T]`
+    /// and `A | B` name more than one type, and guessing which is the
+    /// receiver would be inference wearing an annotation's clothes.
+    pub type_path: Vec<String>,
+}
+
+/// What one class declaration says about where its members come from.
+///
+/// The `Inherit` references beside a class say *that* it has bases; they do
+/// not say **whose** they are, because a reference carries the nearest
+/// nameable encloser and not the declaration it decorates. Resolving
+/// `self.m()` needs the association, so the association is a header fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassFacts {
+    /// Owner chain plus the class's own name, mangled exactly as its FQN is.
+    pub path: Vec<String>,
+    /// Base-class expressions in source order — the same [`RefTarget`] the
+    /// `Inherit` reference beside each one carries, so the resolver reads one
+    /// parse rather than two.
+    ///
+    /// `metaclass=M` is deliberately absent: §3.3.3 makes it the class's
+    /// type, not a base, and it contributes nothing to the MRO.
+    pub bases: Vec<RefTarget>,
+    /// The class names a metaclass, so members may be injected at class
+    /// creation with no source site at all (F-11). Django's `ModelBase`
+    /// putting `objects` and `_meta` on every model is the corpus instance.
+    pub has_metaclass: bool,
+}
+
 /// Per-file Python facts only the Python resolver reads.
 ///
 /// `rel_path` is here for the same reason Go's is: a Python module's name is
@@ -155,6 +209,11 @@ pub struct PyHeader {
     /// The file mutates `sys.path`, so absolute imports elsewhere may mean
     /// something the configured roots cannot express (B-21).
     pub mutates_sys_path: bool,
+    /// Every `name: Type` association the file states, in source order (E-05).
+    pub annotations: Vec<AnnotatedName>,
+    /// Every nameable class the file declares, in source order, with its
+    /// bases — the input the resolver's static MRO is built from (E-01).
+    pub classes: Vec<ClassFacts>,
 }
 
 /// The Python extractor. Stateless.
@@ -324,7 +383,11 @@ fn enclosing_definition(node: &SgNode) -> Option<Encloser> {
 /// than an ordinary variable that happens to be called `self`.
 fn first_parameter_name(func: &SgNode) -> Option<String> {
     let params = func.field("parameters")?;
-    let p = params.children().find(|c| c.is_named())?;
+    parameter_name(&params.children().find(|c| c.is_named())?)
+}
+
+/// The name one parameter binds, whatever syntax declares it.
+fn parameter_name(p: &SgNode) -> Option<String> {
     match &*p.kind() {
         "identifier" => Some(p.text().to_string()),
         "default_parameter" | "typed_default_parameter" => {
@@ -721,6 +784,7 @@ fn import_specs(stmt: &SgNode) -> Vec<ImportSpec> {
             if let Some(star) = stmt.children().find(|c| c.kind() == "wildcard_import") {
                 return vec![ImportSpec {
                     form: ImportForm::Star { level, module },
+                    at_module: false,
                     span: span_of(&star),
                 }];
             }
@@ -748,6 +812,7 @@ fn module_spec(node: &SgNode) -> Option<ImportSpec> {
                 path: dotted_parts(node),
                 alias: None,
             },
+            at_module: false,
             span,
         }),
         "aliased_import" => Some(ImportSpec {
@@ -755,6 +820,7 @@ fn module_spec(node: &SgNode) -> Option<ImportSpec> {
                 path: dotted_parts(&node.field("name")?),
                 alias: Some(node.field("alias")?.text().to_string()),
             },
+            at_module: false,
             span,
         }),
         _ => None,
@@ -778,6 +844,7 @@ fn from_spec(node: &SgNode, level: u8, module: &[String]) -> Option<ImportSpec> 
             name,
             alias,
         },
+        at_module: false,
         span,
     })
 }
@@ -971,6 +1038,50 @@ fn push_annotation(node: &SgNode, refs: &mut Vec<Reference>, blocks: &Blocks) {
     }
 }
 
+/// The single type an annotation names, or `None` when it names none or many.
+///
+/// `c: Client` and `c: mod.Client` and `c: "Client"` (PEP 563/B-24) each name
+/// exactly one type. `c: Optional[Client]`, `c: Client | None` and
+/// `c: Sequence[Client]` do not: picking one of them as *the* receiver type is
+/// a guess, and a guess is what this whole layer exists not to make.
+fn annotation_type_path(node: &SgNode) -> Option<Vec<String>> {
+    // tree-sitter wraps a parameter or variable annotation in a `type` node.
+    let inner = if node.kind() == "type" {
+        node.children().find(|c| c.is_named())?
+    } else {
+        node.clone()
+    };
+    match &*inner.kind() {
+        "identifier" => Some(vec![inner.text().to_string()]),
+        "attribute" => {
+            let target = dotted_target(&inner);
+            (target.root == TargetRoot::Name && !target.segments.is_empty())
+                .then_some(target.segments)
+        }
+        "string" => {
+            string_forward_ref(&inner).map(|text| text.split('.').map(str::to_string).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Record one `name: Type` association, mangled the way a reference to either
+/// name would be, so the two sides can be compared without a second rule.
+fn push_annotated_name(header: &mut PyHeader, site: &SgNode, name: &str, annotation: &SgNode) {
+    let Some(mut type_path) = annotation_type_path(annotation) else {
+        return;
+    };
+    let class = innermost_class_name(site);
+    for segment in &mut type_path {
+        *segment = mangle(segment, class.as_deref());
+    }
+    header.annotations.push(AnnotatedName {
+        scope: enclosing_definition(site).map_or_else(Vec::new, |e| e.path),
+        name: mangle(name, class.as_deref()),
+        type_path,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Definitions
 // ---------------------------------------------------------------------------
@@ -1144,7 +1255,8 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
         match *rule_id {
             "import" | "import-from" | "import-future" => {
                 let at_module = place_of(node) == Place::Module;
-                for spec in import_specs(node) {
+                for mut spec in import_specs(node) {
+                    spec.at_module = at_module;
                     refs.push(reference(
                         RefKind::Import,
                         node,
@@ -1188,6 +1300,9 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                     for p in params.children().filter(|c| c.is_named()) {
                         if let Some(t) = p.field("type") {
                             push_annotation(&t, &mut refs, &blocks);
+                            if let Some(bound) = parameter_name(&p) {
+                                push_annotated_name(&mut header, &p, &bound, &t);
+                            }
                         }
                     }
                 }
@@ -1225,10 +1340,15 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                 };
                 // Bases are named whether or not the class itself is a node:
                 // the MRO the resolver builds is made of these.
+                let mut bases: Vec<RefTarget> = Vec::new();
+                let mut has_metaclass = false;
                 if let Some(supers) = node.field("superclasses") {
                     for base in supers.children().filter(|c| c.is_named()) {
                         let (kind, expr) = if base.kind() == "keyword_argument" {
                             // `metaclass=M` names M, but M is not a base.
+                            if base.field("name").is_some_and(|n| n.text() == "metaclass") {
+                                has_metaclass = true;
+                            }
                             match base.field("value") {
                                 Some(v) => (RefKind::TypeUse, v),
                                 None => continue,
@@ -1245,6 +1365,16 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                             span_of(&expr),
                             &blocks,
                         ));
+                        // Read back the target the reference just built rather
+                        // than parsing the same expression twice: private-name
+                        // mangling happens inside `reference`, and a base the
+                        // MRO walks has to be spelled the way the reference to
+                        // it is or the two disagree.
+                        if kind == RefKind::Inherit
+                            && let Some(pushed) = refs.last()
+                        {
+                            bases.push(pushed.target.clone());
+                        }
                     }
                 }
                 if place_of(node) == Place::Function {
@@ -1254,12 +1384,15 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                     name_node.text().as_ref(),
                     innermost_class_name(node).as_deref(),
                 );
-                defs.push(py_def(
-                    DefKind::Type,
-                    name,
-                    enclosing_classes(node),
-                    span_of(node),
-                ));
+                let owner = enclosing_classes(node);
+                let mut path = owner.clone();
+                path.push(name.clone());
+                header.classes.push(ClassFacts {
+                    path,
+                    bases,
+                    has_metaclass,
+                });
+                defs.push(py_def(DefKind::Type, name, owner, span_of(node)));
             }
             "assign" => {
                 let Some(left) = node.field("left") else {
@@ -1267,6 +1400,9 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                 };
                 if let Some(t) = node.field("type") {
                     push_annotation(&t, &mut refs, &blocks);
+                    if left.kind() == "identifier" {
+                        push_annotated_name(&mut header, node, &left.text(), &t);
+                    }
                 }
                 let place = place_of(node);
                 let class = innermost_class_name(node);

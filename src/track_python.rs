@@ -86,6 +86,9 @@ use crate::registry::Track;
 
 pub mod extract;
 pub mod lang;
+pub mod project;
+pub mod resolve;
+pub mod stdlib;
 
 /// Python's registration. `scan: None`: the track owns no file and
 /// contributes nothing to a scan until the work above lands.
