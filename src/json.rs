@@ -32,7 +32,7 @@ use crate::gate::{Counts, GateFailure, GateVerdict};
 use crate::model::{Lang, RefKind, reason_name};
 use crate::query::{Definition, Impact, Match, NodeKind, RefSite};
 use crate::resolution_rate;
-use crate::store::{Report, StoredOutcome};
+use crate::store::{FileError, Report, StoredOutcome};
 
 /// The version of the JSON contract this build emits.
 ///
@@ -50,7 +50,26 @@ pub fn scan(report: &Report, config: &Config) -> Value {
         "config": settings(config),
         "languages": languages(report),
         "fqn_collisions": report.fqn_collisions,
+        "file_errors": file_errors(&report.file_errors),
     })
+}
+
+/// The files a scan reached and could not read.
+///
+/// An array and not a count, because a count nobody can act on is a count
+/// nobody looks at: the whole point of recording these is that the paths are
+/// there. Empty on every clean scan, and always present — a reader never has
+/// to tell "no failures" from "this build did not report them".
+///
+/// One entry per file, so the count is the array's length. Additive, so
+/// [`SCHEMA`] does not move: a reader that ignores unknown keys is unaffected.
+fn file_errors(errors: &[FileError]) -> Value {
+    Value::Array(
+        errors
+            .iter()
+            .map(|e| json!({ "path": e.path, "error": e.message }))
+            .collect(),
+    )
 }
 
 /// Everything one `gate` run decided, as the document needs it.
@@ -251,6 +270,12 @@ pub const HELP: &str = concat!(
     "    rate                resolved / (resolved + unresolved), or null when\n",
     "                        there is nothing to measure\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
+    "  file_errors      [{ path, error }] — files the walk reached and could\n",
+    "                   not read: no permission, not UTF-8, gone mid-walk, or\n",
+    "                   a directory it could not descend into. The scan keeps\n",
+    "                   going and measures the rest, so this is how a smaller\n",
+    "                   file set than the tree holds becomes visible. One\n",
+    "                   entry per file; empty when every file read cleanly.\n",
     "  config           the settings this run read, which decide the file set\n",
     "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
@@ -486,6 +511,7 @@ mod tests {
                 },
             )]),
             fqn_collisions: 0,
+            file_errors: Vec::new(),
         };
         let reasons = &languages(&report)["go"]["unresolved_reasons"];
         assert_eq!(

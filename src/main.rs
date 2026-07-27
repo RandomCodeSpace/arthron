@@ -752,8 +752,29 @@ fn report_text(report: &arthron::store::Report) -> String {
     if report.fqn_collisions > 0 {
         outln!(text, "fqn collisions {}", report.fqn_collisions);
     }
+    // Also data, and the one line that says the counts above were taken over
+    // fewer files than the walk found. The paths are what makes it
+    // actionable, so a handful are printed; the rest are in `--json`, whole.
+    if !report.file_errors.is_empty() {
+        outln!(text, "file errors {}", report.file_errors.len());
+        for e in report.file_errors.iter().take(SHOWN_FILE_ERRORS) {
+            outln!(text, "             {}: {}", e.path, e.message);
+        }
+        if let Some(rest) = report.file_errors.len().checked_sub(SHOWN_FILE_ERRORS)
+            && rest > 0
+        {
+            outln!(text, "             … and {rest} more (see --json)");
+        }
+    }
     text
 }
+
+/// How many unreadable files the text report names before it stops listing.
+///
+/// The count is always exact; this bounds the *listing*, so a tree with a
+/// permissions problem across thousands of files does not bury the rates
+/// under its own paths. `--json` carries every one.
+const SHOWN_FILE_ERRORS: usize = 10;
 
 /// Width of the label column, matching [`print_report`]'s.
 const LABEL: usize = 12;

@@ -58,6 +58,24 @@ const CACHE_BYTES: usize = 96 * 1024 * 1024;
 /// The [`META`] key the resolver's manifest fingerprint is stored under.
 const CONFIG_DIGEST_KEY: &str = "config_digest";
 
+/// What both open paths say when redb's exclusive lock is already taken.
+///
+/// redb's own words for it are `Database already open. Cannot acquire lock.`
+/// — true, and it names neither the file nor the thing that is holding it, so
+/// a person who ran two scans at once reads it as corruption. One sentence,
+/// shared by [`Store::open`] and [`ReadStore::open`], because the situation
+/// is the same one from either side: somebody else has the writer's lock.
+///
+/// The lock is `flock(2)`, which redb takes with `try_lock` — non-blocking.
+/// A second open therefore *fails*; it does not queue behind the first and it
+/// does not wait for a transaction to finish. That is the property worth
+/// keeping, and `tests/store_held.rs` bounds it in wall-clock time so that a
+/// future change to a blocking lock fails the build instead of hanging a
+/// scan. `flock` conflicts are per open file description, so a second open
+/// inside one process is refused exactly as a second process is.
+pub const HELD_FOR_WRITING: &str =
+    "the store is held open for writing by another process — a scan is already running against it";
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
 const REFS: TableDefinition<(&str, &[u8]), &[u8]> = TableDefinition::new("refs");
@@ -527,6 +545,22 @@ impl LangTally {
     }
 }
 
+/// One file a scan reached and could not turn into facts.
+///
+/// The never-drop rule, applied one level below a reference: a file that
+/// cannot be read produces no reference at all, so no [`crate::Outcome`] can
+/// carry the failure and a rate computed over the rest is silently taken over
+/// a smaller file set than the one the walk found. Recording the file, with
+/// what the filesystem or the decoder said, is what keeps that visible.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileError {
+    /// The path, repo-relative when the walk got far enough to have one and
+    /// as the walk saw it otherwise.
+    pub path: String,
+    /// One line: what failed.
+    pub message: String,
+}
+
 /// Tallies for every language present in the store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -540,6 +574,20 @@ pub struct Report {
     /// common cause, and before this counter existed one of them silently
     /// overwrote the other.
     pub fqn_collisions: u64,
+    /// The files this scan could not read, sorted by path and deduplicated.
+    ///
+    /// Data like [`Report::fqn_collisions`], and filled by the same hand: the
+    /// store tallies what it holds, and the walk that found these tells the
+    /// report about them afterwards — [`Store::report`] leaves the list
+    /// empty because a store cannot know what a walk failed to reach. A read
+    /// failure is not a scan failure: the walk keeps going, every other file
+    /// is measured, and the ones that were not are named here rather than
+    /// vanishing between the file count and the reference count.
+    ///
+    /// Bounded by the walk's own file list, which a scan already holds in
+    /// full, so carrying every failure costs nothing a scan was not already
+    /// paying.
+    pub file_errors: Vec<FileError>,
 }
 
 /// The whole store as one comparable value: the incremental oracle.
@@ -574,11 +622,23 @@ impl Store {
     /// A store carrying any other [`SCHEMA_VERSION`] is wiped: its tables are
     /// dropped and recreated empty, so the next scan sees no known files and
     /// rebuilds everything.
+    ///
+    /// A store some other handle already holds is refused, immediately and by
+    /// name — see [`HELD_FOR_WRITING`]. There is one writer, and a second one
+    /// is told so rather than left waiting for the first to finish.
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = redb::Builder::new()
             .set_cache_size(CACHE_BYTES)
             .create(path)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                // Named rather than passed through: redb says only
+                // `Database already open. Cannot acquire lock.`, which names
+                // no file and no holder — see [`HELD_FOR_WRITING`].
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                }
+                other => format!("{}: {other}", path.display()),
+            })?;
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let stored = {
@@ -1278,10 +1338,9 @@ impl ReadStore {
             .set_cache_size(CACHE_BYTES)
             .open_read_only(path)
             .map_err(|e| match e {
-                redb::DatabaseError::DatabaseAlreadyOpen => format!(
-                    "{}: the store is open for writing — a scan is running against it",
-                    path.display(),
-                ),
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                }
                 other => format!("{}: {other}", path.display()),
             })?;
         let store = ReadStore { db };

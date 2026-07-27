@@ -26,7 +26,7 @@ use arthron::json::{self, GateOutput};
 use arthron::model::Lang;
 use arthron::pipeline::scan_repo;
 use arthron::query::{NameIndex, definition, impact, references};
-use arthron::store::{LangTally, ReadStore, Report};
+use arthron::store::{FileError, LangTally, ReadStore, Report};
 
 /// A report with one language's tally in it: 3 resolved out of a denominator
 /// of 4, so the rate is exactly 0.75 and the literal below carries no rounding.
@@ -42,6 +42,10 @@ fn report() -> Report {
             },
         )]),
         fqn_collisions: 1,
+        file_errors: vec![FileError {
+            path: "vendor/blob.go".to_string(),
+            message: "reading vendor/blob.go: stream did not contain valid UTF-8".to_string(),
+        }],
     }
 }
 
@@ -79,6 +83,10 @@ fn the_scan_document_is_exactly_this() {
             "config": no_settings(),
             "languages": languages(),
             "fqn_collisions": 1,
+            "file_errors": [{
+                "path": "vendor/blob.go",
+                "error": "reading vendor/blob.go: stream did not contain valid UTF-8",
+            }],
         }),
     );
 }
@@ -98,6 +106,9 @@ fn a_language_with_no_rows_has_no_entry() {
             "config": no_settings(),
             "languages": {},
             "fqn_collisions": 0,
+            // Present and empty, so a reader never has to tell "every file
+            // read cleanly" from "this build does not report that".
+            "file_errors": [],
         }),
     );
 }
