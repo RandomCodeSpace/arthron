@@ -50,20 +50,52 @@ pub fn node_id(domain: Domain, fqn: &str) -> NodeId {
 
 /// A language arthron attributes records to. Grows one variant per language.
 ///
-/// Codes 1–4 are reserved, in the committed language order, for `Java = 1`,
-/// `Js = 2`, `Ts = 3` and `Python = 4`. They are documented rather than
-/// declared so that nothing is ever renumbered when one lands.
+/// A *language* is not a [`Domain`] and not a track. It is the unit a
+/// resolution rate is reported under, and rates are never aggregated — which
+/// is why [`Lang::JavaScript`] and [`Lang::TypeScript`] are two variants even
+/// though they share [`Domain::EcmaScript`] and one resolver family. One
+/// combined EcmaScript number would let a collapse in one of them be masked
+/// by the other.
+///
+/// Codes 0–4 are the committed language order and are storage bytes: `Go = 0`,
+/// `Java = 1`, `JavaScript = 2`, `TypeScript = 3`, `Python = 4`. Appending is
+/// the only permitted change; nothing here is ever renumbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {
     /// The Go programming language.
     Go,
+    /// The Java programming language.
+    Java,
+    /// JavaScript, including the `.mjs` and `.cjs` module dialects.
+    JavaScript,
+    /// TypeScript. A `.d.ts` declaration file is a `.ts` file — the extension
+    /// is `ts` and the `.d` is part of the stem — so it needs no ownership
+    /// rule of its own.
+    TypeScript,
+    /// The Python programming language.
+    Python,
 }
 
 impl Lang {
+    /// Every language, in committed code order. The registry and the
+    /// extension lookup both walk this, so a variant that is not listed here
+    /// owns nothing.
+    pub const ALL: &'static [Lang] = &[
+        Lang::Go,
+        Lang::Java,
+        Lang::JavaScript,
+        Lang::TypeScript,
+        Lang::Python,
+    ];
+
     /// Stable one-byte code used in reporting and storage. Never renumber.
     pub fn code(self) -> u8 {
         match self {
             Lang::Go => 0,
+            Lang::Java => 1,
+            Lang::JavaScript => 2,
+            Lang::TypeScript => 3,
+            Lang::Python => 4,
         }
     }
 
@@ -71,6 +103,10 @@ impl Lang {
     pub fn name(self) -> &'static str {
         match self {
             Lang::Go => "go",
+            Lang::Java => "java",
+            Lang::JavaScript => "javascript",
+            Lang::TypeScript => "typescript",
+            Lang::Python => "python",
         }
     }
 
@@ -78,6 +114,10 @@ impl Lang {
     pub fn from_code(c: u8) -> Option<Lang> {
         match c {
             0 => Some(Lang::Go),
+            1 => Some(Lang::Java),
+            2 => Some(Lang::JavaScript),
+            3 => Some(Lang::TypeScript),
+            4 => Some(Lang::Python),
             _ => None,
         }
     }
@@ -86,7 +126,35 @@ impl Lang {
     pub fn domain(self) -> Domain {
         match self {
             Lang::Go => Domain::Go,
+            Lang::Java => Domain::Jvm,
+            Lang::JavaScript | Lang::TypeScript => Domain::EcmaScript,
+            Lang::Python => Domain::Python,
         }
+    }
+
+    /// File extensions this language owns, without the dot.
+    ///
+    /// Ownership is a partition: exactly one language owns any extension, so
+    /// a walk never has to ask which of two claimants meant it. That is what
+    /// keeps [`Lang::for_extension`] a function rather than a policy.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Lang::Go => &["go"],
+            Lang::Java => &["java"],
+            Lang::JavaScript => &["js", "mjs", "cjs"],
+            Lang::TypeScript => &["ts"],
+            Lang::Python => &["py"],
+        }
+    }
+
+    /// Whether this language owns files with this extension (no dot).
+    pub fn owns_extension(self, ext: &str) -> bool {
+        self.extensions().contains(&ext)
+    }
+
+    /// The single language owning this extension (no dot), if any.
+    pub fn for_extension(ext: &str) -> Option<Lang> {
+        Lang::ALL.iter().copied().find(|l| l.owns_extension(ext))
     }
 }
 
@@ -568,8 +636,70 @@ mod tests {
     fn a_language_hashes_in_its_own_domain() {
         assert_eq!(Lang::Go.domain(), Domain::Go);
         assert_eq!(Lang::Go.domain().code(), Lang::Go.code());
-        assert_eq!(Lang::from_code(Lang::Go.code()), Some(Lang::Go));
-        assert_eq!(Lang::from_code(1), None); // reserved, not yet declared
+        assert_eq!(Lang::Java.domain(), Domain::Jvm);
+        assert_eq!(Lang::Python.domain(), Domain::Python);
+    }
+
+    #[test]
+    fn language_codes_are_the_committed_order_and_round_trip() {
+        // Storage bytes. Appending is the only permitted change; a
+        // renumbering re-keys every stored row silently.
+        assert_eq!(Lang::Go.code(), 0);
+        assert_eq!(Lang::Java.code(), 1);
+        assert_eq!(Lang::JavaScript.code(), 2);
+        assert_eq!(Lang::TypeScript.code(), 3);
+        assert_eq!(Lang::Python.code(), 4);
+        for lang in Lang::ALL {
+            assert_eq!(Lang::from_code(lang.code()), Some(*lang));
+        }
+        assert_eq!(Lang::ALL.len(), 5);
+        assert_eq!(Lang::from_code(5), None);
+    }
+
+    #[test]
+    fn javascript_and_typescript_share_a_domain_and_nothing_else() {
+        // One identity space, because a `.ts` file naming a definition in a
+        // `.js` file has to probe an identity that can exist.
+        assert_eq!(Lang::JavaScript.domain(), Domain::EcmaScript);
+        assert_eq!(Lang::TypeScript.domain(), Domain::EcmaScript);
+        // Two languages, because a rate is per language and never
+        // aggregated: one EcmaScript number would let a collapse in one of
+        // them be masked by the other.
+        assert_ne!(Lang::JavaScript, Lang::TypeScript);
+        assert_ne!(Lang::JavaScript.code(), Lang::TypeScript.code());
+        assert_ne!(Lang::JavaScript.name(), Lang::TypeScript.name());
+        // A language code is not a domain code, and only Go's coincide.
+        assert_ne!(Lang::TypeScript.code(), Lang::TypeScript.domain().code());
+    }
+
+    #[test]
+    fn every_extension_has_exactly_one_owner() {
+        let mut seen: Vec<&str> = Vec::new();
+        for lang in Lang::ALL {
+            for ext in lang.extensions() {
+                assert!(!seen.contains(ext), "two languages claim `.{ext}`");
+                seen.push(ext);
+                assert_eq!(Lang::for_extension(ext), Some(*lang));
+            }
+        }
+        assert_eq!(Lang::for_extension("go"), Some(Lang::Go));
+        assert_eq!(Lang::for_extension("java"), Some(Lang::Java));
+        for ext in ["js", "mjs", "cjs"] {
+            assert_eq!(Lang::for_extension(ext), Some(Lang::JavaScript));
+        }
+        assert_eq!(Lang::for_extension("ts"), Some(Lang::TypeScript));
+        assert_eq!(Lang::for_extension("py"), Some(Lang::Python));
+        // Unclaimed: nobody owns it, and `None` says so rather than guessing.
+        assert_eq!(Lang::for_extension("rs"), None);
+        assert_eq!(Lang::for_extension(""), None);
+        // A `.d.ts` file's extension *is* `ts`; the `.d` is part of the stem.
+        assert_eq!(
+            std::path::Path::new("a/b/types.d.ts")
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(Lang::for_extension),
+            Some(Lang::TypeScript),
+        );
     }
 
     #[test]
