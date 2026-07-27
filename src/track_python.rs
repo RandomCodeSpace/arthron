@@ -1,67 +1,118 @@
-//! The Python track. **Not live.** Owns `.py`.
+//! The Python track. **Live.** Owns `.py`.
 //!
-//! [`TRACK`] is registered with `scan: None`, so the driver runs nothing for
-//! Python and [`crate::registry::Track::owns_extension`] answers `false` for
-//! `py`. The seam exists; the work does not.
+//! [`TRACK`] carries `scan: Some(`[`resolve::scan_python`]`)`, so
+//! [`crate::registry::Track::owns_extension`] answers `true` for `py` and the
+//! driver runs Python over every `.py` file the walk reaches. Three layers,
+//! and the boundary between them is the project's first non-negotiable:
 //!
-//! # Going live
+//! - [`extract`] — one file in, records out, **never an edge**. It is handed a
+//!   path and a source string and has nothing it could link against.
+//! - [`project`] — phase 0: which directories are packages, which are import
+//!   roots, what the project declares as a dependency. Python states a
+//!   module's name in packaging metadata rather than in the source, so this is
+//!   what one `go.mod` line is to Go, spread across four formats.
+//! - [`resolve`] — the one place a Python [`crate::Outcome`] is produced.
+//!   Every reference ends `Resolved`, `External`, or `Unresolved(reason)`, and
+//!   there is no way to express "dropped".
 //!
-//! Every step happens inside this file or under `src/track_python/`. Nothing
-//! in `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track
-//! moves.
+//! [`stdlib`] holds the two name sets that come from outside any repository:
+//! `sys.stdlib_module_names` and the builtins.
 //!
-//! 1. **Submodules, nested.** `mod extract;`, `mod resolve;` here resolve to
-//!    `src/track_python/extract.rs` and `src/track_python/resolve.rs`;
-//!    `lib.rs` already declares `track_python`.
-//! 2. **A [`crate::lang::Language`] impl**, say `PyLang`, with
-//!    `const LANG = Lang::Python`, `const DOMAIN = Domain::Python`,
-//!    `extensions()` returning [`Lang::extensions`] for `Lang::Python` rather
-//!    than a second list, `skip_dirs()` for virtual environments and caches
-//!    (`.venv`, `venv`, `__pycache__`, `.tox`), and the three associated
-//!    types. `Config` is where the import root lives: a package is a
-//!    directory, and which directory is the root is a project fact, so a
-//!    layout it cannot determine is
-//!    [`crate::UnresolvedReason::ProjectLayoutUnknown`] and not a guess.
-//! 3. **An extractor** implementing [`crate::lang::Extractor`], parsing with
-//!    [`crate::sg::SourceTree::parse_python`]. It emits
-//!    [`crate::model::Definition`] and [`crate::model::Reference`] records and
-//!    **never an edge**.
-//! 4. **A resolver** implementing [`crate::lang::Resolver`]: the one place a
-//!    Python [`crate::Outcome`] is produced. Every reference ends `Resolved`,
-//!    `External`, or `Unresolved(reason)`; nothing is dropped. A name bound
-//!    by an assignment, parameter, comprehension, `with` or `except` clause
-//!    ends `Unresolved(LocalBinding)` — reported beside `External` and
-//!    excluded from both terms of the rate.
-//! 5. **Honest reasons.** Python's floor is the largest of the four and is
-//!    supposed to be: `x.m()` where `x` has no annotation is
-//!    [`crate::UnresolvedReason::NeedsTypeInference`], a monkeypatch is
-//!    [`crate::UnresolvedReason::Generated`] or a `Rebind` reference, a
-//!    `from m import *` whose source cannot be enumerated is
-//!    [`crate::UnresolvedReason::WildcardImport`]. A first measurement that
-//!    is mostly `NeedsTypeInference` is the correct measurement. Moving any
-//!    of it into `LocalBinding` or `External` takes it out of the rate's
-//!    denominator and raises the number without linking anything; that is the
-//!    failure mode this track is reviewed for.
-//! 6. **An entry point** with the shape of [`crate::registry::TrackScan`]:
-//!    `fn scan_python(root, db)`, whose body is
-//!    `crate::pipeline::scan::<PyLang>(root, db, &PyExtractor, &PyResolver)`.
-//! 7. **Flip the switch here**: `scan: None` becomes `scan: Some(scan_python)`.
-//! 8. **A baseline**, recorded with `arthron gate --rebase`. Python's rate is
-//!    Python's own and is never averaged into anyone else's.
+//! Sharing the store with the other live tracks is safe in both directions: a
+//! scan forgets only files carrying an extension the running track owns, and
+//! extension ownership is a partition (see [`Lang::for_extension`]); the
+//! manifest fence is per language, and Python's digest is empty when no
+//! manifest was read, which is no opinion rather than a mismatch.
 //!
-//! Sharing the store with a live Go track is safe: a scan forgets only files
-//! carrying an extension the running track owns, and extension ownership is a
-//! partition (see [`Lang::for_extension`]).
+//! # The honesty posture, and what it costs
+//!
+//! Python's unresolved floor is the largest of the four tier-1 languages and
+//! is **supposed** to be. `x.m()` where `x` has no annotation genuinely needs
+//! type inference; `self.client.get()` genuinely needs the type of an
+//! attribute nobody declared. Both are
+//! [`crate::UnresolvedReason::NeedsTypeInference`], and a first measurement
+//! that is mostly that reason is the correct measurement.
+//!
+//! Two moves would raise the rate without linking anything, because both
+//! [`crate::UnresolvedReason::LocalBinding`] and `External` sit outside *both*
+//! terms of the rate:
+//!
+//! - **Widening `LocalBinding`.** Only a reference whose *whole* target is one
+//!   block-bound name is a local binding. `c.send()` where `c` is a parameter
+//!   names `send`, which is a node; it stays in the denominator and goes to
+//!   the annotation table (E-05) and then to an honest reason. A function-local
+//!   `import os` reports `locally_bound` for the very name it introduces
+//!   (B-18) and still resolves as the module reference it is.
+//! - **Widening `External`.** Go decides "standard library?" by asking whether
+//!   the first path segment contains a dot. That test is *inverted* for Python
+//!   — every third-party top-level name has no dot either — so [`stdlib`]
+//!   embeds the frozen set instead, and a package that is neither standard
+//!   library nor a declared dependency is
+//!   [`crate::UnresolvedReason::UnknownPackage`] and counts against the rate.
+//!
+//! # Known under-counts
+//!
+//! Recorded here rather than left to be rediscovered, because each is a
+//! *known* shortfall and none may be quietly closed by widening a bucket:
+//!
+//! - **Attribute reads.** `obj.x` that is not called is not a reference, so a
+//!   `@property` read is a missing edge rather than a wrong one (E-10). A
+//!   blanket read kind would multiply reference volume for modest gain.
+//! - **Module-level `for`, `with` and `except` targets** bind module globals
+//!   and are not emitted as definitions; only assignments, `def`, `class`,
+//!   imports, `__slots__` and `global` writes are. References to such a name
+//!   miss honestly rather than resolve to nothing quietly.
+//! - **Framework string literals.** `mock.patch("pkg.mod.f")` (H-04) and
+//!   `importlib.import_module("a.b")` (B-19) name things literally, and a
+//!   framework rule — not the core extractor — is what turns them into
+//!   references. Until such a rule exists both forms are ordinary calls: the
+//!   call to `import_module` resolves as the standard-library call it is, and
+//!   the specifier — literal or variable — is not a reference at all, so no
+//!   edge is invented for a module named by a string. That means
+//!   [`crate::UnresolvedReason::DynamicModuleSpecifier`] is currently
+//!   unreachable in this track rather than a bucket the corpus fills; when the
+//!   framework rule lands it is the reason the *variable* form must take, and
+//!   a guessed target is never the alternative.
+//! - **Cross-file supertypes.** A base class declared in another file gets one
+//!   probe and no expansion, because the symbol table answers whether an
+//!   identity exists and never what its bases are. The shortfall is
+//!   [`crate::UnresolvedReason::UnindexedSupertype`], and closing it needs the
+//!   phase 1.5 that [`crate::lang::Resolver::link_kinds`] describes and the
+//!   driver does not yet run.
+//! - **Star-import chains.** `from x import *` re-exports the names `x`
+//!   itself imported, transitively (B-10), so a source that star-imports in
+//!   turn passes that chain on. The chain is followed one hop: the probes run
+//!   against what the source *declares*, and a resolver holding one file's
+//!   facts and a membership-only symbol table cannot see the second hop. A
+//!   miss under any star import is therefore
+//!   [`crate::UnresolvedReason::WildcardImport`] and not
+//!   `NoMatchingDefinition` — the weaker claim is the true one, and closing
+//!   the gap needs the same phase 1.5 as the supertype shortfall above.
+//! - **Re-export chains.** `from pkg import Foo` where `pkg/__init__.py`
+//!   re-exports `Foo` resolves to the alias node in `pkg/__init__.py` — a real
+//!   declaration site, one hop short of the definition, because the store does
+//!   not surface [`crate::lang::Entry::Alias`].
+//!
+//! A baseline is recorded with `arthron gate --rebase`. Python's rate is
+//! Python's own and is never averaged into anyone else's.
 
 use crate::model::Lang;
 use crate::registry::Track;
 
-/// Python's registration. `scan: None`: the track owns no file and
-/// contributes nothing to a scan until the work above lands.
+pub mod extract;
+pub mod lang;
+pub mod project;
+pub mod resolve;
+pub mod stdlib;
+
+/// Python's registration. **Live**: the track owns `.py`, so
+/// [`crate::registry::Track::owns_extension`] answers `true` for it and the
+/// driver runs [`resolve::scan_python`] over every Python file the walk
+/// reaches.
 pub const TRACK: Track = Track {
     name: "python",
     langs: &[Lang::Python],
-    scan: None,
+    scan: Some(resolve::scan_python),
 };
 
 #[cfg(test)]
@@ -69,10 +120,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn python_is_registered_but_not_live() {
-        assert!(!TRACK.is_enabled());
+    fn python_is_registered_and_live() {
+        assert!(TRACK.is_enabled());
         assert_eq!(TRACK.langs, [Lang::Python]);
         assert!(Lang::Python.owns_extension("py"));
-        assert!(!TRACK.owns_extension("py"));
+        // Extension ownership is a property of the language whether or not
+        // anything is built for it; whether a scan reads such a file is a
+        // property of the track, and the track now says yes.
+        assert!(TRACK.owns_extension("py"));
+        // Python reports one rate, under its own language code, and shares an
+        // identity space with nobody.
+        assert_eq!(Lang::Python.domain(), crate::model::Domain::Python);
     }
 }
