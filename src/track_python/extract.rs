@@ -509,9 +509,18 @@ struct BlockScope {
     globals: HashSet<String>,
     /// Names a `nonlocal` statement binds in an enclosing function (C-08).
     nonlocals: HashSet<String>,
-    /// A comprehension's leading iterable, evaluated in the *enclosing*
-    /// scope, so the comprehension's own targets do not bind it (C-05).
-    leading_iterable: Option<(usize, usize)>,
+    /// Byte ranges inside this block that Python evaluates in the *enclosing*
+    /// scope, so this block's own bindings must not be consulted for a
+    /// reference sitting in one.
+    ///
+    /// Two shapes qualify. A comprehension's leading iterable (C-05). And a
+    /// function header — parameter defaults, parameter annotations, the
+    /// return annotation and the type-parameter list — which §8.8 and
+    /// PEP 484/526 evaluate at `def` time, before the block the `def` creates
+    /// exists. The grammar puts all of them under `function_definition` as
+    /// siblings of `body`, which is exactly why a walk up the ancestors finds
+    /// the wrong scope without this.
+    evaluated_outside: Vec<(usize, usize)>,
 }
 
 /// Every binding block in one file, keyed by byte range.
@@ -555,12 +564,22 @@ fn block_scope(node: &SgNode) -> BlockScope {
         }
         if let Some(right) = clauses.first().and_then(|c| c.field("right")) {
             let r = right.range();
-            s.leading_iterable = Some((r.start, r.end));
+            s.evaluated_outside.push((r.start, r.end));
         }
         return s;
     }
     if let Some(params) = node.field("parameters") {
         bind_parameters(&params, &mut s.bound);
+        // The parameter *names* bind here; everything else written inside the
+        // list — defaults and annotations — is evaluated outside.
+        let r = params.range();
+        s.evaluated_outside.push((r.start, r.end));
+    }
+    for field in ["return_type", "type_parameters"] {
+        if let Some(n) = node.field(field) {
+            let r = n.range();
+            s.evaluated_outside.push((r.start, r.end));
+        }
     }
     if let Some(body) = node.field("body") {
         collect_bindings(&body, &mut s);
@@ -756,9 +775,10 @@ fn is_locally_bound(blocks: &Blocks, node: &SgNode, name: &str) -> bool {
         let Some(scope) = blocks.get(&a) else {
             continue;
         };
-        if let Some((start, end)) = scope.leading_iterable
-            && site >= start
-            && site < end
+        if scope
+            .evaluated_outside
+            .iter()
+            .any(|&(start, end)| site >= start && site < end)
         {
             continue; // evaluated in the enclosing scope
         }
@@ -971,6 +991,19 @@ fn dotted_target(expr: &SgNode) -> RefTarget {
         root: TargetRoot::Expr,
         segments,
     }
+}
+
+/// Peel a generic subscription off an expression in a type position.
+///
+/// `Store[T]` names `Store`; `a.b.C[int]` names `a.b.C`. Only the outermost
+/// subscription is removed, because that is the only one the grammar can put
+/// there — `Store[T][U]` is not a base-class shape any spec sanctions, and
+/// peeling repeatedly would start unwrapping real expressions.
+fn strip_type_subscript<'a>(expr: &SgNode<'a>) -> SgNode<'a> {
+    if expr.kind() != "subscript" {
+        return expr.clone();
+    }
+    expr.field("value").unwrap_or_else(|| expr.clone())
 }
 
 /// The number of arguments at a call site.
@@ -1410,6 +1443,14 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                         } else {
                             (RefKind::Inherit, base.clone())
                         };
+                        // §8.9 + PEP 484: a base written `Store[T]` is a
+                        // *subscription in a type position*, and the class it
+                        // names is `Store`. Stripped here and nowhere else —
+                        // `dotted_target` must keep treating a subscript in an
+                        // expression position as opaque, because `d["k"].m()`
+                        // is an item lookup and descending into it would
+                        // invent a receiver nobody wrote (§I.2, E-07).
+                        let expr = strip_type_subscript(&expr);
                         refs.push(reference(
                             kind,
                             &expr,

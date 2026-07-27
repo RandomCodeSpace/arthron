@@ -1760,6 +1760,107 @@ mod tests {
     }
 
     #[test]
+    fn a_default_or_annotation_is_evaluated_in_the_enclosing_scope() {
+        // §8.8 and PEP 484/526: a parameter default and an annotation are
+        // evaluated at `def` time, in the block *around* the function, not
+        // inside the one the `def` creates. They sit under
+        // `function_definition` as siblings of `body`, so consulting the
+        // function's own bound set for them makes a name the body happens to
+        // rebind swallow a reference that never enters the body at all —
+        // straight out of both terms of the rate through `LocalBinding`.
+        let cfg = project(&["pkg"]);
+        let annotated = concat!(
+            "class Config:\n",
+            "    pass\n",
+            "\n",
+            "def load(path) -> Config:\n",
+            "    Config = read(path)\n",
+            "    return Config\n",
+        );
+        assert_eq!(
+            outcome_of(&cfg, "pkg/mod.py", annotated, &["pkg.mod#Config"], "Config"),
+            resolved_to("pkg.mod#Config")
+        );
+        // The same rule, on the default side, where the parameter shadows the
+        // very module the default reads from.
+        let defaulted = concat!(
+            "import queue\n",
+            "\n",
+            "def spawn(queue=queue.Queue()):\n",
+            "    return queue\n",
+        );
+        assert_eq!(
+            outcome_of(&cfg, "pkg/mod.py", defaulted, &[], "queue.Queue"),
+            Outcome::External("py:std:queue".to_string())
+        );
+        // The body is still the function's own scope, and a name bound there
+        // is still a local — the exclusion must not leak past the header.
+        // (A call, because a bare identifier load is not a reference at all.)
+        let body = concat!(
+            "class Config:\n",
+            "    pass\n",
+            "\n",
+            "def load(path):\n",
+            "    Config = read(path)\n",
+            "    return Config()\n",
+        );
+        assert_eq!(
+            reason(&cfg, "pkg/mod.py", body, &["pkg.mod#Config"], "Config"),
+            UnresolvedReason::LocalBinding
+        );
+    }
+
+    #[test]
+    fn a_generic_base_class_is_still_a_base_class() {
+        // E-01 rests on the static MRO, and the MRO is made of base-class
+        // references. `class Repo(Store[T])` writes the base as a `subscript`,
+        // and a target parsed straight off that node keeps no segments at all
+        // — so the base named nothing, the walk had nowhere to go, and every
+        // inherited member of a generic base was unreachable.
+        //
+        // The subscription is stripped at the base-class site and nowhere
+        // else: in a *type* position `Store[T]` names the class `Store`, but
+        // in an expression position `d["k"]` is an item lookup and descending
+        // into it would invent a receiver nobody wrote.
+        let cfg = project(&["pkg"]);
+        let source = concat!(
+            "from typing import Generic, TypeVar\n",
+            "\n",
+            "T = TypeVar(\"T\")\n",
+            "\n",
+            "class Store(Generic[T]):\n",
+            "    def save(self):\n",
+            "        pass\n",
+            "\n",
+            "class Repo(Store[T]):\n",
+            "    def use(self):\n",
+            "        return self.save()\n",
+        );
+        assert_eq!(
+            outcome_of(
+                &cfg,
+                "pkg/mod.py",
+                source,
+                &["pkg.mod#Store", "pkg.mod#Store.save", "pkg.mod#Repo"],
+                "self.save"
+            ),
+            resolved_to("pkg.mod#Store.save")
+        );
+        // The expression position must keep its honest reason: a member on a
+        // subscript result needs the type of that result (§I.2).
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/mod.py",
+                "def f(d):\n    return d[\"k\"].m()\n",
+                &[],
+                "d[\"k\"].m"
+            ),
+            UnresolvedReason::NeedsExpressionType
+        );
+    }
+
+    #[test]
     fn a_local_shadowing_a_builtin_does_not_leave_the_rate_as_external() {
         // C-02, and the same anti-gaming property `resolve_name` protects when
         // it refuses to call a dotted target `LocalBinding`: a reference whose
