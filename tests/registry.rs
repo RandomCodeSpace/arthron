@@ -88,16 +88,25 @@ fn a_disabled_track_owns_no_file() {
         }
     }
     // And the converse, so this test cannot pass by the registry being empty.
+    // Which tracks beyond Go are live changes as tracks land; Go always is.
     let live: Vec<&str> = REGISTRY
         .iter()
         .filter(|t| t.is_enabled())
         .map(|t| t.name)
         .collect();
-    assert_eq!(live, ["go"]);
+    assert!(live.contains(&"go"), "go is not live: {live:?}");
+}
+
+/// The track that owns `file`'s extension, if any language claims it.
+fn owning_track(file: &str) -> Option<&'static arthron::registry::Track> {
+    let ext = Path::new(file).extension().and_then(|e| e.to_str())?;
+    REGISTRY
+        .iter()
+        .find(|t| t.langs.iter().any(|l| l.extensions().contains(&ext)))
 }
 
 #[test]
-fn scanning_a_mixed_language_tree_scans_only_go() {
+fn scanning_a_mixed_language_tree_reads_only_live_tracks() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     mixed_tree(root);
@@ -105,13 +114,22 @@ fn scanning_a_mixed_language_tree_scans_only_go() {
 
     let report = scan_repo(root, &db).expect("scan succeeds");
 
-    // One report line, and it is Go's. Not one line per registered language:
-    // a track that read nothing has nothing to report, and inventing a zero
-    // row for it would make "not built" look like "measured, found nothing".
-    assert_eq!(
-        report.per_lang.keys().copied().collect::<Vec<_>>(),
-        [Lang::Go.code()]
-    );
+    // Every report line belongs to a live track — never one line per
+    // registered language: a track that read nothing has nothing to report,
+    // and inventing a zero row for it would make "not built" look like
+    // "measured, found nothing". Go's line is always among them.
+    for code in report.per_lang.keys() {
+        let lang = Lang::from_code(*code).expect("reported lang exists");
+        let track = REGISTRY
+            .iter()
+            .find(|t| t.langs.contains(&lang))
+            .expect("reported lang is registered");
+        assert!(
+            track.is_enabled(),
+            "disabled track `{}` produced a report line",
+            track.name,
+        );
+    }
     let go = &report.per_lang[&Lang::Go.code()];
     assert!(go.resolved > 0, "the Go half of the tree still resolves");
 
@@ -120,22 +138,33 @@ fn scanning_a_mixed_language_tree_scans_only_go() {
     // it did or did not extract.
     let store = Store::open(&db).expect("store opens");
     let files = store.known_files().expect("known files");
-    assert_eq!(files, ["app/app.go"]);
+    assert!(
+        files.contains(&"app/app.go".to_string()),
+        "the Go file was not scanned: {files:?}",
+    );
     for file in &files {
-        let ext = Path::new(file).extension().and_then(|e| e.to_str());
-        assert_eq!(ext, Some("go"), "{file} is not a Go file");
+        let track = owning_track(file).expect("scanned file has an owner");
+        assert!(
+            track.is_enabled(),
+            "disabled track `{}` leaked a read of {file}",
+            track.name,
+        );
     }
 }
 
 #[test]
-fn the_registry_scan_and_the_go_scan_agree_while_go_is_the_only_track() {
+fn the_registry_scan_never_changes_gos_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     mixed_tree(root);
 
-    // Two cold stores, same tree: going through the registry must not change
-    // one byte of what a direct Go scan produces.
+    // Two cold stores, same tree: whatever other tracks are live, going
+    // through the registry must not change one byte of Go's tally against
+    // a direct Go-only scan.
     let via_registry = scan_repo(root, &root.join("registry.redb")).expect("registry scan");
     let via_go = scan_go(root, &root.join("go.redb")).expect("go scan");
-    assert_eq!(via_registry, via_go);
+    assert_eq!(
+        via_registry.per_lang[&Lang::Go.code()],
+        via_go.per_lang[&Lang::Go.code()],
+    );
 }
