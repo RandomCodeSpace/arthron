@@ -10,6 +10,8 @@
 
 use crate::lang::Language;
 use crate::model::{DeclSpace, Domain, Lang, Span};
+use crate::track_ecma::project::EcmaConfig;
+use crate::track_ecma::resolve::EcmaScope;
 
 /// Which grammar a file is parsed with.
 ///
@@ -171,21 +173,34 @@ pub struct EcmaHeader {
     pub exports: Vec<ExportEntry>,
 }
 
-/// The EcmaScript resolver's per-file scope.
+/// A reserved owner segment marking a declaration in the **Type** space.
 ///
-/// Empty until the resolver lands: the binding table it will hold is built
-/// from [`EcmaHeader`] plus a probe, and building it is a linking step the
-/// extractor is not allowed to take.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EcmaScope;
+/// [`crate::model::Encloser`] carries a path and a kind and no space, and
+/// [`crate::model::Encloser::as_definition`] hardcodes [`DeclSpace::Value`] —
+/// so an FQN that read `Definition.space` would make an interface member's
+/// outgoing edge start at an identity no node has. The tag rides in the owner
+/// chain, which `as_definition` *does* preserve, and it is spelled with angle
+/// brackets precisely because no `IdentifierName` can be.
+pub const SPACE_TAG_TYPE: &str = "<type>";
 
-/// The EcmaScript resolver's project configuration.
+/// A reserved owner segment marking a declaration in the **Namespace** space.
+/// See [`SPACE_TAG_TYPE`].
+pub const SPACE_TAG_NS: &str = "<ns>";
+
+/// A reserved owner segment marking a declaration in the **Value** space.
 ///
-/// Empty until the resolver lands. It will carry the `package.json` scopes,
-/// the tsconfig chain's `baseUrl`/`paths`, and the condition set — none of
-/// which any extractor may read.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EcmaConfig;
+/// Never emitted — an untagged chain already means `Value` — but accepted, so
+/// a caller that tags every space explicitly is not silently wrong.
+pub const SPACE_TAG_VALUE: &str = "<value>";
+
+/// The declaration space a reserved owner tag names.
+pub fn space_tag(space: DeclSpace) -> Option<&'static str> {
+    match space {
+        DeclSpace::Value => None,
+        DeclSpace::Type => Some(SPACE_TAG_TYPE),
+        DeclSpace::Namespace => Some(SPACE_TAG_NS),
+    }
+}
 
 /// JavaScript, as the shared driver sees it.
 pub struct JsLang;

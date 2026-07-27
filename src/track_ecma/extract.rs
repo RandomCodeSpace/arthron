@@ -42,7 +42,7 @@ use crate::sg::{Rules, SgNode, SourceTree, span_of};
 use crate::track_ecma::bind::{is_function_like, is_locally_bound, pattern_names};
 use crate::track_ecma::lang::{
     Dialect, EcmaHeader, ExportEntry, ImportBinding, ImportSyntax, ImportedName, JsLang,
-    ModuleImport, ModuleKind, ModuleKindSource, TsLang,
+    ModuleImport, ModuleKind, ModuleKindSource, TsLang, space_tag,
 };
 
 /// The embedded JavaScript extraction rules.
@@ -69,6 +69,17 @@ pub const EXPORT_EQUALS: &str = "export=";
 /// its owner cannot be derived from the path. Not a valid identifier, for the
 /// same reason [`DEFAULT_LOCAL`] is not.
 pub const GLOBAL_OWNER: &str = "<global>";
+
+/// The reserved name of the marker recording that a module's export set is
+/// not enumerable from this file.
+///
+/// `export * from './x'` makes the set a fixed point over the module graph
+/// (ES `GetExportedNames`) and a `module.exports` spread makes it a runtime
+/// value. Either way a later lookup that misses must be able to say "the set
+/// could not be enumerated" rather than "the name is absent", and this is the
+/// node that lets it. `*` is not a valid `IdentifierName`, so it collides
+/// with nothing written.
+pub const STAR_EXPORT: &str = "*";
 
 /// The JavaScript extractor. Stateless.
 pub struct JsExtractor;
@@ -404,6 +415,13 @@ fn member_target(node: &SgNode) -> RefTarget {
 /// inside one belongs to the named definition around it. A named declaration
 /// that is itself inside a function is skipped for the same reason — the
 /// walk continues outward until it finds one the graph can hold.
+///
+/// The returned path carries a reserved space tag whenever the enclosing
+/// declaration is not in the Value space. [`Encloser`] has no space field and
+/// [`Encloser::as_definition`] hardcodes [`DeclSpace::Value`], so without the
+/// tag an edge out of an `interface` body would be sourced at an identity no
+/// node has — see the FQN grammar's fourth invariant in
+/// [`crate::track_ecma::resolve`].
 fn enclosing_definition(node: &SgNode) -> Option<Encloser> {
     for ancestor in node.ancestors() {
         let found = match &*ancestor.kind() {
@@ -440,7 +458,16 @@ fn enclosing_definition(node: &SgNode) -> Option<Encloser> {
         let Some(owner) = owner_of(&ancestor) else {
             continue;
         };
-        let mut path = owner.path;
+        // The declaration's own space when the ancestor kind fixes one, else
+        // its container's — an interface member is a Type-space declaration
+        // because `interface_body` is a Type-space container.
+        let space = match &*ancestor.kind() {
+            "interface_declaration" | "type_alias_declaration" => DeclSpace::Type,
+            "internal_module" => DeclSpace::Namespace,
+            _ => owner.space.unwrap_or(DeclSpace::Value),
+        };
+        let mut path: Vec<String> = space_tag(space).into_iter().map(str::to_string).collect();
+        path.extend(owner.path);
         path.push(name);
         return Some(Encloser { path, kind });
     }
@@ -671,11 +698,87 @@ fn finish(mut ctx: Ctx, rel_path: &str) -> EcmaFacts {
         ),
     );
 
+    // The module's export *surface*, as nodes an importer can probe.
+    //
+    // Not a link and not a fixed point: each entry is a fact this file wrote
+    // about a name it exports. What the name ultimately reaches is the
+    // resolver's, and for a re-export it is a hop this core cannot yet
+    // record — see `resolve::EcmaResolver::index_keys`.
+    let aliases = export_aliases(&ctx.header, &ctx.defs);
+    ctx.defs.extend(aliases);
+
     EcmaFacts {
         header: ctx.header,
         defs: ctx.defs,
         refs: ctx.refs,
     }
+}
+
+/// The alias definitions a file's export entries contribute.
+///
+/// An entry earns a node only when the exported name is not already the name
+/// of a module-level declaration in this file. `export function parse(){}`
+/// exports the definition under its own name, so the definition *is* the
+/// export surface and a second node under the same identity would be one
+/// record overwriting the other. `export { p as parse }`, a re-export, and
+/// every `default` do need one: no declaration here carries that name.
+fn export_aliases(header: &EcmaHeader, defs: &[Definition]) -> Vec<Definition> {
+    let declared: Vec<(&str, DeclSpace)> = defs
+        .iter()
+        .filter(|d| d.owner.is_empty() && d.kind != DefKind::Module)
+        .map(|d| (d.name.as_str(), d.space))
+        .collect();
+    let mut out: Vec<Definition> = Vec::new();
+    let mut seen: Vec<(String, DeclSpace)> = Vec::new();
+    let push = |name: &str,
+                owner: Vec<String>,
+                space: DeclSpace,
+                span: Span,
+                out: &mut Vec<Definition>,
+                seen: &mut Vec<(String, DeclSpace)>| {
+        let key = (format!("{}{name}", owner.join(".")), space);
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        out.push(def(
+            DefKind::Alias,
+            name,
+            owner,
+            space,
+            DefFacets::EXPORTED,
+            span,
+        ));
+    };
+    for entry in &header.exports {
+        let Some(name) = &entry.export_name else {
+            // The bare star, and the CommonJS spread that is its equivalent.
+            push(
+                STAR_EXPORT,
+                vec![],
+                entry.space,
+                entry.span,
+                &mut out,
+                &mut seen,
+            );
+            continue;
+        };
+        // No `AmbiguousExport` marker is minted here, deliberately. ES
+        // `ResolveExport` returns that sentinel only when two *star* exports
+        // supply one name from different modules — which needs
+        // `GetExportedNames`, a fixed point over the module graph that this
+        // build does not run (see `resolve`'s module header). Two explicit
+        // exports of one name are a duplicate-export SyntaxError in a module
+        // and last-writer-wins in CommonJS, so neither is ambiguous, and a
+        // marker for them would be a node no reference can name.
+        let is_own_declaration = entry.local_name.as_deref() == Some(name.as_str())
+            && declared.contains(&(name.as_str(), entry.space));
+        if is_own_declaration {
+            continue;
+        }
+        push(name, vec![], entry.space, entry.span, &mut out, &mut seen);
+    }
+    out
 }
 
 /// Node kinds that make their subtree a type position.
@@ -817,6 +920,45 @@ fn export_reference(ctx: &mut Ctx, node: &SgNode, specifier: Option<String>, spa
     });
 }
 
+/// One reference per *name* a re-export forwards, sourced at that name's
+/// alias node rather than at the module.
+///
+/// B7/B10: `export { parse } from './parse.js'` is a reference that is
+/// neither a call nor an import, and one reference for the whole statement
+/// would leave a barrel's names unlinked — the edge would say only that
+/// `index.js` mentions `parse.js`, not that `index.js#value:parse` reaches
+/// `parse.js#value:parse`. The encloser is what makes the alias the edge's
+/// source: the driver names an edge's source with the same function that
+/// names definitions, so the alias node and the edge out of it cannot
+/// disagree.
+fn reexport_reference(
+    ctx: &mut Ctx,
+    spec_node: &SgNode,
+    specifier: &str,
+    imported: &str,
+    exported: &str,
+    space: DeclSpace,
+) {
+    let mut path: Vec<String> = space_tag(space).into_iter().map(str::to_string).collect();
+    path.push(exported.to_string());
+    ctx.refs.push(Reference {
+        kind: RefKind::Export,
+        space,
+        raw_target: specifier.to_string(),
+        target: RefTarget {
+            root: TargetRoot::Name,
+            segments: vec![specifier.to_string(), imported.to_string()],
+        },
+        locally_bound: false,
+        argc: None,
+        enclosing: Some(Encloser {
+            path,
+            kind: DefKind::Alias,
+        }),
+        span: span_of(spec_node),
+    });
+}
+
 fn import_statement(ctx: &mut Ctx, node: &SgNode) {
     ctx.esm_syntax = true;
     // A22: `import x = require("m")` — a CommonJS whole-module binding
@@ -927,6 +1069,15 @@ fn specifier_names(spec: &SgNode) -> Vec<String> {
 }
 
 fn export_statement(ctx: &mut Ctx, node: &SgNode) {
+    // An `export` inside a namespace or an ambient-module body belongs to
+    // that container, not to the file: it does not make the file a Module and
+    // it contributes nothing to the file's export map. The declaration itself
+    // is still a node — its own rule emits it — so leaving here loses no fact,
+    // and staying would mint a module-level export alias for a name the module
+    // does not export.
+    if owner_of(node).is_none_or(|o| !o.path.is_empty()) {
+        return;
+    }
     ctx.esm_syntax = true;
     let span = span_of(node);
     let space = if has_child(node, "type") {
@@ -964,13 +1115,38 @@ fn export_statement(ctx: &mut Ctx, node: &SgNode) {
             .find(|c| c.kind() == "identifier")
             .map(|c| c.text().to_string());
         ctx.push_export(indirect_entry(
-            name,
+            name.clone(),
             specifier.clone(),
             ImportedName::Namespace,
             space,
             span,
         ));
-        export_reference(ctx, node, specifier, space);
+        // B6: the namespace object *is* the exported name, so the edge starts
+        // at that alias and lands on the module it wraps.
+        match (&name, &specifier) {
+            (Some(exported), Some(spec)) => {
+                let mut path: Vec<String> =
+                    space_tag(space).into_iter().map(str::to_string).collect();
+                path.push(exported.clone());
+                ctx.refs.push(Reference {
+                    kind: RefKind::Export,
+                    space,
+                    raw_target: spec.clone(),
+                    target: RefTarget {
+                        root: TargetRoot::Name,
+                        segments: vec![spec.clone()],
+                    },
+                    locally_bound: false,
+                    argc: None,
+                    enclosing: Some(Encloser {
+                        path,
+                        kind: DefKind::Alias,
+                    }),
+                    span,
+                });
+            }
+            _ => export_reference(ctx, node, specifier, space),
+        }
         return;
     }
 
@@ -1001,24 +1177,24 @@ fn export_statement(ctx: &mut Ctx, node: &SgNode) {
                 continue;
             };
             let exported = names.get(1).cloned().unwrap_or_else(|| local.clone());
-            let entry = match &specifier {
+            let entry = match specifier.clone() {
                 // B7: a pure indirection — no local binding is created.
-                Some(_) => indirect_entry(
-                    Some(exported),
-                    specifier.clone(),
-                    ImportedName::Named(local),
-                    space,
-                    span_of(&spec),
-                ),
+                Some(request) => {
+                    reexport_reference(ctx, &spec, &request, &local, &exported, space);
+                    indirect_entry(
+                        Some(exported),
+                        Some(request),
+                        ImportedName::Named(local),
+                        space,
+                        span_of(&spec),
+                    )
+                }
                 // B2: the FQN is the *declaring* local name, never the
                 // exported one, or renaming an export would re-key an
                 // unchanged definition.
                 None => local_entry(exported, local, space, span_of(&spec)),
             };
             ctx.push_export(entry);
-        }
-        if specifier.is_some() {
-            export_reference(ctx, node, specifier, space);
         }
         return;
     }
@@ -2160,9 +2336,25 @@ mod tests {
         facts.defs.iter().filter(|d| d.name == name).collect()
     }
 
-    /// The one definition with this name, or a panic naming what was found.
+    /// Every *export alias* with this name — the export-surface entries, not
+    /// declarations.
+    fn aliases<'f>(facts: &'f EcmaFacts, name: &str) -> Vec<&'f Definition> {
+        defs(facts, name)
+            .into_iter()
+            .filter(|d| d.kind == DefKind::Alias)
+            .collect()
+    }
+
+    /// The one *declaration* with this name, or a panic naming what was found.
+    ///
+    /// Export aliases are excluded: `export { p as parse }` puts `parse` in
+    /// the node keyspace so an importer can probe it (E13/B10), but nothing in
+    /// this file declares anything called `parse`.
     fn one<'f>(facts: &'f EcmaFacts, name: &str) -> &'f Definition {
-        let found = defs(facts, name);
+        let found: Vec<&Definition> = defs(facts, name)
+            .into_iter()
+            .filter(|d| d.kind != DefKind::Alias)
+            .collect();
         assert_eq!(
             found.len(),
             1,
@@ -2517,7 +2709,11 @@ mod tests {
         // definition and cascade a re-resolve.
         let facts = js("function p(){}\nexport { p as parse };\n");
         assert_eq!(one(&facts, "p").name, "p");
-        assert!(defs(&facts, "parse").is_empty(), "no node named `parse`");
+        assert_eq!(one(&facts, "p").kind, DefKind::Function);
+        // Nothing here *declares* `parse` — but the export surface carries it,
+        // as an alias, so an importer has an identity to probe (E13).
+        assert_eq!(aliases(&facts, "parse").len(), 1);
+        assert!(aliases(&facts, "parse")[0].owner.is_empty());
         assert_eq!(export(&facts, "parse").local_name.as_deref(), Some("p"));
     }
 
@@ -2598,16 +2794,28 @@ mod tests {
     fn an_indirect_re_export_creates_no_local_binding() {
         // B7: `export { x } from 'm'` is a pure indirection.
         let facts = js("export { q, r as s } from './y.js';\n");
-        assert!(defs(&facts, "q").is_empty());
+        // Nothing local is declared; the only `q` is the export alias.
+        assert_eq!(defs(&facts, "q").len(), 1);
+        assert_eq!(aliases(&facts, "q").len(), 1);
         let q = export(&facts, "q");
         assert_eq!(q.local_name, None);
         assert_eq!(q.import_name, Some(ImportedName::Named("q".into())));
         assert_eq!(q.module_request.as_deref(), Some("./y.js"));
         let s = export(&facts, "s");
         assert_eq!(s.import_name, Some(ImportedName::Named("r".into())));
-        // One reference for the statement, not one per specifier: the module
-        // is named once.
-        assert_eq!(refs(&facts, RefKind::Export).len(), 1);
+        // One reference per *name*, not one per statement: each is an edge
+        // out of a different alias node, and one reference for the statement
+        // could only be sourced at the module — leaving the barrel's names
+        // unlinked, which is the whole failure B7 describes.
+        let exports = refs(&facts, RefKind::Export);
+        assert_eq!(exports.len(), 2);
+        let sources: Vec<Vec<String>> = exports
+            .iter()
+            .map(|r| r.enclosing.as_ref().expect("an alias source").path.clone())
+            .collect();
+        assert_eq!(sources, [vec!["q".to_string()], vec!["s".to_string()]]);
+        assert_eq!(exports[0].target.segments, ["./y.js", "q"]);
+        assert_eq!(exports[1].target.segments, ["./y.js", "r"]);
     }
 
     #[test]
@@ -2737,8 +2945,10 @@ mod tests {
             Some("*default*.foo")
         );
         assert_eq!(one(&facts, "qux").kind, DefKind::Field);
-        // An alias for an existing binding declares nothing new.
-        assert!(defs(&facts, "bar").is_empty());
+        // An alias for an existing binding declares nothing new — the only
+        // `bar` in the file is the export-surface alias.
+        assert_eq!(defs(&facts, "bar").len(), 1);
+        assert_eq!(aliases(&facts, "bar").len(), 1);
         assert_eq!(
             export(&facts, "bar").local_name.as_deref(),
             Some("localThing")

@@ -77,13 +77,53 @@
 
 mod bind;
 pub mod extract;
+mod globals;
+mod json;
 pub mod lang;
+pub mod project;
+pub mod resolve;
+pub mod specifier;
+
+use std::path::Path;
 
 use crate::model::Lang;
+use crate::pipeline::scan;
 use crate::registry::Track;
+use crate::store::Report;
+use crate::track_ecma::extract::{JsExtractor, TsExtractor};
+use crate::track_ecma::lang::{JsLang, TsLang};
+use crate::track_ecma::resolve::{JS_RESOLVER, TS_RESOLVER};
 
-/// The EcmaScript family's registration. `scan: None`: the track owns no
-/// file and contributes nothing to a scan until the work above lands.
+/// Scan a repository's JavaScript and TypeScript, in that order.
+///
+/// **The order is a decision.** Both languages land in one store and one
+/// identity space, and the driver's wake set is filtered by the files the
+/// *running* language owns — so a reference in a file of language A that
+/// probes an identity language B declares later is not re-resolved when B
+/// declares it. Whichever runs second therefore resolves against a complete
+/// table and whichever runs first does not, for names.
+///
+/// JavaScript runs first because a `.ts` file naming a definition in a `.js`
+/// file is the direction that exists: `allowJs`, and every hand-written
+/// `.d.ts` describing a `.js` implementation. The reverse — a `.js` file
+/// importing a name out of a `.ts` source — is not something any build does,
+/// so it is the direction to give up.
+///
+/// *Module* identity is not affected either way: a specifier resolves against
+/// the file set both languages' configs are built from, so a `.js` file
+/// importing a `.ts` file still links to the right module node whichever ran
+/// first.
+///
+/// The returned [`Report`] is the TypeScript pass's, which is the whole
+/// report: [`crate::store::Store::report`] tallies every row in the store and
+/// keys the tallies by language, so JavaScript's line is already in it and no
+/// combined EcmaScript number exists to return.
+pub fn scan_ecma(root: &Path, db_path: &Path) -> Result<Report, String> {
+    scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER)?;
+    scan::<TsLang>(root, db_path, &TsExtractor, &TS_RESOLVER)
+}
+
+/// The EcmaScript family's registration.
 ///
 /// `langs` lists two entries because two rates are reported. One track is an
 /// implementation fact; two languages is a reporting obligation.
@@ -96,12 +136,16 @@ pub const TRACK: Track = Track {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Domain;
 
     #[test]
     fn ecma_is_registered_but_not_live() {
         assert!(!TRACK.is_enabled());
         for ext in ["js", "mjs", "cjs", "ts"] {
-            assert!(Lang::for_extension(ext).is_some());
+            assert_eq!(
+                Lang::for_extension(ext).map(Lang::domain),
+                Some(Domain::EcmaScript)
+            );
             assert!(!TRACK.owns_extension(ext));
         }
     }
