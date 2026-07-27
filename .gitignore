@@ -11,6 +11,10 @@
 # Claude Code worktrees
 /.claude/worktrees/
 
+# Session discussion docs (specs, plans) - local working artifacts.
+# The public record is docs/decisions.md and docs/evidence/.
+/docs/superpowers/
+
 # Local scratch
 /tmp/
 /bench/corpora/

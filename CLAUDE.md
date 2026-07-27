@@ -2,8 +2,9 @@
 
 Read these before doing anything in this repo:
 
-1. [`docs/superpowers/specs/2026-07-26-arthron-design.md`](docs/superpowers/specs/2026-07-26-arthron-design.md)
-   — the approved design. Start here.
+1. `docs/superpowers/specs/2026-07-26-arthron-design.md` — the approved design
+   (local, untracked). Start here if you have it; otherwise `docs/decisions.md`
+   carries every decision and its rationale.
 2. [`docs/evidence/2026-07-26-baseline-measurements.md`](docs/evidence/2026-07-26-baseline-measurements.md)
    — the measurements every design claim rests on.
 3. [`docs/decisions.md`](docs/decisions.md) — decision log, newest first.

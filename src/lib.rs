@@ -5,8 +5,8 @@
 //! between two files resolves to exactly one outcome, and that failing to
 //! resolve is recorded rather than discarded.
 //!
-//! The approved design lives in the repository under
-//! `docs/superpowers/specs/`. Read that before depending on anything here.
+//! The design decisions and their rationale are recorded in the repository's
+//! `docs/decisions.md`. Read that before depending on anything here.
 //!
 //! # Why this contract exists
 //!

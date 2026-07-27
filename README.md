@@ -8,8 +8,8 @@ A local-first code intelligence engine. It parses each file in isolation, then
 **resolves** the references between them into a verified graph — and tells you
 honestly which references it could not resolve.
 
-> **Status: design phase.** The engine is not implemented. The approved design
-> lives in [`docs/superpowers/specs/2026-07-26-arthron-design.md`](docs/superpowers/specs/2026-07-26-arthron-design.md).
+> **Status: design phase.** The engine is not implemented. The design decisions
+> and their rationale are recorded in [`docs/decisions.md`](docs/decisions.md).
 > Start there.
 >
 > The published `0.0.0` crate is not usable software. It ships the resolution
