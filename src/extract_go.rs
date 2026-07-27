@@ -192,33 +192,55 @@ fn statement_binds(stmt: &SgNode, name: &str) -> bool {
     }
 }
 
-/// Whether a clause's header binds `name` for the whole clause.
-fn header_binds(clause: &SgNode, name: &str) -> bool {
-    let init_binds = |c: &SgNode| c.kind() == "short_var_declaration" && declares(c, name);
+/// Whether a clause's header binds `name` at a site starting at `site`.
+///
+/// A declared identifier's scope starts at the *end* of its declaration, so a
+/// header binds the part of its clause that follows it and not its own
+/// right-hand side: in `if x := x(); cond`, the `x()` names whatever `x` was
+/// in scope before the header — typically a package-level function or an
+/// import — and only the body sees the new one. Binding the initialiser too
+/// would move a real reference into the local bucket, deleting it from
+/// *both* terms of the resolution rate.
+fn header_binds(clause: &SgNode, name: &str, site: usize) -> bool {
+    let init_binds = |c: &SgNode| {
+        c.kind() == "short_var_declaration" && declares(c, name) && c.range().end <= site
+    };
     match &*clause.kind() {
         // `if v := f(); cond` is visible in the consequence *and* the else;
-        // `switch v := f(); x` in every case.
+        // `switch v := f(); x` in every case. In `f()` itself, never.
         "if_statement" | "expression_switch_statement" => clause.children().any(|c| init_binds(&c)),
         // `switch v := x.(type)` binds `v` in every case clause. The alias
         // is a bare `expression_list` before `:=`, not a declaration node,
-        // so it is read positionally; an optional initialiser binds like an
-        // ordinary switch's.
+        // so it is read positionally, and the guard it closes runs to the
+        // body's opening brace — `switch v := v.(type)` is legal and its
+        // operand is the outer `v`. An optional initialiser binds like an
+        // ordinary switch's. With no brace the file did not parse that far;
+        // not binding keeps the reference in the rate rather than deleting
+        // it.
         "type_switch_statement" => {
             clause.children().any(|c| init_binds(&c))
                 || (short_declares(clause)
                     && clause
                         .children()
-                        .any(|c| c.kind() == "expression_list" && list_binds(&c, name)))
+                        .any(|c| c.kind() == "expression_list" && list_binds(&c, name))
+                    && clause
+                        .children()
+                        .find(|c| c.kind() == "{")
+                        .is_some_and(|body| body.range().start <= site))
         }
         "for_statement" => clause.children().any(|c| match &*c.kind() {
             "for_clause" => c.children().any(|i| init_binds(&i)),
-            "range_clause" => short_declares(&c) && declares(&c, name),
+            "range_clause" => short_declares(&c) && declares(&c, name) && c.range().end <= site,
             _ => false,
         }),
-        // `case v := <-ch:` binds `v` in that clause alone.
-        "communication_case" => clause
-            .children()
-            .any(|c| c.kind() == "receive_statement" && short_declares(&c) && declares(&c, name)),
+        // `case v := <-ch:` binds `v` in that clause alone, and not in the
+        // channel expression it receives from.
+        "communication_case" => clause.children().any(|c| {
+            c.kind() == "receive_statement"
+                && short_declares(&c)
+                && declares(&c, name)
+                && c.range().end <= site
+        }),
         _ => false,
     }
 }
@@ -283,7 +305,7 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
                         .children()
                         .any(|s| s.range().end <= site && statement_binds(&s, name));
             }
-            _ => bound = bound || header_binds(&ancestor, name),
+            _ => bound = bound || header_binds(&ancestor, name, site),
         }
         if bound && in_function {
             return true;
@@ -836,6 +858,43 @@ func helper() {
             "package main\n\nvar k func()\n\nfunc f(m map[int]int) {\n\tfor k = range m {\n\t\tk()\n\t}\n}\n",
         );
         assert!(!bound(&f, "k"));
+    }
+
+    #[test]
+    fn a_clause_header_does_not_bind_its_own_initialiser() {
+        // A declared identifier's scope starts at the end of its
+        // declaration, so a clause header's own right-hand side names
+        // whatever was in scope before the header — here the package-level
+        // function of the same name. Reading the header as binding its own
+        // initialiser moves a real reference into the local bucket, which
+        // raises the rate by deleting it from both of the rate's terms.
+        let f = extract(
+            "main.go",
+            concat!(
+                "package main\n\n",
+                "func x() func() { return nil }\n",
+                "func v() map[int]func() { return nil }\n",
+                "func c() chan func() { return nil }\n",
+                "func s() any { return nil }\n\n",
+                "func f(cond bool) {\n",
+                "\tif x := x(); cond {\n\t\tx()\n\t}\n",
+                "\tfor _, v := range v() {\n\t\tv()\n\t}\n",
+                "\tselect {\n\tcase c := <-c():\n\t\tc()\n\t}\n",
+                "\tswitch s := s().(type) {\n\tcase int:\n\t\t_ = s\n\t}\n",
+                "}\n",
+            ),
+        );
+        let sites = |name: &str| -> Vec<bool> {
+            call_refs(&f)
+                .iter()
+                .filter(|r| r.raw_target == name)
+                .map(|r| r.locally_bound)
+                .collect()
+        };
+        assert_eq!(sites("x"), [false, true], "if-init RHS, then the body");
+        assert_eq!(sites("v"), [false, true], "range RHS, then the body");
+        assert_eq!(sites("c"), [false, true], "receive RHS, then the body");
+        assert_eq!(sites("s"), [false], "the type-switch guard's own RHS");
     }
 
     #[test]
