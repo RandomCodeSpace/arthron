@@ -13,6 +13,10 @@
 //!     --baseline baselines/javascript-fastify.toml  --rebase --commit <pin>
 //! arthron gate corpus/typescript/vue-core --language typescript \
 //!     --baseline baselines/typescript-vue-core.toml --rebase --commit <pin>
+//! arthron gate corpus/javascript/express  --language javascript \
+//!     --baseline baselines/javascript-express.toml --rebase --commit dbac741
+//! arthron gate corpus/typescript/zod      --language typescript \
+//!     --baseline baselines/typescript-zod.toml     --rebase --commit 1fb56a5
 //! ```
 //!
 //! `--language` is load-bearing and the rendered header comment omits it: the
@@ -37,13 +41,60 @@ use arthron::track_ecma::extract::extract;
 use arthron::track_ecma::lang::{Dialect, JsLang, TsLang};
 use arthron::track_ecma::scan_ecma;
 
+/// Every EcmaScript corpus: `(root, language, baseline, the manifest whose
+/// presence proves the corpus was cloned in)`.
+///
+/// The marker is per corpus and not a constant, because a package manifest is
+/// not always at the root: zod is vendored as the `packages/zod/` member of a
+/// monorepo, kept at its real repo-relative path so its `extends` chain still
+/// reaches `.configs/tsconfig.base.json`. Looking for `package.json` at the
+/// root there finds nothing and would skip the whole corpus silently, which is
+/// a vacuous pass wearing a gate's clothes.
+const CORPORA: &[(&str, Lang, &str, &str)] = &[
+    (
+        "corpus/javascript/fastify",
+        Lang::JavaScript,
+        "baselines/javascript-fastify.toml",
+        "package.json",
+    ),
+    (
+        "corpus/javascript/express",
+        Lang::JavaScript,
+        "baselines/javascript-express.toml",
+        "package.json",
+    ),
+    (
+        "corpus/typescript/vue-core",
+        Lang::TypeScript,
+        "baselines/typescript-vue-core.toml",
+        "package.json",
+    ),
+    (
+        "corpus/typescript/zod",
+        Lang::TypeScript,
+        "baselines/typescript-zod.toml",
+        "packages/zod/package.json",
+    ),
+];
+
+/// The marker a corpus is recognised by, or a failure naming the corpus: a
+/// root this file does not describe cannot be checked for presence at all.
+fn marker_for(corpus: &Path) -> &'static str {
+    let name = corpus.to_string_lossy().replace('\\', "/");
+    CORPORA
+        .iter()
+        .find(|(root, ..)| *root == name)
+        .map(|(_, _, _, marker)| *marker)
+        .unwrap_or_else(|| panic!("{name} is not one of the corpora CORPORA describes"))
+}
+
 /// Whether a corpus has been cloned in.
 ///
 /// It lives in RandomCodeSpace/arthron-corpus, cloned into ./corpus
 /// (gitignored). Skipping is correct when it is absent — failing would make an
 /// unfetched corpus look like a broken engine.
 fn corpus_present(corpus: &Path) -> bool {
-    if corpus.join("package.json").is_file() {
+    if corpus.join(marker_for(corpus)).is_file() {
         return true;
     }
     println!(
@@ -104,6 +155,11 @@ fn gate(corpus: &Path, lang: Lang, baseline_path: &str) {
         lang.name(),
         "{baseline_path} measures another language"
     );
+    assert_eq!(
+        b.corpus,
+        corpus.to_string_lossy().replace('\\', "/"),
+        "{baseline_path} was recorded from another corpus",
+    );
     match evaluate(&b, &measured) {
         GateVerdict::Pass { improved } => {
             if improved {
@@ -133,6 +189,49 @@ fn typescript_holds_its_baseline_on_vue_core() {
         Lang::TypeScript,
         "baselines/typescript-vue-core.toml",
     );
+}
+
+#[test]
+fn javascript_holds_its_baseline_on_express() {
+    // The second JavaScript corpus. express 5 declares no `main`, no `type`,
+    // no `exports` and no `module` at all, so its 25 directory specifiers
+    // reach the package root only through Node's implicit `index.js` — a rule
+    // fastify's tree never asks the resolver to apply.
+    gate(
+        Path::new("corpus/javascript/express"),
+        Lang::JavaScript,
+        "baselines/javascript-express.toml",
+    );
+}
+
+#[test]
+fn typescript_holds_its_baseline_on_zod() {
+    // The second TypeScript corpus, and the opposite idiom to vue-core on
+    // every axis that decides module resolution: no `paths` mapping at all,
+    // `"module": "nodenext"` with extension-ful relative specifiers, and
+    // resolution through `exports` conditions.
+    gate(
+        Path::new("corpus/typescript/zod"),
+        Lang::TypeScript,
+        "baselines/typescript-zod.toml",
+    );
+}
+
+#[test]
+fn every_ecmascript_corpus_has_its_own_baseline() {
+    // Four corpora, four baselines, and no two of them the same file: one
+    // number covering two repositories would let a collapse in either hide
+    // behind the other, exactly as one number covering two languages would.
+    let mut seen: Vec<&str> = CORPORA.iter().map(|(_, _, path, _)| *path).collect();
+    seen.sort_unstable();
+    let count = seen.len();
+    seen.dedup();
+    assert_eq!(seen.len(), count, "two corpora share a baseline file");
+    for (root, lang, path, _) in CORPORA {
+        let b = baseline(path);
+        assert_eq!(b.language, lang.name(), "{path} measures another language");
+        assert_eq!(b.corpus, *root, "{path} was recorded from another corpus");
+    }
 }
 
 #[test]

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arthron::extract_go::extract;
+use arthron::gate::{Counts, GateVerdict, evaluate, parse_baseline};
 use arthron::model::{Lang, reason_name};
 use arthron::pipeline::{scan_go, source_files};
 use arthron::resolve_go::GoLang;
@@ -282,4 +283,84 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
     fs::remove_file(&victim).expect("deleting the file");
     scan_go(&tree, &warm_db).expect("delete");
     assert_matches_cold(&tree, &warm_db, &format!("{rel} deleted"));
+}
+
+/// Compare one Go corpus against its committed baseline.
+///
+/// The ratchet is the project's own, reused rather than reimplemented:
+/// [`parse_baseline`] reads the file `arthron gate --rebase` wrote and
+/// [`evaluate`] performs the same exact integer comparison the command does.
+/// Running it here as well as in CI is what makes a rate regression — or
+/// drift in `external` or `local_binding`, the two columns that sit outside
+/// *both* terms of the rate and are therefore the one way the gate could be
+/// raised without anything being linked — fail `cargo test` wherever the
+/// corpus is present.
+///
+/// One baseline per corpus, never one aggregated number. They are written by
+/// the command and by nothing else:
+///
+/// ```text
+/// arthron gate corpus/go/codeiq --language go \
+///     --baseline baselines/go-codeiq.toml --rebase --commit 853efde
+/// arthron gate corpus/go/caddy  --language go \
+///     --baseline baselines/go-caddy.toml  --rebase --commit 853efde
+/// ```
+fn assert_ratchet(corpus: &str, baseline_path: &str) {
+    let root = Path::new(corpus);
+    if !corpus_present(root) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let report = scan_go(root, &dir.path().join("graph.redb")).expect("scan");
+    let go = &report.per_lang[&Lang::Go.code()];
+    let measured = Counts {
+        resolved: go.resolved,
+        external: go.external,
+        local_binding: go.local_binding,
+        unresolved: go.unresolved_total(),
+    };
+    println!(
+        "{corpus}: resolved {} external {} local-binding {} unresolved {}",
+        measured.resolved, measured.external, measured.local_binding, measured.unresolved,
+    );
+    for (code, count) in &go.unresolved {
+        println!("  {}: {count}", reason_name(*code));
+    }
+
+    let text = std::fs::read_to_string(baseline_path)
+        .unwrap_or_else(|e| panic!("reading {baseline_path}: {e}"));
+    let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{baseline_path}: {e}"));
+    assert_eq!(
+        baseline.language,
+        Lang::Go.name(),
+        "{baseline_path} measures another language; rates are per language and never aggregated",
+    );
+    assert_eq!(
+        baseline.corpus, corpus,
+        "{baseline_path} was recorded from another corpus",
+    );
+    match evaluate(&baseline, &measured) {
+        GateVerdict::Pass { improved } => {
+            if improved {
+                println!("gate: pass — improved on {baseline_path}; re-base to move the ratchet");
+            }
+        }
+        GateVerdict::Fail(failures) => {
+            panic!("{baseline_path}: {failures:?}\nmeasured {measured:?}")
+        }
+        GateVerdict::Error(e) => panic!("{baseline_path}: {e}"),
+    }
+}
+
+#[test]
+fn go_holds_its_baseline_on_codeiq() {
+    assert_ratchet("corpus/go/codeiq", "baselines/go-codeiq.toml");
+}
+
+#[test]
+fn go_holds_its_baseline_on_caddy() {
+    // The second Go corpus, and not a formality: caddy holds 28 FQNs that two
+    // files each declare, and its local-binding column is three times
+    // codeiq's. A single corpus locks in a number rather than a capability.
+    assert_ratchet("corpus/go/caddy", "baselines/go-caddy.toml");
 }
