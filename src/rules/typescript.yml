@@ -1,0 +1,132 @@
+# Node kinds the TypeScript extractor interprets. Ids shared with
+# `javascript.yml` are interpreted by the same Rust arm; the ids below the
+# shared block have no JavaScript counterpart.
+#
+# The two files exist because a `kind:` is resolved against one grammar's node
+# ids at compile time: a rule compiled for `typescript` matched against a tree
+# parsed as `javascript` selects by a number that means something else.
+id: import-stmt
+language: typescript
+rule:
+  kind: import_statement
+---
+id: export-stmt
+language: typescript
+rule:
+  kind: export_statement
+---
+id: def-function
+language: typescript
+rule:
+  any:
+    - kind: function_declaration
+    - kind: generator_function_declaration
+---
+id: def-class
+language: typescript
+rule:
+  any:
+    - kind: class_declaration
+    - kind: abstract_class_declaration
+---
+id: def-binding
+language: typescript
+rule:
+  any:
+    - kind: lexical_declaration
+    - kind: variable_declaration
+---
+id: def-assign
+language: typescript
+rule:
+  kind: assignment_expression
+---
+id: ref-call
+language: typescript
+rule:
+  kind: call_expression
+---
+id: ref-new
+language: typescript
+rule:
+  kind: new_expression
+---
+# C15/F1: `declare function f(): void` and every overload signature. One node
+# per name, never one per signature.
+id: def-signature
+language: typescript
+rule:
+  kind: function_signature
+---
+# C1: the Type space.
+id: def-interface
+language: typescript
+rule:
+  kind: interface_declaration
+---
+id: def-type-alias
+language: typescript
+rule:
+  kind: type_alias_declaration
+---
+# C8/C10/C11: an enum declares in Type and Value, and its members are nodes.
+id: def-enum
+language: typescript
+rule:
+  kind: enum_declaration
+---
+# C12/C13: `namespace A.B.C { … }`. Only `A` is bound in the enclosing scope,
+# so the nested segments are synthesised by the extractor.
+id: def-namespace
+language: typescript
+rule:
+  kind: internal_module
+---
+# A17/B19/C15: `declare module "foo" {}`, `declare global {}`, `declare const`.
+id: def-ambient
+language: typescript
+rule:
+  kind: ambient_declaration
+---
+# C21/C29: every written type name. `predefined_type` (`void`, `string`) is
+# deliberately absent — it names nothing in any repository.
+id: ref-type
+language: typescript
+rule:
+  any:
+    - kind: type_identifier
+    - kind: nested_type_identifier
+---
+# C20: `typeof x` names a **value** from a type position, which is why
+# `RefKind` alone cannot select the declaration space.
+id: ref-type-query
+language: typescript
+rule:
+  kind: type_query
+---
+# C28: `@Injectable()`. Emitted as an annotation, and the call inside it is
+# suppressed, so one decorator is one reference and not two.
+id: ref-decorator
+language: typescript
+rule:
+  kind: decorator
+---
+# C29: `extends` / `implements`, distinct from a call.
+id: ref-heritage
+language: typescript
+rule:
+  any:
+    - kind: extends_clause
+    - kind: implements_clause
+    - kind: extends_type_clause
+---
+# A18: `/// <reference path="./types.d.ts" />` and `types="node"`. An import
+# that is not an import statement — it adds a file, or a whole `@types`
+# package's globals, to the program. Selected by kind *and* text, so the rule
+# reads only the handful of comments that are directives rather than every
+# comment in the corpus.
+id: ref-triple-slash
+language: typescript
+rule:
+  kind: comment
+  regex: '^///\s*<reference\s'
