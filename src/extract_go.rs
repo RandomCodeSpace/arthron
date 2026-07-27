@@ -18,7 +18,8 @@ const GO_RULES: &str = include_str!("rules/go.yml");
 pub struct Import {
     /// Alias if written (`f "fmt"` → `f`; `. "x"` → `.`; `_ "x"` → `_`).
     pub alias: Option<String>,
-    /// The import path with surrounding quotes stripped.
+    /// The import path with surrounding quotes stripped, whether the
+    /// literal was interpreted (`"fmt"`) or raw (`` `fmt` ``).
     pub path: String,
     /// Where the spec sits.
     pub span: Span,
@@ -119,7 +120,12 @@ pub fn extract(source: &str) -> FileFacts {
                 let Some(path_node) = node.field("path") else {
                     continue;
                 };
-                let path = path_node.text().trim_matches('"').to_string();
+                // Go import paths are string literals: interpreted ("fmt")
+                // or raw (`fmt`). Strip whichever quoting was written.
+                let path = path_node
+                    .text()
+                    .trim_matches(|c| c == '"' || c == '`')
+                    .to_string();
                 let alias = node.field("name").map(|n| n.text().to_string());
                 facts.imports.push(Import {
                     alias,
@@ -161,9 +167,13 @@ pub fn extract(source: &str) -> FileFacts {
                 };
                 // const/var specs may declare several names at once;
                 // type_spec has exactly one. Collect whichever the
-                // grammar provides.
+                // grammar provides. `field_children` walks the field's
+                // whole run, so it also yields the `,` separators —
+                // keep identifiers only, or `const A, B` would define
+                // a bogus `,`.
                 let mut names: Vec<String> = node
                     .field_children("name")
+                    .filter(|n| n.kind() == "identifier")
                     .map(|n| n.text().to_string())
                     .collect();
                 if names.is_empty()
@@ -248,6 +258,39 @@ func helper() {
         assert_eq!(paths, ["fmt", "net/http", "embed"]);
         assert_eq!(f.imports[1].alias.as_deref(), Some("h"));
         assert_eq!(f.imports[2].alias.as_deref(), Some("_"));
+    }
+
+    #[test]
+    fn raw_string_import_paths_are_unquoted() {
+        let f = extract("package main\n\nimport `fmt`\n");
+        let paths: Vec<_> = f.imports.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["fmt"]);
+        assert!(
+            !f.imports
+                .iter()
+                .any(|i| i.path.contains('`') || i.path.contains('"')),
+            "import paths keep quote characters: {:?}",
+            f.imports
+        );
+    }
+
+    #[test]
+    fn multi_name_specs_define_exactly_their_identifiers() {
+        let f = extract("package main\n\nconst A, B = 1, 2\n\nvar X, Y int\n");
+        let consts: Vec<_> = f
+            .defs
+            .iter()
+            .filter(|d| d.kind == DefKind::Const)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(consts, ["A", "B"]);
+        let vars: Vec<_> = f
+            .defs
+            .iter()
+            .filter(|d| d.kind == DefKind::Var)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(vars, ["X", "Y"]);
     }
 
     #[test]
