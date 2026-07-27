@@ -67,6 +67,29 @@
 //!   with two declaration sites, because an import names a name and tier 2
 //!   emits no site that states an arity. A tier-1 Kotlin track refines this
 //!   the way Java's `name/argc` key already does.
+//! - **Nothing fences an import to its Gradle module, and the corpus does not
+//!   exercise the hazard.** Kotlin's [`crate::lang::Resolver::owns_file`]
+//!   answers `true` for every file the walk reached, because okio's modules
+//!   *share* a
+//!   package — both `okio` and `okio-testing-support` declare `package okio`
+//!   — so a per-module fence would make the testing helpers invisible to the
+//!   module they were written for. The cost is that an import can resolve
+//!   into a module whose build file its own never depends on, and nothing
+//!   here would notice. In okio it costs nothing, but that is the corpus
+//!   being well-behaved rather than this resolver checking: every
+//!   cross-module resolve happens to follow a dependency the build declares
+//!   (`okio` on `okio-testing-support` and `okio-fakefilesystem`, and both of
+//!   those on `okio`), and the resolves that look cross-target are `jvmTest`
+//!   reading its own extra `kotlin.srcDir`. A corpus with two modules that
+//!   declare one package and do *not* depend on each other is what would earn
+//!   a fence; until one is measured, this is a relaxation nobody has probed.
+//! - **A definition this extractor loses can be reported as the corpus's
+//!   missing package.** `UnknownPackage` and `NoMatchingDefinition` are told
+//!   apart by where the path leaves what this build holds, and that cannot
+//!   distinguish a package generated outside the tree from a classifier the
+//!   extractor dropped. It costs no rate — both count against it — but it
+//!   blunts the bucket that otherwise means *our* bug. Argued and pinned in
+//!   [`resolve`].
 //! - **Kotlin is the first live language whose `mergeable` is not
 //!   unconditionally `false`, and the shared driver's collision count says
 //!   so.** 429 definition identities in the corpus are declared by more than

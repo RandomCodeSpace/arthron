@@ -56,6 +56,26 @@
 //!   package that was never in the tree — the misattribution the Java review
 //!   round called out one layer down.
 //!
+//!   **That split is a reading of the evidence, not a probe, and it is wrong
+//!   in one direction.** This resolver cannot tell *"the head names a package
+//!   generated outside the tree"* from *"the head names a classifier this
+//!   extractor lost"*, because both leave the identical hole: a declared
+//!   package prefix whose next segment is in no table. So an extractor defect
+//!   that drops a classifier is reported as **the corpus's** missing package
+//!   whenever the chain is two segments or longer, while the very same defect
+//!   under a one-segment chain lands honestly in `NoMatchingDefinition`.
+//!   The unit test
+//!   `a_lost_classifier_is_misreported_as_a_package_nobody_indexed` pins all
+//!   four shapes below, so this is a recorded limit rather than an accident. It moves nothing between the rate's terms — both misses count
+//!   against it — but it does blunt the one bucket this track reads as *our*
+//!   bug, so a rising `UnknownPackage` count is a reason to suspect the
+//!   extractor before believing the corpus. The corpus is currently on the
+//!   lucky side of it: its 10 really are the cinterop case, and the grammar
+//!   defect's 68 land in `NoMatchingDefinition` only because
+//!   `okio#ByteString` survives in two of its four source sets. Had the
+//!   misparse taken all four, all 68 would have been reported as a package
+//!   nobody indexed.
+//!
 //! Both misses count **against** the rate. Neither is `External`, which is
 //! the point: a package this build cannot see is not a package it may wave
 //! out of the denominator.
@@ -262,6 +282,11 @@ impl Resolver<KtLang> for KtResolver {
     /// written for. What is genuinely not ours is `build/`, and that is
     /// pruned from the walk by [`KtLang::skip_dirs`] rather than filtered out
     /// of it.
+    ///
+    /// The relaxation is unprobed rather than proven safe: with no fence, an
+    /// import may resolve into a module its own build file never depends on.
+    /// okio never asks — see the known limits on [`crate::track_kotlin`] —
+    /// which is the corpus being well-behaved, not this answer checking.
     fn owns_file(&self, _cfg: &(), _rel_path: &str) -> bool {
         true
     }
@@ -610,6 +635,51 @@ mod tests {
         // And it is *not* external: a package this build cannot see is not
         // one it may wave out of the denominator.
         assert!(!matches!(r.outcome, Outcome::External(_)));
+    }
+
+    #[test]
+    fn a_lost_classifier_is_misreported_as_a_package_nobody_indexed() {
+        // The one direction the `UnknownPackage` rule gets wrong, pinned so
+        // that it is a recorded limit rather than an accident. Every case
+        // below is the *same* import; only what this build lost differs.
+        const IMPORT: &str = "package p\nimport okio.TestUtil.SEGMENT_SIZE\n";
+
+        // Nothing lost.
+        let whole = resolve(
+            IMPORT,
+            &["okio", "okio#TestUtil", "okio#TestUtil.SEGMENT_SIZE!"],
+        );
+        assert_eq!(
+            whole.outcome,
+            Outcome::Resolved(Probes::id("okio#TestUtil.SEGMENT_SIZE!")),
+        );
+
+        // Lose the member only: honest. The head is a classifier this build
+        // holds, so the hole is demonstrably inside something it indexed.
+        let member_lost = resolve(IMPORT, &["okio", "okio#TestUtil"]);
+        assert_eq!(
+            member_lost.outcome,
+            Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        );
+
+        // Lose the classifier — which is an extractor defect, ours — and the
+        // hole becomes indistinguishable from `okio.TestUtil` being a package
+        // generated outside the tree. It is reported as the corpus's.
+        let classifier_lost = resolve(IMPORT, &["okio"]);
+        assert_eq!(
+            classifier_lost.outcome,
+            Outcome::Unresolved(UnresolvedReason::UnknownPackage),
+            "the misattribution this test exists to record, not to bless",
+        );
+
+        // The identical defect under a one-segment chain is reported
+        // honestly, which is what makes the line above a limit of the rule
+        // rather than a property of the defect.
+        let one_segment = resolve("package p\nimport okio.Buffer\n", &["okio"]);
+        assert_eq!(
+            one_segment.outcome,
+            Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        );
     }
 
     #[test]
