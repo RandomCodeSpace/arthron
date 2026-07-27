@@ -933,6 +933,7 @@ impl JavaResolver {
                 return group;
             }
         };
+        let start = fqn_start.clone();
         let mut keys = vec![name.to_string()];
         for argc in 0..=Self::NAME_PROBE_ARITY {
             keys.push(fqn::arity_key(name, argc));
@@ -960,6 +961,11 @@ impl JavaResolver {
                         claimed.insert(key.clone());
                         group.ambiguous = true;
                     }
+                    // §8.2 again: a supertype's private member is not a
+                    // member of this type, so it neither claims the key nor
+                    // joins the group whose size decides `AmbiguousOverload`.
+                    Some(Entry::Definition { facets, .. })
+                        if type_fqn != start && facets.contains(DefFacets::PRIVATE) => {}
                     Some(Entry::Definition { .. }) => {
                         claimed.insert(key.clone());
                         group
@@ -1040,6 +1046,17 @@ impl JavaResolver {
     /// not modelled: nothing at a call site says whether the target is
     /// static, so the candidate set can only be too large, and a set that is
     /// too large ends `AmbiguousOverload` rather than at a wrong edge.
+    ///
+    /// A hit on a *class* is the answer as soon as it is met: every non-
+    /// interface the walk can reach sits on the receiver's superclass chain,
+    /// which is linear and drained before any interface, so the first one is
+    /// the nearest one. A hit on an interface is not, and §9.4.1 says why —
+    /// a declaration is inherited only when no subinterface in the same set
+    /// redeclares it, and neither the order two interfaces are written in nor
+    /// which side of a file boundary they came from decides that. Interface
+    /// hits are therefore collected and then filtered by
+    /// [`JavaResolver::most_specific`]; the walk stops early only on the
+    /// receiver's own type, where nothing can be more specific.
     fn lookup(
         &self,
         cfg: &JavaConfig,
@@ -1056,7 +1073,8 @@ impl JavaResolver {
         };
         let mut unindexed = false;
         let mut seen: HashSet<String> = HashSet::new();
-        let mut queue: Vec<(String, Option<Vec<String>>)> = vec![(fqn_start, local_start)];
+        let mut inherited: Vec<(String, NodeId)> = Vec::new();
+        let mut queue: Vec<(String, Option<Vec<String>>)> = vec![(fqn_start.clone(), local_start)];
         while let Some((type_fqn, local)) = queue.pop() {
             if !seen.insert(type_fqn.clone()) {
                 continue;
@@ -1067,9 +1085,21 @@ impl JavaResolver {
                         kind: DefKind::Alias,
                         ..
                     }) => return Member::Ambiguous,
+                    // §8.2: a private member is not inherited, so a
+                    // supertype's is not a candidate here at all. Skipped and
+                    // not returned — the walk carries on to whatever the
+                    // subtype really can name, which is what the compiler
+                    // does. On the receiver's own type it is an ordinary
+                    // member and the facet says nothing.
+                    Some(Entry::Definition { facets, .. })
+                        if type_fqn != fqn_start && facets.contains(DefFacets::PRIVATE) => {}
                     Some(Entry::Definition { .. }) => {
                         let id = node_id(JavaLang::DOMAIN, &fqn::member_fqn(&type_fqn, key));
-                        return Member::Found(id);
+                        if type_fqn == fqn_start || !Self::declares_interface(&type_fqn, p) {
+                            return Member::Found(id);
+                        }
+                        inherited.push((type_fqn.clone(), id));
+                        break;
                     }
                     _ => {}
                 }
@@ -1106,7 +1136,78 @@ impl JavaResolver {
                 }
             }
         }
-        Member::Missing { unindexed }
+        match Self::most_specific(&inherited, p) {
+            Some(id) => Member::Found(id),
+            None => Member::Missing { unindexed },
+        }
+    }
+
+    /// The one interface declaration a class actually inherits (§9.4.1).
+    ///
+    /// A declaration is struck out when some *other* interface that declared
+    /// the same member extends it: that subinterface overrides it, and only
+    /// the override is inherited. `C implements Alpha, Beta` with
+    /// `Beta extends Alpha` therefore answers `Beta`, whichever order the
+    /// two are written in and whichever side of a file boundary they were
+    /// read from — `javac` on that tree agrees.
+    ///
+    /// Several may survive: unrelated interfaces declaring one signature is
+    /// legal, and §15.12.2.1 leaves the compiler to pick among declarations
+    /// that are equally specific. Walk order picks here, for the same reason
+    /// it always did — the call really does reach a body, and reporting it
+    /// unresolvable would trade a slightly-wrong edge for no edge at all.
+    fn most_specific(hits: &[(String, NodeId)], p: &mut Probes<'_>) -> Option<NodeId> {
+        let (_, first) = hits.first()?;
+        if hits.len() == 1 {
+            return Some(*first);
+        }
+        for (type_fqn, id) in hits {
+            let overridden = hits
+                .iter()
+                .any(|(other, _)| other != type_fqn && Self::reaches_supertype(other, type_fqn, p));
+            if !overridden {
+                return Some(*id);
+            }
+        }
+        Some(*first)
+    }
+
+    /// Whether `sub` reaches `sup` through the stored supertype relation.
+    ///
+    /// Bounded by [`JavaResolver::MAX_SUPERTYPES`] like every other closure
+    /// walk here, and for the same reason: a cut walk answers `false`, which
+    /// keeps the earlier hit rather than inventing a later one.
+    fn reaches_supertype(sub: &str, sup: &str, p: &mut Probes<'_>) -> bool {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue = vec![sub.to_string()];
+        while let Some(type_fqn) = queue.pop() {
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                return false;
+            }
+            if !seen.insert(type_fqn.clone()) {
+                continue;
+            }
+            for (fqn, _) in Self::indexed_supers(&type_fqn, p) {
+                if fqn == sup {
+                    return true;
+                }
+                queue.push(fqn);
+            }
+        }
+        false
+    }
+
+    /// Whether a type this repository declares is an interface (§9.1),
+    /// annotation types included (§9.6).
+    ///
+    /// Probed rather than inferred, so the read is logged: an outcome that
+    /// depends on this facet has to be woken when the facet moves, which is
+    /// what carrying it in [`crate::store::NodePayload`] arranges.
+    fn declares_interface(type_fqn: &str, p: &mut Probes<'_>) -> bool {
+        matches!(
+            p.get(type_fqn),
+            Some(Entry::Definition { facets, .. }) if facets.contains(DefFacets::INTERFACE)
+        )
     }
 
     /// Turn a member lookup into an outcome, with the honest miss.

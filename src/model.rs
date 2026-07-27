@@ -272,7 +272,7 @@ impl DefKind {
 
 /// Declaration attributes that no shared `match` branches on.
 ///
-/// A bitset rather than a dependency: eleven flags do not justify a crate,
+/// A bitset rather than a dependency: a dozen flags do not justify a crate,
 /// and the alternative — one [`DefKind`] variant per attribute — makes every
 /// shared `match` language-specific.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -302,6 +302,16 @@ impl DefFacets {
     pub const SYNTHETIC: DefFacets = DefFacets(1 << 9);
     /// A constant enumeration, inlined at every use site.
     pub const CONST_ENUM: DefFacets = DefFacets(1 << 10);
+    /// Visible only inside the declaration that wrote it, and so **not
+    /// inherited** by anything below it.
+    ///
+    /// The negation of [`DefFacets::EXPORTED`] cannot say this: "not public"
+    /// covers three of JLS §6.6.1's four levels, and only the narrowest of
+    /// them takes a member out of a subtype's inherited set. A resolver
+    /// reading this bit removes a candidate; a resolver reading its absence
+    /// learns nothing, which is the honest asymmetry — a language that does
+    /// not set it is a language whose closures are unchanged.
+    pub const PRIVATE: DefFacets = DefFacets(1 << 11);
 
     /// The raw bits, for storage.
     pub fn bits(self) -> u16 {

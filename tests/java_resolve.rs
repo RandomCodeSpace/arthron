@@ -821,3 +821,148 @@ fn a_type_identifier_inside_a_parse_error_is_not_a_reference() {
         scan.dump(),
     );
 }
+
+/// §8.4.8 and §9.4.1: a class inherits a default method from the *most
+/// specific* superinterface that declares it. `Impl implements Alpha, Beta`
+/// with `Beta extends Alpha` inherits `Beta.m`, whatever order the two are
+/// written in — `javac` on this exact tree prints `beta`.
+///
+/// The closure walked the stored supertype list as a stack and returned the
+/// first declaration it met, so declaration order decided the answer and the
+/// two sides of a file boundary decided it differently. Both spellings are
+/// asserted here, because an order-dependent walk passes one of them by luck.
+#[test]
+fn a_subinterfaces_default_beats_its_superinterfaces() {
+    let tree = |implements: &str| {
+        vec![
+            (
+                "com/acme/Alpha.java",
+                r#"package com.acme;
+public interface Alpha { default String m() { return "alpha"; } }
+"#
+                .to_string(),
+            ),
+            (
+                "com/acme/Beta.java",
+                r#"package com.acme;
+public interface Beta extends Alpha { default String m() { return "beta"; } }
+"#
+                .to_string(),
+            ),
+            (
+                "com/acme/Impl.java",
+                format!("package com.acme;\npublic class Impl implements {implements} {{ }}\n"),
+            ),
+            (
+                "com/acme/UseImpl.java",
+                r#"package com.acme;
+public class UseImpl {
+    String go(Impl impl) { return impl.m(); }
+}
+"#
+                .to_string(),
+            ),
+        ]
+    };
+    for implements in ["Alpha, Beta", "Beta, Alpha"] {
+        let owned = tree(implements);
+        let files: Vec<(&str, &str)> = owned.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let scan = scan(&files);
+        assert_eq!(
+            scan.one("impl.m", RefKind::Call),
+            "RESOLVED com.acme#Beta.m/0",
+            "`implements {implements}` must still inherit the subinterface's default",
+        );
+    }
+}
+
+/// The same rule inside one file: the walk that reads `scope.supers` has to
+/// agree with the one that reads the stored relation.
+#[test]
+fn a_subinterfaces_default_beats_its_superinterface_in_one_file() {
+    let files = vec![
+        (
+            "com/acme/Alpha.java",
+            r#"package com.acme;
+public interface Alpha { default String m() { return "alpha"; } }
+"#,
+        ),
+        (
+            "com/acme/Beta.java",
+            r#"package com.acme;
+public interface Beta extends Alpha { default String m() { return "beta"; } }
+"#,
+        ),
+        (
+            "com/acme/Local.java",
+            r#"package com.acme;
+public class Local implements Alpha, Beta {
+    String go() { return this.m(); }
+}
+"#,
+        ),
+    ];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.m", RefKind::Call),
+        "RESOLVED com.acme#Beta.m/0",
+    );
+}
+
+/// §8.2: a private member is not inherited, so a supertype's is not a
+/// candidate below it. `javac` on this exact tree says `cannot find symbol`
+/// for `hidden()` in `Sub` — which is the point: the closure used to answer
+/// with `Base.hidden`, an edge into a body the subclass cannot name.
+///
+/// The tree does not compile, and that is the honest scope of the rule: in
+/// source that does compile, no site names an inaccessible member, so this
+/// changes no corpus number. It changes what arthron says about source that
+/// is mid-edit, generated, or read without the module that completes it —
+/// which is most of what a scanner meets.
+#[test]
+fn a_private_member_of_a_supertype_is_not_inherited() {
+    let files = vec![
+        (
+            "com/acme/Hidden.java",
+            r#"package com.acme;
+public class Hidden {
+    private String only() { return "hidden"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Below.java",
+            r#"package com.acme;
+public class Below extends Hidden {
+    String go() { return this.only(); }
+}
+"#,
+        ),
+    ];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.only", RefKind::Call),
+        "UnindexedSupertype",
+        "a private supertype member is not a candidate, and the miss stays honest",
+    );
+}
+
+/// The same member named on the type that declares it is an ordinary one.
+/// The facet removes a member from *subtypes*, never from its own owner.
+#[test]
+fn a_private_member_still_resolves_on_the_type_that_declares_it() {
+    let files = vec![(
+        "com/acme/Owner.java",
+        r#"package com.acme;
+public class Owner {
+    private String only() { return "owner"; }
+    String go() { return this.only(); }
+}
+"#,
+    )];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.only", RefKind::Call),
+        "RESOLVED com.acme#Owner.only/0",
+    );
+}
