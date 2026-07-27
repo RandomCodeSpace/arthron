@@ -43,11 +43,15 @@ use crate::store::{
 
 /// Files a phase writes in one transaction.
 ///
-/// A phase's batch is the one structure in it whose size is the corpus's, so
-/// a whole-event batch makes a cold scan's peak memory the tree's size — and
-/// on a large repository that is how the 512 MB ceiling is crossed. Bounding
-/// it bounds the phase: what a batch holds, and the dirty pages redb holds
-/// for the transaction writing it, are both freed at the boundary.
+/// Bounding the batch bounds one term of a scan's memory, not the scan's:
+/// what a batch holds, and the dirty pages redb holds for the transaction
+/// writing it, are both freed at the boundary instead of growing to the size
+/// of the event. Other structures beside it are still the corpus's — see
+/// [`scan`] — so peak RSS stays linear in the tree. Measured on the 2 vCPU
+/// reference hardware: 343 MB over a 1.79M-line Go corpus, 676 MB over that
+/// same corpus with its owned set doubled. The 512 MB ceiling is an envelope
+/// the reference corpus sits well inside, not a structural bound, and it is
+/// crossed somewhere near 1.5× that tree.
 ///
 /// 500 because that is the measured shape of the trade: 500 files in one
 /// transaction against 216ms as 500 separate ones. Nothing about the graph
@@ -130,6 +134,19 @@ struct RefAcc {
 /// the definition phase, and a file's supertypes are a function of its own
 /// bytes and that set, so a file this round wakes re-derives exactly the rows
 /// it already holds.
+///
+/// # Memory
+///
+/// Peak RSS is linear in the tree, not in the batch. What a cold scan holds
+/// at once is the changed set — every owned file, parsed — from the walk
+/// until phase 2 consumes it, and beside it, one phase at a time, the symbol
+/// table each phase probes, the FQN index the supertype phase reads, and the
+/// two definition maps the widening compares. Each of those is dropped where
+/// the phase that reads it ends, which is why they are dropped by name below
+/// rather than at the end of the function; the changed set spans them all,
+/// and it is the tree. The 512 MB ceiling is therefore an envelope measured
+/// against the reference corpus, not a property of this code — see
+/// [`BATCH_FILES`].
 pub fn scan<L: Language>(
     root: &Path,
     db_path: &Path,
@@ -147,6 +164,11 @@ pub fn scan<L: Language>(
         .into_iter()
         .map(|e| (e.path, e.message))
         .collect();
+    // The owned files this event could not read. A subset of `file_errors`,
+    // and not derivable from it: that map also carries directories the walk
+    // could not descend into and paths that are not UTF-8, neither of which
+    // is a file the store holds facts under.
+    let mut stale: BTreeSet<String> = BTreeSet::new();
     let mut index = FileIndex {
         files: Vec::with_capacity(paths.len()),
     };
@@ -210,6 +232,7 @@ pub fn scan<L: Language>(
             // over is a fact about that tree rather than a reason to measure
             // none of it.
             Err(e) => {
+                stale.insert(rel.clone());
                 file_errors.insert(rel, e);
                 continue;
             }
@@ -225,6 +248,13 @@ pub fn scan<L: Language>(
             facts,
         });
     }
+
+    // Stepping over an unreadable file kept its facts; this is the other
+    // half of that trade. Written before the event's first fact rather than
+    // with the rest of it, so that a store error later in the scan cannot
+    // leave a file both stale and claiming to be current — see
+    // [`Store::forget_hashes`].
+    flush_stale(&store, &mut stale)?;
 
     // A file the store knows and this walk did not reach is gone: deleted,
     // renamed, or no longer owned because a nested manifest appeared above
@@ -334,7 +364,7 @@ pub fn scan<L: Language>(
     // taking the whole scan down with it.
     let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &covered, &owned)?
         .into_iter()
-        .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors))
+        .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
         .collect();
     // Their definitions cannot have changed — their bytes did not — so this
     // re-asserts an ownership record identical to the one already stored,
@@ -432,7 +462,7 @@ pub fn scan<L: Language>(
         covered.extend(waking.iter().map(|f| f.rel_path.as_str()));
         roused = wake_files(&store, &moved, &covered, &owned)?
             .into_iter()
-            .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors))
+            .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
             .collect();
         // Their phase-1 half is already stored and their bytes did not move,
         // so there is nothing to re-assert: only their references are stale.
@@ -458,6 +488,10 @@ pub fn scan<L: Language>(
     }
     flush_refs(&store, &mut ref_batch, 1)?;
 
+    // The files the two waking rounds could not read. Their halves are as
+    // stale as the walk's were, and for the same reason.
+    flush_stale(&store, &mut stale)?;
+
     let mut report = store.report()?;
     report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
     report.file_errors = named(file_errors);
@@ -465,19 +499,35 @@ pub fn scan<L: Language>(
 }
 
 /// Read and extract one woken file, or record why it could not be.
+///
+/// A file this event woke and could not read keeps rows the event has just
+/// invalidated, so it goes in `stale` exactly as an unreadable file in the
+/// walk does.
 fn woken<L: Language>(
     ex: &dyn Extractor<L>,
     path: &Path,
     rel: String,
     file_errors: &mut BTreeMap<String, String>,
+    stale: &mut BTreeSet<String>,
 ) -> Option<ScannedFile<L>> {
     match scan_file(ex, path, rel.clone()) {
         Ok(file) => Some(file),
         Err(e) => {
+            stale.insert(rel.clone());
             file_errors.insert(rel, e);
             None
         }
     }
+}
+
+/// Hand back the store's currency claim for every owned file this event
+/// could not read, and empty the set so a later call does not rewrite them.
+fn flush_stale(store: &Store, stale: &mut BTreeSet<String>) -> Result<(), String> {
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = std::mem::take(stale).into_iter().collect();
+    store.forget_hashes(&paths)
 }
 
 /// The accumulated failures, as the report carries them: sorted by path,
@@ -1047,6 +1097,22 @@ pub fn source_files_with<L: Language>(
         // and the report said nothing about which one.
         let entry = match entry {
             Ok(entry) => entry,
+            // The scanned root is not an entry the walk can step over: it is
+            // the tree. A root that does not exist, or that this process may
+            // not read, produced no file set at all, and a report of zeros
+            // over no file set is indistinguishable from a clean scan of an
+            // empty repository — the shape `scan_repo_with` refuses to
+            // return for exactly this reason. So this one failure is fatal
+            // and every failure beneath it is data.
+            Err(e) if at_root(root, &e) => {
+                // `walk_failure`'s message, not the error's: `ignore` prints
+                // the path inside it, and this line already opens with it.
+                return Err(format!(
+                    "{}: {}",
+                    root.display(),
+                    walk_failure(root, &e).message
+                ));
+            }
             Err(e) => {
                 errors.push(walk_failure(root, &e));
                 continue;
@@ -1088,6 +1154,17 @@ pub fn source_files_with<L: Language>(
         out.push(path.to_path_buf());
     }
     Ok((out, errors))
+}
+
+/// Whether a walk failure is about the scanned root itself rather than
+/// something under it.
+///
+/// Matched on the path the error carries, not on the spelling
+/// [`walk_failure`] gives it: that function also names the root for a failure
+/// that has no path of its own — a symbolic-link loop, a malformed ignore
+/// file — and those are failures *within* a tree the walk did reach.
+fn at_root(root: &Path, e: &ignore::Error) -> bool {
+    matches!(e, ignore::Error::WithPath { path, .. } if path == root)
 }
 
 /// A walk failure, split into the path it names and what it says.

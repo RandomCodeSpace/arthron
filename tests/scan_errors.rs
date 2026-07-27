@@ -7,6 +7,14 @@
 //! guards: a rate computed over a smaller file set than the tree holds looks
 //! exactly like a rate computed over all of it.
 //!
+//! Two limits on that rule, guarded here too. A file stepped over keeps its
+//! facts but loses the store's claim that they are current, so the next scan
+//! that can read it re-reads it — otherwise a file whose bytes never move
+//! keeps rows resolved against a graph that has since changed, and no report
+//! ever says so again. And the scanned root is not a file the walk can step
+//! over: a root that is not there measured nothing, which is a failure and
+//! not a tree of zeros.
+//!
 //! The permission cases need a process that permissions apply to. Running as
 //! root reads a `chmod 000` file happily, so each of those tests checks that
 //! the mode actually took and says so instead of asserting something the
@@ -210,6 +218,80 @@ fn an_unreadable_file_keeps_the_facts_it_produced_when_it_could_be_read() {
     assert!(
         after.contains(&"util/later.go".to_string()),
         "an unreadable file must not be treated as deleted: {after:?}",
+    );
+}
+
+#[test]
+fn an_unreadable_file_is_re_read_by_the_next_scan_that_can_read_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fixture(root);
+
+    let first = scan_repo(root, &db(root)).expect("the first scan reads everything");
+    assert!(first.file_errors.is_empty(), "{:?}", first.file_errors);
+
+    // The file goes unreadable, and *while it is*, the definition it calls is
+    // renamed. Its stored row still says `Resolved`, and its own bytes never
+    // move — so nothing about the file itself will ever look changed again.
+    let locked = root.join("app/app.go");
+    if !make_unreadable(&locked) {
+        eprintln!("skipped: this process reads a chmod 000 file (running as root?)");
+        return;
+    }
+    write(
+        root,
+        "util/util.go",
+        "package util\n\nfunc Parsed(s string) string { return s }\n",
+    );
+    let second = scan_repo(root, &db(root)).expect("the second scan tolerates it");
+    assert!(
+        errored(&second, "app/app.go").is_some(),
+        "{:?}",
+        second.file_errors,
+    );
+
+    restore(&locked, 0o644);
+    let third = scan_repo(root, &db(root)).expect("the third scan reads it again");
+    assert!(third.file_errors.is_empty(), "{:?}", third.file_errors);
+
+    // The whole store, not the tally: a stale row that happens to sum the
+    // same way is the failure this is guarding, so the comparison is against
+    // everything a cold scan of the very same tree builds — rows, edges and
+    // the nodes those edges reach.
+    let cold_dir = tempfile::tempdir().expect("tempdir");
+    let cold_db = cold_dir.path().join("cold.redb");
+    let cold_report = scan_repo(root, &cold_db).expect("a cold scan of the same tree");
+    let cold = Store::open(&cold_db)
+        .expect("the cold store opens")
+        .snapshot()
+        .expect("the cold snapshot");
+    let warm = Store::open(&db(root))
+        .expect("the warm store opens")
+        .snapshot()
+        .expect("the warm snapshot");
+
+    assert_eq!(
+        cold_report, third,
+        "a scan that stepped over a file must not report it as measured once it can read it",
+    );
+    assert_eq!(
+        cold, warm,
+        "the store a recovered scan leaves must be the store a cold scan builds",
+    );
+}
+
+#[test]
+fn a_root_the_walk_cannot_reach_fails_the_scan_instead_of_measuring_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-tree");
+
+    // Not a file the walk stepped over: nothing was measured at all, and a
+    // report of zeros is what a gate would read as a clean corpus.
+    let err = scan_repo(&missing, &dir.path().join("graph.redb"))
+        .expect_err("a root that does not exist is not a measurement");
+    assert!(
+        err.contains(&missing.display().to_string()),
+        "the error has to say which root: {err}",
     );
 }
 

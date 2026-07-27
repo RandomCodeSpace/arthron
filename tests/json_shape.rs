@@ -58,6 +58,17 @@ fn no_settings() -> Value {
     json!({ "include": [], "exclude": [], "tracks": {} })
 }
 
+/// The `file_errors` array [`report`] produces, quoted once and shared by the
+/// scan and gate literals for the same reason [`languages`] is: a gate that
+/// re-bases over a corpus it could not fully read has to say so in the same
+/// words a scan does.
+fn file_errors() -> Value {
+    json!([{
+        "path": "vendor/blob.go",
+        "error": "reading vendor/blob.go: stream did not contain valid UTF-8",
+    }])
+}
+
 /// The `languages` sub-document [`report`] produces, quoted once and shared by
 /// the scan and gate literals — they are one contract, not two.
 fn languages() -> Value {
@@ -83,10 +94,7 @@ fn the_scan_document_is_exactly_this() {
             "config": no_settings(),
             "languages": languages(),
             "fqn_collisions": 1,
-            "file_errors": [{
-                "path": "vendor/blob.go",
-                "error": "reading vendor/blob.go: stream did not contain valid UTF-8",
-            }],
+            "file_errors": file_errors(),
         }),
     );
 }
@@ -178,6 +186,7 @@ fn the_passing_gate_document_is_exactly_this() {
             },
             "languages": languages(),
             "fqn_collisions": 1,
+            "file_errors": file_errors(),
         }),
     );
 }
@@ -306,6 +315,7 @@ fn every_gate_document_carries_the_same_keys_whatever_it_decided() {
             "corpus",
             "error",
             "failures",
+            "file_errors",
             "fqn_collisions",
             "improved",
             "language",

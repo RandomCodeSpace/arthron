@@ -128,6 +128,12 @@ pub fn gate(out: &GateOutput<'_>) -> Value {
         "measured": counts(out.measured),
         "languages": languages(out.report),
         "fqn_collisions": out.report.fqn_collisions,
+        // The same array the scan document carries, and for a stronger
+        // reason: a gate's whole job is to say whether a corpus still
+        // measures what it did, and a re-base writes a baseline from this
+        // run. A corpus the scan could not fully read is a fact about the
+        // measurement, so the document CI reads has to carry it too.
+        "file_errors": file_errors(&out.report.file_errors),
     })
 }
 
@@ -280,7 +286,8 @@ pub const HELP: &str = concat!(
     "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
     "gate\n",
-    "  schema, command (\"gate\"), languages, fqn_collisions, config  as for scan\n",
+    "  schema, command (\"gate\"), languages, fqn_collisions, file_errors,\n",
+    "  config           as for scan\n",
     "  action           \"compare\" or \"rebase\"\n",
     "  language         the one language this gate measured\n",
     "  baseline_path    the baseline file read or written\n",
