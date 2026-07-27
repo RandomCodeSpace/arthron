@@ -135,6 +135,19 @@ pub fn scan<L: Language>(
         .filter(|known| !owned.contains_key(known))
         .collect();
 
+    // The container names this event's own files decide, folded in before
+    // phase 1 rather than after it. The store answers for the files this
+    // event did not touch and cannot answer for the ones it did — on a cold
+    // scan it answers nothing at all — so without this phase 1 builds
+    // identities from names phase 2 then disagrees with.
+    let mut event_names: HashMap<String, String> = HashMap::new();
+    for file in &changed {
+        if let Some((path, name)) = rs.declared_container(&cfg, &file.facts.header) {
+            event_names.insert(path, name);
+        }
+    }
+    rs.learn_containers(&mut cfg, &event_names);
+
     // What this event's own files declared before it ran, read before a
     // single fact is written. After phase 1 has rewritten the ownership
     // records this comparison is against itself, and the affected set comes

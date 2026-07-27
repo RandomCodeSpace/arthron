@@ -167,6 +167,23 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// is never invalidated by this.
     fn config_digest(&self, cfg: &L::Config) -> Vec<u8>;
 
+    /// The container this file *decides the name of*, as
+    /// `(container identity, declared name)`.
+    ///
+    /// Both phases build identities by asking what a container is called, so
+    /// they have to ask with the same knowledge. The store answers for files
+    /// an event did not touch; this answers for the ones it did, and the
+    /// driver folds the result in *before* the definition phase. Without it
+    /// phase 1 sees only what earlier scans stored while phase 2 sees what
+    /// phase 1 just wrote, and one file's definitions can land under one
+    /// identity with their edges sourced at another.
+    ///
+    /// `None` when the file does not decide that name. A Go `_test.go` file
+    /// may declare an external test package — `package foo_test` beside
+    /// package `foo` — which is a container of its own rather than a
+    /// statement about the directory's.
+    fn declared_container(&self, cfg: &L::Config, header: &L::Header) -> Option<(String, String)>;
+
     /// Fold container names the store already holds into the config.
     ///
     /// Binding an unaliased import needs a fact out of the *imported*

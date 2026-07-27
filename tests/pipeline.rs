@@ -177,6 +177,57 @@ fn a_local_and_a_package_level_call_of_one_name_are_two_rows() {
 }
 
 #[test]
+fn a_package_genuinely_named_like_a_test_package_lands_in_one_namespace() {
+    // `weird/` declares `package api_test` in its production file, so
+    // `api_test` is that directory's real package name and its `_test.go`
+    // file is an ordinary in-package test — not an external test package.
+    //
+    // Both phases decide that by asking what the directory's package is
+    // called, and they ask with different knowledge: phase 1 sees only the
+    // container names the store held before the event, phase 2 sees the
+    // ones phase 1 just wrote. On a cold scan phase 1 has no name for the
+    // directory and falls back to `weird`, files the test file's
+    // definitions under `weird#test`, and phase 2 — now knowing the name is
+    // `api_test` — sources their edges at `weird`. One file, two
+    // namespaces, and an edge from a node nothing declares.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(
+        root,
+        "weird/prod.go",
+        "package api_test\n\nfunc Helper() {}\n",
+    );
+    write(
+        root,
+        "weird/prod_test.go",
+        "package api_test\n\nfunc TestX() {\n\tHelper()\n}\n",
+    );
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("scan succeeds");
+    let store = Store::open(&db).expect("store opens");
+
+    assert!(
+        node(&store, "example.com/app/weird.TestX").is_some(),
+        "the test file shares its directory's package, so it is not `#test`",
+    );
+    assert_eq!(
+        node(&store, "example.com/app/weird#test.TestX"),
+        None,
+        "an external test package is one whose name differs from the \
+         directory's; here they are the same",
+    );
+    assert!(
+        calls(
+            &store,
+            "example.com/app/weird.TestX",
+            "example.com/app/weird.Helper",
+        ),
+        "the edge must start at the node the definition phase declared",
+    );
+}
+
+#[test]
 fn an_external_reference_gets_a_node_and_an_edge() {
     // A dependency outside the repository is a node like any other, so a
     // call into one is a real edge rather than a dead end — and giving it

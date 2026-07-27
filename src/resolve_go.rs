@@ -507,6 +507,24 @@ impl Resolver<GoLang> for GoResolver {
         hasher.finalize().as_bytes().to_vec()
     }
 
+    fn declared_container(&self, cfg: &GoModule, header: &GoHeader) -> Option<(String, String)> {
+        // Only a non-test file decides a directory's package name. A
+        // `_test.go` file may declare an external test package — `package
+        // foo_test` beside package `foo` — and reading that as the
+        // directory's own name is exactly the confusion this prevents:
+        // `is_external_test_package` asks whether the declared name differs
+        // from the directory's, and it cannot be its own answer.
+        if header.rel_path.ends_with("_test.go") {
+            return None;
+        }
+        let name = header.package.as_deref().filter(|n| !n.is_empty())?;
+        let rel_dir = match header.rel_path.rsplit_once('/') {
+            Some((dir, _)) => dir,
+            None => "",
+        };
+        Some((self.package_path(cfg, rel_dir), name.to_string()))
+    }
+
     fn learn_containers(&self, cfg: &mut GoModule, names: &HashMap<String, String>) {
         for (path, name) in names {
             cfg.package_names.insert(path.clone(), name.clone());
