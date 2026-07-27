@@ -168,6 +168,38 @@ fn gating_against_a_baseline_that_does_not_exist_is_a_usage_error() {
 }
 
 #[test]
+fn a_registered_but_disabled_language_is_refused_before_the_scan() {
+    // `Lang::ALL` carries every ratified language, most of whose tracks are
+    // not live. Gating one of those can only ever fail, so it must fail
+    // immediately: a name that validated and then scanned would spend a
+    // whole cold run on a corpus before reporting a usage error.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    fixture(&root);
+    let db = dir.path().join("never.redb");
+
+    let out = gate(
+        &root,
+        &dir.path().join("b.toml"),
+        &db,
+        &["--language", "rust", "--rebase"],
+    );
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("not live"), "stderr: {err}");
+    assert!(err.contains("rust"), "the error names the language: {err}");
+    assert!(
+        err.contains("go"),
+        "the error names what can be gated: {err}"
+    );
+    // Nothing was measured: no report on stdout and no store on disk.
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(out_text.is_empty(), "a scan ran anyway: {out_text}");
+    assert!(!db.exists(), "a scan ran anyway: {} exists", db.display());
+}
+
+#[test]
 fn an_unknown_language_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     let out = gate(

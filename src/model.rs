@@ -287,6 +287,13 @@ impl Lang {
     /// track is disabled it owns no file at all
     /// ([`crate::registry::Track::owns_extension`]), so a tier-2 entry
     /// changes nothing a scan reads; the go-live wave finalizes the list.
+    ///
+    /// The partition is committed; the tier-2 lists are not yet complete.
+    /// Each holds a minimal claim — `.hcl` and `.tfvars`, `.sbt`, `.zsh` and
+    /// the like are left unclaimed rather than assigned elsewhere — because
+    /// widening a disabled language's list changes nothing a scan reads, and
+    /// that track's go-live commit is the first point at which anyone has
+    /// parsed the files and can say the claim holds.
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             Lang::Go => &["go"],
@@ -294,13 +301,18 @@ impl Lang {
             Lang::JavaScript => &["js", "mjs", "cjs"],
             Lang::TypeScript => &["ts"],
             Lang::Python => &["py"],
-            // Deliberately **not** `c`: a `.c` file read under the C++
-            // grammar is parsed as the wrong language, and the two disagree
-            // often enough for that to produce wrong records rather than
-            // merely coarse ones. C rides this track later under its own
-            // decision — which is also when [`Domain::Cxx`] starts carrying
-            // two languages, and why the domain is named for the family.
-            Lang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh", "hxx", "h"],
+            // Deliberately **not** `c`, and for exactly the same reason
+            // not `h`. Measured against the pinned grammar: a K&R-style
+            // definition — valid C, not valid C++ — parses cleanly under
+            // the C grammar and yields an error node under the C++ one, so
+            // the two really are different languages here and a `.c` file
+            // read on this track is read as the wrong one. `.h` is the C
+            // header extension before it is anything else and carries that
+            // same hazard, so this list stops at the spellings only C++
+            // uses. Both ride this track later under C's own decision —
+            // which is also when [`Domain::Cxx`] starts carrying two
+            // languages, and why the domain is named for the family.
+            Lang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
             Lang::CSharp => &["cs"],
             Lang::Kotlin => &["kt", "kts"],
             Lang::Swift => &["swift"],
@@ -312,9 +324,14 @@ impl Lang {
             Lang::Elixir => &["ex", "exs"],
             Lang::Haskell => &["hs"],
             Lang::Lua => &["lua"],
-            // Not `bats`: a `.bats` file is a test DSL that the shell
-            // grammar does not parse, so claiming it would hand the walk a
-            // file this language cannot read.
+            // Not `bats`: the shell grammar does not reject a `.bats`
+            // file, it misreads one. Measured against the pinned grammar, a
+            // `@test "name" { ... }` block parses with zero error nodes, but
+            // the `@test` header and the closing brace each come out as an
+            // ordinary `command` — where a real shell function comes out as
+            // one `function_definition`. Claiming the extension would hand
+            // the walk a file that parses into records for things it does
+            // not declare, which is worse than not reading it.
             Lang::Bash => &["sh", "bash"],
             Lang::Hcl => &["tf"],
         }
@@ -858,10 +875,11 @@ mod tests {
         assert_eq!(Domain::Jvm.code(), 1);
         assert_eq!(Domain::EcmaScript.code(), 2);
         assert_eq!(Domain::Python.code(), 3);
-        let mut codes: Vec<u8> = pairs.iter().map(|(_, d)| d.code()).collect();
+        // Exactly `4..=17`, in that order: contiguous, no tier-1 code
+        // reused, and — the sequence being strictly increasing — every code
+        // distinct, which is what says no two languages share a domain.
+        let codes: Vec<u8> = pairs.iter().map(|(_, d)| d.code()).collect();
         assert_eq!(codes, (4u8..=17).collect::<Vec<u8>>());
-        codes.dedup();
-        assert_eq!(codes.len(), pairs.len(), "two languages share a domain");
     }
 
     #[test]
@@ -933,12 +951,14 @@ mod tests {
         assert_eq!(Lang::for_extension("ts"), Some(Lang::TypeScript));
         assert_eq!(Lang::for_extension("py"), Some(Lang::Python));
         assert_eq!(Lang::for_extension("rs"), Some(Lang::Rust));
-        // Unclaimed, and each on purpose. `.c` is not C++: reading one under
-        // the C++ grammar parses it as the wrong language, so C waits for its
-        // own decision on the `Cpp` track. `.bats` is not shell: it is a test
-        // DSL the shell grammar does not parse. `None` says so in both cases
-        // rather than handing the file to a near-miss claimant.
+        // Unclaimed, and each on purpose. `.c` and `.h` are C, not C++:
+        // read on the `Cpp` track either would be read under the wrong
+        // grammar, so both wait for C's own decision. `.bats` is not shell:
+        // the shell grammar parses it without complaint and misreads it,
+        // which yields wrong records rather than none. `None` says so in
+        // every case rather than handing the file to a near-miss claimant.
         assert_eq!(Lang::for_extension("c"), None);
+        assert_eq!(Lang::for_extension("h"), None);
         assert_eq!(Lang::for_extension("bats"), None);
         assert_eq!(Lang::for_extension(""), None);
         // A `.d.ts` file's extension *is* `ts`; the `.d` is part of the stem.

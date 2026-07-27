@@ -180,11 +180,15 @@ pub mod store;
 
 // One module per language track. Every registered track is declared here,
 // live or not, so that bringing a language up edits only that track's own
-// file — see `registry.rs` for the rule and each track's module docs for the
-// steps. A track nests its extractor and resolver under `src/track_<name>/`,
-// which is why this list does not grow when one is built.
+// file — see `registry.rs` for that rule, and `track_go` for the shape a live
+// track takes. A track nests its extractor and resolver under
+// `src/track_<name>/`, which is why this list does not grow when one is built.
 //
-// The four tier-1 tracks, in committed order.
+// Both groups below are alphabetical, which the committed order is not: that
+// order is `REGISTRY`'s and `Lang::ALL`'s (go, java, ecma, python, then the
+// tier-2 tracks), and nothing reads the order of these declarations.
+//
+// The four tier-1 tracks.
 pub mod track_ecma;
 pub mod track_go;
 pub mod track_java;
