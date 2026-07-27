@@ -65,14 +65,29 @@
 //! - **Framework string literals.** `mock.patch("pkg.mod.f")` (H-04) and
 //!   `importlib.import_module("a.b")` (B-19) name things literally, and a
 //!   framework rule — not the core extractor — is what turns them into
-//!   references. Until then they are ordinary calls, and the *variable* forms
-//!   stay [`crate::UnresolvedReason::DynamicModuleSpecifier`], never a guess.
+//!   references. Until such a rule exists both forms are ordinary calls: the
+//!   call to `import_module` resolves as the standard-library call it is, and
+//!   the specifier — literal or variable — is not a reference at all, so no
+//!   edge is invented for a module named by a string. That means
+//!   [`crate::UnresolvedReason::DynamicModuleSpecifier`] is currently
+//!   unreachable in this track rather than a bucket the corpus fills; when the
+//!   framework rule lands it is the reason the *variable* form must take, and
+//!   a guessed target is never the alternative.
 //! - **Cross-file supertypes.** A base class declared in another file gets one
 //!   probe and no expansion, because the symbol table answers whether an
 //!   identity exists and never what its bases are. The shortfall is
 //!   [`crate::UnresolvedReason::UnindexedSupertype`], and closing it needs the
 //!   phase 1.5 that [`crate::lang::Resolver::link_kinds`] describes and the
 //!   driver does not yet run.
+//! - **Star-import chains.** `from x import *` re-exports the names `x`
+//!   itself imported, transitively (B-10), so a source that star-imports in
+//!   turn passes that chain on. The chain is followed one hop: the probes run
+//!   against what the source *declares*, and a resolver holding one file's
+//!   facts and a membership-only symbol table cannot see the second hop. A
+//!   miss under any star import is therefore
+//!   [`crate::UnresolvedReason::WildcardImport`] and not
+//!   `NoMatchingDefinition` — the weaker claim is the true one, and closing
+//!   the gap needs the same phase 1.5 as the supertype shortfall above.
 //! - **Re-export chains.** `from pkg import Foo` where `pkg/__init__.py`
 //!   re-exports `Foo` resolves to the alias node in `pkg/__init__.py` — a real
 //!   declaration site, one hop short of the definition, because the store does

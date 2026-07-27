@@ -381,13 +381,23 @@ impl PyResolver {
         }
         // §7.11: a star import makes the source module's public names module
         // globals here. Go's `dot_imports` loop is structurally the same probe.
-        walk.unenumerable_star |= scope.star_unanchored;
+        //
+        // Reached only when nothing in this module binds the head name, so any
+        // star import present is the one thing that could still have supplied
+        // it — and a miss against one is inconclusive whatever the source is.
+        // Outside the repository the export set is not in the graph at all.
+        // Inside it the probes below cover the names that source *declares*,
+        // but §7.11's export set also carries the names it imported, and
+        // transitively so: a source that itself star-imports re-exports that
+        // chain. A resolver holds one file's facts and a membership-only
+        // symbol table, so it cannot see a second hop, and the chain is
+        // followed to a cap of one. `NoMatchingDefinition` would claim the
+        // name is declared nowhere it could be, which the chained shape
+        // falsifies; `WildcardImport` claims only what was actually checked
+        // and names the phase-1.5 module-facts pass that would close it
+        // (B-10/B-11).
+        walk.unenumerable_star |= scope.star_unanchored || !scope.stars.is_empty();
         for star in &scope.stars {
-            if is_stdlib(top_segment(star)) || cfg.declares_dependency(top_segment(star)) {
-                // Its export set is not in the graph, so a miss here proves
-                // nothing about whether the name exists (B-11).
-                walk.unenumerable_star = true;
-            }
             for module_fqn in cfg.module_fqns(&scope.root, star) {
                 let base = format!("{module_fqn}#{head}");
                 out.push(if rest.is_empty() {
@@ -1825,6 +1835,18 @@ mod tests {
             ),
             resolved_to("pkg#thing")
         );
+    }
+
+    #[test]
+    fn a_miss_against_a_star_source_does_not_claim_the_name_is_absent() {
+        // B-10: the export set of `from x import *` is x's own non-underscore
+        // bindings **plus its non-underscore imported names**, transitively.
+        // A resolver sees one file's facts and a membership-only symbol table,
+        // so it can prove `gone` is not declared *directly* in `pkg` and it
+        // cannot see whether `pkg` itself star-imports. `NoMatchingDefinition`
+        // asserts the second, stronger claim, and the chained shape below
+        // proves that claim false.
+        let cfg = project(&["pkg"]);
         assert_eq!(
             reason(
                 &cfg,
@@ -1833,6 +1855,28 @@ mod tests {
                 &["pkg"],
                 "gone"
             ),
+            UnresolvedReason::WildcardImport
+        );
+        // The chained shape, and the reason the rule above is not precision
+        // thrown away: `pkg.top` star-imports `pkg.mid`, which star-imports
+        // `pkg.deep`, which declares `deep`. The name is reachable at runtime
+        // and only the second hop is invisible from here, so the honest claim
+        // is the weaker one.
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/top.py",
+                "from .mid import *\n\ndeep()\n",
+                &["pkg", "pkg.mid", "pkg.deep", "pkg.deep#deep"],
+                "deep"
+            ),
+            UnresolvedReason::WildcardImport
+        );
+        // A file with no star import at all keeps the stronger claim: nothing
+        // could have supplied the name, so its absence really is a missing
+        // definition, and the denominator keeps a reason naming real work.
+        assert_eq!(
+            reason(&cfg, "app.py", "gone()\n", &["pkg"], "gone"),
             UnresolvedReason::NoMatchingDefinition
         );
     }
