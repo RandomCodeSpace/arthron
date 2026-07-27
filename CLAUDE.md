@@ -5,8 +5,9 @@ Read these before doing anything in this repo:
 1. `docs/superpowers/specs/2026-07-26-arthron-design.md` — the approved design
    (local, untracked). Start here if you have it; otherwise `docs/decisions.md`
    carries every decision and its rationale.
-2. [`docs/evidence/2026-07-26-baseline-measurements.md`](docs/evidence/2026-07-26-baseline-measurements.md)
-   — the measurements every design claim rests on.
+2. `docs/evidence/` — the measurements every design claim rests on (local,
+   untracked). They cite a private predecessor's internals, so the numbers
+   reach the public record through `docs/decisions.md` instead.
 3. [`docs/decisions.md`](docs/decisions.md) — decision log, newest first.
 4. [`CONTEXT.md`](CONTEXT.md) — the project glossary. Use its terms; respect
    its `_Avoid_` lists.
@@ -37,10 +38,12 @@ updating the design doc and saying why.
 ## Conventions
 
 Design and discussion sessions happen in the **main checkout**; their artifacts
-(specs, plans) live in `docs/superpowers/` — local, untracked, never committed.
-Implementation happens in **worktrees**. The public record is `docs/decisions.md`
-and `docs/evidence/` only.
+(specs in `docs/superpowers/`, measurement write-ups in `docs/evidence/`) are
+local, untracked, never committed. Implementation happens in **worktrees**.
+`docs/decisions.md` is the only public record.
 
 Rust. Record new decisions in `docs/decisions.md` — newest first, with what was
 rejected and why. New measurements go in `docs/evidence/` and must be executed,
 never estimated; if a benchmark turns out to be invalid, keep it with the reason.
+When a measurement justifies a decision, quote the number in `decisions.md` —
+never a path into a private repository.

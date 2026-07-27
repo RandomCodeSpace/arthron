@@ -2,7 +2,8 @@
 //!
 //! This layer interprets nothing — it stores what the resolver decided and
 //! tallies it back out. One write transaction per [`Batch`] (batch per
-//! event, per the redb stress test in docs/evidence/).
+//! event: 500 files in one transaction measured 60ms against 216ms as 500
+//! separate transactions).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;

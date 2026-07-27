@@ -44,8 +44,8 @@ of three buckets:
 **Resolution rate is the primary quality gate** — ranked above performance. A
 change that lowers it fails the build. The honest baseline today is 0%.
 
-See [`docs/evidence/2026-07-26-baseline-measurements.md`](docs/evidence/2026-07-26-baseline-measurements.md)
-for the measurements behind every claim above.
+Every number above was measured, not estimated. The measurements are recorded
+in [`docs/decisions.md`](docs/decisions.md) alongside the decisions they drove.
 
 ## Shape
 

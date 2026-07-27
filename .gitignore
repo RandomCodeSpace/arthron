@@ -11,9 +11,11 @@
 # Claude Code worktrees
 /.claude/worktrees/
 
-# Session discussion docs (specs, plans) - local working artifacts.
-# The public record is docs/decisions.md and docs/evidence/.
+# Local working artifacts: session discussion docs (specs, plans) and the
+# raw measurement write-ups. The public record is docs/decisions.md, which
+# carries the conclusions without the private predecessor's internals.
 /docs/superpowers/
+/docs/evidence/
 
 # Test corpora — RandomCodeSpace/arthron-corpus, cloned in, never vendored
 /corpus/

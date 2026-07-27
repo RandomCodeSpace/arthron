@@ -4,6 +4,40 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Measurement write-ups are local; decisions carry the numbers
+
+**Decision:** `docs/evidence/` is untracked and local, alongside
+`docs/superpowers/`. `docs/decisions.md` is the only public record. Numbers
+that justify a decision are quoted inline here; the raw write-ups stay off the
+public repository, and so does anything naming a private repository's
+internals.
+
+**Why:** this repository is public, and the baseline write-up cited the
+predecessor's internal file paths and line numbers to attribute root causes.
+That is the right level of rigour for an internal document and the wrong thing
+to publish — more so now that the predecessor repository is being deleted, at
+which point those paths reference nothing anyone can check.
+
+**What was preserved:** the measurements themselves. Every number the write-ups
+supported — the 1-call-edge graph, the redb stress-test figures, the 46.8% Go
+baseline — is quoted in the entries above and below. Nothing that justified a
+decision was lost; only the private repository's structure was dropped.
+
+**Consequence for the gate.** The entry
+"[Gate baselines ratchet only by commit](#2026-07-26--gate-baselines-ratchet-only-by-commit)"
+requires per-language baselines to be committed. The narrative write-up no
+longer is. When `arthron gate` is built it needs a small tracked
+machine-readable baseline file — the rate per language and nothing else, which
+carries no private detail. Recorded here so the two decisions do not silently
+contradict each other.
+
+**Measured Go baseline, for that file when it exists:** `go = 0.468`
+(resolved 4,467; external 6,083; unresolved 5,077 — `NeedsTypeInference` 4,826,
+`NoMatchingDefinition` 251), on the `codeiq` corpus at `6dd90b5`. Predecessor
+baseline on the same corpus: 0%.
+
+---
+
 ## 2026-07-26 — First milestone: walking skeleton, Go first
 
 **Decision:** the first milestone is a thin vertical slice through all five
@@ -285,10 +319,13 @@ records, zerocopy for fixed-size edge PODs.
 **Constraint given:** performant, on-disk, actively maintained. Cross-process or
 cross-language access explicitly not required if it costs performance.
 
-**Stress-tested before committing** — full numbers in
-[`evidence/2026-07-26-baseline-measurements.md`](evidence/2026-07-26-baseline-measurements.md) §5.
-The single-writer concern did not survive measurement: under continuous write
-pressure on 2 vCPU, readers sustained 854,782 reads/s with a 13.65ms worst case.
+**Stress-tested before committing**, modelling the 5M-LOC target at 152k nodes
+and 114k edges on 2 vCPU. The single-writer concern did not survive
+measurement: under continuous write pressure, readers sustained 854,782
+reads/s with a 13.65ms worst case. Baseline build 592.69ms; single-file save
+494.67µs average, 1.04ms worst; 500 files in one transaction 59.97ms against
+216.04ms as 500 transactions (3.6×, real but not a wall); `db.compact()`
+returned a churned 257 MB file to 125 MB in 1.39s.
 
 **Rejected:** `sled` (still `1.0.0-alpha.124`, last touched 2024-10-11) and
 `rkyv` (actively maintained, but recent work is fuzzer fixes for UAF and type
@@ -304,10 +341,13 @@ possibly-corrupt CI-restored cache).
 linking and classifies every reference as `Resolved`, `External`, or
 `Unresolved`. **It never drops.**
 
-**Why:** `codeiq` let 100+ detectors build edges, then silently discarded any
-edge whose endpoints were not already known. Result: 14,423 method nodes, 1 call
-edge, 0 `RESOLVED` edges. See
-[`evidence/2026-07-26-baseline-measurements.md`](evidence/2026-07-26-baseline-measurements.md) §2.
+**Why:** the predecessor let 100+ detectors build edges, then silently
+discarded any edge whose endpoints were not already known. Measured on a
+1.33M-line corpus: 14,423 method nodes produced **1** call edge; edge kinds
+were `contains` 13,232, `imports` 11,843, `defines` 2,991, `calls` 1;
+confidence was `LEXICAL` 24,454, `SYNTACTIC` 5,831, `RESOLVED` **0**; and
+4,190 external nodes were created and referenced by nothing. 102 of 107
+detector files attempted no cross-file work at all.
 
 A detector sees one file. It cannot know whether a target exists elsewhere. So
 it either guesses (dropped) or gives up (nothing). Only a layer that sees all
