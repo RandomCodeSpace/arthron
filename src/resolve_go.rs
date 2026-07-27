@@ -33,21 +33,27 @@ pub fn parse_go_mod(src: &str) -> Option<GoModule> {
     let mut in_require_block = false;
     for line in src.lines() {
         let line = line.split("//").next().unwrap_or("").trim();
-        if line.is_empty() {
+        // go.mod separates a directive from its argument with any run of
+        // whitespace — gofmt writes tabs — so tokenise rather than match a
+        // single-space prefix.
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else {
+            continue; // blank, or comment-only
+        };
+        let second = tokens.next();
+        if in_require_block {
+            if first == ")" {
+                in_require_block = false;
+            } else {
+                requires.push(first.to_string());
+            }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("module ") {
-            path = Some(rest.trim().to_string());
-        } else if line == "require (" {
-            in_require_block = true;
-        } else if in_require_block && line == ")" {
-            in_require_block = false;
-        } else if in_require_block && let Some(dep) = line.split_whitespace().next() {
-            requires.push(dep.to_string());
-        } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some(dep) = rest.split_whitespace().next()
-        {
-            requires.push(dep.to_string());
+        match (first, second) {
+            ("module", Some(module_path)) => path = Some(module_path.to_string()),
+            ("require", Some("(")) => in_require_block = true,
+            ("require", Some(dep)) => requires.push(dep.to_string()),
+            _ => {}
         }
     }
     Some(GoModule {
@@ -91,6 +97,44 @@ pub struct FileScope {
     pub dot_imports: Vec<String>,
 }
 
+/// Whether a path segment is a Go major-version marker (`v2`, `v3`, …).
+fn is_version_segment(segment: &str) -> bool {
+    match segment.strip_prefix('v') {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// The name an unaliased import binds to, derived from its path.
+///
+/// Go binds an unaliased import to the imported package's *declared* name,
+/// which lives in that package's source and not in the import path. This is
+/// therefore a heuristic, and one for **external** packages only: their
+/// sources are never indexed, so the path is the only evidence there is.
+/// Module version suffixes are how the last segment usually lies, so strip
+/// them — `gopkg.in/yaml.v3` binds `yaml`, `github.com/foo/bar/v2` binds
+/// `bar`, and a plain path binds its last segment.
+///
+/// Internal packages are not this function's problem: the extractor already
+/// records their declared names (`FileFacts::package`), and correcting those
+/// bindings belongs to the pipeline, which is the layer that sees every
+/// package in the repository. Until it does so, an internal package whose
+/// declared name differs from its directory name simply misses — as
+/// `NeedsTypeInference`, never as a wrong edge.
+fn import_binding(path: &str) -> &str {
+    let mut segments = path.rsplit('/');
+    let last = segments.next().unwrap_or(path);
+    if is_version_segment(last) {
+        // `github.com/foo/bar/v2` → `bar`; a bare `v2` has nothing before it.
+        return segments.next().filter(|s| !s.is_empty()).unwrap_or(last);
+    }
+    match last.rsplit_once('.') {
+        // `gopkg.in/yaml.v3` → `yaml`
+        Some((name, version)) if !name.is_empty() && is_version_segment(version) => name,
+        _ => last,
+    }
+}
+
 /// Build a [`FileScope`] from a file's extracted facts.
 pub fn file_scope(module: &GoModule, rel_dir: &str, facts: &FileFacts) -> FileScope {
     let resolver = GoResolver {
@@ -106,8 +150,7 @@ pub fn file_scope(module: &GoModule, rel_dir: &str, facts: &FileFacts) -> FileSc
                 imports.insert(alias.to_string(), imp.path.clone());
             }
             None => {
-                let last = imp.path.rsplit('/').next().unwrap_or(&imp.path);
-                imports.insert(last.to_string(), imp.path.clone());
+                imports.insert(import_binding(&imp.path).to_string(), imp.path.clone());
             }
         }
     }
@@ -205,29 +248,39 @@ impl GoResolver {
     ) -> Resolution {
         match &r.target {
             RefTarget::Plain { name } => {
-                if GO_BUILTINS.contains(&name.as_str()) {
-                    return Resolution {
-                        outcome: Outcome::External("go:builtin".to_string()),
-                        candidates: vec![],
-                    };
-                }
                 // Same package first, then internal dot-imports, in order.
-                let mut candidates = vec![node_id(Lang::Go, &format!("{}.{name}", scope.pkg_path))];
-                for dot in &scope.dot_imports {
-                    if self.is_internal(dot) {
-                        candidates.push(node_id(Lang::Go, &format!("{dot}.{name}")));
-                    }
-                }
-                for id in &candidates {
-                    if probe.contains(id) {
+                // Generated and probed one at a time, stopping at the first
+                // hit: `candidates` must list what was probed and nothing
+                // else, or the invalidation index it feeds would wake this
+                // reference for edits that could not change its outcome.
+                let same_pkg = format!("{}.{name}", scope.pkg_path);
+                let dotted = scope
+                    .dot_imports
+                    .iter()
+                    .filter(|dot| self.is_internal(dot))
+                    .map(|dot| format!("{dot}.{name}"));
+                let mut candidates = Vec::new();
+                for fqn in std::iter::once(same_pkg).chain(dotted) {
+                    let id = node_id(Lang::Go, &fqn);
+                    candidates.push(id);
+                    if probe.contains(&id) {
                         return Resolution {
-                            outcome: Outcome::Resolved(*id),
+                            outcome: Outcome::Resolved(id),
                             candidates,
                         };
                     }
                 }
+                // Nothing in scope defines the name. The universe scope is
+                // the outermost one, so a builtin is the answer only after
+                // every candidate has been probed and missed — otherwise a
+                // package-level `min` could never resolve.
+                let outcome = if GO_BUILTINS.contains(&name.as_str()) {
+                    Outcome::External("go:builtin".to_string())
+                } else {
+                    Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
+                };
                 Resolution {
-                    outcome: Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+                    outcome,
                     candidates,
                 }
             }
@@ -267,6 +320,7 @@ impl GoResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract_go::Import;
     use crate::model::{RefKind, Span};
     use std::collections::HashSet;
 
@@ -310,6 +364,21 @@ mod tests {
         .unwrap();
         assert_eq!(m.path, "example.com/app");
         assert_eq!(m.requires, ["github.com/pkg/errors", "golang.org/x/sync"]);
+    }
+
+    #[test]
+    fn go_mod_directives_tolerate_tabs_and_runs_of_spaces() {
+        // gofmt aligns go.mod with tabs, so "module\tpath" is the common
+        // on-disk shape, not the exception.
+        let spaced = parse_go_mod(
+            "module example.com/app\n\ngo 1.22\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1 // indirect\n)\nrequire golang.org/x/sync v0.7.0\n",
+        )
+        .expect("spaced go.mod parses");
+        let tabbed = parse_go_mod(
+            "module\texample.com/app\n\ngo 1.22\n\nrequire\t(\n\tgithub.com/pkg/errors\tv0.9.1 // indirect\n)\nrequire   golang.org/x/sync v0.7.0\n",
+        )
+        .expect("tab-separated go.mod parses");
+        assert_eq!(tabbed, spaced);
     }
 
     #[test]
@@ -380,6 +449,116 @@ mod tests {
         let t: HashSet<NodeId> = HashSet::new();
         let res = r.resolve_call(&call(RefTarget::Plain { name: "len".into() }), &scope(), &t);
         assert_eq!(res.outcome, Outcome::External("go:builtin".into()));
+    }
+
+    #[test]
+    fn unaliased_imports_bind_without_module_version_suffixes() {
+        let span = Span {
+            byte_start: 0,
+            byte_end: 0,
+            line: 1,
+        };
+        let unaliased = |path: &str| Import {
+            alias: None,
+            path: path.to_string(),
+            span,
+        };
+        let facts = FileFacts {
+            imports: vec![
+                unaliased("gopkg.in/yaml.v3"),
+                unaliased("github.com/foo/bar/v2"),
+                unaliased("example.com/plain"),
+            ],
+            ..FileFacts::default()
+        };
+        let s = file_scope(&module(), "server", &facts);
+        assert_eq!(
+            s.imports.get("yaml").map(String::as_str),
+            Some("gopkg.in/yaml.v3")
+        );
+        assert_eq!(
+            s.imports.get("bar").map(String::as_str),
+            Some("github.com/foo/bar/v2")
+        );
+        assert_eq!(
+            s.imports.get("plain").map(String::as_str),
+            Some("example.com/plain")
+        );
+        assert_eq!(s.imports.len(), 3);
+
+        // The symptom the binding name causes: an unknown qualifier is read
+        // as a variable, so every `yaml.X()` call would need type inference.
+        let r = GoResolver { module: module() };
+        let t: HashSet<NodeId> = HashSet::new();
+        let res = r.resolve_call(
+            &call(RefTarget::Qualified {
+                qualifier: "yaml".into(),
+                name: "Unmarshal".into(),
+            }),
+            &s,
+            &t,
+        );
+        assert_eq!(res.outcome, Outcome::External("gopkg.in/yaml.v3".into()));
+    }
+
+    #[test]
+    fn candidates_record_exactly_what_was_probed() {
+        // `candidates` feeds the invalidation index: a candidate listed but
+        // never probed would wake this reference for an edit that could not
+        // have changed its outcome.
+        let r = GoResolver { module: module() };
+        let same_pkg = node_id(Lang::Go, "example.com/app/server.helper");
+        let dot = node_id(Lang::Go, "example.com/app/util.helper");
+        let mut s = scope();
+        s.dot_imports.push("example.com/app/util".into());
+
+        let mut table = HashSet::new();
+        let miss = r.resolve_call(
+            &call(RefTarget::Plain {
+                name: "helper".into(),
+            }),
+            &s,
+            &table,
+        );
+        // A total miss probes every candidate, so it records every candidate.
+        assert_eq!(miss.candidates, vec![same_pkg, dot]);
+
+        table.insert(same_pkg);
+        let hit = r.resolve_call(
+            &call(RefTarget::Plain {
+                name: "helper".into(),
+            }),
+            &s,
+            &table,
+        );
+        assert_eq!(hit.outcome, Outcome::Resolved(same_pkg));
+        assert_eq!(hit.candidates.len(), 1, "the dot-import was never probed");
+        assert_eq!(hit.candidates, vec![same_pkg]);
+    }
+
+    #[test]
+    fn a_package_level_definition_beats_the_builtin_of_the_same_name() {
+        // Go's universe scope is the outermost one: a package-level `min`
+        // shadows the builtin, so the builtin answer is only correct once
+        // every candidate in scope has been probed and missed.
+        let r = GoResolver { module: module() };
+        let min = node_id(Lang::Go, "example.com/app/server.min");
+        let mut table = HashSet::new();
+        let builtin = r.resolve_call(
+            &call(RefTarget::Plain { name: "min".into() }),
+            &scope(),
+            &table,
+        );
+        assert_eq!(builtin.outcome, Outcome::External("go:builtin".into()));
+        assert_eq!(builtin.candidates, vec![min]); // the miss is still recorded
+        table.insert(min);
+        let shadowed = r.resolve_call(
+            &call(RefTarget::Plain { name: "min".into() }),
+            &scope(),
+            &table,
+        );
+        assert_eq!(shadowed.outcome, Outcome::Resolved(min));
+        assert_eq!(shadowed.candidates, vec![min]);
     }
 
     #[test]
