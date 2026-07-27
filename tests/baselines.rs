@@ -32,6 +32,7 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/typescript-zod.toml", "tests/corpus_ecma.rs"),
     ("baselines/python-django.toml", "tests/corpus_python.rs"),
     ("baselines/python-flask.toml", "tests/corpus_python.rs"),
+    ("baselines/ruby-rack.toml", "tests/ruby_corpus.rs"),
 ];
 
 #[test]
