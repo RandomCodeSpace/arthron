@@ -724,11 +724,21 @@ fn report_text(report: &arthron::store::Report) -> String {
     lang_codes.insert(Lang::Go.code());
     for lang_code in lang_codes {
         let tally = report.per_lang.get(&lang_code).unwrap_or(&empty);
-        let lang = Lang::from_code(lang_code).map_or("unknown", Lang::name);
+        let known = Lang::from_code(lang_code);
+        let lang = known.map_or("unknown", Lang::name);
         let unresolved = tally.unresolved_total();
         let rate = match resolution_rate(tally.resolved, unresolved) {
             Some(r) => format!("{:.1}%", r * 100.0),
             None => "n/a (nothing to measure)".to_string(),
+        };
+        // What the rate is a rate *of*. A tier-1 rate is taken over calls,
+        // type uses and imports; a tier-2 rate over imports alone, which is a
+        // strictly smaller denominator. Printing both in one column without
+        // saying which is which invites the one comparison neither number
+        // supports, so the column says which.
+        let tier = match known {
+            Some(l) => format!(" (tier {}: {})", l.tier(), l.rate_scope()),
+            None => String::new(),
         };
         // `local-binding` gets its own column rather than a share of
         // `unresolved`: it is policy-caused — locals are not nodes by
@@ -737,7 +747,7 @@ fn report_text(report: &arthron::store::Report) -> String {
         outln!(
             text,
             "{lang:<12} resolved {:<8} external {:<8} local-binding {:<8} \
-             unresolved {:<8} rate {rate}",
+             unresolved {:<8} rate {rate}{tier}",
             tally.resolved,
             tally.external,
             tally.local_binding,
