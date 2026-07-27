@@ -1,28 +1,27 @@
-//! Local-first code intelligence.
+//! Local-first code intelligence: parse each file in isolation, then resolve
+//! the references between them into a verified graph.
 //!
-//! **Status: design phase.** The engine is not implemented. What ships here is
-//! the one thing the design is built around — the contract that every reference
-//! between two files resolves to exactly one outcome, and that failing to
-//! resolve is recorded rather than discarded.
+//! **Status: early.** Scanning works and produces a real graph for Go; the
+//! remaining tier-1 languages and the CI, watch and query surfaces are not
+//! built yet. The API is pre-1.0 and will change.
 //!
-//! The design decisions and their rationale are recorded in the repository's
-//! `docs/decisions.md`. Read that before depending on anything here.
+//! # The contract
 //!
-//! # Why this contract exists
+//! [`Outcome`] is the type the whole engine is built around. Every reference
+//! between two files resolves to exactly one of its three variants, and there
+//! is no way to express "dropped".
 //!
-//! Its predecessor let each of 100+ single-file detectors build graph edges
-//! directly, then silently dropped any edge whose endpoints were not already
-//! known. Measured on a 1.33M-line corpus, that produced 14,423 method nodes
-//! and exactly one call edge, with zero edges reaching resolved confidence —
-//! and reported success throughout.
+//! A file-local extractor cannot know whether the symbol it just saw is defined
+//! elsewhere in the repository. Let it emit edges anyway and it must either
+//! guess — leaving something downstream to discard the guess — or give up and
+//! emit nothing. Both yield a graph that looks populated, links almost nothing
+//! across files, and reports success while doing it.
 //!
-//! A detector sees one file. It cannot know whether a target exists elsewhere,
-//! so it either guesses (and the guess is dropped) or gives up (and emits
-//! nothing). Both paths yield a graph that looks populated and links nothing.
-//!
-//! The fix is to make the failure impossible to hide: detectors emit
-//! references, one resolver owns linking, and [`Outcome::Unresolved`] carries a
-//! [`UnresolvedReason`] instead of vanishing.
+//! So extractors emit references and never edges; one resolver, which sees
+//! every file, owns all linking; and a reference that cannot be linked becomes
+//! [`Outcome::Unresolved`] carrying a [`UnresolvedReason`] rather than
+//! vanishing. Aggregated, those reasons are the measurement of where language
+//! support is thin — which is what [`resolution_rate`] reports.
 
 #![forbid(unsafe_code)]
 
