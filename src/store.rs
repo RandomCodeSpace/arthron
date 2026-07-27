@@ -5,7 +5,7 @@
 //! event: 500 files in one transaction measured 60ms against 216ms as 500
 //! separate transactions).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use bincode::{Decode, Encode, config};
@@ -40,6 +40,12 @@ pub enum NodeRecord {
     Package {
         /// The package's import path.
         import_path: String,
+        /// The name the package's files declare, when a scanned file in it
+        /// declared one. An unaliased import binds *this*, not the last
+        /// segment of the import path, and the two differ often enough that
+        /// guessing from the path is how a call to an internal package
+        /// silently misses.
+        name: Option<String>,
     },
 }
 
@@ -185,6 +191,61 @@ impl Store {
             .get(path)
             .map_err(|e| e.to_string())?
             .map(|guard| *guard.value()))
+    }
+
+    /// The record stored under a node id, if the node exists.
+    ///
+    /// The graph's identity surface: what a given FQN hashes to is either a
+    /// node or it is not, and this is how that question gets asked.
+    pub fn node(&self, id: &NodeId) -> Result<Option<NodeRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let Some(guard) = table.get(id).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let (record, _): (NodeRecord, usize) =
+            bincode::decode_from_slice(guard.value(), config::standard())
+                .map_err(|e| e.to_string())?;
+        Ok(Some(record))
+    }
+
+    /// Whether the graph holds this exact edge.
+    ///
+    /// An edge is a resolved reference, so `src` is the node the reference
+    /// sat in — which is the assertion worth making about it.
+    pub fn has_edge(&self, src: &NodeId, dst: &NodeId, kind: u8) -> Result<bool, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(EDGES).map_err(|e| e.to_string())?;
+        Ok(table
+            .get((src, dst, kind))
+            .map_err(|e| e.to_string())?
+            .is_some())
+    }
+
+    /// Declared package name for every package node that has one, keyed by
+    /// import path.
+    ///
+    /// Binding an unaliased import needs the *imported* package's declared
+    /// name, so an event that changes one file must still know the names of
+    /// packages it did not touch. The store is where those live.
+    pub fn package_names(&self) -> Result<HashMap<String, String>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = HashMap::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            let (record, _): (NodeRecord, usize) =
+                bincode::decode_from_slice(value.value(), config::standard())
+                    .map_err(|e| e.to_string())?;
+            if let NodeRecord::Package {
+                import_path,
+                name: Some(name),
+            } = record
+            {
+                out.insert(import_path, name);
+            }
+        }
+        Ok(out)
     }
 
     /// All node ids, as the pipeline's symbol-probe set.

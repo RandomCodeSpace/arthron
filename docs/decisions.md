@@ -4,6 +4,63 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Package identity: declared names, no `init` node, `_test` is its own package
+
+Three corrections to what a Go node *is*, all of them cases where the graph
+named something the language does not.
+
+**Declared package names.** An unaliased import binds the imported package's
+**declared** name, which lives in that package's source, not in its path.
+Directory `utilx` declaring `package util` is imported as
+`example.com/app/utilx` and written `util.Parse`. The pipeline — the only
+layer that sees every package — now carries an import-path → declared-name map
+and corrects the binding for internal imports; `NodeRecord::Package` gained a
+`name` field so a scan that touches one file still knows the names of packages
+it did not read. External packages keep the path heuristic: their source is
+never indexed, so the path is the only evidence there is.
+
+**`init` is not a node.** Go forbids naming `func init()` — it cannot be
+called, assigned, or referred to — and a package may declare any number of
+them. By the rule that [a node is a thing a reference can
+name](#2026-07-26--graph-model-a-node-is-a-thing-a-reference-can-name), it is
+not one. It gets no definition node, and calls inside it are sourced at the
+package node, exactly like a package-level variable's initialiser. The corpus
+has 116 of them.
+
+**External test packages get their own package.** `package foo_test` in the
+directory of package `foo` is a second package sharing a directory. Its
+definitions now live under `{pkg_path}_test`, with their own package node. It
+reaches the package under test through the explicit import it has to write
+anyway.
+
+**Why these three together:** each was a distinct way for one identity to
+stand for several things, or for a thing nothing can name to become a node.
+Sharing a namespace between production and test packages permits a *false*
+resolution — a production file's same-package candidate hitting a test-only
+definition — which is worse than a miss, because a miss is counted and a wrong
+edge is not.
+
+**Rejected:** deriving internal bindings from the import path (the previous
+behaviour: silently turns every call through such an import into
+`NeedsTypeInference`); having the resolver read the imported package's source
+to find its name (extraction is per-file, and the resolver probes identities
+rather than parsing); giving each `init` a file-qualified identity such as
+`{pkg}.init@file` (a node no reference can name is still not a node, and files
+are fields, not identity); dropping `_test.go` files from the scan (loses real
+references, and improves the rate by measuring less).
+
+**Storage:** `NodeRecord::Package` is a schema change. The format is pre-1.0
+and unversioned, so existing `.redb` files do not decode — delete and rescan.
+
+**Measured:** the `codeiq` corpus rate is unchanged at **46.8%** (resolved
+4,467; external 6,085; unresolved 5,075). These are identity fixes, not rate
+fixes: no directory in that corpus declares a package name differing from its
+own name, and its external test packages call across the boundary only through
+imports, so no reference outcome moves. The evidence for each fix is the
+integration test that fails without it, not the corpus number.
+
+---
+
 ## 2026-07-27 — Measurement write-ups are local; decisions carry the numbers
 
 **Decision:** `docs/evidence/` is untracked and local, alongside
