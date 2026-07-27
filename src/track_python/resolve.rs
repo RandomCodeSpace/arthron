@@ -495,7 +495,33 @@ impl PyResolver {
         probe: &dyn SymbolProbe,
         probed: &mut Vec<NodeId>,
     ) -> Outcome<NodeId, String> {
-        if let Some(package) = &walk.external {
+        // Does this repository own the top-level name of any module the walk
+        // searched, and is there one it does not own?
+        //
+        // Asked once, up front, and reused twice below, because
+        // `probe_in_order` deliberately never reads the same identity twice —
+        // asking the same question again further down would get `None` back
+        // and read it as the opposite answer.
+        let mut owns_a_searched_root = false;
+        let mut misses_a_searched_root = false;
+        for module in &walk.searched_modules {
+            let owned = cfg.module_fqns(&scope.root, top_segment(module));
+            if Self::probe_in_order(probe, &owned, probed).is_some() {
+                owns_a_searched_root = true;
+            } else {
+                misses_a_searched_root = true;
+            }
+        }
+        // §5.5: `sys.path` order decides which distribution a name reaches, so
+        // a first-party package shadows the standard library or a dependency
+        // of the same name. `note_external` records its walk fact from a
+        // frozen *name* set before any in-repository candidate has been
+        // probed, so honouring it unconditionally answered for a distribution
+        // this reference never reaches — and took the reference out of both
+        // rate terms to do it.
+        if let Some(package) = &walk.external
+            && !owns_a_searched_root
+        {
             return Outcome::External(package.clone());
         }
         let head = segments.first().map(String::as_str).unwrap_or("");
@@ -535,11 +561,8 @@ impl PyResolver {
         // would blame this repository for a name that was never in it. This
         // is exactly the test `missing_module` applies at an import site,
         // asked again at the use site so the two agree.
-        for module in &walk.searched_modules {
-            let roots = cfg.module_fqns(&scope.root, top_segment(module));
-            if Self::probe_in_order(probe, &roots, probed).is_none() {
-                return Outcome::Unresolved(UnresolvedReason::UnknownPackage);
-            }
+        if misses_a_searched_root {
+            return Outcome::Unresolved(UnresolvedReason::UnknownPackage);
         }
         if walk.root_typed {
             return Outcome::Unresolved(if walk.unindexed_supertype {
@@ -593,6 +616,19 @@ impl PyResolver {
             // nothing about why this module is missing.
             return Outcome::Unresolved(UnresolvedReason::ModuleNotFound);
         }
+        // §5.5: `sys.path` order decides which distribution a name reaches,
+        // and a first-party package on the path shadows the standard library
+        // or a dependency of the same name. `is_stdlib` and
+        // `declares_dependency` are frozen *name* sets and say nothing about
+        // this repository, so both are asked only once the repository has
+        // been asked and said no. Getting the order wrong turned a genuinely
+        // broken first-party import into `External`, which both silenced the
+        // breakage and took the reference out of the rate.
+        let owned: Vec<String> = cfg.module_fqns(&scope.root, top);
+        let repo_owns_top = Self::probe_in_order(probe, &owned, probed).is_some();
+        if repo_owns_top {
+            return Outcome::Unresolved(UnresolvedReason::ModuleNotFound);
+        }
         if is_stdlib(top) {
             return Outcome::External(stdlib_package(top));
         }
@@ -609,15 +645,9 @@ impl PyResolver {
         if scope.mutates_sys_path {
             return Outcome::Unresolved(UnresolvedReason::ProjectLayoutUnknown);
         }
-        // A top-level package this repository does declare means the specifier
-        // named a module inside it that does not exist; anything else is
-        // outside the repository and was never indexed.
-        let roots: Vec<String> = cfg.module_fqns(&scope.root, top);
-        if Self::probe_in_order(probe, &roots, probed).is_some() {
-            Outcome::Unresolved(UnresolvedReason::ModuleNotFound)
-        } else {
-            Outcome::Unresolved(UnresolvedReason::UnknownPackage)
-        }
+        // The repository was already asked above and said no, so whatever this
+        // names is outside it and was never indexed.
+        Outcome::Unresolved(UnresolvedReason::UnknownPackage)
     }
 
     /// Classify an import reference.
@@ -1756,6 +1786,56 @@ mod tests {
         assert_eq!(
             reason(&cfg, "pkg/mod.py", cooperative, &[], "super().run"),
             UnresolvedReason::DynamicDispatch
+        );
+    }
+
+    #[test]
+    fn a_first_party_package_beats_a_standard_library_name() {
+        // B-23 and §5.5: `sys.path` order decides, and a first-party package
+        // on the path shadows the distribution of the same name. `is_stdlib`
+        // is a frozen *name* set, not evidence about this repository, so
+        // asking it before asking whether the repository owns the name turns
+        // a genuinely broken first-party import into `External` — silencing
+        // the breakage and taking the reference out of both rate terms.
+        let cfg = project(&["queue"]);
+        assert_eq!(
+            reason(
+                &cfg,
+                "app.py",
+                "import queue.helpers\n",
+                &["queue"],
+                "queue.helpers"
+            ),
+            UnresolvedReason::ModuleNotFound
+        );
+        // Same question asked at the use site, where the answer used to come
+        // from a walk fact recorded before any in-repository candidate ran.
+        assert_eq!(
+            reason(
+                &cfg,
+                "app.py",
+                "import queue\n\nqueue.Missing()\n",
+                &["queue"],
+                "queue.Missing"
+            ),
+            UnresolvedReason::NoMatchingDefinition
+        );
+        // The control that keeps this narrow: a repository that does *not*
+        // own the name still gets the standard library, at both sites.
+        let plain = project(&["pkg"]);
+        assert_eq!(
+            outcome_of(&plain, "app.py", "import queue\n", &[], "queue"),
+            Outcome::External("py:std:queue".to_string())
+        );
+        assert_eq!(
+            outcome_of(
+                &plain,
+                "app.py",
+                "import queue\n\nqueue.Missing()\n",
+                &[],
+                "queue.Missing"
+            ),
+            Outcome::External("py:std:queue".to_string())
         );
     }
 
