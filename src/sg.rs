@@ -99,6 +99,15 @@ impl SourceTree {
         Self::parse(SupportLang::Rust, source)
     }
 
+    /// Parse Kotlin source — `.kt` and `.kts` alike.
+    ///
+    /// One grammar for both: a Gradle build script is Kotlin whose top level
+    /// happens to be statements rather than declarations, not a dialect of
+    /// its own, and the walk is what decides which files a scan reads.
+    pub fn parse_kotlin(source: &str) -> Self {
+        Self::parse(SupportLang::Kotlin, source)
+    }
+
     /// Parse Scala source.
     ///
     /// One grammar for every dialect: Scala 2 and Scala 3 differ in surface
@@ -257,6 +266,34 @@ rule:
             "function_item",
             "hi",
         );
+    }
+
+    /// Kotlin, which [`one_match`] cannot check: tree-sitter-kotlin names no
+    /// `name` field on a declaration, so the name is a child of a known kind
+    /// rather than a field. The point of the test is the same — the grammar
+    /// is compiled into this build, and a missing one would match nothing.
+    #[test]
+    fn parses_kotlin() {
+        let rules = Rules::compile("id: t\nlanguage: kotlin\nrule:\n  kind: class_declaration\n")
+            .expect("rules compile");
+        // `.kts` is the same grammar: a build script is Kotlin whose top
+        // level happens to be statements.
+        for source in ["class Greeter { fun hi() {} }\n", "class Greeter\n"] {
+            let tree = SourceTree::parse_kotlin(source);
+            let found = tree.matches(&rules);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected one class_declaration in {source:?}"
+            );
+            let (_, node) = &found[0];
+            assert_eq!(node.kind(), "class_declaration");
+            let name = node
+                .children()
+                .find(|c| c.kind() == "type_identifier")
+                .expect("the declaration names a type");
+            assert_eq!(name.text(), "Greeter");
+        }
     }
 
     #[test]
