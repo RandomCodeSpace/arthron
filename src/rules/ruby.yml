@@ -1,0 +1,34 @@
+id: def-module
+language: ruby
+rule:
+  kind: module
+---
+id: def-class
+language: ruby
+rule:
+  kind: class
+---
+id: def-method
+language: ruby
+rule:
+  kind: method
+---
+id: def-singleton-method
+language: ruby
+rule:
+  kind: singleton_method
+---
+id: assign
+language: ruby
+rule:
+  kind: assignment
+---
+id: opassign
+language: ruby
+rule:
+  kind: operator_assignment
+---
+id: call
+language: ruby
+rule:
+  kind: call

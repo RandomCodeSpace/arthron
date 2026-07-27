@@ -75,6 +75,15 @@ impl SourceTree {
         Self::parse(SupportLang::Python, source)
     }
 
+    /// Parse Ruby source.
+    ///
+    /// One grammar for every `.rb` file: a gemspec, a Rakefile and a library
+    /// file are the same language, and only the walk decides which of them a
+    /// scan reads.
+    pub fn parse_ruby(source: &str) -> Self {
+        Self::parse(SupportLang::Ruby, source)
+    }
+
     /// Parse PHP source.
     ///
     /// One grammar for the whole file, including the text outside `<?php`
@@ -212,6 +221,16 @@ rule:
             "id: t\nlanguage: python\nrule:\n  kind: function_definition\n",
             "function_definition",
             "hi",
+        );
+    }
+
+    #[test]
+    fn parses_ruby() {
+        one_match(
+            &SourceTree::parse_ruby("module Rack\n  class Request\n  end\nend\n"),
+            "id: t\nlanguage: ruby\nrule:\n  kind: module\n",
+            "module",
+            "Rack",
         );
     }
 }

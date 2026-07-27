@@ -34,8 +34,10 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/python-django.toml", "tests/corpus_python.rs"),
     ("baselines/python-flask.toml", "tests/corpus_python.rs"),
     // Tier 2. The file format is the same and the comparison is the same;
-    // what the numbers mean is not — PHP's rate is over its `use` imports.
+    // what the numbers mean is not — these rates are over each track's
+    // imports.
     ("baselines/php-guzzle.toml", "tests/php_corpus.rs"),
+    ("baselines/ruby-rack.toml", "tests/ruby_corpus.rs"),
 ];
 
 #[test]
