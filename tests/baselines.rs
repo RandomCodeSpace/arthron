@@ -5,7 +5,7 @@
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
 //! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
-//! `tests/csharp_corpus.rs`, and `tests/probes.rs` for
+//! `tests/csharp_corpus.rs`, `tests/hcl_corpus.rs`, and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -60,6 +60,14 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/kotlin-okio.toml", "tests/kotlin_corpus.rs"),
     ("baselines/scala-upickle.toml", "tests/scala_corpus.rs"),
     ("baselines/csharp-serilog.toml", "tests/csharp_corpus.rs"),
+    // Best effort, which is a statement about how much of the language the
+    // track reads and not about how honestly it reports it: HCL has no import
+    // statement at all, so its denominator is 24 `module` sources over 65
+    // files and the definition census beside it carries the weight.
+    (
+        "baselines/hcl-terraform-aws-vpc.toml",
+        "tests/hcl_corpus.rs",
+    ),
 ];
 
 #[test]

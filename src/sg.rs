@@ -129,6 +129,17 @@ impl SourceTree {
         Self::parse(SupportLang::Scala, source)
     }
 
+    /// Parse HCL source.
+    ///
+    /// One grammar for every HCL dialect the extension list claims — today
+    /// only `.tf`. The grammar reads a Terraform configuration as a flat
+    /// sequence of `block`s and `attribute`s and knows nothing about which
+    /// block types Terraform gives meaning to, which is why every such
+    /// judgement is the extractor's and none of it is here.
+    pub fn parse_hcl(source: &str) -> Self {
+        Self::parse(SupportLang::Hcl, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -315,6 +326,29 @@ rule:
                 .expect("the declaration names a type");
             assert_eq!(name.text(), "Greeter");
         }
+    }
+
+    /// HCL, which [`one_match`] cannot check: tree-sitter-hcl names no `name`
+    /// field on a block — the block type and its labels are positional
+    /// children — so the block type is the first `identifier` and every label
+    /// after it is a `string_lit` or a bare `identifier`. The point of the
+    /// test is the same as every other one here: the grammar is compiled into
+    /// this build, and a missing one would match nothing.
+    #[test]
+    fn parses_hcl() {
+        let rules =
+            Rules::compile("id: t\nlanguage: hcl\nrule:\n  kind: block\n").expect("rules compile");
+        let tree = SourceTree::parse_hcl("resource \"aws_vpc\" \"this\" {\n  cidr = 1\n}\n");
+        let found = tree.matches(&rules);
+        assert_eq!(found.len(), 1, "expected one block");
+        let (_, node) = &found[0];
+        assert_eq!(node.kind(), "block");
+        let head: Vec<String> = node
+            .children()
+            .take_while(|c| c.kind() != "block_start")
+            .map(|c| c.text().to_string())
+            .collect();
+        assert_eq!(head, ["resource", "\"aws_vpc\"", "\"this\""]);
     }
 
     #[test]
