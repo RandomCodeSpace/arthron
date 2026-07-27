@@ -4,6 +4,46 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Tier-2 languages registered as disabled tracks; each family is its own domain
+
+**Decision:** the 14 ratified tier-2 languages enter the model as `Lang`
+variants with append-only wire codes 5–18 (Cpp, CSharp, Kotlin, Swift, Ruby,
+Php, Rust, Scala, Dart, Elixir, Haskell, Lua, Bash, Hcl — codes 0–4
+untouched) and as disabled registry tracks. A disabled track owns no files,
+so the change reads nothing new and moves no number; the registry test that
+a mixed-language scan never changes Go's tally passes unchanged. Every
+grammar was verified against the pinned ast-grep 0.44.1 `SupportLang` enum —
+none invented.
+
+**Each family gets its own `Domain`.** Kotlin and Scala are deliberately
+*not* folded into `Jvm`. Sharing a domain is a measurable capability claim —
+it asserts a `.kt` import can name a `.java` definition in one reference
+space, the way `.ts`/`.js` provably share module resolution. Nobody has
+measured JVM cross-language linking here yet; a domain can be widened later
+by evidence, but a wrongly shared identity space silently mints
+cross-language edges. `Domain::Cxx` is named for the family so C can join it
+if C support ever lands.
+*Rejected:* `Kotlin → Domain::Jvm` by analogy with EcmaScript (the analogy
+imports a capability instead of measuring one).
+
+**Deliberate non-claims, asserted in tests rather than left implicit:**
+`.c` and `.h` are unclaimed — a C file parsed under a C++ grammar is the
+wrong language, and a measured K&R sample misparses under the C++ grammar;
+`.bats` is unclaimed — the shell grammar *misreads* it (zero error nodes,
+but `@test` blocks come back as ordinary commands, not functions); `.hcl`,
+`.tfvars`, `.sbt`, `.zsh` stay unclaimed until a go-live commit measures
+them. Widening a disabled language's extension list changes nothing a scan
+reads, so the first honest moment to claim an extension is the commit that
+parses it.
+
+**`arthron gate --language <registered-but-disabled>` refuses before
+scanning** — usage error, exit 2, no store created, and the message lists
+only what this build can gate.
+*Rejected:* scanning first and failing on the empty tally (burns a full
+cold scan and prints a report line that looks like a measurement).
+
+---
+
 ## 2026-07-27 — A framework rule may mint nodes, in a framework-owned namespace that no language tally counts
 
 **Decision:** `fw:<framework>/<kind>#<key>` — `fw:django/route#myapp:detail`,
