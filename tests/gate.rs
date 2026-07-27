@@ -166,3 +166,21 @@ fn gating_against_a_baseline_that_does_not_exist_is_a_usage_error() {
         stderr(&missing)
     );
 }
+
+#[test]
+fn an_unknown_language_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = gate(
+        dir.path(),
+        &dir.path().join("b.toml"),
+        &dir.path().join("g.redb"),
+        &["--language", "klingon"],
+    );
+    assert_eq!(out.status.code(), Some(2), "usage error is exit 2");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown language"), "stderr: {err}");
+    assert!(
+        err.contains("go"),
+        "the error names the valid languages: {err}"
+    );
+}
