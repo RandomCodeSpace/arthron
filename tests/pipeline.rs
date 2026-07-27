@@ -643,3 +643,39 @@ fn second_scan_of_unchanged_tree_reports_the_same() {
     let second = scan_go(dir.path(), &db).expect("second scan");
     assert_eq!(first.per_lang, second.per_lang);
 }
+
+#[test]
+fn a_tree_with_none_of_a_languages_files_is_not_an_error() {
+    // A Go-less repository owes nobody a go.mod: the scan must return, not
+    // fail reading a manifest that has no reason to exist. This is what lets
+    // `scan_repo` run every live track over a single-language repository.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/greet.py", "def hi():\n    hi()\n");
+
+    let report = scan_go(root, &root.join("graph.redb")).expect("a fileless scan succeeds");
+    assert!(
+        !report.per_lang.contains_key(&Lang::Go.code()),
+        "a language that read nothing reported a line",
+    );
+}
+
+#[test]
+fn a_language_whose_files_all_vanished_is_forgotten_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let db = root.join("graph.redb");
+    write(root, "go.mod", "module example.com/app\n");
+    write(root, "app/app.go", "package app\n\nfunc Run() { Run() }\n");
+    scan_go(root, &db).expect("first scan");
+
+    fs::remove_file(root.join("app/app.go")).unwrap();
+    fs::remove_file(root.join("go.mod")).unwrap();
+    let report = scan_go(root, &db).expect("the scan after deletion succeeds");
+    assert!(!report.per_lang.contains_key(&Lang::Go.code()));
+    let store = Store::open(&db).expect("store opens");
+    assert!(
+        store.known_files().expect("known files").is_empty(),
+        "the vanished language's files were not forgotten",
+    );
+}
