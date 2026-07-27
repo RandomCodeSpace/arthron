@@ -1,9 +1,9 @@
 //! Local-first code intelligence: parse each file in isolation, then resolve
 //! the references between them into a verified graph.
 //!
-//! **Status: early.** Scanning works and produces a real graph for Go; the
-//! remaining tier-1 languages and the CI, watch and query surfaces are not
-//! built yet. The API is pre-1.0 and will change.
+//! **Status: early.** Scanning, the [`gate`] and the [`query`] surface all
+//! work, across every tier-1 language; the watch surface is not built yet.
+//! The API is pre-1.0 and will change.
 //!
 //! # The contract
 //!
@@ -173,6 +173,7 @@ pub mod gate;
 pub mod lang;
 pub mod model;
 pub mod pipeline;
+pub mod query;
 pub mod registry;
 pub mod resolve_go;
 pub mod sg;

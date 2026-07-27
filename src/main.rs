@@ -11,14 +11,29 @@ use arthron::gate::{
 };
 use arthron::model::{Lang, reason_name};
 use arthron::pipeline::scan_repo;
+use arthron::query::{
+    DEFAULT_IMPACT_DEPTH, Impact, Match, NameIndex, NodeKind, RefSite, definition, impact,
+    references,
+};
 use arthron::resolution_rate;
-use arthron::store::LangTally;
+use arthron::store::{LangTally, ReadStore, StoredOutcome};
 
 /// Exit code for a gate regression: the run worked, the numbers are worse.
 const EXIT_GATE_FAILED: u8 = 1;
+/// Exit code for a query that selected no single node — no match, or several.
+///
+/// Deliberately the same value as [`EXIT_GATE_FAILED`] and deliberately a
+/// different constant: both mean "the command ran and the answer is no", and
+/// neither means the run failed. A store that would not open is
+/// [`EXIT_USAGE`] instead, because then there is no answer at all.
+const EXIT_NO_ANSWER: u8 = 1;
 /// Exit code for usage and I/O problems: nothing was measured, so neither a
 /// pass nor a failure may be reported.
 const EXIT_USAGE: u8 = 2;
+
+/// Where a query looks for the graph when `--db` is not given: the path
+/// `arthron scan .` writes.
+const DEFAULT_DB: &str = ".arthron/graph.redb";
 
 #[derive(Parser)]
 #[command(name = "arthron", about = "Local-first code intelligence", version)]
@@ -70,6 +85,48 @@ enum Command {
         #[arg(long)]
         commit: Option<String>,
     },
+    /// Ask the stored graph about a name.
+    ///
+    /// The store is opened read-only: a query never creates it, never
+    /// rebuilds it, and fails at once rather than waiting when a scan is
+    /// holding it for writing.
+    ///
+    /// A name may be a full FQN or any suffix of one that starts at a
+    /// separator. A suffix several nodes end is answered with all of them —
+    /// exit code 1, and the list to choose from — because picking one would
+    /// be a guess.
+    ///
+    /// Exit codes: 0 answered, 1 no match or ambiguous, 2 usage or I/O error.
+    Query {
+        #[command(subcommand)]
+        verb: QueryVerb,
+        /// Database file (default: .arthron/graph.redb).
+        #[arg(long, global = true)]
+        db: Option<PathBuf>,
+    },
+}
+
+/// The three questions the graph answers about a name.
+#[derive(Subcommand)]
+enum QueryVerb {
+    /// The definition record and every site that declares it.
+    Def {
+        /// A full FQN, or a suffix of one starting at a separator.
+        name: String,
+    },
+    /// Every stored reference row that resolved to this name.
+    Refs {
+        /// A full FQN, or a suffix of one starting at a separator.
+        name: String,
+    },
+    /// What transitively reaches this name, layer by layer.
+    Impact {
+        /// A full FQN, or a suffix of one starting at a separator.
+        name: String,
+        /// How many hops of the reverse closure to walk.
+        #[arg(long, default_value_t = DEFAULT_IMPACT_DEPTH)]
+        depth: u32,
+    },
 }
 
 fn main() -> ExitCode {
@@ -109,6 +166,10 @@ fn main() -> ExitCode {
             rebase,
             commit.as_deref(),
         ),
+        Command::Query { verb, db } => {
+            let db_path = db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB));
+            run_query(&verb, &db_path)
+        }
     }
 }
 
@@ -385,5 +446,200 @@ fn print_report(report: &arthron::store::Report) {
     // repository, printed so it can be looked at, never gating anything.
     if report.fqn_collisions > 0 {
         println!("fqn collisions {}", report.fqn_collisions);
+    }
+}
+
+/// Width of the label column, matching [`print_report`]'s.
+const LABEL: usize = 12;
+
+fn run_query(verb: &QueryVerb, db_path: &Path) -> ExitCode {
+    let store = match ReadStore::open(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let index = match NameIndex::build(&store) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("arthron: {}: {e}", db_path.display());
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let name = match verb {
+        QueryVerb::Def { name } | QueryVerb::Refs { name } => name,
+        QueryVerb::Impact { name, .. } => name,
+    };
+    let node = match select(&index, name) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+
+    let outcome = match verb {
+        QueryVerb::Def { .. } => show_definition(&store, &node),
+        QueryVerb::Refs { .. } => show_references(&store, &node),
+        QueryVerb::Impact { depth, .. } => show_impact(&store, &node, *depth),
+    };
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+/// Narrow a name to the one node it selects, or print why it does not.
+///
+/// Both failures print to stdout and exit 1: an ambiguous name *is* an
+/// answer — here are the nodes, pick one — and burying it on stderr would
+/// hide the list a person needs in order to re-run.
+fn select(index: &NameIndex, name: &str) -> Result<Match, ExitCode> {
+    let mut hits = index.lookup(name);
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        0 => {
+            // An empty graph and a name that is not in a populated one are
+            // different facts, and only one of them means "fix the name".
+            if index.is_empty() {
+                println!("no match for {name:?} — the store holds no nodes; run `arthron scan`");
+            } else {
+                println!("no match for {name:?}");
+            }
+            Err(ExitCode::from(EXIT_NO_ANSWER))
+        }
+        n => {
+            println!("ambiguous: {n} matches for {name:?}");
+            let width = hits.iter().map(|m| m.name.len()).max().unwrap_or(0);
+            for m in &hits {
+                println!("  {:<width$}  {}", m.name, kind_name(m.kind));
+            }
+            Err(ExitCode::from(EXIT_NO_ANSWER))
+        }
+    }
+}
+
+/// A node kind as the report style spells it.
+fn kind_name(kind: NodeKind) -> String {
+    match kind {
+        NodeKind::Definition(k) => k.name().to_string(),
+        NodeKind::Package => "package".to_string(),
+        NodeKind::External => "external".to_string(),
+        NodeKind::Missing => "missing (an edge names it; no node declares it)".to_string(),
+    }
+}
+
+fn show_definition(store: &ReadStore, node: &Match) -> Result<(), String> {
+    let Some(def) = definition(store, &node.id)? else {
+        // The index came from the node table, so this is unreachable short of
+        // the store changing underneath — which a read-only open forbids.
+        return Err(format!("{}: the node vanished between reads", node.name));
+    };
+    println!("{:<LABEL$} {}", "definition", def.node.name);
+    println!("{:<LABEL$} {}", "kind", kind_name(def.node.kind));
+    if def.declarations.is_empty() {
+        // Only reachable for a node whose sites were all forgotten, which the
+        // store deletes outright — printed rather than assumed away.
+        println!("{:<LABEL$} none recorded", "declared");
+    }
+    // One line per site, not a count: a node two files declare is a fact
+    // about the repository and collapsing it would hide the twin.
+    for site in &def.declarations {
+        println!("{:<LABEL$} {}:{}", "declared", site.file, site.line);
+    }
+    for target in &def.targets {
+        println!(
+            "{:<LABEL$} {}  {}",
+            "alias of",
+            target.name,
+            kind_name(target.kind)
+        );
+    }
+    Ok(())
+}
+
+fn show_references(store: &ReadStore, node: &Match) -> Result<(), String> {
+    let sites = references(store, &node.id)?;
+    if sites.is_empty() {
+        println!(
+            "{:<LABEL$} {} — no stored row resolves here",
+            "references", node.name
+        );
+        return Ok(());
+    }
+    let occurrences: u64 = sites.iter().map(|s| u64::from(s.count)).sum();
+    println!(
+        "{:<LABEL$} {} — {} row(s), {occurrences} occurrence(s)",
+        "references",
+        node.name,
+        sites.len(),
+    );
+    let places: Vec<String> = sites
+        .iter()
+        .map(|s| format!("{}:{}", s.file, s.line))
+        .collect();
+    let place_w = width(places.iter().map(String::as_str));
+    let kind_w = width(sites.iter().map(ref_kind_name));
+    let encloser_w = width(sites.iter().map(|s| s.enclosing.as_str()));
+    let target_w = width(sites.iter().map(|s| s.raw_target.as_str()));
+    for (site, place) in sites.iter().zip(&places) {
+        println!(
+            "  {place:<place_w$}  {:<kind_w$}  {:<encloser_w$}  {:<target_w$}  x{:<4} {}",
+            ref_kind_name(site),
+            site.enclosing,
+            site.raw_target,
+            site.count,
+            outcome_name(&site.outcome),
+        );
+    }
+    Ok(())
+}
+
+fn show_impact(store: &ReadStore, node: &Match, depth: u32) -> Result<(), String> {
+    let Impact { layers, truncated } = impact(store, &node.id, depth)?;
+    let total: usize = layers.iter().map(Vec::len).sum();
+    println!(
+        "{:<LABEL$} {} — depth {depth}, {total} node(s)",
+        "impact", node.name,
+    );
+    if layers.is_empty() && !truncated {
+        println!("  nothing in the graph reaches it");
+    }
+    for (hop, layer) in layers.iter().enumerate() {
+        println!("depth {:<6} {} node(s)", hop + 1, layer.len());
+        let name_w = width(layer.iter().map(|m| m.name.as_str()));
+        for m in layer {
+            println!("  {:<name_w$}  {}", m.name, kind_name(m.kind));
+        }
+    }
+    // A bounded closure and an exhausted one print the same layers, so the
+    // difference has to be said out loud rather than inferred from the count.
+    if truncated {
+        println!(
+            "{:<LABEL$} the walk stopped at depth {depth}; more reaches it beyond",
+            "truncated"
+        );
+    }
+    Ok(())
+}
+
+/// The widest of a set of column values, for aligned output.
+fn width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
+    values.map(str::len).max().unwrap_or(0)
+}
+
+/// A reference kind as the report style spells it. A stored code no variant
+/// carries is shown as the code, never guessed at.
+fn ref_kind_name(site: &RefSite) -> &'static str {
+    site.kind.map_or("unknown", |k| k.name())
+}
+
+/// The stored outcome as one column.
+fn outcome_name(outcome: &StoredOutcome) -> String {
+    match outcome {
+        StoredOutcome::Resolved(_) => "resolved".to_string(),
+        StoredOutcome::External(pkg) => format!("external {pkg}"),
+        StoredOutcome::Unresolved(reason) => format!("unresolved {}", reason_name(*reason)),
     }
 }

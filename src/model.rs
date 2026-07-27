@@ -252,6 +252,22 @@ impl DefKind {
         self as u8
     }
 
+    /// Human-readable name, for report and query output.
+    pub fn name(self) -> &'static str {
+        match self {
+            DefKind::Function => "function",
+            DefKind::Method => "method",
+            DefKind::Type => "type",
+            DefKind::Const => "const",
+            DefKind::Var => "var",
+            DefKind::Constructor => "constructor",
+            DefKind::Field => "field",
+            DefKind::Property => "property",
+            DefKind::Module => "module",
+            DefKind::Alias => "alias",
+        }
+    }
+
     /// Inverse of [`DefKind::code`]. `None` for codes no variant carries.
     pub fn from_code(c: u8) -> Option<DefKind> {
         Some(match c {
@@ -410,6 +426,22 @@ impl RefKind {
     /// Stable one-byte storage code. Never renumber.
     pub fn code(self) -> u8 {
         self as u8
+    }
+
+    /// Human-readable name, for report and query output.
+    pub fn name(self) -> &'static str {
+        match self {
+            RefKind::Call => "call",
+            RefKind::Import => "import",
+            RefKind::TypeUse => "type-use",
+            RefKind::Inherit => "inherit",
+            RefKind::New => "new",
+            RefKind::Export => "export",
+            RefKind::FieldAccess => "field-access",
+            RefKind::Annotation => "annotation",
+            RefKind::MethodRef => "method-ref",
+            RefKind::Rebind => "rebind",
+        }
     }
 
     /// Inverse of [`RefKind::code`]. `None` for codes no variant carries.

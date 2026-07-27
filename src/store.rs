@@ -19,8 +19,8 @@ use std::path::Path;
 
 use bincode::{Decode, Encode, config};
 use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    TableDefinition,
+    Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable, TableDefinition,
 };
 
 use crate::UnresolvedReason;
@@ -1178,6 +1178,155 @@ impl Store {
             }
         }
         Ok(report)
+    }
+}
+
+/// A read-only handle on a graph some earlier scan wrote.
+///
+/// A separate type rather than a mode of [`Store`], because the two differ in
+/// everything a reader must not do. [`Store::open`] *creates* the file, takes
+/// redb's write lock, and wipes the tables outright when the store carries
+/// another [`SCHEMA_VERSION`]. A query that did any of those would answer a
+/// question by destroying the answer — and a query run by habit against a
+/// path with a typo in it would silently mint an empty graph and report that
+/// the name is not in the repository.
+///
+/// It also gives the concurrency answer for free. redb takes an exclusive
+/// file lock for writing, so opening read-only while a scan holds the store
+/// fails immediately with [`redb::DatabaseError::DatabaseAlreadyOpen`] rather
+/// than blocking or reading a half-written transaction — see
+/// [`ReadStore::open`], which is where that becomes a sentence a person can
+/// act on.
+pub struct ReadStore {
+    db: ReadOnlyDatabase,
+}
+
+// Hand-written because a redb database is not `Debug` and because there is
+// nothing about an open handle worth printing. It exists so that
+// `ReadStore::open(..).expect_err(..)` compiles for callers testing the
+// refusals this type is largely built to give.
+impl std::fmt::Debug for ReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadStore")
+    }
+}
+
+impl ReadStore {
+    /// Open an existing store for reading only.
+    ///
+    /// Three failures, each named rather than collapsed into "cannot open":
+    /// the file is not there, a scan is holding it for writing, or it was
+    /// written under a different schema generation. The last is a refusal and
+    /// not a wipe: a reader that rebuilt the store to satisfy itself would
+    /// destroy a graph whose owner never asked for one.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let db = ReadOnlyDatabase::open(path).map_err(|e| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => format!(
+                "{}: the store is open for writing — a scan is running against it",
+                path.display(),
+            ),
+            other => format!("{}: {other}", path.display()),
+        })?;
+        let store = ReadStore { db };
+        match store.schema_version()? {
+            Some(SCHEMA_VERSION) => Ok(store),
+            // No `meta` table and no key both mean the same thing: nothing
+            // ever stamped a generation here, so nothing may be read out of
+            // it as though a resolver had.
+            found => Err(format!(
+                "{}: schema generation {} — this build reads {SCHEMA_VERSION}; re-run `arthron scan`",
+                path.display(),
+                found.map_or_else(|| "absent".to_string(), |v| v.to_string()),
+            )),
+        }
+    }
+
+    /// The generation stamped in [`META`], if the store carries one.
+    fn schema_version(&self) -> Result<Option<u32>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        // A store no write transaction ever touched has no `meta` table at
+        // all, which is an absent generation and not an I/O failure.
+        let Ok(meta) = txn.open_table(META) else {
+            return Ok(None);
+        };
+        Ok(meta
+            .get(SCHEMA_VERSION_KEY)
+            .map_err(|e| e.to_string())?
+            .and_then(|guard| <[u8; 4]>::try_from(guard.value()).ok())
+            .map(u32::from_le_bytes))
+    }
+
+    /// The record stored under a node id, if the node exists.
+    pub fn node(&self, id: &NodeId) -> Result<Option<NodeRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        read_node(&table, id)
+    }
+
+    /// Visit every node in the graph, in identity order.
+    ///
+    /// A visitor and not a `Vec`, because the caller decides what to keep: a
+    /// name index wants a string and a kind per node and nothing else, and
+    /// materialising every declaration site of every node in a large
+    /// repository to build one would cost orders of magnitude more than the
+    /// index it produced.
+    pub fn for_each_node(
+        &self,
+        mut visit: impl FnMut(NodeId, NodeRecord) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            visit(*key.value(), decode(value.value())?)?;
+        }
+        Ok(())
+    }
+
+    /// Visit every reference row in the graph, in key order.
+    ///
+    /// Whole-table and not an index lookup on purpose. The candidate index
+    /// would answer "which rows probed this identity" far faster, but it is
+    /// the *invalidation* index: it holds exactly what each resolver declared
+    /// it read, and a resolver that under-declared would make this query drop
+    /// reference sites without saying so. The rows are the store's own record
+    /// of what resolved, and reading them is the only answer that cannot be
+    /// wrong in that direction.
+    pub fn for_each_row(
+        &self,
+        mut visit: impl FnMut(RefKey, RefRecord) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(REFS).map_err(|e| e.to_string())?;
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            let (file, encoded) = key.value();
+            visit(RefKey::join(file, encoded)?, decode(value.value())?)?;
+        }
+        Ok(())
+    }
+
+    /// Every node with an edge *into* this one, with the edge's
+    /// [`crate::model::RefKind`] code.
+    ///
+    /// Served by [`REV_EDGES`], which is keyed `(dst, src, kind)`, so one
+    /// node's predecessors are one contiguous range rather than a scan of
+    /// every edge in the repository. That is what makes a layered reverse
+    /// closure affordable at all.
+    pub fn edges_into(&self, dst: &NodeId) -> Result<Vec<(NodeId, u8)>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
+        let (low, high) = ([0u8; 16], [0xffu8; 16]);
+        let mut out = Vec::new();
+        for entry in table
+            .range((dst, &low, u8::MIN)..=(dst, &high, u8::MAX))
+            .map_err(|e| e.to_string())?
+        {
+            let (key, _) = entry.map_err(|e| e.to_string())?;
+            let (_, src, kind) = key.value();
+            out.push((*src, kind));
+        }
+        Ok(out)
     }
 }
 
