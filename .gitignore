@@ -3,9 +3,13 @@
 **/*.rs.bk
 *.pdb
 
-# arthron's own store, when it exists
-/.arthron/
+# arthron's own store — created next to whatever tree gets scanned,
+# including the vendored corpus, so ignore it at any depth
+.arthron/
 *.redb
+
+# Claude Code worktrees
+/.claude/worktrees/
 
 # Local scratch
 /tmp/
