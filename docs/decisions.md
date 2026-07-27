@@ -4,6 +4,133 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Resolver honesty fixes move the Go baseline
+
+Re-measured after the three fix commits, so the recorded baseline is what the
+engine actually does rather than what it did before them. Release build,
+`arthron scan corpus/go/codeiq` against a cold store, `codeiq` pinned at
+`6dd90b5`, 397 `.go` files.
+
+| | resolved | external | unresolved | `NeedsTypeInference` | `NoMatchingDefinition` | rate |
+|---|---|---|---|---|---|---|
+| before | 4467 | 6083 | 5077 | 4826 | 251 | 46.80% |
+| after | 4467 | **6085** | **5075** | **4824** | 251 | 46.81% |
+
+The rate still prints as 46.8%. That is the honest headline: three correctness
+fixes moved two references, and none of them moved the number the gate watches.
+
+**What each fix did, measured one commit at a time** — each commit built and
+run in isolation, because attributing a delta to a fix without measuring the
+commit that contains it is a guess:
+
+- **Extraction — raw-string imports, multi-name spec definitions:** zero
+  references moved. The corpus writes no `` import `fmt` `` and no
+  `const A, B = …` whose bogus `,` definition anything went on to name. The
+  fixes are real; this corpus does not exercise them.
+- **Resolution — version-aware import binding:** the entire delta. Two
+  references, both `yaml.Marshal(…)`, in the two files that import
+  `gopkg.in/yaml.v3` *without* an alias. Before, the unaliased import bound
+  `yaml.v3`, so the qualifier `yaml` was read as a variable and the call was
+  charged to `NeedsTypeInference`; now it binds `yaml` and the call is
+  correctly `External`. The third `yaml.*` call site was already correct — its
+  file writes the alias out (`yaml "gopkg.in/yaml.v3"`), which is precisely
+  what made the bug survive a reading of the corpus.
+- **Resolution — probe-before-builtin, probed-only candidates,
+  whitespace-robust `go.mod`:** zero references moved. The corpus declares no
+  package-level shadow of a builtin, and its `go.mod` is space-separated.
+- **Package identity — declared package names:** zero references moved. No
+  *importable* package in the corpus declares a name its directory does not
+  already carry; the only mismatches are two `package main` directories under
+  `cmd/`, which nothing may import. (Grepping for `^package` finds three more,
+  all inside raw-string Go fixtures in `_test.go` files — the extractor parses
+  the real AST and never saw them.)
+- **Package identity — `init` is not a node, `_test` is its own package:**
+  zero references moved, and node counts changed, which is the expected shape.
+  116 `func init()` declarations across 20 packages stopped producing
+  definition nodes — as one `{pkg}.init` identity per package, not 116, since
+  they collapsed onto each other. 26 external-test files across 6 packages
+  moved their definitions into `{pkg}_test`. The predicted risk that `_test`
+  namespacing would *lower* `resolved` by breaking a wrong resolution did not
+  materialise: no production file in this corpus was resolving to a
+  test-only definition.
+
+**Completeness is now asserted, not claimed.** A rate is no evidence that
+nothing was dropped — quietly discarding the references it cannot link would
+*raise* it. Both acceptance suites now re-extract independently and assert
+that `resolved + external + unresolved` equals the reference count exactly:
+**15,627** on the corpus, and it was 15,627 before the fixes too. The three
+commits reclassified references and neither gained nor lost one.
+
+**Rejected: ratcheting the gate to 46.8% now.** The baseline is honest but the
+fixes it reflects are almost untested by this corpus — four of the five moved
+nothing here. A ratchet against a single corpus that exercises so little would
+lock in a number, not a capability. The gate command comes with a second
+corpus.
+
+Cold scan 0.52 s, maximum RSS 17,536 KB, store 2.3 MB; warm re-scan 0.01 s,
+8,320 KB, identical tallies. AMD EPYC 9354P, 8 cores — not the 2 vCPU
+reference hardware, so these are an upper bound on this box and not a 2 vCPU
+claim.
+
+---
+
+## 2026-07-27 — Package identity: declared names, no `init` node, `_test` is its own package
+
+Three corrections to what a Go node *is*, all of them cases where the graph
+named something the language does not.
+
+**Declared package names.** An unaliased import binds the imported package's
+**declared** name, which lives in that package's source, not in its path.
+Directory `utilx` declaring `package util` is imported as
+`example.com/app/utilx` and written `util.Parse`. The pipeline — the only
+layer that sees every package — now carries an import-path → declared-name map
+and corrects the binding for internal imports; `NodeRecord::Package` gained a
+`name` field so a scan that touches one file still knows the names of packages
+it did not read. External packages keep the path heuristic: their source is
+never indexed, so the path is the only evidence there is.
+
+**`init` is not a node.** Go forbids naming `func init()` — it cannot be
+called, assigned, or referred to — and a package may declare any number of
+them. By the rule that [a node is a thing a reference can
+name](#2026-07-26--graph-model-a-node-is-a-thing-a-reference-can-name), it is
+not one. It gets no definition node, and calls inside it are sourced at the
+package node, exactly like a package-level variable's initialiser. The corpus
+has 116 of them.
+
+**External test packages get their own package.** `package foo_test` in the
+directory of package `foo` is a second package sharing a directory. Its
+definitions now live under `{pkg_path}_test`, with their own package node. It
+reaches the package under test through the explicit import it has to write
+anyway.
+
+**Why these three together:** each was a distinct way for one identity to
+stand for several things, or for a thing nothing can name to become a node.
+Sharing a namespace between production and test packages permits a *false*
+resolution — a production file's same-package candidate hitting a test-only
+definition — which is worse than a miss, because a miss is counted and a wrong
+edge is not.
+
+**Rejected:** deriving internal bindings from the import path (the previous
+behaviour: silently turns every call through such an import into
+`NeedsTypeInference`); having the resolver read the imported package's source
+to find its name (extraction is per-file, and the resolver probes identities
+rather than parsing); giving each `init` a file-qualified identity such as
+`{pkg}.init@file` (a node no reference can name is still not a node, and files
+are fields, not identity); dropping `_test.go` files from the scan (loses real
+references, and improves the rate by measuring less).
+
+**Storage:** `NodeRecord::Package` is a schema change. The format is pre-1.0
+and unversioned, so existing `.redb` files do not decode — delete and rescan.
+
+**Measured:** the `codeiq` corpus rate is unchanged at **46.8%** (resolved
+4,467; external 6,085; unresolved 5,075). These are identity fixes, not rate
+fixes: no directory in that corpus declares a package name differing from its
+own name, and its external test packages call across the boundary only through
+imports, so no reference outcome moves. The evidence for each fix is the
+integration test that fails without it, not the corpus number.
+
+---
+
 ## 2026-07-27 — Measurement write-ups are local; decisions carry the numbers
 
 **Decision:** `docs/evidence/` is untracked and local, alongside
