@@ -152,6 +152,11 @@ struct Walk {
     /// A supertype the walk could not expand: it lives in another file, so
     /// its own bases are not readable from here.
     unindexed_supertype: bool,
+    /// The root resolved to a node this file declares that is **not** a class
+    /// — a module-level variable, or a function. Its members are not
+    /// enumerable from any declaration, so a miss below it is the type of the
+    /// root going unknown, not a definition going missing.
+    opaque_root: bool,
     /// A star-imported module whose export set cannot be enumerated (B-11).
     unenumerable_star: bool,
     /// The root binds to something outside the repository.
@@ -277,7 +282,11 @@ impl PyResolver {
         };
         if !scope.classes.contains(owner) {
             // Not a class this file declares — an attribute of one, or a name
-            // that is not a class at all. Nothing to linearize.
+            // that is not a class at all. Nothing to linearize, and nothing
+            // that could tell us what members it has: `register = mk()` is a
+            // node, but `register.tag` is a member of whatever `mk()`
+            // returned.
+            walk.opaque_root = true;
             return;
         }
         for base in scope.bases.get(owner).map(Vec::as_slice).unwrap_or(&[]) {
@@ -495,9 +504,28 @@ impl PyResolver {
                 return Outcome::Unresolved(UnresolvedReason::Generated);
             }
         }
+        // A module whose top-level package is neither the standard library
+        // (answered by `walk.external` above), nor a declared dependency (the
+        // same), nor anything this repository declares was never indexed. The
+        // member asked of it is that package's, and `NoMatchingDefinition`
+        // would blame this repository for a name that was never in it. This
+        // is exactly the test `missing_module` applies at an import site,
+        // asked again at the use site so the two agree.
+        for module in &walk.searched_modules {
+            let roots = cfg.module_fqns(&scope.root, top_segment(module));
+            if Self::probe_in_order(probe, &roots, probed).is_none() {
+                return Outcome::Unresolved(UnresolvedReason::UnknownPackage);
+            }
+        }
         if walk.root_typed {
             return Outcome::Unresolved(if walk.unindexed_supertype {
+                // A class chain that ran out of readable bases.
                 UnresolvedReason::UnindexedSupertype
+            } else if walk.opaque_root {
+                // The root is a node, but not one whose members are written
+                // down anywhere. That is the same missing fact as `x.m()` on
+                // an unannotated local: the type of the root.
+                UnresolvedReason::NeedsTypeInference
             } else {
                 UnresolvedReason::NoMatchingDefinition
             });
@@ -531,17 +559,14 @@ impl PyResolver {
         probe: &dyn SymbolProbe,
         probed: &mut Vec<NodeId>,
     ) -> Outcome<NodeId, String> {
-        if scope.mutates_sys_path {
-            // B-21: resolution proceeded on roots the file itself changed, so
-            // the failure is arthron's layout, not a missing module.
-            return Outcome::Unresolved(UnresolvedReason::ProjectLayoutUnknown);
-        }
         let top = top_segment(dotted);
         if cfg.ext_modules.contains(dotted) {
             return Outcome::External(dotted.to_string()); // A-10
         }
         if level > 0 {
-            // A relative import is in-repository by construction.
+            // A relative import is in-repository by construction, and it
+            // never consults `sys.path`, so a mutation of that path says
+            // nothing about why this module is missing.
             return Outcome::Unresolved(UnresolvedReason::ModuleNotFound);
         }
         if is_stdlib(top) {
@@ -549,6 +574,16 @@ impl PyResolver {
         }
         if cfg.declares_dependency(top) {
             return Outcome::External(top.to_string());
+        }
+        // B-21, and only now: resolution proceeded on roots the file itself
+        // changed, so the failure is arthron's layout rather than a missing
+        // module. It is asked *after* the three answers above because none of
+        // them depends on the search path — `is_stdlib` reads a frozen name
+        // set — and blaming the layout for `import os` would put a reference
+        // arthron knows the answer to into the rate's denominator under a
+        // reason naming work that does not exist.
+        if scope.mutates_sys_path {
+            return Outcome::Unresolved(UnresolvedReason::ProjectLayoutUnknown);
         }
         // A top-level package this repository does declare means the specifier
         // named a module inside it that does not exist; anything else is
@@ -1979,5 +2014,116 @@ mod tests {
                 _ => assert_eq!(hit, 0, "a miss must have read no hit"),
             }
         }
+    }
+
+    // -- reasons that must name the right piece of work -------------------
+
+    #[test]
+    fn a_standard_library_import_is_external_even_where_the_file_edits_sys_path() {
+        // The companion to B-21 above, and the half that was wrong: a file
+        // that mutates `sys.path` cannot thereby stop `os` being the standard
+        // library. `is_stdlib` reads a frozen name set, not the filesystem, so
+        // the answer does not depend on the search path at all. Blaming the
+        // layout here put a reference arthron knows the answer to into the
+        // rate's denominator and named a piece of work that does not exist.
+        let mut cfg = project(&["pkg"]);
+        cfg.dependencies.insert("requests".to_string());
+        let source = concat!(
+            "import sys\n",
+            "import os\n",
+            "import requests\n",
+            "sys.path.append('vendor')\n",
+        );
+        assert_eq!(
+            outcome_of(&cfg, "pkg/m.py", source, &[], "os"),
+            Outcome::External("py:std:os".to_string()),
+        );
+        assert_eq!(
+            outcome_of(&cfg, "pkg/m.py", source, &[], "requests"),
+            Outcome::External("requests".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_relative_import_is_not_blamed_on_sys_path() {
+        // A relative import never consults `sys.path`, so a mutation of it
+        // says nothing about why the module is missing.
+        let cfg = project(&["pkg"]);
+        let source = "import sys\nsys.path.append('vendor')\nfrom .gone import thing\n";
+        assert_eq!(
+            reason(&cfg, "pkg/m.py", source, &[], ".gone.thing"),
+            UnresolvedReason::ModuleNotFound,
+        );
+    }
+
+    #[test]
+    fn a_member_of_an_untyped_module_level_name_needs_type_inference() {
+        // `register = template.Library()` then `register.tag()`. The root is
+        // bound and is a node, so the old answer was `NoMatchingDefinition` —
+        // which asserts that `tag` is defined nowhere. It is defined on
+        // `Library`; what is missing is the *type* of `register`, and that is
+        // the same work `x.m()` on an unannotated local names.
+        let cfg = project(&["pkg"]);
+        let source = "register = make()\n\n\ndef f():\n    register.tag()\n";
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/m.py",
+                source,
+                &["pkg.m#register"],
+                "register.tag"
+            ),
+            UnresolvedReason::NeedsTypeInference,
+        );
+    }
+
+    #[test]
+    fn a_member_a_known_class_does_not_declare_is_still_a_missing_definition() {
+        // The contrast that keeps the fix above from swallowing the bucket:
+        // when the root *is* a class this file declares, its members are
+        // enumerable, and a miss really is a missing definition.
+        let cfg = project(&["pkg"]);
+        let source = "class C:\n    def a(self):\n        pass\n\n\ndef f():\n    C.b()\n";
+        assert_eq!(
+            reason(&cfg, "pkg/m.py", source, &["pkg.m#C", "pkg.m#C.a"], "C.b"),
+            UnresolvedReason::NoMatchingDefinition,
+        );
+    }
+
+    #[test]
+    fn a_member_of_an_unindexed_third_party_module_is_an_unknown_package() {
+        // `import docutils.core` is `UnknownPackage` at the import site
+        // because the package is neither standard library, nor declared, nor
+        // in this repository. `docutils.core.publish_parts()` is the same
+        // fact, and `NoMatchingDefinition` would blame this repository for a
+        // name that was never in it.
+        let cfg = project(&["pkg"]);
+        let source = "import docutils.core\n\n\ndef f():\n    docutils.core.publish_parts()\n";
+        assert_eq!(
+            reason(&cfg, "pkg/m.py", source, &[], "docutils.core.publish_parts"),
+            UnresolvedReason::UnknownPackage,
+        );
+        assert_eq!(
+            reason(&cfg, "pkg/m.py", source, &[], "docutils.core"),
+            UnresolvedReason::UnknownPackage,
+        );
+    }
+
+    #[test]
+    fn a_member_of_an_in_repository_module_is_still_a_missing_definition() {
+        // The contrast for the fix above: the module is in the repository, so
+        // its namespace really was searched and a miss really is missing.
+        let cfg = project(&["pkg"]);
+        let source = "import pkg.util\n\n\ndef f():\n    pkg.util.gone()\n";
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/m.py",
+                source,
+                &["pkg", "pkg.util"],
+                "pkg.util.gone"
+            ),
+            UnresolvedReason::NoMatchingDefinition,
+        );
     }
 }
