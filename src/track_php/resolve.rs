@@ -221,6 +221,10 @@ impl PhpResolver {
         match cfg.claiming_prefix(segments) {
             // Rule 4.
             Some((prefix_len, dirs)) => {
+                // The one resolution input that is neither a probe nor the
+                // manifest: whether the walk found the file PSR-4 maps this
+                // name onto. [`Resolver::config_digest`] is what carries it
+                // into the store's invalidation, and says what that costs.
                 let claimed_here =
                     kind == UseKind::Class && cfg.psr4_file_exists(dirs, &segments[prefix_len..]);
                 Outcome::Unresolved(if claimed_here {
@@ -248,9 +252,34 @@ impl Resolver<PhpLang> for PhpResolver {
         Ok(project::load(root, &files.files))
     }
 
-    /// The PSR-4 map, and only it. The file set is a phase-0 input too and is
-    /// deliberately absent: it changes whenever a file is added, and folding
-    /// it in here would wipe the store on every scan.
+    /// The PSR-4 map **and the file set**, because rule 4 reads both.
+    ///
+    /// The map alone would be the obvious fingerprint — it is the manifest,
+    /// and the manifest is what decides every identity here. But
+    /// [`PhpProject::psr4_file_exists`] is what tells
+    /// [`crate::UnresolvedReason::NoMatchingDefinition`] from
+    /// [`crate::UnresolvedReason::ModuleNotFound`], and it asks whether the
+    /// path PSR-4 maps a name onto is one the walk found. That makes the
+    /// file set a phase-0 input a resolution consults, and an input a
+    /// resolution consults has to reach the store through one of the two
+    /// channels an incremental scan can invalidate on: this fingerprint, or
+    /// the candidate index, which records identities and cannot record the
+    /// absence of a file. So it belongs here.
+    ///
+    /// Leaving it out is not a smaller version of this — it is a warm store
+    /// that disagrees with a cold scan of the same tree. Adding
+    /// `src/Missing/Thing.php` changes no identity that a
+    /// `use A\Missing\Thing;` row ever probed, so nothing wakes the row, and
+    /// it keeps saying `ModuleNotFound` where a cold scan now says
+    /// `NoMatchingDefinition`.
+    ///
+    /// **What it costs, stated rather than discovered:** a scan that adds,
+    /// deletes or renames a `.php` file re-fences this language and rebuilds
+    /// its slice of the store cold. Editing one does not — the file set is
+    /// the *set of paths*, not their contents, and the per-file content
+    /// hashes are what carry an edit. That is the common case in a dev loop
+    /// and it stays incremental. The set is hashed rather than concatenated
+    /// so the fingerprint is bounded on a repository of any size.
     fn config_digest(&self, cfg: &PhpProject) -> Vec<u8> {
         let mut out = Vec::new();
         for (prefix, dirs) in &cfg.psr4 {
@@ -262,6 +291,15 @@ impl Resolver<PhpLang> for PhpResolver {
             }
             out.push(2);
         }
+        // A `BTreeSet`, so one file set hashes one way however the walk
+        // ordered it.
+        let mut files = blake3::Hasher::new();
+        for file in &cfg.files {
+            files.update(file.as_bytes());
+            files.update(&[0]);
+        }
+        out.push(3);
+        out.extend_from_slice(files.finalize().as_bytes());
         out
     }
 

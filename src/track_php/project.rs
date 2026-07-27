@@ -50,6 +50,12 @@ pub struct PhpProject {
     /// because a manifest that declares no PSR-4 prefix determines no layout.
     pub manifest: bool,
     /// Every repository-relative `.php` path the walk found.
+    ///
+    /// A resolution input, not a diagnostic: [`PhpProject::psr4_file_exists`]
+    /// reads it, so [`crate::lang::Resolver::config_digest`] fingerprints it
+    /// — anything here that a resolution consults and the digest omits is an
+    /// input an incremental scan cannot invalidate on. Extension-filtered by
+    /// the walk, so a file in another language never re-fences this one.
     pub files: BTreeSet<String>,
 }
 

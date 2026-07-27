@@ -267,6 +267,43 @@ fn a_use_function_miss_under_a_claimed_prefix_is_module_not_found() {
 }
 
 #[test]
+fn the_config_digest_covers_every_input_a_resolution_reads() {
+    // Both of them, because rule 4 reads both. The manifest decides which
+    // names this repository claims; the file set decides whether the path
+    // PSR-4 maps a claimed name onto is here, which is the whole difference
+    // between `NoMatchingDefinition` and `ModuleNotFound`. An input a
+    // resolution reads and this does not cover is one an incremental scan
+    // cannot invalidate on, and a warm store that keeps the old answer.
+    let base = project(&[("App", "src")], &["src/Client.php"]);
+    let same = project(&[("App", "src")], &["src/Client.php"]);
+    assert_eq!(
+        PhpResolver.config_digest(&base),
+        PhpResolver.config_digest(&same),
+    );
+    let remapped = project(&[("App", "lib")], &["src/Client.php"]);
+    assert_ne!(
+        PhpResolver.config_digest(&base),
+        PhpResolver.config_digest(&remapped),
+        "the manifest moved",
+    );
+    let grown = project(
+        &[("App", "src")],
+        &["src/Client.php", "src/Missing/Thing.php"],
+    );
+    assert_ne!(
+        PhpResolver.config_digest(&base),
+        PhpResolver.config_digest(&grown),
+        "a file appeared at a path rule 4 tests",
+    );
+    // Bounded: the file set is hashed, not concatenated, so the fingerprint
+    // is the same size on a repository of any size.
+    assert_eq!(
+        PhpResolver.config_digest(&base).len(),
+        PhpResolver.config_digest(&grown).len(),
+    );
+}
+
+#[test]
 fn every_probe_is_recorded_and_nothing_else_is() {
     // The candidate list feeds the invalidation index: a probe missing from
     // it is a reference an incremental scan never wakes.
