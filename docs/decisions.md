@@ -4,6 +4,55 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — First tier-2 tracks live: Rust 98.0%, Ruby 85.3%, PHP 67.9%
+
+Three tracks landed in parallel from one batch, each measured against its
+vendored corpus with `gate --rebase`, each now enforced in CI. A tier-2 rate
+is an **import-resolution rate** — definitions, structure, and imports, no
+call edges — and is never comparable to a tier-1 rate or to another
+language's.
+
+| language | corpus | resolved | external | unresolved | rate |
+|---|---|---|---|---|---|
+| Rust | ripgrep e89fff8 | 649 | 411 | 13 | **98.0%** |
+| Ruby | rack e1f22fd | 291 | 1 | 50 | **85.3%** |
+| PHP | guzzle 3aeea04 | 360 | 265 | 170 | **67.9%** |
+
+PHP's 170 unresolved are all `ModuleNotFound`: `use` statements naming
+sibling packages under the same vendor namespace that sit outside the
+corpus snapshot — an honest floor of the snapshot's scope, not a resolver
+gap. Rust's 13 are 11 `AliasCycle` (the `pub extern crate grep_printer as
+printer` re-export chains) and 2 `NoMatchingDefinition`.
+
+**What the adversarial reviews caught before merge, recorded because the
+class recurs:**
+
+- *An in-repo crate laundered as `External`* (Rust, high): the resolver read
+  only literal `path =` dependencies, so `foo = { workspace = true }` — the
+  standard spelling since Cargo 1.64 — sent a sibling crate outside the
+  measurement entirely. `External` sits outside both rate terms, so the
+  reference vanished rather than failing; the corpus itself never spells it
+  that way, which is exactly why the reviewer probed it with fixtures.
+  Fixed: workspace dependency tables are now resolved from the root
+  manifest.
+- *A wrong edge beats a miss* (Rust, medium): a `path` dependency named like
+  a local module shadowed the local, binding the reference to the wrong
+  crate. Fixed against rustc's own binding order, proven with a
+  discriminating fixture.
+- *A census, not a count* (Ruby, high): the corpus acceptance asserted the
+  tally but not the definition census, so an extractor bug dropping 566 of
+  633 methods kept every test green — proven by mutation. The acceptance
+  now pins the full per-kind census plus nine named definitions with their
+  declaration lines.
+
+**Unexercised mechanisms, recorded in the corpus provenance rather than
+implemented blind:** ripgrep contains no `#[path]` attribute and no
+`workspace = true` (the latter now implemented anyway, fixture-proven);
+guzzle contains no `use function`/`use const`, so PHP's global-fallback
+rule remains unexercised until a corpus exercises it.
+
+---
+
 ## 2026-07-27 — Tier-2 languages registered as disabled tracks; each family is its own domain
 
 **Decision:** the 14 ratified tier-2 languages enter the model as `Lang`
