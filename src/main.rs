@@ -10,7 +10,7 @@ use arthron::gate::{
     Baseline, Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
 };
 use arthron::model::{Lang, reason_name};
-use arthron::pipeline::scan_go;
+use arthron::pipeline::scan_repo;
 use arthron::resolution_rate;
 use arthron::store::LangTally;
 
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
                 eprintln!("arthron: creating {}: {e}", parent.display());
                 return ExitCode::FAILURE;
             }
-            match scan_go(&path, &db_path) {
+            match scan_repo(&path, &db_path) {
                 Ok(report) => {
                     print_report(&report);
                     ExitCode::SUCCESS
@@ -181,7 +181,10 @@ fn run_gate(
         return ExitCode::from(EXIT_USAGE);
     }
 
-    let report = match scan_go(path, &db_path) {
+    // Every enabled track, then one language's tally out of the result: the
+    // gate is per language and a baseline names the one it measures, so
+    // scanning the whole registry never turns into gating a combined number.
+    let report = match scan_repo(path, &db_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("arthron: {e}");
