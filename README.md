@@ -100,21 +100,22 @@ socket bound. See [`docs/mcp.md`](docs/mcp.md).
 
 | | State |
 |---|---|
-| `arthron scan` | **Working** — Go |
-| Go resolution | **Working** — definitions, imports, calls, per-reason unresolved reporting |
+| `arthron scan` | **Working** — Go, Java, JavaScript, TypeScript, Python, PHP |
+| Tier-1 resolution | **Working** — definitions, imports, calls, per-reason unresolved reporting |
+| Tier-2 resolution | **Working** — PHP: definitions, structure and imports, no call edges |
 | Incremental re-scan | **Working** — content-hash changed set |
-| Java · JavaScript · TypeScript · Python | Planned, in that order |
-| `arthron gate` (CI, fails on regression) | Planned |
-| `arthron impact <path>` (blast radius) | Planned |
+| `arthron gate` (CI, fails on regression) | **Working** — one committed baseline per corpus, in [`baselines/`](baselines) |
+| `arthron query` (definitions, references, blast radius) | **Working** |
 | `arthron mcp` (MCP server, stdio) | **Working** — [`docs/mcp.md`](docs/mcp.md) |
 | `arthron watch` · daemon | Planned |
 
 Language *coverage* spans the 27 languages ast-grep's built-in parsers handle.
 Language *capability* is tiered and declared rather than assumed:
 
-- **Tier 1** — definitions, references, and call-graph resolution. Go today;
-  Java, JavaScript, TypeScript and Python next.
-- **Tier 2** — definitions and file structure, no verified call edges.
+- **Tier 1** — definitions, references, and call-graph resolution. Go, Java,
+  JavaScript, TypeScript and Python today.
+- **Tier 2** — definitions and file structure, no verified call edges. PHP
+  today; the rest of the ratified tier-2 set is registered and not yet live.
 
 Tier 2 is honest rather than degraded: you get symbols and imports, you do not
 get call edges, and the tool says which is which instead of inventing the
