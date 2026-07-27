@@ -2014,6 +2014,21 @@ mod tests {
         site(f, kind, raw).locally_bound
     }
 
+    fn def<'f>(f: &'f FileFacts<JavaLang>, name: &str) -> &'f Definition {
+        f.defs
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no definition named `{name}`: {:?}", f.defs))
+    }
+
+    fn defs_named<'f>(f: &'f FileFacts<JavaLang>, name: &str) -> Vec<&'f Definition> {
+        f.defs.iter().filter(|d| d.name == name).collect()
+    }
+
+    fn segments(r: &Reference) -> Vec<&str> {
+        r.target.segments.iter().map(String::as_str).collect()
+    }
+
     fn binding<'f>(f: &'f FileFacts<JavaLang>, name: &str) -> &'f Binding {
         f.header
             .bindings
@@ -2295,5 +2310,1018 @@ mod tests {
             "        Foo thing = null;\n        Runnable r = new Runnable() {\n            public void run() {\n                thing.m();\n            }\n        };",
         ));
         assert!(bound(&f, RefKind::Call, "thing.m"));
+    }
+
+    // ---------------------------------------------------------------
+    // Compilation units, packages and imports (P-01..P-05, I-01..I-10)
+    // ---------------------------------------------------------------
+
+    const UNIT: &str = r#"package com.acme.util;
+
+import java.util.List;
+import java.util.*;
+import static org.junit.Assert.assertEquals;
+import static java.util.Arrays.*;
+import java.util.Map.Entry;
+import java.util.List;
+
+class Helper {}
+
+public class Outer {}
+"#;
+
+    #[test]
+    fn the_package_is_the_declaration_and_not_the_directory() {
+        // P-01 / §7.2: the package-to-directory mapping is
+        // implementation-specific, so a file under `src/main/java/com/acme`
+        // declaring `package com.acme.util;` is in `com.acme.util`.
+        let f = facts(UNIT);
+        assert_eq!(f.header.package.as_deref(), Some("com.acme.util"));
+        assert_eq!(f.header.rel_path, "src/main/java/com/acme/A.java");
+        // The container definition is the package, and it is `defs[0]` so the
+        // driver finds it wherever a reference has no nameable encloser.
+        assert_eq!(f.defs[0].kind, DefKind::Module);
+        assert_eq!(f.defs[0].name, "com.acme.util");
+        assert_eq!(f.defs[0].space, DeclSpace::Namespace);
+    }
+
+    #[test]
+    fn the_unnamed_package_says_nothing_rather_than_naming_nothing() {
+        // P-03 / §7.4.2. An empty container name means "this file does not
+        // say", which is not the same as naming the empty string.
+        let f = facts(
+            "class A {}
+",
+        );
+        assert_eq!(f.header.package, None);
+        assert_eq!(f.defs[0].kind, DefKind::Module);
+        assert_eq!(f.defs[0].name, "");
+    }
+
+    #[test]
+    fn several_top_level_types_in_one_compilation_unit() {
+        // P-04 / §7.6: at most one may be public; the rest are package-private
+        // and still top-level, with plain `pkg.Name` binary names.
+        let f = facts(UNIT);
+        assert!(def(&f, "Helper").owner.is_empty());
+        assert!(def(&f, "Outer").owner.is_empty());
+        assert!(!def(&f, "Helper").facets.contains(DefFacets::EXPORTED));
+        assert!(def(&f, "Outer").facets.contains(DefFacets::EXPORTED));
+    }
+
+    #[test]
+    fn every_import_form_is_recorded_with_its_tier() {
+        // I-01..I-05, I-09: the *form* decides the candidate tier (N-03), so a
+        // bool for `static` would not be enough.
+        let f = facts(UNIT);
+        let forms: Vec<(ImportKind, String)> = f
+            .header
+            .imports
+            .iter()
+            .map(|i| (i.kind, i.segments.join(".")))
+            .collect();
+        assert_eq!(
+            forms,
+            [
+                (ImportKind::SingleType, "java.util.List".to_string()),
+                (ImportKind::TypeOnDemand, "java.util".to_string()),
+                (
+                    ImportKind::SingleStatic,
+                    "org.junit.Assert.assertEquals".to_string()
+                ),
+                (ImportKind::StaticOnDemand, "java.util.Arrays".to_string()),
+                // I-09: the package/type split in `java.util.Map.Entry` is not
+                // decidable lexically — `java.util.Map` could have been a
+                // package — so the extractor segments and the resolver splits.
+                (ImportKind::SingleType, "java.util.Map.Entry".to_string()),
+                (ImportKind::SingleType, "java.util.List".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn imports_are_references_and_header_entries() {
+        // I-10: unused, duplicate and same-package imports are all legal and
+        // all still references. Skipping the duplicate would lower the
+        // denominator the resolution rate is measured against.
+        let f = facts(UNIT);
+        let imports = refs_of(&f, RefKind::Import);
+        assert_eq!(imports.len(), f.header.imports.len());
+        for (r, i) in imports.iter().zip(&f.header.imports) {
+            assert_eq!(
+                segments(r),
+                i.segments.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+            assert_eq!(r.span, i.span);
+            assert_eq!(r.enclosing, None);
+            assert!(!r.locally_bound);
+            assert_eq!(r.argc, None);
+        }
+        // The two `java.util.List` sites are one dedup row and the on-demand
+        // one is not confusable with them.
+        let raws: Vec<&str> = imports.iter().map(|r| r.raw_target.as_str()).collect();
+        assert_eq!(raws.iter().filter(|t| **t == "java.util.List").count(), 2);
+        assert!(raws.contains(&"java.util.*"));
+        assert!(raws.contains(&"java.util.Arrays.*"));
+        // A static import reads the value table; a type import the type one.
+        assert_eq!(
+            site(&f, RefKind::Import, "org.junit.Assert.assertEquals").space,
+            DeclSpace::Value
+        );
+        assert_eq!(
+            site(&f, RefKind::Import, "java.util.List").space,
+            DeclSpace::Type
+        );
+        assert_eq!(
+            site(&f, RefKind::Import, "java.util.*").space,
+            DeclSpace::Namespace
+        );
+    }
+
+    #[test]
+    fn module_info_declares_a_module_and_its_directives_are_references() {
+        // P-05: a module is a nameable thing and therefore a node. I-08:
+        // `requires` names modules and `exports` names packages.
+        let f = extract(
+            "module-info.java",
+            "module com.acme.app {
+    requires com.other;
+    exports com.acme.api;
+}
+",
+        );
+        assert_eq!(f.header.module.as_deref(), Some("com.acme.app"));
+        assert_eq!(f.header.package, None);
+        assert_eq!(f.defs[0].kind, DefKind::Module);
+        assert_eq!(f.defs[0].name, "com.acme.app");
+        assert_eq!(
+            segments(site(&f, RefKind::Import, "com.other")),
+            ["com", "other"]
+        );
+        assert_eq!(
+            segments(site(&f, RefKind::Export, "com.acme.api")),
+            ["com", "acme", "api"]
+        );
+    }
+
+    #[test]
+    fn a_module_import_is_recognised_even_though_the_grammar_errors_on_it() {
+        // I-07 / JEP 511. This grammar version parses `import module M;` with
+        // an ERROR node inside the name, and reading it through the
+        // `scope`/`name` fields would silently drop a segment and record
+        // `module` as the first package name. Recognising the shape is the
+        // difference between an honest low-priority gap and a false fact.
+        let f = facts(
+            "import module java.base;
+
+class A {}
+",
+        );
+        assert_eq!(f.header.imports.len(), 1);
+        assert_eq!(f.header.imports[0].kind, ImportKind::Module);
+        assert_eq!(f.header.imports[0].segments, ["java", "base"]);
+        assert_eq!(
+            site(&f, RefKind::Import, "module java.base").space,
+            DeclSpace::Namespace
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Types as scopes and the node rule (T-01..T-07, D-01..D-11)
+    // ---------------------------------------------------------------
+
+    const TYPES: &str = r#"package p;
+
+public class Outer {
+    static class Inner {
+        void deep() {}
+    }
+
+    class NonStatic {}
+
+    interface Contract {
+        int LIMIT = 1;
+
+        void required();
+
+        default void provided() {}
+
+        static void helper() {}
+    }
+}
+
+enum Color {
+    RED,
+    GREEN {
+        void hidden() {}
+    };
+
+    void shared() {}
+}
+
+record Point(int x, int y) {}
+
+@interface Anno {
+    String value();
+}
+"#;
+
+    #[test]
+    fn nested_types_carry_their_enclosing_chain() {
+        // T-01, T-02: both are nameable as `Outer.Inner`; they differ only in
+        // construction and in having an enclosing instance.
+        let f = facts(TYPES);
+        assert_eq!(def(&f, "Inner").owner, ["Outer"]);
+        assert!(def(&f, "Inner").facets.contains(DefFacets::STATIC));
+        assert_eq!(def(&f, "NonStatic").owner, ["Outer"]);
+        assert!(!def(&f, "NonStatic").facets.contains(DefFacets::STATIC));
+        assert_eq!(def(&f, "deep").owner, ["Outer", "Inner"]);
+        // §9.5: a member type of an interface is implicitly public and static.
+        assert!(def(&f, "Contract").facets.contains(DefFacets::INTERFACE));
+        assert!(def(&f, "Contract").facets.contains(DefFacets::STATIC));
+    }
+
+    #[test]
+    fn the_kind_of_a_type_is_a_facet_and_not_a_kind() {
+        let f = facts(TYPES);
+        for (name, facet) in [
+            ("Color", DefFacets::ENUM),
+            ("Point", DefFacets::RECORD),
+            ("Anno", DefFacets::ANNOTATION),
+            ("Contract", DefFacets::INTERFACE),
+        ] {
+            let d = def(&f, name);
+            assert_eq!(d.kind, DefKind::Type, "{name}");
+            assert_eq!(d.space, DeclSpace::Type, "{name}");
+            assert!(d.facets.contains(facet), "{name}");
+        }
+    }
+
+    #[test]
+    fn interface_members_are_public_and_the_abstract_ones_say_so() {
+        // §9.3, §9.4: interface members are implicitly public and interface
+        // fields are also static. I-06's candidate-order rule turns on exactly
+        // the static bit, so it is not decoration.
+        let f = facts(TYPES);
+        let limit = def(&f, "LIMIT");
+        assert!(limit.facets.contains(DefFacets::EXPORTED));
+        assert!(limit.facets.contains(DefFacets::STATIC));
+        let required = def(&f, "required");
+        assert!(required.facets.contains(DefFacets::ABSTRACT));
+        assert!(!def(&f, "provided").facets.contains(DefFacets::ABSTRACT));
+        assert!(def(&f, "helper").facets.contains(DefFacets::STATIC));
+    }
+
+    #[test]
+    fn enum_constants_are_fields_and_a_constant_body_declares_nothing() {
+        // D-05, T-05: the constant is a nameable static field; its body is an
+        // anonymous subclass (§8.9.3) and has no canonical name.
+        let f = facts(TYPES);
+        for name in ["RED", "GREEN"] {
+            let d = def(&f, name);
+            assert_eq!(d.kind, DefKind::Field);
+            assert_eq!(d.owner, ["Color"]);
+            assert!(d.facets.contains(DefFacets::STATIC));
+        }
+        assert_eq!(def(&f, "shared").owner, ["Color"]);
+        assert!(
+            defs_named(&f, "hidden").is_empty(),
+            "an enum constant body is anonymous and declares nothing nameable"
+        );
+    }
+
+    #[test]
+    fn an_annotation_element_is_a_method() {
+        // D-08 / §9.6.1.
+        let f = facts(TYPES);
+        let value = def(&f, "value");
+        assert_eq!(value.kind, DefKind::Method);
+        assert_eq!(value.owner, ["Anno"]);
+        assert_eq!(value.params.as_ref().map(|p| p.count), Some(0));
+        assert!(value.facets.contains(DefFacets::ABSTRACT));
+    }
+
+    #[test]
+    fn local_and_anonymous_classes_are_not_definitions() {
+        // T-03, T-04: §6.7 gives neither a canonical name, and §13.1's
+        // `Outer$1` numbering is occurrence-ordered — using it as a NodeId
+        // input would make inserting one anonymous class re-key every later
+        // one, which is the whole-file ID cascade the identity decision was
+        // made to avoid.
+        let f = facts(
+            "package p;
+
+class A {
+    void f() {
+        class Local {
+            void inner() {}
+        }
+        Runnable r = new Runnable() {
+            public void run() {}
+        };
+    }
+}
+",
+        );
+        assert!(defs_named(&f, "Local").is_empty());
+        assert!(defs_named(&f, "inner").is_empty());
+        assert!(defs_named(&f, "run").is_empty());
+        // What *is* declared: `A`, its default constructor, and `f`.
+        let names: Vec<&str> = f.defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["p", "A", "A", "f"]);
+    }
+
+    #[test]
+    fn the_enclosing_chain_is_a_path_that_skips_what_cannot_be_named() {
+        // T-07, T-03, T-04, T-06: a call inside a lambda, a local class or an
+        // anonymous class belongs to the nameable member around it, because
+        // that is the only node an edge could start at.
+        let f = facts(
+            "package p;
+
+class Outer {
+    class Inner {
+        void deep() {
+            plain();
+            Runnable r = () -> lambda();
+            Runnable q = new Runnable() {
+                public void run() {
+                    anon();
+                }
+            };
+            class Local {
+                void lm() {
+                    local();
+                }
+            }
+        }
+    }
+}
+",
+        );
+        let want = Some(Encloser {
+            path: vec!["Outer".into(), "Inner".into(), "deep()".into()],
+            kind: DefKind::Method,
+        });
+        for raw in ["plain", "lambda", "anon", "local"] {
+            assert_eq!(site(&f, RefKind::Call, raw).enclosing, want, "`{raw}`");
+        }
+    }
+
+    #[test]
+    fn an_initializer_encloses_at_the_owning_type() {
+        // D-11: a type is a node and JVMS §2.9.2's `<clinit>` is not a
+        // nameable name, so a call in a field or static initializer is
+        // attributed to the owning type.
+        let f = facts(
+            "package p;
+
+class A {
+    int n = compute();
+
+    static {
+        boot();
+    }
+
+    {
+        setup();
+    }
+}
+",
+        );
+        let want = Some(Encloser {
+            path: vec!["A".into()],
+            kind: DefKind::Type,
+        });
+        for raw in ["compute", "boot", "setup"] {
+            assert_eq!(site(&f, RefKind::Call, raw).enclosing, want, "`{raw}`");
+        }
+        // A site above every type has no encloser at all and sources at the
+        // file's container instead.
+        let unit = facts("package p;\n\nimport q.R;\n\nclass A {}\n");
+        assert_eq!(site(&unit, RefKind::Import, "q.R").enclosing, None);
+    }
+
+    // ---------------------------------------------------------------
+    // Methods, overloads, arity (M-01, M-05, M-06, M-08, M-10)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn overloads_are_separate_definitions_carrying_their_signature() {
+        // M-01: `Foo#m(String)` and `Foo#m(int)` are two definitions and two
+        // nodes. Collapsing them is silent graph corruption, not a lowered
+        // rate — the most dangerous single gap on the case study's list.
+        let f = facts(
+            "package p;
+
+class A {
+    void m(String s) {}
+    void m(int i) {}
+    void m(String fmt, Object... args) {}
+}
+",
+        );
+        let shapes: Vec<(u32, bool, Vec<String>)> = defs_named(&f, "m")
+            .iter()
+            .filter_map(|d| d.params.as_ref())
+            .map(|p| (p.count, p.varargs, p.types.clone()))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                (1, false, vec!["String".to_string()]),
+                (1, false, vec!["int".to_string()]),
+                // M-05 / §8.4.1: the `...` is kept because the declared type
+                // *is* an array type, and dropping it would make `f(int)` and
+                // `f(int...)` one key while §15.12.2 ranks them differently.
+                (2, true, vec!["String".to_string(), "Object...".to_string()]),
+            ]
+        );
+        let varargs = defs_named(&f, "m")
+            .into_iter()
+            .find(|d| d.params.as_ref().is_some_and(|p| p.varargs))
+            .expect("a varargs overload");
+        assert!(varargs.facets.contains(DefFacets::VARARGS));
+    }
+
+    #[test]
+    fn the_enclosing_path_distinguishes_two_overloads() {
+        // The core's `Encloser` carries no parameter shape, so the source of
+        // an edge inside `m(String)` and one inside `m(int)` would be the same
+        // node. Carrying the source-level parameter list in the last path
+        // segment is the workaround; without it the graph is corrupt rather
+        // than merely thin.
+        let f = facts(
+            "package p;
+
+class A {
+    void m(String s) { one(); }
+    void m(int i) { two(); }
+}
+",
+        );
+        assert_eq!(
+            site(&f, RefKind::Call, "one")
+                .enclosing
+                .as_ref()
+                .map(|e| e.path.clone()),
+            Some(vec!["A".to_string(), "m(String)".to_string()])
+        );
+        assert_eq!(
+            site(&f, RefKind::Call, "two")
+                .enclosing
+                .as_ref()
+                .map(|e| e.path.clone()),
+            Some(vec!["A".to_string(), "m(int)".to_string()])
+        );
+    }
+
+    #[test]
+    fn every_call_and_creation_site_carries_an_argument_count() {
+        // M-06: the one fact a call site has about the callee's signature that
+        // its name does not carry, and the minimum for any overload
+        // discrimination at all.
+        let f = facts(&in_method(
+            "        g();
+        g(1);
+        g(1, 2);
+        new Foo();
+        new Foo(1);",
+        ));
+        let calls: Vec<Option<u32>> = refs_of(&f, RefKind::Call).iter().map(|r| r.argc).collect();
+        assert_eq!(calls, [Some(0), Some(1), Some(2)]);
+        let news: Vec<Option<u32>> = refs_of(&f, RefKind::New).iter().map(|r| r.argc).collect();
+        assert_eq!(news, [Some(0), Some(1)]);
+        // A type use has no argument list, and `None` is a different fact from
+        // `Some(0)`.
+        assert_eq!(site(&f, RefKind::TypeUse, "Foo").argc, None);
+    }
+
+    #[test]
+    fn explicit_type_arguments_do_not_split_the_dedup_key() {
+        // M-08 / §15.12: type arguments constrain inference, not identity, so
+        // the two sites below name one method and must be one row.
+        let f = facts(&in_method(
+            "        Collections.<String>emptyList();
+        Collections.emptyList();",
+        ));
+        let raws: Vec<&str> = refs_of(&f, RefKind::Call)
+            .iter()
+            .map(|r| r.raw_target.as_str())
+            .collect();
+        assert_eq!(raws, ["Collections.emptyList", "Collections.emptyList"]);
+        for r in refs_of(&f, RefKind::Call) {
+            assert_eq!(segments(r), ["Collections", "emptyList"]);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Implicit members (D-09, D-10, C-02)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_record_synthesizes_its_components_accessors_and_canonical_constructor() {
+        // D-09, D-10, C-02: `new Point(1, 2)`, `p.x()` and `p.equals(q)` all
+        // name real members that no declaration syntax states. An extractor
+        // that only reads declarations makes every one of them a false
+        // `NoMatchingDefinition`.
+        let f = facts(
+            "package p;
+
+record Point(int x, int y) {}
+",
+        );
+        let synth: Vec<(&str, DefKind, u32)> = f
+            .defs
+            .iter()
+            .filter(|d| d.facets.contains(DefFacets::SYNTHETIC))
+            .map(|d| {
+                (
+                    d.name.as_str(),
+                    d.kind,
+                    d.params.as_ref().map_or(u32::MAX, |p| p.count),
+                )
+            })
+            .collect();
+        assert_eq!(
+            synth,
+            [
+                ("x", DefKind::Field, u32::MAX),
+                ("x", DefKind::Method, 0),
+                ("y", DefKind::Field, u32::MAX),
+                ("y", DefKind::Method, 0),
+                ("Point", DefKind::Constructor, 2),
+                ("equals", DefKind::Method, 1),
+                ("hashCode", DefKind::Method, 0),
+                ("toString", DefKind::Method, 0),
+            ]
+        );
+        assert_eq!(
+            defs_named(&f, "Point")
+                .iter()
+                .find(|d| d.kind == DefKind::Constructor)
+                .and_then(|d| d.params.as_ref())
+                .map(|p| p.types.clone()),
+            Some(vec!["int".to_string(), "int".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_written_member_is_not_synthesized_twice() {
+        // §8.10.4: a compact constructor *is* the canonical one, and a written
+        // accessor replaces the implicit one.
+        let f = facts(
+            "package p;
+
+record Point(int x, int y) {
+    Point {
+        check();
+    }
+
+    public int x() {
+        return x;
+    }
+
+    public String toString() {
+        return \"\";
+    }
+}
+",
+        );
+        let ctors = defs_named(&f, "Point");
+        assert_eq!(
+            ctors
+                .iter()
+                .filter(|d| d.kind == DefKind::Constructor)
+                .count(),
+            1,
+            "the compact constructor is the canonical one"
+        );
+        // A compact constructor's parameters are the record's components.
+        assert_eq!(
+            ctors
+                .iter()
+                .find(|d| d.kind == DefKind::Constructor)
+                .and_then(|d| d.params.as_ref())
+                .map(|p| p.count),
+            Some(2)
+        );
+        assert_eq!(
+            defs_named(&f, "x")
+                .iter()
+                .filter(|d| d.kind == DefKind::Method)
+                .count(),
+            1
+        );
+        assert_eq!(defs_named(&f, "toString").len(), 1);
+        assert!(!def(&f, "toString").facets.contains(DefFacets::SYNTHETIC));
+    }
+
+    #[test]
+    fn an_enum_synthesizes_values_and_valueof() {
+        // D-10 / §8.9.3.
+        let f = facts(
+            "package p;
+
+enum Color { RED }
+",
+        );
+        let values = def(&f, "values");
+        assert!(values.facets.contains(DefFacets::STATIC));
+        assert!(values.facets.contains(DefFacets::SYNTHETIC));
+        assert_eq!(values.params.as_ref().map(|p| p.count), Some(0));
+        assert_eq!(
+            def(&f, "valueOf").params.as_ref().map(|p| p.types.clone()),
+            Some(vec!["String".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_class_with_no_constructor_gets_the_implicit_one() {
+        // C-02 / §8.8.9: `new Foo()` on a source-constructorless class must
+        // resolve, and it takes the class's own access.
+        let f = facts(
+            "package p;
+
+public class A {}
+
+class B {
+    B(int x) {}
+}
+",
+        );
+        let a = defs_named(&f, "A");
+        let ctor = a
+            .iter()
+            .find(|d| d.kind == DefKind::Constructor)
+            .expect("a default constructor");
+        assert!(ctor.facets.contains(DefFacets::SYNTHETIC));
+        assert!(ctor.facets.contains(DefFacets::EXPORTED));
+        assert_eq!(ctor.params.as_ref().map(|p| p.count), Some(0));
+        // `B` writes one, so nothing is implied.
+        assert_eq!(
+            defs_named(&f, "B")
+                .iter()
+                .filter(|d| d.kind == DefKind::Constructor)
+                .count(),
+            1
+        );
+        assert!(
+            !defs_named(&f, "B")
+                .iter()
+                .any(|d| d.facets.contains(DefFacets::SYNTHETIC))
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Inheritance, construction, and the target shapes (H-01, H-03, C-*)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn supertypes_are_inherit_references_and_permits_is_not() {
+        // H-01: member lookup cannot start until `extends`/`implements` have
+        // themselves resolved, so these are load-bearing inputs and not
+        // decoration. `permits` names *subtypes*, which is an ordinary type
+        // use.
+        let f = facts(
+            "package p;
+
+sealed class A extends q.Base<T> implements Iface, r.Other permits Sub {}
+",
+        );
+        let inherits: Vec<Vec<&str>> = refs_of(&f, RefKind::Inherit)
+            .iter()
+            .map(|r| segments(r))
+            .collect();
+        assert_eq!(
+            inherits,
+            [vec!["q", "Base"], vec!["Iface"], vec!["r", "Other"]]
+        );
+        for r in refs_of(&f, RefKind::Inherit) {
+            assert_eq!(r.space, DeclSpace::Type);
+        }
+        assert_eq!(site(&f, RefKind::TypeUse, "Sub").kind, RefKind::TypeUse);
+        // The type argument inside `q.Base<T>` is still a type use of its own.
+        assert_eq!(site(&f, RefKind::TypeUse, "T").kind, RefKind::TypeUse);
+    }
+
+    #[test]
+    fn super_and_qualified_this_are_roots_and_not_expressions() {
+        // H-03: `super.m()`, `Iface.super.m()` and `Outer.this.m()` are fully
+        // resolvable with no inference anywhere. Letting them fall to an
+        // expression root would throw away cheap wins under an
+        // honest-sounding label.
+        let f = facts(
+            "package p;
+
+class A {
+    class Inner {
+        void f() {
+            super.m();
+            Iface.super.m();
+            Outer.this.m();
+            this.m();
+            this.field.m();
+        }
+    }
+}
+",
+        );
+        let by_raw = |raw: &str| site(&f, RefKind::Call, raw).target.clone();
+        assert_eq!(
+            by_raw("super.m"),
+            RefTarget {
+                root: TargetRoot::Super { qualifier: vec![] },
+                segments: vec!["m".into()],
+            }
+        );
+        assert_eq!(
+            by_raw("Iface.super.m"),
+            RefTarget {
+                root: TargetRoot::Super {
+                    qualifier: vec!["Iface".into()]
+                },
+                segments: vec!["m".into()],
+            }
+        );
+        assert_eq!(
+            by_raw("Outer.this.m"),
+            RefTarget {
+                root: TargetRoot::This {
+                    qualifier: vec!["Outer".into()]
+                },
+                segments: vec!["m".into()],
+            }
+        );
+        assert_eq!(
+            by_raw("this.m"),
+            RefTarget {
+                root: TargetRoot::This { qualifier: vec![] },
+                segments: vec!["m".into()],
+            }
+        );
+        assert_eq!(
+            by_raw("this.field.m"),
+            RefTarget {
+                root: TargetRoot::This { qualifier: vec![] },
+                segments: vec!["field".into(), "m".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn creation_sites_name_a_constructor_and_a_type() {
+        // C-01: two references in one expression. C-04: the enclosing instance
+        // is not part of the target, so `outer.new Inner()` and
+        // `new Outer.Inner()` normalise to the same shape of name. C-06: a
+        // diamond still names the raw type, because erasure discards the
+        // arguments anyway.
+        let f = facts(&in_method(
+            "        new Foo(1);
+        new a.b.Foo<>();
+        outer.new Inner();
+        new Outer.Inner();",
+        ));
+        let news: Vec<(Vec<&str>, Option<u32>)> = refs_of(&f, RefKind::New)
+            .iter()
+            .map(|r| (segments(r), r.argc))
+            .collect();
+        assert_eq!(
+            news,
+            [
+                (vec!["Foo"], Some(1)),
+                (vec!["a", "b", "Foo"], Some(0)),
+                (vec!["Inner"], Some(0)),
+                (vec!["Outer", "Inner"], Some(0)),
+            ]
+        );
+        // The type half of `new Foo(1)` is a type use of its own.
+        assert!(
+            refs_of(&f, RefKind::TypeUse)
+                .iter()
+                .any(|r| segments(r) == ["Foo"])
+        );
+    }
+
+    #[test]
+    fn array_creation_names_no_constructor() {
+        // C-07 / §15.10.1: `new int[10]` is not a reference to any definition,
+        // and inventing one would put a guess in the denominator.
+        let f = facts(&in_method(
+            "        int[] a = new int[10];
+        String[] b = new String[] { \"x\" };
+        Foo c = new Foo();",
+        ));
+        let news: Vec<Vec<&str>> = refs_of(&f, RefKind::New)
+            .iter()
+            .map(|r| segments(r))
+            .collect();
+        assert_eq!(news, [vec!["Foo"]]);
+    }
+
+    #[test]
+    fn an_anonymous_creation_targets_the_named_supertype() {
+        // C-05 / §15.9.5.1: the constructor actually invoked is the
+        // supertype's — the anonymous class has none that can be named
+        // (T-04) — so the target is the type that was written.
+        let f = facts(&in_method(
+            "        Runnable r = new Runnable() {
+            public void run() {}
+        };",
+        ));
+        let news = refs_of(&f, RefKind::New);
+        assert_eq!(news.len(), 1);
+        assert_eq!(segments(news[0]), ["Runnable"]);
+        assert_eq!(news[0].argc, Some(0));
+    }
+
+    #[test]
+    fn this_and_super_constructor_invocations_are_creation_sites() {
+        // C-03 / §8.8.7.1: both name `<init>` on a type the file knows, and
+        // both are fully resolvable.
+        let f = facts(
+            "package p;
+
+class A {
+    A() {
+        this(1);
+    }
+
+    A(int x) {
+        super(x);
+    }
+}
+",
+        );
+        let news: Vec<(&TargetRoot, Option<u32>)> = refs_of(&f, RefKind::New)
+            .iter()
+            .map(|r| (&r.target.root, r.argc))
+            .collect();
+        assert_eq!(
+            news,
+            [
+                (&TargetRoot::This { qualifier: vec![] }, Some(1)),
+                (&TargetRoot::Super { qualifier: vec![] }, Some(1)),
+            ]
+        );
+        for r in refs_of(&f, RefKind::New) {
+            assert!(r.target.segments.is_empty());
+            assert!(!r.locally_bound);
+        }
+    }
+
+    #[test]
+    fn an_enum_constant_with_arguments_is_a_creation_site() {
+        // §8.9.1. A constant with no argument list has no written site, and
+        // C-09 forbids inventing one.
+        let f = facts(
+            "package p;
+
+enum Color {
+    RED(1),
+    GREEN;
+
+    Color() {}
+
+    Color(int n) {}
+}
+",
+        );
+        let news: Vec<(Vec<&str>, Option<u32>)> = refs_of(&f, RefKind::New)
+            .iter()
+            .map(|r| (segments(r), r.argc))
+            .collect();
+        assert_eq!(news, [(vec!["Color"], Some(1))]);
+    }
+
+    #[test]
+    fn method_references_name_a_method_or_a_constructor() {
+        // C-08 / §15.13. `<init>` cannot be a Java identifier (§3.8 excludes
+        // `<` and `>`), so it names the constructor unambiguously. The arity
+        // is `None` because the overload is chosen by the target functional
+        // interface type, not by an argument list at this site.
+        let f = facts(&in_method(
+            "        Supplier<Foo> a = Foo::new;
+        Runnable b = Outer::helper;
+        Function<K, V> c = a.b.C::get;
+        Runnable d = local::run;",
+        ));
+        let shapes: Vec<(Vec<&str>, Option<u32>)> = refs_of(&f, RefKind::MethodRef)
+            .iter()
+            .map(|r| (segments(r), r.argc))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                (vec!["Foo", "<init>"], None),
+                (vec!["Outer", "helper"], None),
+                (vec!["a", "b", "C", "get"], None),
+                (vec!["local", "run"], None),
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Qualifiers and honest limits (N-04, X-01)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_multi_segment_qualifier_keeps_every_segment() {
+        // N-04: `RefTarget` carrying one qualifier identifier would collapse
+        // every `org.slf4j.LoggerFactory.getLogger(…)`-shaped call into an
+        // expression root and hide a fully resolvable case behind
+        // `NeedsTypeInference`. §6.5.2's reclassification needs the segments.
+        let f = facts(&in_method(
+            "        org.slf4j.LoggerFactory.getLogger(A.class);
+        p.q();
+        r();",
+        ));
+        assert_eq!(
+            segments(site(&f, RefKind::Call, "org.slf4j.LoggerFactory.getLogger")),
+            ["org", "slf4j", "LoggerFactory", "getLogger"]
+        );
+        assert_eq!(segments(site(&f, RefKind::Call, "p.q")), ["p", "q"]);
+        assert_eq!(segments(site(&f, RefKind::Call, "r")), ["r"]);
+        for raw in ["org.slf4j.LoggerFactory.getLogger", "p.q", "r"] {
+            assert_eq!(site(&f, RefKind::Call, raw).target.root, TargetRoot::Name);
+        }
+    }
+
+    #[test]
+    fn an_expression_receiver_keeps_only_its_trailing_selectors() {
+        // X-01 / §15.12.1: the type of a Primary is genuinely needed, and this
+        // is the one call shape the study says to leave alone.
+        let f = facts(&in_method(
+            "        getService().start();
+        list.get(0).foo();
+        ((Foo) x).m();
+        arr[i].m();",
+        ));
+        let expressions: Vec<(&str, Vec<&str>)> = refs_of(&f, RefKind::Call)
+            .iter()
+            .filter(|r| r.target.root == TargetRoot::Expr)
+            .map(|r| (r.raw_target.as_str(), segments(r)))
+            .collect();
+        assert_eq!(
+            expressions,
+            [
+                ("getService().start", vec!["start"]),
+                ("list.get(0).foo", vec!["foo"]),
+                ("((Foo)x).m", vec!["m"]),
+                ("arr[i].m", vec!["m"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_access_is_a_site_only_where_it_is_not_a_qualifier() {
+        // The chain's segments already carry the qualifier, so emitting the
+        // inner accesses too would count one name several times and inflate
+        // the denominator.
+        let f = facts(&in_method(
+            "        System.out.println(x);
+        a.b.c = 1;
+        int n = Integer.MAX_VALUE;",
+        ));
+        let accesses: Vec<Vec<&str>> = refs_of(&f, RefKind::FieldAccess)
+            .iter()
+            .map(|r| segments(r))
+            .collect();
+        assert_eq!(
+            accesses,
+            [vec!["a", "b", "c"], vec!["Integer", "MAX_VALUE"]]
+        );
+        assert_eq!(
+            segments(site(&f, RefKind::Call, "System.out.println")),
+            ["System", "out", "println"]
+        );
+    }
+
+    #[test]
+    fn annotations_are_references_to_a_type() {
+        let f = facts(
+            "package p;
+
+@Service
+@q.Scoped(\"x\")
+class A {
+    @Override
+    public String toString() {
+        return \"\";
+    }
+}
+",
+        );
+        let annotations: Vec<Vec<&str>> = refs_of(&f, RefKind::Annotation)
+            .iter()
+            .map(|r| segments(r))
+            .collect();
+        assert_eq!(
+            annotations,
+            [vec!["Service"], vec!["q", "Scoped"], vec!["Override"]]
+        );
+        for r in refs_of(&f, RefKind::Annotation) {
+            assert_eq!(r.space, DeclSpace::Type);
+        }
     }
 }
