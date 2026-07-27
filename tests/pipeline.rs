@@ -135,6 +135,48 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
 }
 
 #[test]
+fn a_local_and_a_package_level_call_of_one_name_are_two_rows() {
+    // Same file, same enclosing function, same site text, same arity — and
+    // two different outcomes, because an inner block binds the first and
+    // only the second names the package-level function. Collapsing them
+    // into one row keeps whichever outcome came first and attributes both
+    // occurrences to it, moving a resolved reference into the local-binding
+    // bucket without ever dropping a row: every count still sums, and the
+    // rate is wrong in both terms.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(
+        dir.path(),
+        "p/p.go",
+        concat!(
+            "package p\n\n",
+            "func x() {}\n\n",
+            "func f() {\n",
+            "\t{\n\t\tx := func() {}\n\t\tx()\n\t}\n",
+            "\tx()\n",
+            "}\n",
+        ),
+    );
+    let db = dir.path().join("graph.redb");
+    let report = scan_go(dir.path(), &db).expect("scan succeeds");
+    let go_tally = &report.per_lang[&Lang::Go.code()];
+
+    assert_eq!(
+        go_tally.local_binding, 1,
+        "exactly one call names the block-local",
+    );
+    assert_eq!(
+        go_tally.resolved, 1,
+        "exactly one call names the package-level x",
+    );
+    let store = Store::open(&db).expect("store opens");
+    assert!(
+        calls(&store, "example.com/app/p.f", "example.com/app/p.x"),
+        "the package-level call is a real edge",
+    );
+}
+
+#[test]
 fn an_external_reference_gets_a_node_and_an_edge() {
     // A dependency outside the repository is a node like any other, so a
     // call into one is a real edge rather than a dead end — and giving it

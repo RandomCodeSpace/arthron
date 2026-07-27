@@ -56,6 +56,7 @@ fn key(file: &str, enclosing: &str, raw: &str) -> RefKey {
         enclosing: enclosing.to_string(),
         raw_target: raw.to_string(),
         argc: None,
+        locally_bound: false,
     }
 }
 
@@ -407,6 +408,10 @@ fn row_keys_round_trip_through_the_split_encoding() {
             space: 2,
             ..key("pkg/a.go", "m/pkg.C.m", "x")
         },
+        RefKey {
+            locally_bound: true,
+            ..key("pkg/a.go", "m/pkg.Caller", "x")
+        },
     ];
     for original in cases {
         let (file, encoded) = original.split();
@@ -422,6 +427,15 @@ fn row_keys_round_trip_through_the_split_encoding() {
         ..unknown.clone()
     };
     assert_ne!(unknown.split().1, zero.split().1);
+
+    // A block-local `x()` and the package-level `x()` after it agree on
+    // every other component and resolve differently, so they must be
+    // different keys — one row carries one outcome.
+    let bound = RefKey {
+        locally_bound: true,
+        ..unknown.clone()
+    };
+    assert_ne!(unknown.split().1, bound.split().1);
 
     // Trailing bytes are an error: an encoding that accepts two byte
     // strings for one key is not a key.
