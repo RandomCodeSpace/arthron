@@ -11,6 +11,7 @@ use arthron::gate::{
     Baseline, Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
 };
 use arthron::json;
+use arthron::mcp;
 use arthron::model::{Lang, reason_name};
 use arthron::pipeline::scan_repo_with;
 use arthron::query::{
@@ -128,6 +129,21 @@ enum Command {
         #[arg(long, global = true, long_help = json::HELP)]
         json: bool,
     },
+    /// Serve the graph to an agent over the Model Context Protocol, on stdio.
+    ///
+    /// JSON-RPC 2.0, one message per line, stdin in and stdout out. Every tool
+    /// returns the same document `--json` prints, from the same library calls
+    /// the other commands make: there is no second answer for agents.
+    ///
+    /// No socket is opened and no address is bound.
+    #[command(after_long_help = mcp::HELP)]
+    Mcp {
+        /// The graph the query tools read (default: the config's `db`, else
+        /// .arthron/graph.redb). `scan_repo` writes wherever its own
+        /// arguments say.
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 /// The three questions the graph answers about a name.
@@ -174,22 +190,53 @@ fn main() -> ExitCode {
             commit.as_deref(),
             json,
         ),
-        Command::Query { verb, db, json } => {
-            // The query has no path argument, so its configuration is the
-            // working directory's — the repository you are standing in, which
-            // is the one whose graph `.arthron/graph.redb` names.
-            let root = PathBuf::from(".");
-            let config = match Config::load(&root) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("arthron: {e}");
-                    return ExitCode::from(EXIT_USAGE);
-                }
-            };
-            let db_path = db
-                .or_else(|| config.db_path(&root))
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_DB));
-            run_query(&verb, &db_path, json)
+        Command::Query { verb, db, json } => match working_db(db) {
+            Ok(db_path) => run_query(&verb, &db_path, json),
+            Err(e) => {
+                eprintln!("arthron: {e}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+        Command::Mcp { db } => match working_db(db) {
+            Ok(db_path) => run_mcp(db_path),
+            Err(e) => {
+                eprintln!("arthron: {e}");
+                ExitCode::from(EXIT_USAGE)
+            }
+        },
+    }
+}
+
+/// The graph a command with no path argument reads.
+///
+/// `query` and `mcp` both take a name rather than a repository, so their
+/// configuration is the working directory's — the repository you are standing
+/// in, which is the one whose graph `.arthron/graph.redb` names. The flag wins
+/// over the file, as everywhere else.
+fn working_db(db: Option<PathBuf>) -> Result<PathBuf, String> {
+    let root = PathBuf::from(".");
+    let config = Config::load(&root)?;
+    Ok(db
+        .or_else(|| config.db_path(&root))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DB)))
+}
+
+/// Answer MCP messages on stdin until end of input.
+///
+/// The store is not opened here: a client's first call is usually `scan_repo`,
+/// which creates it, so a server whose graph does not exist yet must still
+/// start.
+fn run_mcp(db_path: PathBuf) -> ExitCode {
+    let server = mcp::Server::new(db_path);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    match server.run(&mut stdin.lock(), &mut stdout.lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // A broken pipe or an unreadable stdin: the transport itself
+            // failed, so there is nowhere to send a JSON-RPC error.
+            eprintln!("arthron: {e}");
+            ExitCode::from(EXIT_USAGE)
         }
     }
 }

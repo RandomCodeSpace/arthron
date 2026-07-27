@@ -2,9 +2,9 @@
 //! the references between them into a verified graph.
 //!
 //! **Status: early.** Scanning, the [`gate`] and the [`query`] surface all
-//! work, across every tier-1 language, in a report for a person or a [`json`]
-//! document for a script; the watch surface is not built yet. The API is
-//! pre-1.0 and will change.
+//! work, across every tier-1 language, in a report for a person, a [`json`]
+//! document for a script, or an [`mcp`] tool call for an agent; the watch
+//! surface is not built yet. The API is pre-1.0 and will change.
 //!
 //! # The contract
 //!
@@ -174,6 +174,7 @@ pub mod extract_go;
 pub mod gate;
 pub mod json;
 pub mod lang;
+pub mod mcp;
 pub mod model;
 pub mod pipeline;
 pub mod query;
