@@ -898,6 +898,40 @@ func helper() {
     }
 
     #[test]
+    fn an_else_if_initialiser_sees_the_outer_headers_binding() {
+        // The two rules meet in one place: an `else if` header does not bind
+        // its *own* initialiser, but it sits inside the `if` whose header
+        // already closed, so that outer binding does reach it. Walking the
+        // ancestors has to reject the inner header and accept the outer one
+        // for the same site — getting either half wrong moves a reference
+        // between the local bucket and the rate.
+        let f = extract(
+            "main.go",
+            concat!(
+                "package main\n\n",
+                "func x() func() { return nil }\n\n",
+                "func f(cond bool) {\n",
+                "\tif x := x(); cond {\n\t\tx()\n",
+                "\t} else if y := x(); cond {\n\t\ty()\n\t}\n",
+                "}\n",
+            ),
+        );
+        let sites: Vec<bool> = call_refs(&f)
+            .iter()
+            .filter(|r| r.raw_target == "x")
+            .map(|r| r.locally_bound)
+            .collect();
+        assert_eq!(
+            sites,
+            [false, true, true],
+            "the outer init RHS names the package-level `x`; the consequence \
+             body and the else-if's own initialiser both name the one the \
+             outer header bound",
+        );
+        assert!(bound(&f, "y"), "the else-if binds its own body");
+    }
+
+    #[test]
     fn named_results_and_receivers_bind_the_whole_body() {
         let f = extract(
             "main.go",

@@ -315,6 +315,29 @@ fn renaming_a_packages_declared_name_lands_a_cold_scans_store() {
 }
 
 #[test]
+fn renaming_the_package_clause_of_a_later_sibling_lands_a_cold_scans_store() {
+    // The invalidation compares two payloads that are not read the same way:
+    // the "before" side is the *merged* node record, whose package name comes
+    // from the first declaration site, and the "now" side is the single
+    // file's own record. A rename in the file that sorts *second* moves only
+    // the second site, so the two sides are asymmetric exactly there. The
+    // comparison has to stay conservative enough to wake the importer anyway.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    write(root, "util/a.go", "package util\n\nfunc Parse() {}\n");
+    write(root, "util/z.go", "package util\n\nfunc Other() {}\n");
+    write(root, "server/server.go", SERVER);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("cold scan");
+
+    write(root, "util/z.go", "package helper\n\nfunc Other() {}\n");
+    scan_go(root, &db).expect("scan after the rename");
+
+    assert_matches_cold(root, &db);
+}
+
+#[test]
 fn adding_a_definition_repoints_an_unresolved_caller_in_an_unchanged_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
