@@ -59,6 +59,12 @@ order. A key may name a node directly or stand for one under another shape
 An index key that names a node under another name — an export alias or a
 re-export. An alias is an entry pointing at a node, not a node itself.
 
+**Track**:
+One language family's pluggable unit: its language(s), extractor, resolver,
+and go-live switch, registered in a fixed order. A disabled track owns no
+files. Going live edits only the track's own module.
+_Avoid_: plugin, backend
+
 **Resolution rate**:
 `Resolved / (Resolved + Unresolved)` for one language. Never aggregated across
 languages. The primary quality gate.

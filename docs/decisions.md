@@ -143,6 +143,71 @@ that wrote the file would not be the one the gate compares against.
 
 ---
 
+## 2026-07-27 — Tier 1 complete: five languages, six corpus gates, one frozen core
+
+The three language tracks ratified in the road-to-27 plan ran concurrently
+over the frozen Phase 2 core and landed the same day. Every rate below is
+per-language, measured on a release build against a cold store, and gated by
+a committed baseline the CLI itself wrote.
+
+| Language | Corpus | resolved | external | local-binding | unresolved | rate |
+|---|---|---|---|---|---|---|
+| Go | codeiq | 4467 | 6085 | 4276 | 799 | 84.8% |
+| Go | caddy | 3006 | 9571 | 9425 | 1815 | 62.4% |
+| Java | commons-lang | 38940 | 68333 | 2062 | 19708 | 66.4% |
+| JavaScript | fastify | 2795 | 5159 | 21542 | 1640 | 63.0% |
+| TypeScript | vue-core | 17897 | 3694 | 9564 | 36345 | 33.0% |
+| Python | django | 18850 | 13326 | 826 | 14017 | 57.4% |
+
+The floors are honest and named: Java's `AmbiguousOverload` 10302 and
+`NeedsExpressionType` 6566; TypeScript's `NoMatchingDefinition` 14672 and
+`WildcardImport` 9004 (dominated by barrel re-exports the store cannot yet
+follow — see the alias gap below); Python's `NeedsTypeInference` 10256.
+TypeScript's 33.0% is the honest cost of a monorepo built on `paths`
+mappings and barrels; raising it is capability work, not reclassification.
+
+**Going live edits one file.** A track enables itself in its own module
+(`scan: None` → `Some`), and the registry treats a disabled track as owning
+no files. The three tracks' pull requests touched no shared file and merged
+without a single conflict. Two supporting rules earned their keep: a scan
+may only declare deleted the files whose extension it owns, and the manifest
+fence is per language with an empty digest meaning no opinion.
+
+**The frozen core held, because it was policed.** Three core defects were
+found by tracks that refused to work around them in their own code, and each
+became a dedicated core PR before any track hit it in anger: registry tests
+that asserted Go was alone (every go-live would have broken them); a global
+manifest fence (the second live track wiped the first's graph on every
+scan); a CLI that could neither scan a Go-less repository nor gate any
+language but Go. No track ever edited a core file.
+
+**Every adversarial finding was reproduced or rebutted, none blanket-accepted.**
+Java: 11 findings, 11 fixed, 0 rebutted — headline, wrong *resolved* edges
+from an erased anonymous-class frame, caught only by new tests that assert
+the name a row resolved to, since a wrong edge moves no count. Python: the
+review moved the rate 57.2% → 57.4% with the movement itself audited — three
+fixes pulled 44 references *out* of `External` back into the denominator
+(lowering pressure), one linked 61 references that never needed inference;
+net gain is linking, not reclassification. EcmaScript: static and instance
+members had collapsed onto one identity; the discriminator now rides the
+owner chain as the `prototype` segment, which ES conveniently forbids as a
+static member name.
+
+**Named core work for Phase 4.5**, each with its measured cost today:
+definition facets are not persisted, so no resolver can branch on a stored
+facet; the driver never runs the supertype-closure phase (`link_kinds` is
+declared and never called) — `UnindexedSupertype` 710 in Java, 1468 in
+Python; the store never surfaces alias entries, so re-export chains stop one
+hop short — the bulk of TypeScript's 14672 `NoMatchingDefinition`.
+
+**Rejected:** merging JavaScript and TypeScript into one reported rate (one
+resolver family, one domain, two languages — a `.ts` import may name a `.js`
+definition, and the two numbers still never aggregate); shrinking any floor
+by guessing (every review was instructed to flag decidable cases inside a
+floor, and did).
+
+---
+
 ## 2026-07-27 — Seven adversarial-review findings, and two reserved characters
 
 An adversarial review of the phase-2 core produced seven findings. Each was
