@@ -41,6 +41,20 @@ use crate::store::{
     RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
 };
 
+/// Files a phase writes in one transaction.
+///
+/// A phase's batch is the one structure in it whose size is the corpus's, so
+/// a whole-event batch makes a cold scan's peak memory the tree's size — and
+/// on a large repository that is how the 512 MB ceiling is crossed. Bounding
+/// it bounds the phase: what a batch holds, and the dirty pages redb holds
+/// for the transaction writing it, are both freed at the boundary.
+///
+/// 500 because that is the measured shape of the trade: 500 files in one
+/// transaction against 216ms as 500 separate ones. Nothing about the graph
+/// depends on the number — a file's facts are applied in the same order at
+/// any batch size — only the memory and the transaction count do.
+const BATCH_FILES: usize = 500;
+
 /// One file this event re-reads, extracted.
 ///
 /// Either its bytes moved, or an identity it referenced did — both mean the
@@ -239,23 +253,36 @@ pub fn scan<L: Language>(
     store.forget_files(&deleted)?;
 
     // Phase 1: definition and container nodes for the changed set.
+    //
+    // Written in batches of [`BATCH_FILES`] rather than one transaction over
+    // the event. The probe is read once, before the first batch commits, and
+    // every file in the phase is named against that one table — so which
+    // batch a file lands in decides nothing, and the graph a batched phase
+    // leaves is the graph a single transaction left.
     let probe = store.symbol_entries()?;
     // The definitions this event declared, by identity. Two of them under
     // one identity is the only case the language can be asked about.
     let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
     let mut def_batch = DefBatch {
-        files: Vec::with_capacity(changed.len()),
+        files: Vec::with_capacity(BATCH_FILES),
     };
+    // Every identity any batch flagged as doubly declared. Collected rather
+    // than believed: a batch judges the graph as it stands when it commits,
+    // and only the finished event can say which of them still stands — see
+    // [`Store::definition_collisions`].
+    let mut flagged: BTreeSet<NodeId> = BTreeSet::new();
+    // Accumulated a batch at a time for the same reason the batch is: this
+    // is what the event declares, and it has to outlive the records it was
+    // read from.
+    let mut declared_now: BTreeMap<NodeId, NodePayload> = BTreeMap::new();
     for file in &changed {
-        def_batch
-            .files
-            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        let defs = phase_one(rs, &cfg, file, &probe, &mut event_defs);
+        for (id, record) in &defs.nodes {
+            declared_now.insert(*id, record.payload());
+        }
+        def_batch.files.push(defs);
+        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
     }
-    let declared_now: BTreeMap<NodeId, NodePayload> = def_batch
-        .files
-        .iter()
-        .flat_map(|f| f.nodes.iter().map(|(id, rec)| (*id, rec.payload())))
-        .collect();
 
     // The identities this event started declaring, stopped declaring, or
     // changed the meaning of. The third case is not the same as the first
@@ -289,11 +316,22 @@ pub fn scan<L: Language>(
         def_batch
             .files
             .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
     }
+    flush_defs(&store, &mut def_batch, &mut flagged, 1)?;
+    drop(def_batch);
+    // Both halves of the comparison have done their work; `touched` is the
+    // whole of what the event kept from them.
+    drop(declared_before);
+    drop(declared_now);
 
-    let colliding = store.apply_defs(&def_batch)?;
+    let colliding = store.definition_collisions(&flagged)?;
     let merged = mergeable_count(rs, &colliding, &event_defs);
+    drop(event_defs);
 
+    // The phase-1 probe goes before the phase-2 one is read: holding two
+    // whole symbol tables at once buys nothing, and phase 1 is over.
+    drop(probe);
     // The container names phase 1 just wrote are part of the scope every file
     // is resolved against, so the config is refreshed before any scope is
     // built — by phase 1.5 as much as by phase 2.
@@ -322,24 +360,27 @@ pub fn scan<L: Language>(
                 .or_insert(record);
         }
         let fqns = store.definition_fqns()?;
+        // Batched like phase 1, and for the same reason. A file's supertype
+        // rows are a function of its own bytes and the definition table this
+        // phase never writes to, so a batch boundary moves no row.
         let mut super_batch = SuperBatch {
-            files: Vec::with_capacity(changed.len() + waking.len()),
+            files: Vec::with_capacity(BATCH_FILES),
         };
-        for file in changed.iter().chain(waking.iter()) {
-            super_batch
-                .files
-                .push(phase_supers(rs, &cfg, file, &probe, &fqns, links));
-        }
         let mut supers_now: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
-        for file in &super_batch.files {
-            for (id, record) in &file.types {
+        for file in changed.iter().chain(waking.iter()) {
+            let supers = phase_supers(rs, &cfg, file, &probe, &fqns, links);
+            for (id, record) in &supers.types {
                 supers_now
                     .entry(*id)
                     .and_modify(|held| held.merge(record.clone()))
                     .or_insert_with(|| record.clone());
             }
+            super_batch.files.push(supers);
+            flush_supers(&store, &mut super_batch, BATCH_FILES)?;
         }
-        store.apply_supers(&super_batch)?;
+        flush_supers(&store, &mut super_batch, 1)?;
+        drop(super_batch);
+        drop(fqns);
 
         // The same widening the definition phase performs, for the same
         // reason and with the same over-approximation: a type whose
@@ -372,17 +413,69 @@ pub fn scan<L: Language>(
 
     // Phase 2: resolve every reference in the changed set and in every file
     // this event woke, in either round.
+    //
+    // The files are *consumed* here, not borrowed. Phase 2 is the last thing
+    // that reads a file's extracted facts, and on a cold scan those facts are
+    // the largest thing the process holds — the whole tree, parsed. Dropping
+    // each file's as its half is built is what lets the batches be allocated
+    // out of the memory the facts are giving back, rather than beside it.
     let mut ref_batch = RefBatch {
-        files: Vec::with_capacity(changed.len() + waking.len() + roused.len()),
+        files: Vec::with_capacity(BATCH_FILES),
     };
-    for file in changed.iter().chain(waking.iter()).chain(roused.iter()) {
-        ref_batch.files.push(phase_two(rs, &cfg, file, &probe));
+    for file in changed.into_iter().chain(waking).chain(roused) {
+        let refs = phase_two(rs, &cfg, &file, &probe);
+        drop(file);
+        ref_batch.files.push(refs);
+        flush_refs(&store, &mut ref_batch, BATCH_FILES)?;
     }
-    store.apply_refs(&ref_batch)?;
+    flush_refs(&store, &mut ref_batch, 1)?;
 
     let mut report = store.report()?;
     report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
     Ok(report)
+}
+
+/// Commit a phase-1 batch and forget it, once it holds `limit` files.
+///
+/// `limit` is [`BATCH_FILES`] inside a loop and `1` after it, which is the
+/// "commit whatever is left" call: an empty batch is never written, because
+/// a transaction over no files is a transaction with nothing to say.
+///
+/// Clearing the batch is the point, not committing it. The batch and the
+/// dirty pages redb holds for it are the phase's whole memory, and both go
+/// back at this boundary.
+fn flush_defs(
+    store: &Store,
+    batch: &mut DefBatch,
+    flagged: &mut BTreeSet<NodeId>,
+    limit: usize,
+) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    flagged.extend(store.apply_defs(batch)?);
+    batch.files.clear();
+    Ok(())
+}
+
+/// [`flush_defs`], for the supertype phase.
+fn flush_supers(store: &Store, batch: &mut SuperBatch, limit: usize) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    store.apply_supers(batch)?;
+    batch.files.clear();
+    Ok(())
+}
+
+/// [`flush_defs`], for the reference phase.
+fn flush_refs(store: &Store, batch: &mut RefBatch, limit: usize) -> Result<(), String> {
+    if batch.files.is_empty() || batch.files.len() < limit {
+        return Ok(());
+    }
+    store.apply_refs(batch)?;
+    batch.files.clear();
+    Ok(())
 }
 
 /// The unchanged files holding a reference that probed one of `touched`.

@@ -11,8 +11,12 @@
 //! make phase 2's replace delete what phase 1 just wrote for the same file,
 //! and the symptom would look like "some definitions randomly missing".
 //!
-//! One write transaction per batch (batch per event: 500 files in one
-//! transaction measured 60ms against 216ms as 500 separate transactions).
+//! One write transaction per batch, and a batch is a fixed number of files
+//! rather than the whole event (500 files in one transaction measured 60ms
+//! against 216ms as 500 separate transactions). The bound is what makes a
+//! scan's memory a function of the batch instead of the corpus: redb holds a
+//! transaction's dirty pages until it commits, so an event-sized transaction
+//! is an event-sized allocation, and a cold scan's event is the whole tree.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -36,6 +40,20 @@ pub const SCHEMA_VERSION: u32 = 8;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// Bytes redb may hold in its page cache, read and dirty pages together.
+///
+/// redb's own default is 1 GiB, which is not a cache at all for a store this
+/// size: a 257 MB graph fits inside it whole, nothing is ever evicted, and
+/// the process's peak becomes the database's size. Naming a smaller budget
+/// makes redb flush dirty pages as a transaction runs and evict clean ones
+/// as it reads, which is the difference between a bounded scan and one whose
+/// memory tracks the corpus.
+///
+/// Chosen against the 512 MB ceiling on the 2 vCPU reference hardware, with
+/// room left for the batch and the symbol table beside it. Correctness does
+/// not depend on the number — a cache is a cache — only the ceiling does.
+const CACHE_BYTES: usize = 96 * 1024 * 1024;
 
 /// The [`META`] key the resolver's manifest fingerprint is stored under.
 const CONFIG_DIGEST_KEY: &str = "config_digest";
@@ -557,7 +575,10 @@ impl Store {
     /// dropped and recreated empty, so the next scan sees no known files and
     /// rebuilds everything.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let db = Database::create(path).map_err(|e| e.to_string())?;
+        let db = redb::Builder::new()
+            .set_cache_size(CACHE_BYTES)
+            .create(path)
+            .map_err(|e| e.to_string())?;
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let stored = {
@@ -652,11 +673,18 @@ impl Store {
     /// Replace the phase-1 half of every file in the batch, in one
     /// transaction.
     ///
-    /// Returns the identities that ended this call with a *definition*
+    /// Returns the identities that ended *this call* with a *definition*
     /// declared in more than one file — the mechanical half of the FQN
     /// grammar's injectivity obligation. The store never judges what that
     /// means: two declarations sharing an FQN are a collision in one
     /// language and one entity in another, and only the language knows.
+    ///
+    /// "This call" is the whole of the promise. An event applies several
+    /// batches, and a batch sees only the graph as it stands when it commits
+    /// — an identity two files claim is flagged by whichever batch brings the
+    /// second one in, and an identity a later batch takes back is flagged all
+    /// the same. A caller spanning batches therefore collects these and asks
+    /// [`Store::definition_collisions`] which of them survived the event.
     pub fn apply_defs(&self, batch: &DefBatch) -> Result<Vec<NodeId>, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
         let mut colliding = Vec::new();
@@ -691,6 +719,32 @@ impl Store {
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(colliding)
+    }
+
+    /// Which of these identities a *definition* is declared for in more than
+    /// one file, as the graph stands right now.
+    ///
+    /// The settled answer to the question [`Store::apply_defs`] can only
+    /// answer per batch. Every identity any batch flagged goes in; what comes
+    /// out is the subset the finished event still holds two declarations for,
+    /// which is exactly what a single event-sized transaction would have
+    /// reported. One read transaction, because an event asks about every
+    /// identity it flagged at once.
+    pub fn definition_collisions(&self, ids: &BTreeSet<NodeId>) -> Result<Vec<NodeId>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(record) = read_node(&nodes, id)?
+                && record.is_definition_collision()
+            {
+                out.push(*id);
+            }
+        }
+        Ok(out)
     }
 
     /// Replace the supertype half of every file in the batch, in one
@@ -1220,13 +1274,16 @@ impl ReadStore {
     /// not a wipe: a reader that rebuilt the store to satisfy itself would
     /// destroy a graph whose owner never asked for one.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let db = ReadOnlyDatabase::open(path).map_err(|e| match e {
-            redb::DatabaseError::DatabaseAlreadyOpen => format!(
-                "{}: the store is open for writing — a scan is running against it",
-                path.display(),
-            ),
-            other => format!("{}: {other}", path.display()),
-        })?;
+        let db = redb::Builder::new()
+            .set_cache_size(CACHE_BYTES)
+            .open_read_only(path)
+            .map_err(|e| match e {
+                redb::DatabaseError::DatabaseAlreadyOpen => format!(
+                    "{}: the store is open for writing — a scan is running against it",
+                    path.display(),
+                ),
+                other => format!("{}: {other}", path.display()),
+            })?;
         let store = ReadStore { db };
         match store.schema_version()? {
             Some(SCHEMA_VERSION) => Ok(store),
