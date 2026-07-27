@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -1144,7 +1144,7 @@ mod tests {
             file: file.to_string(),
             kind: 0,
             space: 0,
-            enclosing: "m/pkg.Caller".to_string(),
+            enclosing: "m/pkg#Caller".to_string(),
             raw_target: raw.to_string(),
             argc: None,
             locally_bound: false,
@@ -1154,15 +1154,15 @@ mod tests {
     #[test]
     fn a_batch_round_trips_through_both_halves() {
         let (_dir, store) = open_temp();
-        let def = node_id(Domain::Go, "m/pkg.Foo");
-        let caller = node_id(Domain::Go, "m/pkg.Bar");
+        let def = node_id(Domain::Go, "m/pkg#Foo");
+        let caller = node_id(Domain::Go, "m/pkg#Bar");
         let defs = DefBatch {
             files: vec![FileDefs {
                 path: "pkg/a.go".into(),
                 nodes: vec![(
                     def,
                     NodeRecord::Definition {
-                        fqn: "m/pkg.Foo".into(),
+                        fqn: "m/pkg#Foo".into(),
                         kind: 0,
                         declarations: vec![site("pkg/a.go", 3)],
                     },
@@ -1203,7 +1203,7 @@ mod tests {
     #[test]
     fn report_sums_counts_by_language_and_reason() {
         let (_dir, store) = open_temp();
-        let def = node_id(Domain::Go, "m/pkg.Foo");
+        let def = node_id(Domain::Go, "m/pkg#Foo");
         let rec = |outcome, count| RefRecord {
             outcome,
             count,
@@ -1255,7 +1255,7 @@ mod tests {
         // reason map, so `unresolved_total` cannot accidentally include it
         // and the rate cannot be gamed by growing the bucket.
         let (_dir, store) = open_temp();
-        let def = node_id(Domain::Go, "m/pkg.Foo");
+        let def = node_id(Domain::Go, "m/pkg#Foo");
         let rec = |outcome, count| RefRecord {
             outcome,
             count,
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn a_definition_two_files_declare_is_a_collision_but_a_package_is_not() {
         let (_dir, store) = open_temp();
-        let twin = node_id(Domain::Go, "m/pkg.plat");
+        let twin = node_id(Domain::Go, "m/pkg#plat");
         let pkg = node_id(Domain::Go, "m/pkg");
         let declare = |path: &str, line: u32| FileDefs {
             path: path.to_string(),
@@ -1306,7 +1306,7 @@ mod tests {
                 (
                     twin,
                     NodeRecord::Definition {
-                        fqn: "m/pkg.plat".into(),
+                        fqn: "m/pkg#plat".into(),
                         kind: 0,
                         declarations: vec![site(path, line)],
                     },

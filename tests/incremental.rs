@@ -254,8 +254,8 @@ fn renaming_the_module_lands_a_cold_scans_store() {
     scan_go(root, &db).expect("cold scan");
     assert!(calls(
         &db,
-        "example.com/app/server.Serve",
-        "example.com/app/util.Parse",
+        "example.com/app/server#Serve",
+        "example.com/app/util#Parse",
     ));
 
     write(root, "go.mod", "module example.com/renamed\n\ngo 1.22\n");
@@ -279,8 +279,8 @@ fn renaming_a_packages_declared_name_lands_a_cold_scans_store() {
     scan_go(root, &db).expect("cold scan");
     assert!(calls(
         &db,
-        "example.com/app/server.Serve",
-        "example.com/app/util.Parse",
+        "example.com/app/server#Serve",
+        "example.com/app/util#Parse",
     ));
 
     write(
@@ -315,12 +315,12 @@ fn adding_a_definition_repoints_an_unresolved_caller_in_an_unchanged_file() {
 
     assert_eq!(
         outcome(&db, "server/caller.go", "Missing"),
-        StoredOutcome::Resolved(go("example.com/app/server.Missing")),
+        StoredOutcome::Resolved(go("example.com/app/server#Missing")),
     );
     assert!(calls(
         &db,
-        "example.com/app/server.Call",
-        "example.com/app/server.Missing",
+        "example.com/app/server#Call",
+        "example.com/app/server#Missing",
     ));
     assert_matches_cold(root, &db);
 }
@@ -336,8 +336,8 @@ fn removing_it_again_returns_the_caller_to_unresolved() {
     scan_go(root, &db).expect("first scan");
     assert!(calls(
         &db,
-        "example.com/app/server.Call",
-        "example.com/app/server.Missing",
+        "example.com/app/server#Call",
+        "example.com/app/server#Missing",
     ));
 
     fs::remove_file(root.join("server/missing.go")).unwrap();
@@ -350,8 +350,8 @@ fn removing_it_again_returns_the_caller_to_unresolved() {
     );
     assert!(!calls(
         &db,
-        "example.com/app/server.Call",
-        "example.com/app/server.Missing",
+        "example.com/app/server#Call",
+        "example.com/app/server#Missing",
     ));
     assert_matches_cold(root, &db);
 }
@@ -373,7 +373,7 @@ fn a_higher_priority_definition_repoints_a_resolved_caller() {
     scan_go(root, &db).expect("first scan");
     assert_eq!(
         outcome(&db, "server/dotter.go", "Parse"),
-        StoredOutcome::Resolved(go("example.com/app/util.Parse")),
+        StoredOutcome::Resolved(go("example.com/app/util#Parse")),
     );
 
     write(
@@ -385,19 +385,19 @@ fn a_higher_priority_definition_repoints_a_resolved_caller() {
 
     assert_eq!(
         outcome(&db, "server/dotter.go", "Parse"),
-        StoredOutcome::Resolved(go("example.com/app/server.Parse")),
+        StoredOutcome::Resolved(go("example.com/app/server#Parse")),
         "the same package outranks a dot-import",
     );
     assert!(calls(
         &db,
-        "example.com/app/server.Dot",
-        "example.com/app/server.Parse",
+        "example.com/app/server#Dot",
+        "example.com/app/server#Parse",
     ));
     assert!(
         !calls(
             &db,
-            "example.com/app/server.Dot",
-            "example.com/app/util.Parse",
+            "example.com/app/server#Dot",
+            "example.com/app/util#Parse",
         ),
         "the edge re-points; it does not accumulate",
     );
@@ -413,7 +413,7 @@ fn deleting_the_only_definition_of_a_package_removes_its_node_and_edges() {
     scan_go(root, &db).expect("first scan");
     assert_eq!(
         outcome(&db, "server/server.go", "util.Parse"),
-        StoredOutcome::Resolved(go("example.com/app/util.Parse")),
+        StoredOutcome::Resolved(go("example.com/app/util#Parse")),
     );
 
     // The importer is never edited: both its import and its qualified call
@@ -435,14 +435,14 @@ fn deleting_the_only_definition_of_a_package_removes_its_node_and_edges() {
     assert!(
         !snapshot
             .nodes
-            .contains_key(&go("example.com/app/util.Parse"))
+            .contains_key(&go("example.com/app/util#Parse"))
     );
     assert!(
         !snapshot
             .edges
             .iter()
             .any(|(_, dst, _)| *dst == go("example.com/app/util")
-                || *dst == go("example.com/app/util.Parse")),
+                || *dst == go("example.com/app/util#Parse")),
         "no edge is left pointing at a node nothing declares",
     );
     assert_matches_cold(root, &db);
@@ -509,7 +509,7 @@ fn the_candidate_index_names_only_the_files_that_probed_an_identity() {
 
     let rows = Store::open(&db)
         .unwrap()
-        .rows_for(&[go("example.com/app/server.Missing")])
+        .rows_for(&[go("example.com/app/server#Missing")])
         .unwrap();
     let files: BTreeSet<&str> = rows.iter().map(|key| key.file.as_str()).collect();
     assert_eq!(
@@ -577,7 +577,7 @@ fn cold_equals_warm_survives_every_sequence() {
 
     assert_eq!(
         outcome(&db, "server/caller.go", "Missing"),
-        StoredOutcome::Resolved(go("example.com/app/server.Missing")),
+        StoredOutcome::Resolved(go("example.com/app/server#Missing")),
     );
     assert_matches_cold(root, &db);
 }
@@ -620,7 +620,7 @@ fn inserting_a_declaration_above_another_changes_no_unrelated_node_id() {
         lost.is_empty(),
         "identities an unrelated insert moved: {lost:?}"
     );
-    assert!(after.contains(&go("example.com/app/util.Added")));
+    assert!(after.contains(&go("example.com/app/util#Added")));
     assert_matches_cold(root, &db);
 }
 

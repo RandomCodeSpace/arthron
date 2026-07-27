@@ -203,15 +203,20 @@ pub fn is_external_test_package(rel_path: &str, declared: &str, dir_pkg_name: &s
 /// An external test package may not be imported by anything, and its
 /// definitions must not sit in the production package's namespace, where a
 /// same-package candidate from a production file would wrongly hit one. It
-/// gets `{dir_pkg_path}#test` — its own package, with its own node. It
+/// gets `{dir_pkg_path}!test` — its own package, with its own node. It
 /// reaches the package under test the ordinary way, through the explicit
 /// import it has to write anyway.
 ///
-/// The separator is `#`, which the Go module-path grammar forbids in an
-/// import path, so `{dir}#test` is an identity no real directory can claim.
-/// A `_test` suffix could: a directory literally named `foo_test` beside the
+/// The marker is `!`, which the Go module-path grammar forbids in an import
+/// path, so `{dir}!test` is an identity no real directory can claim. A
+/// `_test` suffix could: a directory literally named `foo_test` beside the
 /// external test package of `foo` used to share one namespace with it, and a
 /// same-package candidate could cross between the two.
+///
+/// It is `!` and not the `#` that separates a container from its members,
+/// because `#` is already spoken for: `{dir}#test` would be exactly the FQN
+/// of a definition named `test` in package `{dir}`, and `func test()` is an
+/// ordinary unexported helper. Two reserved characters, one job each.
 pub fn package_path_for_file(
     rel_path: &str,
     dir_pkg_path: &str,
@@ -220,7 +225,7 @@ pub fn package_path_for_file(
 ) -> String {
     match declared {
         Some(name) if is_external_test_package(rel_path, name, dir_pkg_name) => {
-            format!("{dir_pkg_path}#test")
+            format!("{dir_pkg_path}!test")
         }
         _ => dir_pkg_path.to_string(),
     }
@@ -384,12 +389,12 @@ impl GoResolver {
                 // hit: `candidates` must list what was probed and nothing
                 // else, or the invalidation index it feeds would wake this
                 // reference for edits that could not change its outcome.
-                let same_pkg = format!("{}.{name}", scope.pkg_path);
+                let same_pkg = format!("{}#{name}", scope.pkg_path);
                 let dotted = scope
                     .dot_imports
                     .iter()
                     .filter(|dot| self.is_internal(cfg, dot))
-                    .map(|dot| format!("{dot}.{name}"));
+                    .map(|dot| format!("{dot}#{name}"));
                 let mut candidates = Vec::new();
                 for fqn in std::iter::once(same_pkg).chain(dotted) {
                     let id = node_id(Domain::Go, &fqn);
@@ -418,7 +423,7 @@ impl GoResolver {
             [qualifier, name] => {
                 match scope.imports.get(qualifier) {
                     Some(path) if self.is_internal(cfg, path) => {
-                        let id = node_id(Domain::Go, &format!("{path}.{name}"));
+                        let id = node_id(Domain::Go, &format!("{path}#{name}"));
                         let outcome = if probe.probe(&id).is_some() {
                             Outcome::Resolved(id)
                         } else {
@@ -555,11 +560,21 @@ impl Resolver<GoLang> for GoResolver {
         if owner.is_empty() && is_init_func(def) {
             return None; // nothing can name it, so it is not a node
         }
+        // `#` separates a container from its members, and `.` only joins
+        // identifiers *within* one container — a method to its receiver
+        // type. It cannot be `.` throughout: a Go import path may carry a
+        // dot inside a path element (`gopkg.in/yaml.v3`, and any directory
+        // someone names `p.Foo`), so `{pkg}.{name}` would give the function
+        // `Foo` of package `example.com/m/p` and the package in directory
+        // `p.Foo` one identity and one node, each silently overwriting the
+        // other. `#` is forbidden in an import path and in an identifier
+        // alike, so a definition's FQN carries exactly one and a container's
+        // carries none.
         if owner.is_empty() {
-            Some(Fqn::new(format!("{pkg_path}.{}", def.name)))
+            Some(Fqn::new(format!("{pkg_path}#{}", def.name)))
         } else {
             Some(Fqn::new(format!(
-                "{pkg_path}.{}.{}",
+                "{pkg_path}#{}.{}",
                 owner.join("."),
                 def.name
             )))
@@ -756,7 +771,7 @@ mod tests {
         let method = def(DefKind::Method, "init", &["Conn"]);
         assert_eq!(
             r.def_fqn(&cfg, &h, &method.owner, &method, &probe),
-            Some(Fqn::new("example.com/app/boot.Conn.init"))
+            Some(Fqn::new("example.com/app/boot#Conn.init"))
         );
 
         // The edge source for a call inside `init` is the same `None`.
@@ -784,7 +799,7 @@ mod tests {
         let from_def = r.def_fqn(&cfg, &h, &method.owner, &method, &probe);
         assert_eq!(
             from_def,
-            Some(Fqn::new("example.com/app/server.Handler.Handle"))
+            Some(Fqn::new("example.com/app/server#Handler.Handle"))
         );
 
         let encloser = Encloser {
@@ -841,7 +856,7 @@ mod tests {
                 Some("graph_test"),
                 "graph"
             ),
-            "example.com/app/graph#test"
+            "example.com/app/graph!test"
         );
         // An in-package test file is the production package.
         assert_eq!(
@@ -902,7 +917,7 @@ mod tests {
             Some("graph_test"),
             "graph_test",
         );
-        assert_eq!(external, "example.com/app/graph#test");
+        assert_eq!(external, "example.com/app/graph!test");
         assert_eq!(sibling, "example.com/app/graph_test");
         assert_ne!(external, sibling);
     }
@@ -950,7 +965,7 @@ mod tests {
     fn plain_call_probes_same_package() {
         let r = GoResolver;
         let cfg = module();
-        let helper = node_id(Domain::Go, "example.com/app/server.helper");
+        let helper = node_id(Domain::Go, "example.com/app/server#helper");
         let mut table = HashSet::new();
         let miss = r.resolve_call(&cfg, &call(named(&["helper"])), &scope(), &table);
         assert_eq!(
@@ -1052,8 +1067,8 @@ mod tests {
         // have changed its outcome.
         let r = GoResolver;
         let cfg = module();
-        let same_pkg = node_id(Domain::Go, "example.com/app/server.helper");
-        let dot = node_id(Domain::Go, "example.com/app/util.helper");
+        let same_pkg = node_id(Domain::Go, "example.com/app/server#helper");
+        let dot = node_id(Domain::Go, "example.com/app/util#helper");
         let mut s = scope();
         s.dot_imports.push("example.com/app/util".into());
 
@@ -1076,7 +1091,7 @@ mod tests {
         // every candidate in scope has been probed and missed.
         let r = GoResolver;
         let cfg = module();
-        let min = node_id(Domain::Go, "example.com/app/server.min");
+        let min = node_id(Domain::Go, "example.com/app/server#min");
         let mut table = HashSet::new();
         let builtin = r.resolve_call(&cfg, &call(named(&["min"])), &scope(), &table);
         assert_eq!(builtin.outcome, Outcome::External("go:builtin".into()));
@@ -1091,7 +1106,7 @@ mod tests {
     fn qualified_calls_classify_by_import_table() {
         let r = GoResolver;
         let cfg = module();
-        let target = node_id(Domain::Go, "example.com/app/util.Parse");
+        let target = node_id(Domain::Go, "example.com/app/util#Parse");
         let mut table = HashSet::new();
         table.insert(target);
         let internal = r.resolve_call(&cfg, &call(named(&["util", "Parse"])), &scope(), &table);
@@ -1164,7 +1179,7 @@ mod tests {
         // only difference, and it is what stops a wrong edge being emitted.
         let r = GoResolver;
         let cfg = module();
-        let helper = node_id(Domain::Go, "example.com/app/server.helper");
+        let helper = node_id(Domain::Go, "example.com/app/server#helper");
         let mut table = HashSet::new();
         table.insert(helper);
         let s = scope();

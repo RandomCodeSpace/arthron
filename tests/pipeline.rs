@@ -171,7 +171,7 @@ fn a_local_and_a_package_level_call_of_one_name_are_two_rows() {
     );
     let store = Store::open(&db).expect("store opens");
     assert!(
-        calls(&store, "example.com/app/p.f", "example.com/app/p.x"),
+        calls(&store, "example.com/app/p#f", "example.com/app/p#x"),
         "the package-level call is a real edge",
     );
 }
@@ -208,11 +208,11 @@ fn a_package_genuinely_named_like_a_test_package_lands_in_one_namespace() {
     let store = Store::open(&db).expect("store opens");
 
     assert!(
-        node(&store, "example.com/app/weird.TestX").is_some(),
+        node(&store, "example.com/app/weird#TestX").is_some(),
         "the test file shares its directory's package, so it is not `#test`",
     );
     assert_eq!(
-        node(&store, "example.com/app/weird#test.TestX"),
+        node(&store, "example.com/app/weird!test#TestX"),
         None,
         "an external test package is one whose name differs from the \
          directory's; here they are the same",
@@ -220,10 +220,47 @@ fn a_package_genuinely_named_like_a_test_package_lands_in_one_namespace() {
     assert!(
         calls(
             &store,
-            "example.com/app/weird.TestX",
-            "example.com/app/weird.Helper",
+            "example.com/app/weird#TestX",
+            "example.com/app/weird#Helper",
         ),
         "the edge must start at the node the definition phase declared",
+    );
+}
+
+#[test]
+fn a_dotted_directory_name_cannot_collide_with_a_definition() {
+    // A Go import path may carry a dot inside a path element — `gopkg.in`
+    // and `yaml.v2` both do — so a directory may legitimately be named
+    // `p.Foo`. Joining a container to its members with `.` then gives the
+    // function `Foo` of package `example.com/m/p` and the package in
+    // directory `p.Foo` the same FQN, and therefore the same node: one
+    // record, silently overwritten by whichever was written last.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/m\n\ngo 1.22\n");
+    write(root, "p/p.go", "package p\n\nfunc Foo() {}\n");
+    write(root, "p.Foo/x.go", "package pfoo\n\nfunc Bar() {}\n");
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("scan succeeds");
+    let store = Store::open(&db).expect("store opens");
+
+    let at_package_path = node(&store, "example.com/m/p.Foo");
+    assert!(
+        matches!(at_package_path, Some(NodeRecord::Package { .. })),
+        "the package in directory `p.Foo` must keep its own identity, not \
+         share one with the function `Foo` of package `p`: {at_package_path:?}",
+    );
+    let function = node(&store, "example.com/m/p#Foo");
+    assert!(
+        matches!(function, Some(NodeRecord::Definition { .. })),
+        "the function has an identity of its own, and `#` is what keeps it \
+         out of every import path's keyspace: {function:?}",
+    );
+    assert_eq!(
+        store.report().expect("report").fqn_collisions,
+        0,
+        "a package and a function are not a definition collision; they are \
+         two nodes that must never have met",
     );
 }
 
@@ -270,7 +307,7 @@ fn an_external_reference_gets_a_node_and_an_edge() {
     ));
     assert!(links(
         &store,
-        "example.com/app/server.Serve",
+        "example.com/app/server#Serve",
         "external:fmt",
         RefKind::Call,
     ));
@@ -314,7 +351,7 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
     assert!(
         !links(
             &store,
-            "example.com/app/server.Handler.Handle",
+            "example.com/app/server#Handler.Handle",
             "external:net/http",
             RefKind::Call,
         ),
@@ -324,7 +361,7 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
     // must survive — the fix is a binding rule, not a blanket suppression.
     assert!(links(
         &store,
-        "example.com/app/server.Serve",
+        "example.com/app/server#Serve",
         "external:net/http",
         RefKind::Call,
     ));
@@ -411,8 +448,8 @@ fn an_unaliased_internal_import_binds_the_declared_package_name() {
     let store = Store::open(&db).expect("reopen");
     assert!(calls(
         &store,
-        "example.com/app/server.Serve",
-        "example.com/app/utilx.Parse",
+        "example.com/app/server#Serve",
+        "example.com/app/utilx#Parse",
     ));
 }
 
@@ -445,12 +482,12 @@ fn init_is_not_a_node_and_its_calls_belong_to_the_package() {
 
     let store = Store::open(&db).expect("reopen");
     assert!(
-        node(&store, "example.com/app/boot.init").is_none(),
+        node(&store, "example.com/app/boot#init").is_none(),
         "init is not nameable, so it must not be a node"
     );
-    assert!(node(&store, "example.com/app/boot.setup").is_some());
+    assert!(node(&store, "example.com/app/boot#setup").is_some());
     assert!(
-        calls(&store, "example.com/app/boot", "example.com/app/boot.setup"),
+        calls(&store, "example.com/app/boot", "example.com/app/boot#setup"),
         "a call inside init is sourced at the package node"
     );
 }
@@ -490,31 +527,31 @@ fn an_external_test_package_gets_its_own_namespace() {
     // `#` is forbidden in a Go module path, so `{dir}#test` is an identity
     // no real directory can claim — a sibling directory named `graph_test`
     // used to share this namespace.
-    assert!(node(&store, "example.com/app/graph#test.helperT").is_some());
+    assert!(node(&store, "example.com/app/graph!test#helperT").is_some());
     assert!(
-        node(&store, "example.com/app/graph_test.helperT").is_none(),
+        node(&store, "example.com/app/graph_test#helperT").is_none(),
         "a directory named `graph_test` may exist; this namespace is not it"
     );
     assert!(
-        node(&store, "example.com/app/graph.helperT").is_none(),
+        node(&store, "example.com/app/graph#helperT").is_none(),
         "a test-file definition must not land in the production namespace"
     );
     assert!(
-        node(&store, "example.com/app/graph#test.Run").is_some(),
+        node(&store, "example.com/app/graph!test#Run").is_some(),
         "every definition in the test file is namespaced, not just some"
     );
     // The production definition keeps its own FQN, and the test package
     // reaches it the ordinary way: through its import.
-    assert!(node(&store, "example.com/app/graph.Build").is_some());
+    assert!(node(&store, "example.com/app/graph#Build").is_some());
     assert!(calls(
         &store,
-        "example.com/app/graph#test.Run",
-        "example.com/app/graph.Build",
+        "example.com/app/graph!test#Run",
+        "example.com/app/graph#Build",
     ));
     assert!(calls(
         &store,
-        "example.com/app/graph#test.Run",
-        "example.com/app/graph#test.helperT",
+        "example.com/app/graph!test#Run",
+        "example.com/app/graph!test#helperT",
     ));
 }
 
@@ -536,12 +573,12 @@ fn an_in_package_test_file_stays_in_the_production_namespace() {
 
     scan_go(root, &db).expect("scan succeeds");
     let store = Store::open(&db).expect("reopen");
-    assert!(node(&store, "example.com/app/graph.TestBuild").is_some());
-    assert!(node(&store, "example.com/app/graph#test.TestBuild").is_none());
+    assert!(node(&store, "example.com/app/graph#TestBuild").is_some());
+    assert!(node(&store, "example.com/app/graph!test#TestBuild").is_none());
     assert!(calls(
         &store,
-        "example.com/app/graph.TestBuild",
-        "example.com/app/graph.Build",
+        "example.com/app/graph#TestBuild",
+        "example.com/app/graph#Build",
     ));
 }
 

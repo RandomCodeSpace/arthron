@@ -71,13 +71,13 @@ fn record(outcome: StoredOutcome) -> RefRecord {
 
 /// One file's phase-2 half: one row, one edge, one candidate entry.
 fn refs_of(file: &str, raw: &str, target: NodeId) -> FileRefs {
-    let row = key(file, "m/pkg.Caller", raw);
+    let row = key(file, "m/pkg#Caller", raw);
     FileRefs {
         path: file.to_string(),
         hash: [1u8; 32],
         nodes: vec![],
         rows: vec![(row.clone(), record(StoredOutcome::Resolved(target)))],
-        edges: vec![(go("m/pkg.Caller"), target, 0)],
+        edges: vec![(go("m/pkg#Caller"), target, 0)],
         candidates: vec![(target, row)],
     }
 }
@@ -96,13 +96,13 @@ fn a_version_mismatch_forces_a_cold_rescan() {
             .apply_defs(&DefBatch {
                 files: vec![FileDefs {
                     path: "pkg/a.go".into(),
-                    nodes: vec![definition("m/pkg.Foo", "pkg/a.go", 3)],
+                    nodes: vec![definition("m/pkg#Foo", "pkg/a.go", 3)],
                 }],
             })
             .expect("apply defs");
         store
             .apply_refs(&RefBatch {
-                files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+                files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
             })
             .expect("apply refs");
         assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
@@ -142,13 +142,13 @@ fn reopening_a_store_of_the_same_version_keeps_everything() {
             .apply_defs(&DefBatch {
                 files: vec![FileDefs {
                     path: "pkg/a.go".into(),
-                    nodes: vec![definition("m/pkg.Foo", "pkg/a.go", 3)],
+                    nodes: vec![definition("m/pkg#Foo", "pkg/a.go", 3)],
                 }],
             })
             .expect("apply defs");
         store
             .apply_refs(&RefBatch {
-                files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+                files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
             })
             .expect("apply refs");
         store.snapshot().expect("snapshot")
@@ -172,7 +172,7 @@ fn a_manifest_fingerprint_fences_the_store() {
     );
     store
         .apply_refs(&RefBatch {
-            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
         })
         .expect("apply refs");
     assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
@@ -205,8 +205,8 @@ fn replacing_a_file_removes_exactly_its_own_facts() {
     store
         .apply_refs(&RefBatch {
             files: vec![
-                refs_of("pkg/b.go", "Foo", go("m/pkg.Foo")),
-                refs_of("pkg/c.go", "Bar", go("m/pkg.Bar")),
+                refs_of("pkg/b.go", "Foo", go("m/pkg#Foo")),
+                refs_of("pkg/c.go", "Bar", go("m/pkg#Bar")),
             ],
         })
         .expect("apply refs");
@@ -216,39 +216,39 @@ fn replacing_a_file_removes_exactly_its_own_facts() {
     // must come out byte-identical.
     store
         .apply_refs(&RefBatch {
-            files: vec![refs_of("pkg/b.go", "Renamed", go("m/pkg.Renamed"))],
+            files: vec![refs_of("pkg/b.go", "Renamed", go("m/pkg#Renamed"))],
         })
         .expect("replace");
     let after = store.snapshot().expect("snapshot");
 
-    let untouched = key("pkg/c.go", "m/pkg.Caller", "Bar");
+    let untouched = key("pkg/c.go", "m/pkg#Caller", "Bar");
     assert_eq!(after.rows.get(&untouched), before.rows.get(&untouched));
     assert!(
         after
             .edges
-            .contains(&(go("m/pkg.Caller"), go("m/pkg.Bar"), 0))
+            .contains(&(go("m/pkg#Caller"), go("m/pkg#Bar"), 0))
     );
     assert_eq!(
-        after.candidates.get(&go("m/pkg.Bar")),
-        before.candidates.get(&go("m/pkg.Bar")),
+        after.candidates.get(&go("m/pkg#Bar")),
+        before.candidates.get(&go("m/pkg#Bar")),
     );
 
     // And nothing of the old `b.go` survives.
     assert!(
         !after
             .rows
-            .contains_key(&key("pkg/b.go", "m/pkg.Caller", "Foo"))
+            .contains_key(&key("pkg/b.go", "m/pkg#Caller", "Foo"))
     );
     assert!(
         !after
             .edges
-            .contains(&(go("m/pkg.Caller"), go("m/pkg.Foo"), 0))
+            .contains(&(go("m/pkg#Caller"), go("m/pkg#Foo"), 0))
     );
-    assert!(!after.candidates.contains_key(&go("m/pkg.Foo")));
+    assert!(!after.candidates.contains_key(&go("m/pkg#Foo")));
     assert!(
         after
             .rows
-            .contains_key(&key("pkg/b.go", "m/pkg.Caller", "Renamed"))
+            .contains_key(&key("pkg/b.go", "m/pkg#Caller", "Renamed"))
     );
 }
 
@@ -259,15 +259,15 @@ fn a_row_key_identical_but_for_its_file_is_a_different_row() {
     store
         .apply_refs(&RefBatch {
             files: vec![
-                refs_of("pkg/b.go", "Foo", go("m/pkg.Foo")),
-                refs_of("pkg/c.go", "Foo", go("m/pkg.Foo")),
+                refs_of("pkg/b.go", "Foo", go("m/pkg#Foo")),
+                refs_of("pkg/c.go", "Foo", go("m/pkg#Foo")),
             ],
         })
         .expect("apply refs");
     let snapshot = store.snapshot().expect("snapshot");
     assert_eq!(snapshot.rows.len(), 2, "{:?}", snapshot.rows.keys());
     assert_eq!(
-        snapshot.candidates[&go("m/pkg.Foo")].len(),
+        snapshot.candidates[&go("m/pkg#Foo")].len(),
         2,
         "both files probed the identity, so both must be woken by it"
     );
@@ -287,9 +287,9 @@ fn a_row_key_identical_but_for_its_file_is_a_different_row() {
     assert!(
         after
             .rows
-            .contains_key(&key("pkg/c.go", "m/pkg.Caller", "Foo"))
+            .contains_key(&key("pkg/c.go", "m/pkg#Caller", "Foo"))
     );
-    assert_eq!(after.candidates[&go("m/pkg.Foo")].len(), 1);
+    assert_eq!(after.candidates[&go("m/pkg#Foo")].len(), 1);
 }
 
 #[test]
@@ -334,18 +334,18 @@ fn candidate_entries_are_removed_with_their_row() {
     let store = open(&dir.path().join("graph.redb"));
     store
         .apply_refs(&RefBatch {
-            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
         })
         .expect("apply refs");
     assert_eq!(
-        store.candidate_rows(&go("m/pkg.Foo")).unwrap(),
-        [key("pkg/b.go", "m/pkg.Caller", "Foo")],
+        store.candidate_rows(&go("m/pkg#Foo")).unwrap(),
+        [key("pkg/b.go", "m/pkg#Caller", "Foo")],
     );
 
     // The bug this closes: a candidate entry outliving the row that probed
     // it points invalidation at a reference that no longer exists.
     store.forget_files(&["pkg/b.go".into()]).expect("forget");
-    assert!(store.candidate_rows(&go("m/pkg.Foo")).unwrap().is_empty());
+    assert!(store.candidate_rows(&go("m/pkg#Foo")).unwrap().is_empty());
     assert!(store.snapshot().unwrap().candidates.is_empty());
 }
 
@@ -414,7 +414,7 @@ fn applying_a_ref_half_without_its_def_half_does_not_corrupt_the_store() {
     let store = open(&dir.path().join("graph.redb"));
     store
         .apply_refs(&RefBatch {
-            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
         })
         .expect("apply refs");
     let snapshot = store.snapshot().expect("snapshot");
@@ -429,30 +429,30 @@ fn applying_a_ref_half_without_its_def_half_does_not_corrupt_the_store() {
 #[test]
 fn row_keys_round_trip_through_the_split_encoding() {
     let cases = [
-        key("pkg/a.go", "m/pkg.Caller", "Foo"),
+        key("pkg/a.go", "m/pkg#Caller", "Foo"),
         RefKey {
             argc: Some(0),
-            ..key("pkg/a.go", "m/pkg.Caller", "Foo")
+            ..key("pkg/a.go", "m/pkg#Caller", "Foo")
         },
         RefKey {
             argc: Some(u32::MAX),
-            ..key("pkg/a.go", "m/pkg.Caller", "Foo")
+            ..key("pkg/a.go", "m/pkg#Caller", "Foo")
         },
         // No nameable encloser and no container: an empty string, not a
         // missing component.
         key("pkg/a.go", "", "Foo"),
         // A target carrying the separators a hand-rolled encoding would
         // have tripped over.
-        key("pkg/a.go", "m/pkg.Caller", "h.reset().apply"),
-        key("pkg/a.go", "m/pkg.Caller", "a/b\u{0}c.d"),
+        key("pkg/a.go", "m/pkg#Caller", "h.reset().apply"),
+        key("pkg/a.go", "m/pkg#Caller", "a/b\u{0}c.d"),
         RefKey {
             kind: 9,
             space: 2,
-            ..key("pkg/a.go", "m/pkg.C.m", "x")
+            ..key("pkg/a.go", "m/pkg#C.m", "x")
         },
         RefKey {
             locally_bound: true,
-            ..key("pkg/a.go", "m/pkg.Caller", "x")
+            ..key("pkg/a.go", "m/pkg#Caller", "x")
         },
     ];
     for original in cases {
@@ -463,7 +463,7 @@ fn row_keys_round_trip_through_the_split_encoding() {
 
     // `None` and `Some(0)` are different arities, so they must be different
     // keys — collapsing them would merge two call sites into one row.
-    let unknown = key("pkg/a.go", "m/pkg.Caller", "Foo");
+    let unknown = key("pkg/a.go", "m/pkg#Caller", "Foo");
     let zero = RefKey {
         argc: Some(0),
         ..unknown.clone()
@@ -501,12 +501,12 @@ fn an_edge_two_files_produce_survives_one_of_them_being_forgotten() {
     // assertion instead of a corpus.
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir.path().join("graph.redb"));
-    let shared = (go("m/pkg.Caller"), go("m/pkg.Foo"), 0);
+    let shared = (go("m/pkg#Caller"), go("m/pkg#Foo"), 0);
     store
         .apply_refs(&RefBatch {
             files: vec![
-                refs_of("pkg/b.go", "Foo", go("m/pkg.Foo")),
-                refs_of("pkg/c.go", "Foo", go("m/pkg.Foo")),
+                refs_of("pkg/b.go", "Foo", go("m/pkg#Foo")),
+                refs_of("pkg/c.go", "Foo", go("m/pkg#Foo")),
             ],
         })
         .expect("apply refs");
@@ -515,7 +515,7 @@ fn an_edge_two_files_produce_survives_one_of_them_being_forgotten() {
     // Replacing one producer's half leaves the other's claim standing.
     store
         .apply_refs(&RefBatch {
-            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
         })
         .expect("replace");
     assert!(store.snapshot().unwrap().edges.contains(&shared));

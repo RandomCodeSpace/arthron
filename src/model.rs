@@ -527,16 +527,16 @@ mod tests {
     #[test]
     fn node_id_is_deterministic() {
         assert_eq!(
-            node_id(Domain::Go, "m/pkg.Foo"),
-            node_id(Domain::Go, "m/pkg.Foo")
+            node_id(Domain::Go, "m/pkg#Foo"),
+            node_id(Domain::Go, "m/pkg#Foo")
         );
     }
 
     #[test]
     fn node_id_separates_fqns_and_domains() {
         assert_ne!(
-            node_id(Domain::Go, "m/pkg.Foo"),
-            node_id(Domain::Go, "m/pkg.Bar")
+            node_id(Domain::Go, "m/pkg#Foo"),
+            node_id(Domain::Go, "m/pkg#Bar")
         );
         // The domain byte is a hash input, so one FQN in two identity spaces
         // is two nodes.
@@ -550,6 +550,12 @@ mod tests {
         // byte, so every stored id survives the change — and reordering the
         // hash inputs later would silently re-key the whole store, which is
         // what this literal is here to catch.
+        //
+        // The input string is the one the bytes were captured from and is
+        // deliberately left as it was written. It is an opaque argument
+        // here, not an FQN this build would construct: what is pinned is
+        // the hash of *these* bytes, so rewriting it to match a later FQN
+        // grammar would retire the only assertion that can catch a re-key.
         assert_eq!(
             node_id(Domain::Go, "m/pkg.Foo"),
             [

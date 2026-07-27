@@ -244,8 +244,8 @@ mod tests {
 
     #[test]
     fn a_set_probe_answers_presence_and_nothing_more() {
-        let known = node_id(Domain::Go, "m/pkg.Foo");
-        let unknown = node_id(Domain::Go, "m/pkg.Bar");
+        let known = node_id(Domain::Go, "m/pkg#Foo");
+        let unknown = node_id(Domain::Go, "m/pkg#Bar");
         let mut table: HashSet<NodeId> = HashSet::new();
         table.insert(known);
         assert_eq!(table.probe(&known), Some(Entry::Container));
