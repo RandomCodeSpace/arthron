@@ -29,14 +29,22 @@
 //! target is not this repository's to supply, and that evidence exists for
 //! exactly one shape:
 //!
-//! - **An angled include that names no file under any include root.**
-//!   `<vector>`, `<windows.h>`, `<sys/stat.h>`. The angle syntax means "look
-//!   where the implementation looks"; the resolver has enumerated every
-//!   include root this repository declares and probed the tree at every
-//!   candidate path, and found nothing. The header is supplied by the
-//!   toolchain or by a dependency. 154 of the 155 angled directives in the
-//!   files this track reads are this, and calling them unresolved would fill
-//!   the gate with the standard library.
+//! - **An angled include that names no file under any include root**, where
+//!   at least one candidate path was actually probed. `<vector>`,
+//!   `<windows.h>`, `<sys/stat.h>`. The angle syntax means "look where the
+//!   implementation looks"; the resolver has enumerated every include root
+//!   this repository declares and probed the tree at every candidate path,
+//!   and found nothing. The header is supplied by the toolchain or by a
+//!   dependency. 156 of the 157 angled directives in the files this track
+//!   reads are this, and calling them unresolved would fill the gate with the
+//!   standard library.
+//!
+//!   The "actually probed" half is load-bearing and is not decoration on the
+//!   sentence above. A repository that declares no `include/` directory has
+//!   no include roots, so an angled include there builds no candidate and the
+//!   resolver looks nowhere; `External` would then be asserted on no evidence
+//!   at all, against a layout — `-Isrc` and nothing else — that is ordinary
+//!   C++. With nothing probed the answer is a miss with a reason.
 //!
 //! Everything else that misses is a floor and counts *against* the rate:
 //!
@@ -58,6 +66,17 @@
 //!   unchanged: guzzle's 170 `use` statements naming sibling packages outside
 //!   the snapshot are `ModuleNotFound` and count against the rate, because a
 //!   snapshot's scope is an honest floor rather than an external link.
+//!
+//!   **The consequence, stated rather than left to be found:** one bundle can
+//!   draw two verdicts, decided by bracket style alone. googletest is not
+//!   vendored — `test/CMakeLists.txt` adds it as a subdirectory the corpus
+//!   snapshot does not carry — and fmt's tests reach it 16 times: 14 quoted,
+//!   which count against the rate, and 2 angled, which are `External` and
+//!   sit outside it. Both follow their own syntax's rule, and the split runs
+//!   in the conservative direction, the 14-site majority being the counted
+//!   one. It is not a third rule and there is no fix that is not a guess
+//!   about which bundle a header belongs to; reclassifying the 2 would move
+//!   the rate by a tenth of a point.
 //! - **A module name no `export module` in this repository declares.**
 //!   `import std;` names the standard library's module.
 //!   [`UnresolvedReason::UnknownPackage`] — a package outside the repository
@@ -205,10 +224,16 @@ impl CppResolver {
             };
         }
         // A file this repository really does publish on its include path,
-        // under an extension this build does not parse. In-repository, and so
-        // never `External`.
+        // that this scan holds no node for. In-repository, and so never
+        // `External`.
         let in_repo = paths.iter().any(|p| cfg.unparsed.contains(p));
-        let outcome = if in_repo {
+        // `External` is the one bucket outside both terms of the rate, and it
+        // is spent only against evidence: every include root enumerated,
+        // every candidate path probed, nothing found. With no candidate there
+        // is no evidence — a repository that declares no include root probed
+        // nothing at all — and claiming the target is somebody else's would
+        // be the cheapest rate there is. It misses with a reason instead.
+        let outcome = if in_repo || paths.is_empty() {
             crate::Outcome::Unresolved(UnresolvedReason::ModuleNotFound)
         } else {
             crate::Outcome::External(spec.to_string())
@@ -237,8 +262,11 @@ impl CppResolver {
 }
 
 impl Resolver<CppLang> for CppResolver {
-    fn config(&self, root: &Path, _files: &FileIndex) -> Result<CppProject, LayoutError> {
-        layout(root)
+    fn config(&self, root: &Path, files: &FileIndex) -> Result<CppProject, LayoutError> {
+        // The index, not the extension list: what sits on the include path
+        // unparsed is whatever this scan holds no node for. See
+        // [`crate::track_cpp::project`].
+        layout(root, files)
     }
 
     fn config_digest(&self, cfg: &CppProject) -> Vec<u8> {

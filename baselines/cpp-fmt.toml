@@ -13,6 +13,6 @@ corpus = "corpus/cpp/fmt"
 commit = "1be298e"
 language = "cpp"
 resolved = 4
-external = 154
+external = 156
 local_binding = 0
 unresolved = 115

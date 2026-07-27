@@ -9,7 +9,7 @@
 //!
 //! - [`extract`] — one file in, records out, **never an edge**.
 //! - [`project`] — phase 0: where an `#include` starts looking, and what this
-//!   repository publishes there that this build does not parse. C++ states
+//!   repository publishes there that this scan holds no node for. C++ states
 //!   neither in its source, and unlike every language already here it states
 //!   them in no manifest either.
 //! - [`lang`] — the [`crate::lang::Language`] impl and the FQN grammar the
@@ -57,7 +57,10 @@
 //! # Known limits, recorded rather than left to be rediscovered
 //!
 //! - **The preprocessor is not evaluated.** Every `#include` in a file is a
-//!   reference, including the ones inside a `#if` no scan can decide.
+//!   reference, including the ones inside a `#if` no scan can decide. Holding
+//!   that costs one length-preserving pass over the bytes, because a `#if`
+//!   condition the pinned grammar cannot parse otherwise swallows every
+//!   directive after it. See [`extract`].
 //! - **The pinned grammar has no C++20 modules.** `export module fmt;` comes
 //!   back with an `ERROR` node in it and `import fmt;` is shaped like a
 //!   variable declaration, so both are read off the token sequence the

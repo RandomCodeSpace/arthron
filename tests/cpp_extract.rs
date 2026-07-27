@@ -88,6 +88,97 @@ fn no_preprocessor_branch_is_evaluated() {
 }
 
 #[test]
+fn a_condition_the_pinned_grammar_cannot_parse_deletes_no_directive() {
+    // `__has_include(<h>)` is a preprocessor operator the pinned grammar has
+    // no rule for. When it is not the whole condition the misparse does not
+    // stop at the directive: the expression runs off the end of the line and
+    // swallows the rest of the file into one error node, and every
+    // `#include` after it stops existing. Two directives in the measured
+    // corpus went that way, and a file whose *first* condition has the shape
+    // loses all of them. A reference deleted from the denominator is the one
+    // failure this project's gate is built to prevent, so the shapes are
+    // pinned one at a time.
+    for condition in [
+        "__has_include(<version>)",
+        "A && __has_include(<version>)",
+        "__has_include(<version>) && A",
+        "defined(A) && FMT_HAS_INCLUDE(<version>)",
+        "__has_include(<version>) || __has_include(<ranges>)",
+        "FMT_CPLUSPLUS > 201703L && FMT_HAS_INCLUDE(<version>)",
+        "A && __has_include(<experimental/string_view>)",
+        // Spliced across two physical lines, which is one logical directive.
+        "defined(A) && \\\n    __has_include(<version>)",
+    ] {
+        let source = format!("#if {condition}\n#  include <inner>\n#endif\n#include \"tail.h\"\n");
+        assert_eq!(
+            forms("src/a.cc", &source),
+            [
+                IncludeForm::Angle("inner".to_string()),
+                IncludeForm::Quoted("tail.h".to_string()),
+            ],
+            "#if {condition}",
+        );
+    }
+    // A genuine comparison is left exactly as written: the space after `<`
+    // is not a header-name character, so nothing here matches it.
+    assert_eq!(
+        forms(
+            "src/a.cc",
+            "#if A < 3 && B > 1\n#  include <inner>\n#endif\n"
+        ),
+        [IncludeForm::Angle("inner".to_string())],
+    );
+    // And an `#include` is never a condition, so no specifier is ever
+    // rewritten: the directive below is the thing being read, not defused.
+    assert_eq!(
+        forms("src/a.cc", "#include <vector>\n"),
+        [IncludeForm::Angle("vector".to_string())],
+    );
+}
+
+#[test]
+fn defusing_a_condition_moves_no_span_and_reaches_no_comment() {
+    // The rewrite is length-preserving, so every span is the span it would
+    // have been. The same file twice: once with the shape that needs
+    // defusing, once with an equally long condition holding no angle bracket
+    // at all, which the pass leaves untouched.
+    let defused = extract(
+        "src/a.cc",
+        "#if A && __has_include(<version>)\n#endif\nnamespace fmt { struct s {}; }\n",
+    );
+    let plain = extract(
+        "src/a.cc",
+        "#if A && __has_include_0version_0\n#endif\nnamespace fmt { struct s {}; }\n",
+    );
+    let spans: Vec<(u32, u32, u32)> = defused
+        .defs
+        .iter()
+        .map(|d| (d.span.byte_start, d.span.byte_end, d.span.line))
+        .collect();
+    let want: Vec<(u32, u32, u32)> = plain
+        .defs
+        .iter()
+        .map(|d| (d.span.byte_start, d.span.byte_end, d.span.line))
+        .collect();
+    assert_eq!(spans, want);
+
+    // A block comment or a raw string may hold a line that begins `#if`.
+    // Nothing the pass writes may cost one its terminator, so the include
+    // after each of these must still be the only clause in the file.
+    for source in [
+        "/*\n#if A && M(<v*/x>)\n*/\n#include <vector>\n",
+        "/*\n#if A && M(<v>) */\n#include <vector>\n",
+        "const char* s = R\"(\n#if A && M(<v>)\n)\";\n#include <vector>\n",
+    ] {
+        assert_eq!(
+            forms("src/a.cc", source),
+            [IncludeForm::Angle("vector".to_string())],
+            "{source:?}",
+        );
+    }
+}
+
+#[test]
 fn a_module_interface_declares_and_an_import_names() {
     let facts = extract("src/fmt.cc", "module;\nexport module fmt;\nimport std;\n");
     // `module;` opens the global module fragment. It names nothing and

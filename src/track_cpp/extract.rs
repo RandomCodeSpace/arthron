@@ -22,6 +22,14 @@
 //! is the whole file, and it is stated here rather than left to be inferred
 //! from a count.
 //!
+//! Holding that guarantee costs one pass over the bytes before the parse.
+//! `__has_include(<version>)` is a preprocessor operator the pinned grammar
+//! has no rule for, and when it is not the whole condition the misparse does
+//! not stop at the directive — it swallows the rest of the file, and every
+//! `#include` after it stops existing. See [`defuse_header_names`]: the
+//! condition's header name is replaced by an equal-length filler, no branch
+//! is decided, and no span moves.
+//!
 //! # C++20 modules, against a grammar that has none
 //!
 //! The pinned tree-sitter C++ grammar does not know module declarations.
@@ -69,6 +77,7 @@
 //!   `import <vector>;` — contributes no reference. The corpus contains none,
 //!   and a shape nothing measured is a shape this build does not guess at.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::lang::{Extractor, FileFacts};
@@ -306,6 +315,138 @@ fn is_static(node: &SgNode) -> bool {
         .any(|c| c.kind() == "storage_class_specifier" && c.text() == "static")
 }
 
+/// Bytes a header name may be spelled with, for [`defuse_header_names`].
+///
+/// Deliberately narrower than the standard's *h-char-sequence*, which is
+/// anything but `>` and a newline. Narrowing it is what makes the rewrite
+/// safe on bytes this pass has not *proved* are a directive: none of `*`,
+/// `"`, `(`, `)` or a backslash is in the set, so the scan below stops before
+/// it can rewrite away the `*/` of a block comment or the `)delim"` of a raw
+/// string whose interior happens to begin a line with `#if`.
+fn is_header_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'+' | b'-')
+}
+
+/// One logical preprocessing line: the index of the `\n` that ends it, or the
+/// length of the input, following backslash-newline splices.
+fn logical_line_end(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return i,
+            b'\\' => {
+                let mut k = i + 1;
+                while matches!(bytes.get(k), Some(b' ' | b'\t' | b'\r')) {
+                    k += 1;
+                }
+                i = if bytes.get(k) == Some(&b'\n') {
+                    k + 1
+                } else {
+                    i + 1
+                };
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The byte range of a `#if` or `#elif` condition within `start..end`, or
+/// `None` when the line is not one of those two directives.
+///
+/// `#ifdef` and `#ifndef` are not among them and must not be: they are
+/// matched here by the whole directive word, never by a prefix, and neither
+/// takes anything but an identifier.
+fn conditional_condition(bytes: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut i = start;
+    while i < end && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'#') {
+        return None;
+    }
+    i += 1;
+    while i < end && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    let word = i;
+    while i < end && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    matches!(&bytes[word..i], b"if" | b"elif").then_some((i, end))
+}
+
+/// Replace `<header/name>` inside a `#if` or `#elif` condition with an
+/// equal-length filler, before the file is parsed.
+///
+/// # The bug this exists for
+///
+/// `__has_include(<version>)` — and every project macro wrapping it, fmt's
+/// `FMT_HAS_INCLUDE` among them — is a preprocessor operator the pinned
+/// tree-sitter C++ grammar has no rule for. It reads the `<` and `>` as
+/// comparisons, and when the operator is not the whole condition the
+/// expression never terminates: the parse runs off the end of the directive
+/// and swallows the **rest of the file** into one `ERROR` node. Every
+/// `preproc_include` after it stops existing, so the extractor emits no
+/// reference for includes that are plainly there. Measured on the corpus,
+/// two `#include` directives vanished this way; on a file whose first
+/// directive has the shape, *all* of them do.
+///
+/// That is the one failure mode this project's non-negotiables forbid
+/// outright — a reference deleted from the denominator, silently — so it is
+/// fixed at the only place a track may fix a grammar it does not own: the
+/// bytes handed to it.
+///
+/// # Why this is not "evaluating the preprocessor"
+///
+/// Nothing here decides a branch. tree-sitter does not evaluate a `#if`
+/// either — both arms are in the tree whatever the condition says — and tier
+/// 2 reads no condition at all, so replacing a header name inside one with
+/// `0` changes no fact this extractor emits. Every replacement is
+/// **length-preserving**, so every [`Span`] in the file is the span it would
+/// have been, byte for byte, and the [`quoted_content`] of every `#include`
+/// is read off unchanged bytes: an `#include` line is never a condition.
+///
+/// Untouched files pay a scan and no allocation.
+fn defuse_header_names(source: &str) -> Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let end = logical_line_end(bytes, pos);
+        if let Some((from, to)) = conditional_condition(bytes, pos, end) {
+            let mut i = from;
+            while i < to {
+                if bytes[i] == b'<' {
+                    let mut k = i + 1;
+                    while k < to && is_header_name_byte(bytes[k]) {
+                        k += 1;
+                    }
+                    // A non-empty header name, closed on the same logical
+                    // line. `#if A < 3 && B > 1` never matches: the space
+                    // after `<` is not a header-name byte, so a genuine
+                    // comparison is left exactly as written.
+                    if k > i + 1 && k < to && bytes[k] == b'>' {
+                        let buf = out.get_or_insert_with(|| bytes.to_vec());
+                        buf[i] = b'0';
+                        buf[i + 1..=k].fill(b' ');
+                        i = k + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        pos = end.saturating_add(1);
+    }
+    match out {
+        // Only ASCII bytes are read and only ASCII bytes are written, and an
+        // ASCII byte can never be part of a multi-byte sequence, so the
+        // rewrite cannot land inside one.
+        Some(buf) => Cow::Owned(String::from_utf8(buf).expect("ASCII-for-ASCII keeps UTF-8 valid")),
+        None => Cow::Borrowed(source),
+    }
+}
+
 /// Extract one C++ file. The whole of the extractor's public surface.
 pub fn extract(rel_path: &str, source: &str) -> FileFacts<CppLang> {
     static RULES: OnceLock<Rules> = OnceLock::new();
@@ -338,7 +479,10 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<CppLang> {
         },
     ));
 
-    let tree = SourceTree::parse_cpp(source);
+    // The grammar is pinned and has no `__has_include`; see
+    // [`defuse_header_names`] for what one unparseable condition costs.
+    let prepared = defuse_header_names(source);
+    let tree = SourceTree::parse_cpp(&prepared);
     for (rule, node) in tree.matches(rules) {
         match rule {
             "include" => include(&mut facts, &node),
