@@ -492,6 +492,315 @@ public class UseIface {
     assert_eq!(scan.one("Iface", RefKind::New), "EXTERNAL jdk:java.lang");
 }
 
+/// C-05, read off a facet instead of guessed at.
+///
+/// `Iface` is declared in another file, so the only thing that can say it is
+/// an interface is the stored [`arthron::model::DefFacets`] — the guess this
+/// replaces was "the constructor lookup missed, so it must have been an
+/// interface", which is a statement about the *search* and not about the type.
+#[test]
+fn an_anonymous_creation_on_a_class_keeps_the_honest_miss() {
+    let scan = scan(&[
+        (
+            "com/acme/Base.java",
+            r#"package com.acme;
+public class Base {
+    public Base() { }
+}
+"#,
+        ),
+        (
+            "com/acme/UseBase.java",
+            r#"package com.acme;
+public class UseBase {
+    Object o = new Base(1) {
+        public String tag() { return "t"; }
+    };
+}
+"#,
+        ),
+    ]);
+    // `Base` is a class and declares no one-argument constructor, so
+    // §15.9.5.1 has nothing to say here: the site names a constructor that
+    // the search could not finish looking for, which is not the same fact as
+    // "the constructor invoked belongs to `java.lang.Object`". Externalising
+    // it moved the reference out of both rate terms on the strength of a
+    // guess.
+    assert_eq!(scan.one("Base", RefKind::New), "UnindexedSupertype");
+}
+
+/// The same rule at the other end: a name nothing places is not an interface
+/// either, and saying `java.lang` about it invented a package for it.
+#[test]
+fn an_anonymous_creation_on_an_unplaced_name_keeps_the_type_miss() {
+    let scan = scan(&[(
+        "com/acme/UseNowhere.java",
+        r#"package com.acme;
+public class UseNowhere {
+    Object o = new Nowhere() {
+        public String tag() { return "t"; }
+    };
+}
+"#,
+    )]);
+    assert_eq!(scan.one("Nowhere", RefKind::New), "NoMatchingDefinition");
+}
+
+/// The bound on the rule: a creation whose constructor *is* found keeps its
+/// edge, class body or no class body.
+#[test]
+fn an_anonymous_creation_on_a_class_still_reaches_its_constructor() {
+    let scan = scan(&anonymous_class_tree());
+    assert_eq!(
+        scan.one("Base", RefKind::New),
+        "RESOLVED com.acme#Base.<init>/0",
+        "D-10 synthesises §8.8.9's implicit constructor, and it is the target",
+    );
+}
+
+/// The three-level hierarchy the cross-file supertype cases are measured in.
+///
+/// One type per file on purpose: `extends` is the only fact a file states
+/// about its own supertypes, so a hierarchy that fits in one compilation unit
+/// is resolvable without a supertype phase at all and proves nothing about
+/// one.
+fn tower_tree() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "com/acme/Top.java",
+            r#"package com.acme;
+public class Top {
+    public String top() { return "t"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Mid.java",
+            r#"package com.acme;
+public class Mid extends Top {
+    public String mid() { return "m"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Low.java",
+            r#"package com.acme;
+public class Low extends Mid {
+    public String low() { return "l"; }
+}
+"#,
+        ),
+    ]
+}
+
+/// H-01: a member declared two files above the receiver's type resolves.
+#[test]
+fn a_member_two_levels_up_a_cross_file_hierarchy_resolves() {
+    let mut files = tower_tree();
+    files.push((
+        "com/acme/UseTower.java",
+        r#"package com.acme;
+public class UseTower {
+    void go(Low l) {
+        l.low();
+        l.mid();
+        l.top();
+    }
+}
+"#,
+    ));
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("l.low", RefKind::Call),
+        "RESOLVED com.acme#Low.low/0"
+    );
+    assert_eq!(
+        scan.one("l.mid", RefKind::Call),
+        "RESOLVED com.acme#Mid.mid/0"
+    );
+    assert_eq!(
+        scan.one("l.top", RefKind::Call),
+        "RESOLVED com.acme#Top.top/0"
+    );
+}
+
+/// The closure adds targets; it never invents them. A name no type in the
+/// hierarchy declares is still a miss, and still `UnindexedSupertype` —
+/// `java.lang.Object` sits above every chain and is never indexed, so the
+/// closure is short whatever this scan reads.
+#[test]
+fn a_member_no_type_in_the_hierarchy_declares_is_still_unindexed() {
+    let mut files = tower_tree();
+    files.push((
+        "com/acme/UseAbsent.java",
+        r#"package com.acme;
+public class UseAbsent {
+    void go(Low l) {
+        l.absent();
+    }
+}
+"#,
+    ));
+    let scan = scan(&files);
+    assert_eq!(scan.one("l.absent", RefKind::Call), "UnindexedSupertype");
+}
+
+/// An interface's method, declared in a third file, reached through the class
+/// that implements it — and a cycle in the hierarchy terminates.
+#[test]
+fn an_interface_method_resolves_and_a_cyclic_hierarchy_terminates() {
+    let scan = scan(&[
+        (
+            "com/acme/Runner.java",
+            r#"package com.acme;
+public interface Runner {
+    void run();
+    default String describe() { return "runner"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Job.java",
+            r#"package com.acme;
+public class Job implements Runner {
+    public void run() { }
+}
+"#,
+        ),
+        // Illegal Java, and the resolver still has to terminate on it: a
+        // cycle in the store is a cycle whatever the compiler would say.
+        (
+            "com/acme/Loop.java",
+            r#"package com.acme;
+public class Loop extends Knot {
+}
+"#,
+        ),
+        (
+            "com/acme/Knot.java",
+            r#"package com.acme;
+public class Knot extends Loop {
+}
+"#,
+        ),
+        (
+            "com/acme/UseRunner.java",
+            r#"package com.acme;
+public class UseRunner {
+    void go(Job j, Loop k) {
+        j.describe();
+        k.spin();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("j.describe", RefKind::Call),
+        "RESOLVED com.acme#Runner.describe/0",
+    );
+    assert_eq!(scan.one("k.spin", RefKind::Call), "UnindexedSupertype");
+}
+
+/// §8.4.8.1: a superclass method beats a superinterface's default, and the
+/// closure has to preserve that order across a file boundary.
+///
+/// The relation is stored in declaration order — §8.1.4 writes `extends`
+/// before `implements` — and the walk is a stack, so getting this wrong is a
+/// silent wrong edge to the interface rather than a lowered rate.
+#[test]
+fn a_superclass_method_beats_a_superinterface_default_across_files() {
+    let scan = scan(&[
+        (
+            "com/acme/Chatty.java",
+            r#"package com.acme;
+public interface Chatty {
+    default String speak() { return "iface"; }
+}
+"#,
+        ),
+        (
+            "com/acme/BaseSpeak.java",
+            r#"package com.acme;
+public class BaseSpeak {
+    public String speak() { return "class"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Both.java",
+            r#"package com.acme;
+public class Both extends BaseSpeak implements Chatty {
+}
+"#,
+        ),
+        (
+            "com/acme/UseBoth.java",
+            r#"package com.acme;
+public class UseBoth {
+    void go(Both b) {
+        b.speak();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("b.speak", RefKind::Call),
+        "RESOLVED com.acme#BaseSpeak.speak/0",
+    );
+}
+
+/// An in-repository override of an `Object` member is an edge, not a link to
+/// the JDK.
+///
+/// `is_object_member` answers for the member a search *failed* to find, and
+/// before the closure that search stopped at the receiver's own type — so a
+/// `toString` two files up was reported `External("jdk:java.lang")` and left
+/// both terms of the rate. Now the search finds it, and the reference is
+/// resolved: the movement is into the rate, never out of it.
+#[test]
+fn an_object_member_overridden_in_the_repository_resolves_rather_than_externalises() {
+    let scan = scan(&[
+        (
+            "com/acme/Named.java",
+            r#"package com.acme;
+public class Named {
+    public String toString() { return "named"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Sub.java",
+            r#"package com.acme;
+public class Sub extends Named {
+}
+"#,
+        ),
+        (
+            "com/acme/UseNamed.java",
+            r#"package com.acme;
+public class UseNamed {
+    void go(Sub s, Object o) {
+        s.toString();
+        o.hashCode();
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("s.toString", RefKind::Call),
+        "RESOLVED com.acme#Named.toString/0",
+    );
+    // The other direction is untouched: nothing in this repository declares
+    // `hashCode` on `Object`, so it stays the JDK's.
+    assert_eq!(
+        scan.one("o.hashCode", RefKind::Call),
+        "EXTERNAL jdk:java.lang",
+    );
+}
+
 /// A `type_identifier` tree-sitter recovered from inside an `ERROR` region is
 /// not a reference to anything.
 ///
@@ -510,5 +819,150 @@ fn a_type_identifier_inside_a_parse_error_is_not_a_reference() {
         scan.rows.is_empty(),
         "a reference was recovered from inside a parse error\n{}",
         scan.dump(),
+    );
+}
+
+/// §8.4.8 and §9.4.1: a class inherits a default method from the *most
+/// specific* superinterface that declares it. `Impl implements Alpha, Beta`
+/// with `Beta extends Alpha` inherits `Beta.m`, whatever order the two are
+/// written in — `javac` on this exact tree prints `beta`.
+///
+/// The closure walked the stored supertype list as a stack and returned the
+/// first declaration it met, so declaration order decided the answer and the
+/// two sides of a file boundary decided it differently. Both spellings are
+/// asserted here, because an order-dependent walk passes one of them by luck.
+#[test]
+fn a_subinterfaces_default_beats_its_superinterfaces() {
+    let tree = |implements: &str| {
+        vec![
+            (
+                "com/acme/Alpha.java",
+                r#"package com.acme;
+public interface Alpha { default String m() { return "alpha"; } }
+"#
+                .to_string(),
+            ),
+            (
+                "com/acme/Beta.java",
+                r#"package com.acme;
+public interface Beta extends Alpha { default String m() { return "beta"; } }
+"#
+                .to_string(),
+            ),
+            (
+                "com/acme/Impl.java",
+                format!("package com.acme;\npublic class Impl implements {implements} {{ }}\n"),
+            ),
+            (
+                "com/acme/UseImpl.java",
+                r#"package com.acme;
+public class UseImpl {
+    String go(Impl impl) { return impl.m(); }
+}
+"#
+                .to_string(),
+            ),
+        ]
+    };
+    for implements in ["Alpha, Beta", "Beta, Alpha"] {
+        let owned = tree(implements);
+        let files: Vec<(&str, &str)> = owned.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let scan = scan(&files);
+        assert_eq!(
+            scan.one("impl.m", RefKind::Call),
+            "RESOLVED com.acme#Beta.m/0",
+            "`implements {implements}` must still inherit the subinterface's default",
+        );
+    }
+}
+
+/// The same rule inside one file: the walk that reads `scope.supers` has to
+/// agree with the one that reads the stored relation.
+#[test]
+fn a_subinterfaces_default_beats_its_superinterface_in_one_file() {
+    let files = vec![
+        (
+            "com/acme/Alpha.java",
+            r#"package com.acme;
+public interface Alpha { default String m() { return "alpha"; } }
+"#,
+        ),
+        (
+            "com/acme/Beta.java",
+            r#"package com.acme;
+public interface Beta extends Alpha { default String m() { return "beta"; } }
+"#,
+        ),
+        (
+            "com/acme/Local.java",
+            r#"package com.acme;
+public class Local implements Alpha, Beta {
+    String go() { return this.m(); }
+}
+"#,
+        ),
+    ];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.m", RefKind::Call),
+        "RESOLVED com.acme#Beta.m/0",
+    );
+}
+
+/// §8.2: a private member is not inherited, so a supertype's is not a
+/// candidate below it. `javac` on this exact tree says `cannot find symbol`
+/// for `hidden()` in `Sub` — which is the point: the closure used to answer
+/// with `Base.hidden`, an edge into a body the subclass cannot name.
+///
+/// The tree does not compile, and that is the honest scope of the rule: in
+/// source that does compile, no site names an inaccessible member, so this
+/// changes no corpus number. It changes what arthron says about source that
+/// is mid-edit, generated, or read without the module that completes it —
+/// which is most of what a scanner meets.
+#[test]
+fn a_private_member_of_a_supertype_is_not_inherited() {
+    let files = vec![
+        (
+            "com/acme/Hidden.java",
+            r#"package com.acme;
+public class Hidden {
+    private String only() { return "hidden"; }
+}
+"#,
+        ),
+        (
+            "com/acme/Below.java",
+            r#"package com.acme;
+public class Below extends Hidden {
+    String go() { return this.only(); }
+}
+"#,
+        ),
+    ];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.only", RefKind::Call),
+        "UnindexedSupertype",
+        "a private supertype member is not a candidate, and the miss stays honest",
+    );
+}
+
+/// The same member named on the type that declares it is an ordinary one.
+/// The facet removes a member from *subtypes*, never from its own owner.
+#[test]
+fn a_private_member_still_resolves_on_the_type_that_declares_it() {
+    let files = vec![(
+        "com/acme/Owner.java",
+        r#"package com.acme;
+public class Owner {
+    private String only() { return "owner"; }
+    String go() { return this.only(); }
+}
+"#,
+    )];
+    let scan = scan(&files);
+    assert_eq!(
+        scan.one("this.only", RefKind::Call),
+        "RESOLVED com.acme#Owner.only/0",
     );
 }

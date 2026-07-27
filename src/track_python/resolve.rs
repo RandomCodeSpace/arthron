@@ -51,7 +51,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use crate::lang::{FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe};
+use crate::lang::{
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+};
 use crate::model::{
     DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, RefTarget, Reference, TargetRoot,
     node_id,
@@ -66,6 +68,12 @@ use crate::track_python::stdlib::{
     BUILTINS_PACKAGE, is_builtin, is_object_member, is_stdlib, stdlib_package,
 };
 use crate::{Outcome, UnresolvedReason};
+
+/// How far a façade's alias chain is followed.
+///
+/// Python re-export façades nest a few deep at most; the ceiling exists so a
+/// circular import graph terminates rather than looping.
+const MAX_ALIAS_HOPS: usize = 16;
 
 /// How deep the base-class walk goes before giving up.
 ///
@@ -165,6 +173,16 @@ struct Walk {
     external: Option<String>,
     /// Modules whose namespace was searched, for the PEP 562 probe.
     searched_modules: Vec<String>,
+    /// Type identities whose supertype relation this walk read.
+    ///
+    /// Reads like any other, and they belong in the invalidation index for
+    /// the same reason: what a class inherits from decides which candidates
+    /// exist below it, so an edit to a `class C(B)` line three modules away
+    /// changes this reference's answer under an identity that never moved.
+    /// Kept apart from `probed` rather than pushed into it, because
+    /// `probe_in_order` reads that list as "already asked, do not ask again"
+    /// and a class identity can also be a candidate in its own right.
+    consulted: Vec<NodeId>,
 }
 
 impl PyResolver {
@@ -180,11 +198,11 @@ impl PyResolver {
     /// means either the source is broken or the inferred layout is wrong. The
     /// honest outcome is `ProjectLayoutUnknown` — arthron's own inference —
     /// and not `NoMatchingDefinition`, which would blame a definition.
-    fn anchor(scope: &PyScope, level: u8, module: &[String]) -> Option<String> {
+    fn anchor(package: Option<&str>, level: u8, module: &[String]) -> Option<String> {
         let mut base: Vec<String> = if level == 0 {
             Vec::new()
         } else {
-            let package = scope.package.as_ref()?;
+            let package = package?;
             if package.is_empty() {
                 return None; // §5.4.2: relative import beyond top-level
             }
@@ -217,11 +235,57 @@ impl PyResolver {
                 continue; // already read; reading it twice would double-count
             }
             probed.push(id);
-            if probe.probe(&id).is_some() {
-                return Some(id);
+            match probe.probe(&id) {
+                // B-12: a re-export façade. The alias is a real declaration
+                // site, but the definition behind it is the better edge.
+                Some(Entry::Alias { target }) => {
+                    return Some(Self::follow_alias(probe, id, target, probed));
+                }
+                Some(_) => return Some(id),
+                None => {}
             }
         }
         None
+    }
+
+    /// Walk a façade's alias chain to the definition at its end.
+    ///
+    /// Returns a node in every case, never a failure, and that is the point:
+    /// `pkg.Foo` created by `from .core import Foo` is a genuine attribute of
+    /// `pkg` at runtime, so the façade's own alias is always a truthful
+    /// answer. A chain that dead-ends or loops falls back to the last alias
+    /// it stood on rather than reporting a miss — which is why this stage
+    /// cannot move Python's rate, only the precision of its edges.
+    ///
+    /// (EcmaScript decides the cycle case the other way, because there an
+    /// unresolvable `ResolveExport` really does mean the name does not exist.)
+    fn follow_alias(
+        probe: &dyn SymbolProbe,
+        from: NodeId,
+        target: NodeId,
+        probed: &mut Vec<NodeId>,
+    ) -> NodeId {
+        let mut anchor = from;
+        let mut current = target;
+        let mut seen: Vec<NodeId> = vec![from];
+        for _ in 0..MAX_ALIAS_HOPS {
+            if seen.contains(&current) {
+                return anchor;
+            }
+            seen.push(current);
+            if !probed.contains(&current) {
+                probed.push(current);
+            }
+            match probe.probe(&current) {
+                Some(Entry::Alias { target }) => {
+                    anchor = current;
+                    current = target;
+                }
+                Some(_) => return current,
+                None => return anchor,
+            }
+        }
+        anchor
     }
 
     /// Ordered candidates for a dotted path anchored at a module.
@@ -248,39 +312,114 @@ impl PyResolver {
         out.extend(cfg.module_fqns(&scope.root, &join_dotted(module, rest)));
     }
 
-    /// Ordered candidates for a member below a class, own class first and then
-    /// its bases in declaration order (E-01, E-14).
+    /// Ordered candidates for a member below a class: every class in its
+    /// linearization, in linearization order (E-01, E-14).
     ///
-    /// The MRO is walked only as far as the graph can be read: bases declared
-    /// in this file are expanded transitively, and a base declared elsewhere
-    /// gets exactly one probe, because a probe answers "does this identity
-    /// exist" and not "what are its bases". That shortfall is recorded as
-    /// [`Walk::unindexed_supertype`] rather than smoothed over — see the core
-    /// gap noted on [`Resolver::link_kinds`] below.
-    // Recursive: the four trailing parameters are this walk's own state, and
-    // threading them reads better than a struct that would exist only here.
-    #[allow(clippy::too_many_arguments)]
+    /// The order is §3.3.3's C3 and not a walk of the bases, because those
+    /// two disagree on exactly the shape inheritance exists for. `D(B, C)`
+    /// with `B(A)` and `C(A)`, `C` overriding a member of `A`: depth-first
+    /// reaches `A` through `B` and answers `A.m`, and the interpreter calls
+    /// `C.m`. Both answers are a resolved edge, so the difference never shows
+    /// up in a rate — it shows up as a call graph that points at a definition
+    /// the program does not run.
+    ///
+    /// The linearization is built as far as the graph can be read, which is
+    /// both sides of a file boundary: bases declared in this file come from
+    /// [`PyScope::bases`], and a base declared elsewhere from the supertype
+    /// relation the driver's phase 1.5 left in the store (see
+    /// [`Resolver::link_kinds`] below). What remains unreadable — a base that
+    /// resolved outside the repository, or to no definition at all — is
+    /// recorded as [`Walk::unindexed_supertype`] rather than smoothed over,
+    /// because a chain that is short and a chain that is complete give the
+    /// same empty answer and only one of them means the name is absent.
     fn class_member_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         class_fqn: &str,
         member: &[String],
         out: &mut Vec<String>,
         walk: &mut Walk,
-        seen: &mut HashSet<String>,
-        depth: usize,
     ) {
-        if member.is_empty() || depth > MRO_DEPTH || !seen.insert(class_fqn.to_string()) {
+        if member.is_empty() {
             return;
         }
-        out.push(format!("{class_fqn}.{}", member.join(".")));
+        let joined = member.join(".");
+        let mut memo = HashMap::new();
+        for class in Self::linearize(cfg, scope, probe, class_fqn, walk, &mut memo, 0) {
+            out.push(format!("{class}.{joined}"));
+        }
+    }
+
+    /// The C3 linearization of a class (§3.3.3), starting with the class
+    /// itself.
+    ///
+    /// `memo` is both the answer cache and the cycle guard: the key is
+    /// claimed with a one-element placeholder *before* the bases are read, so
+    /// a hierarchy that names itself as its own ancestor — which no legal
+    /// Python program does — terminates instead of recursing. [`MRO_DEPTH`]
+    /// bounds what the walk costs on a hierarchy that is merely deep.
+    fn linearize(
+        cfg: &PyProject,
+        scope: &PyScope,
+        probe: &dyn SymbolProbe,
+        class_fqn: &str,
+        walk: &mut Walk,
+        memo: &mut HashMap<String, Vec<String>>,
+        depth: usize,
+    ) -> Vec<String> {
+        if let Some(done) = memo.get(class_fqn) {
+            return done.clone();
+        }
+        if depth > MRO_DEPTH {
+            return vec![class_fqn.to_string()];
+        }
+        memo.insert(class_fqn.to_string(), vec![class_fqn.to_string()]);
+        let bases = Self::direct_bases(cfg, scope, probe, class_fqn, walk);
+        let mut lists: Vec<Vec<String>> = bases
+            .iter()
+            .map(|base| Self::linearize(cfg, scope, probe, base, walk, memo, depth + 1))
+            .collect();
+        lists.push(bases);
+        let mut mro = vec![class_fqn.to_string()];
+        mro.extend(c3_merge(lists));
+        memo.insert(class_fqn.to_string(), mro.clone());
+        mro
+    }
+
+    /// The direct bases of a class, in declaration order.
+    ///
+    /// Cross-file the answer is the supertype relation the driver placed, and
+    /// reading it is a read of *this class's* identity — recorded, so that
+    /// rewriting its `class C(B)` line wakes the reference that depended on
+    /// it. In-file it is this scope's own `bases`, each resolved through the
+    /// same name lookup any other reference uses.
+    ///
+    /// An empty list means two different things and the walk flags say which:
+    /// a class that states no base at all is fully enumerated — `object` is
+    /// not a node either way — while a base that could not be read leaves the
+    /// chain short and sets [`Walk::unindexed_supertype`].
+    fn direct_bases(
+        cfg: &PyProject,
+        scope: &PyScope,
+        probe: &dyn SymbolProbe,
+        class_fqn: &str,
+        walk: &mut Walk,
+    ) -> Vec<String> {
         let Some(owner) = class_fqn
             .strip_prefix(&scope.module)
             .and_then(|rest| rest.strip_prefix('#'))
         else {
-            // Declared in another file: its own bases are not readable here.
-            walk.unindexed_supertype = true;
-            return;
+            // Declared in another file: its bases are the driver's to state.
+            let id = node_id(Domain::Python, class_fqn);
+            walk.consulted.push(id);
+            let Some(supers) = probe.supertypes(&id) else {
+                // No supertype fact at all: not a class this scan indexed.
+                walk.unindexed_supertype = true;
+                return Vec::new();
+            };
+            walk.unindexed_supertype |= !supers.complete;
+            return supers.fqns.into_iter().map(Fqn::into_string).collect();
         };
         if !scope.classes.contains(owner) {
             // Not a class this file declares — an attribute of one, or a name
@@ -289,8 +428,9 @@ impl PyResolver {
             // node, but `register.tag` is a member of whatever `mk()`
             // returned.
             walk.opaque_root = true;
-            return;
+            return Vec::new();
         }
+        let mut out = Vec::new();
         for base in scope.bases.get(owner).map(Vec::as_slice).unwrap_or(&[]) {
             if base.root != TargetRoot::Name {
                 walk.unindexed_supertype = true;
@@ -298,24 +438,22 @@ impl PyResolver {
             }
             let mut base_fqns = Vec::new();
             let mut base_walk = Walk::default();
-            Self::name_candidates(cfg, scope, &base.segments, &mut base_fqns, &mut base_walk);
+            Self::name_candidates(
+                cfg,
+                scope,
+                probe,
+                &base.segments,
+                &mut base_fqns,
+                &mut base_walk,
+            );
             walk.unindexed_supertype |= base_walk.unindexed_supertype;
+            walk.consulted.append(&mut base_walk.consulted);
             if base_fqns.is_empty() {
                 walk.unindexed_supertype = true;
             }
-            for base_fqn in base_fqns.iter().filter(|f| f.contains('#')) {
-                Self::class_member_candidates(
-                    cfg,
-                    scope,
-                    base_fqn,
-                    member,
-                    out,
-                    walk,
-                    seen,
-                    depth + 1,
-                );
-            }
+            out.extend(base_fqns.into_iter().filter(|f| f.contains('#')));
         }
+        out
     }
 
     /// Ordered candidates for a dotted name read in this file's module block.
@@ -330,6 +468,7 @@ impl PyResolver {
     fn name_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         segments: &[String],
         out: &mut Vec<String>,
         walk: &mut Walk,
@@ -347,9 +486,8 @@ impl PyResolver {
                         if rest.is_empty() {
                             out.push(base);
                         } else {
-                            let mut seen = HashSet::new();
                             Self::class_member_candidates(
-                                cfg, scope, &base, rest, out, walk, &mut seen, 0,
+                                cfg, scope, probe, &base, rest, out, walk,
                             );
                         }
                     }
@@ -368,9 +506,8 @@ impl PyResolver {
                             if rest.is_empty() {
                                 out.push(base);
                             } else {
-                                let mut seen = HashSet::new();
                                 Self::class_member_candidates(
-                                    cfg, scope, &base, rest, out, walk, &mut seen, 0,
+                                    cfg, scope, probe, &base, rest, out, walk,
                                 );
                             }
                         }
@@ -441,6 +578,7 @@ impl PyResolver {
     fn annotation_candidates(
         cfg: &PyProject,
         scope: &PyScope,
+        probe: &dyn SymbolProbe,
         r: &Reference,
         segments: &[String],
         out: &mut Vec<String>,
@@ -459,25 +597,16 @@ impl PyResolver {
         };
         let mut type_fqns = Vec::new();
         let mut type_walk = Walk::default();
-        Self::name_candidates(cfg, scope, type_path, &mut type_fqns, &mut type_walk);
+        Self::name_candidates(cfg, scope, probe, type_path, &mut type_fqns, &mut type_walk);
         if walk.external.is_none() {
             walk.external = type_walk.external;
         }
+        walk.consulted.append(&mut type_walk.consulted);
         // A module is not a type: only the definition half of the candidate
         // list can host a member.
         for type_fqn in type_fqns.iter().filter(|f| f.contains('#')) {
             walk.root_typed = true;
-            let mut seen = HashSet::new();
-            Self::class_member_candidates(
-                cfg,
-                scope,
-                type_fqn,
-                &segments[1..],
-                out,
-                walk,
-                &mut seen,
-                0,
-            );
+            Self::class_member_candidates(cfg, scope, probe, type_fqn, &segments[1..], out, walk);
         }
     }
 
@@ -684,7 +813,7 @@ impl PyResolver {
                 name,
                 ..
             } => {
-                let Some(base) = Self::anchor(scope, *level, module) else {
+                let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                     return unresolved(UnresolvedReason::ProjectLayoutUnknown); // B-08
                 };
                 // §7.11, verbatim: "check if the imported module has an
@@ -721,7 +850,7 @@ impl PyResolver {
                 resolution(outcome, probed)
             }
             ImportForm::Star { level, module } => {
-                let Some(base) = Self::anchor(scope, *level, module) else {
+                let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                     return unresolved(UnresolvedReason::ProjectLayoutUnknown);
                 };
                 let candidates = cfg.module_fqns(&scope.root, &base);
@@ -775,25 +904,27 @@ impl PyResolver {
         let class_fqn = format!("{}#{owner}", scope.module);
         let mut candidates = Vec::new();
         let mut walk = Walk::default();
-        let mut seen = HashSet::new();
         Self::class_member_candidates(
             cfg,
             scope,
+            probe,
             &class_fqn,
             segments,
             &mut candidates,
             &mut walk,
-            &mut seen,
-            0,
         );
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
-            return resolution(Outcome::Resolved(id), probed);
+            return with_walk(Outcome::Resolved(id), &walk, probed);
         }
         // E-12: a class defining `__getattr__` can serve any attribute.
         let fallback = vec![format!("{class_fqn}.__getattr__")];
         if Self::probe_in_order(probe, &fallback, &mut probed).is_some() {
-            return resolution(Outcome::Unresolved(UnresolvedReason::Generated), probed);
+            return with_walk(
+                Outcome::Unresolved(UnresolvedReason::Generated),
+                &walk,
+                probed,
+            );
         }
         let outcome = Outcome::Unresolved(if walk.unindexed_supertype {
             // A supertype whose own bases are unreadable from here: a fixable
@@ -809,7 +940,7 @@ impl PyResolver {
         } else {
             UnresolvedReason::NoMatchingDefinition
         });
-        resolution(outcome, probed)
+        with_walk(outcome, &walk, probed)
     }
 
     /// `super().m()` (E-03).
@@ -861,34 +992,24 @@ impl PyResolver {
                 unresolved(UnresolvedReason::DynamicDispatch)
             };
         }
-        let mut candidates = Vec::new();
+        // §3.3.2.1 starts the lookup *after* this class in the MRO, so the
+        // candidates are its own linearization minus its head — not each base
+        // walked separately, which would put a base's own ancestor ahead of
+        // the sibling base that overrides it and answer with a definition the
+        // interpreter skips.
+        let class_fqn = format!("{}#{owner}", scope.module);
         let mut walk = Walk::default();
-        for base in bases {
-            if base.root != TargetRoot::Name {
-                walk.unindexed_supertype = true;
-                continue;
-            }
-            let mut base_fqns = Vec::new();
-            let mut base_walk = Walk::default();
-            Self::name_candidates(cfg, scope, &base.segments, &mut base_fqns, &mut base_walk);
-            walk.unindexed_supertype |= base_walk.unindexed_supertype;
-            for base_fqn in base_fqns.iter().filter(|f| f.contains('#')) {
-                let mut seen = HashSet::new();
-                Self::class_member_candidates(
-                    cfg,
-                    scope,
-                    base_fqn,
-                    segments,
-                    &mut candidates,
-                    &mut walk,
-                    &mut seen,
-                    0,
-                );
-            }
-        }
+        let mut memo = HashMap::new();
+        let mro = Self::linearize(cfg, scope, probe, &class_fqn, &mut walk, &mut memo, 0);
+        let joined = segments.join(".");
+        let candidates: Vec<String> = mro
+            .iter()
+            .skip(1)
+            .map(|class| format!("{class}.{joined}"))
+            .collect();
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
-            return resolution(Outcome::Resolved(id), probed);
+            return with_walk(Outcome::Resolved(id), &walk, probed);
         }
         let outcome = Outcome::Unresolved(if bases.len() > 1 {
             UnresolvedReason::DynamicDispatch
@@ -897,7 +1018,7 @@ impl PyResolver {
         } else {
             UnresolvedReason::NoMatchingDefinition
         });
-        resolution(outcome, probed)
+        with_walk(outcome, &walk, probed)
     }
 
     /// A name-rooted reference: the ordinary case, and most of the volume.
@@ -928,12 +1049,12 @@ impl PyResolver {
         let mut candidates = Vec::new();
         let mut walk = Walk::default();
         if !r.locally_bound {
-            Self::name_candidates(cfg, scope, segments, &mut candidates, &mut walk);
+            Self::name_candidates(cfg, scope, probe, segments, &mut candidates, &mut walk);
         }
-        Self::annotation_candidates(cfg, scope, r, segments, &mut candidates, &mut walk);
+        Self::annotation_candidates(cfg, scope, probe, r, segments, &mut candidates, &mut walk);
         let mut probed = Vec::new();
         match Self::probe_in_order(probe, &candidates, &mut probed) {
-            Some(id) => resolution(Outcome::Resolved(id), probed),
+            Some(id) => with_walk(Outcome::Resolved(id), &walk, probed),
             None => {
                 let outcome = Self::miss(
                     cfg,
@@ -944,8 +1065,41 @@ impl PyResolver {
                     probe,
                     &mut probed,
                 );
-                resolution(outcome, probed)
+                with_walk(outcome, &walk, probed)
             }
+        }
+    }
+}
+
+/// C3's `merge` (§3.3.3): repeatedly take the head of the first list whose
+/// head appears in no *tail*, and strike it from every list.
+///
+/// A hierarchy with no consistent linearization is a `TypeError` the
+/// interpreter raises at class creation, so no program that runs reaches the
+/// fallback. When it is reached anyway — a broken file, or a chain this build
+/// read only half of — the first remaining head is taken instead. That keeps
+/// the answer ordered and the loop finite, which is a resolver's obligation
+/// on input that cannot run; deciding the program is invalid is not.
+///
+/// Striking the head from *every* list rather than only from the fronts it
+/// leads is the same thing for a consistent hierarchy — a good head is in no
+/// tail — and it is what guarantees progress when the hierarchy is not.
+fn c3_merge(mut lists: Vec<Vec<String>>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        lists.retain(|list| !list.is_empty());
+        let Some(first) = lists.first() else {
+            return out;
+        };
+        let head = lists
+            .iter()
+            .map(|list| &list[0])
+            .find(|cand| !lists.iter().any(|other| other[1..].contains(cand)))
+            .unwrap_or(&first[0])
+            .clone();
+        out.push(head.clone());
+        for list in &mut lists {
+            list.retain(|class| *class != head);
         }
     }
 }
@@ -971,6 +1125,21 @@ fn unresolved(reason: UnresolvedReason) -> Resolution {
         outcome: Outcome::Unresolved(reason),
         candidates: Vec::new(),
     }
+}
+
+/// Close a candidate walk: whatever it consulted is part of what it read.
+///
+/// Appended after the probing rather than before it, because
+/// `probe_in_order` treats an identity already in the list as one it must not
+/// ask about twice — and a class identity is both something this walk
+/// consulted and something a candidate list can legitimately contain.
+fn with_walk(outcome: Outcome<NodeId, String>, walk: &Walk, mut probed: Vec<NodeId>) -> Resolution {
+    for id in &walk.consulted {
+        if !probed.contains(id) {
+            probed.push(*id);
+        }
+    }
+    resolution(outcome, probed)
 }
 
 fn resolution(outcome: Outcome<NodeId, String>, candidates: Vec<NodeId>) -> Resolution {
@@ -1079,6 +1248,64 @@ impl Resolver<PyLang> for PyResolver {
             format!("{}.{}", owner.join("."), def.name)
         };
         Some(Fqn::new(format!("{module}#{member}")))
+    }
+
+    /// B-12: what a module-level `from` import binds, as an identity.
+    ///
+    /// `pkg/__init__.py` doing `from .core import Foo` makes `pkg.Foo` a real
+    /// declaration site — the extractor already emits it as a
+    /// [`DefKind::Alias`] definition — and this is the hop that says *what it
+    /// is*, so a reference to `pkg.Foo` reaches `pkg.core#Foo` rather than
+    /// stopping at the façade.
+    ///
+    /// Only the `from` form contributes. `import a.b` binds a *module*, and
+    /// whether the name after the last dot is a module or a member of one is
+    /// a question only a probe settles — the definition phase has no probe
+    /// worth the name on a cold scan. Guessing `base#name` is safe precisely
+    /// because it degrades well: if the name is a submodule, no node carries
+    /// that identity and the walk falls back to the façade's own alias, which
+    /// is the answer this resolver already gave.
+    fn def_alias_targets(
+        &self,
+        cfg: &PyProject,
+        header: &PyHeader,
+        def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        if def.kind != DefKind::Alias || !def.owner.is_empty() || def.name.is_empty() {
+            return Vec::new();
+        }
+        // `__package__`, by the same rule `scope` uses (B-07/PEP 366), so a
+        // relative import anchors identically in both phases.
+        let package = match cfg.place(&header.rel_path) {
+            ModPlace::Rooted { dotted, .. } => Some(if header.is_package {
+                dotted
+            } else {
+                dotted
+                    .rsplit_once('.')
+                    .map_or_else(String::new, |(p, _)| p.to_string())
+            }),
+            ModPlace::Loose { .. } => None,
+        };
+        for spec in &header.imports {
+            if !spec.at_module || spec.bound_name() != Some(def.name.as_str()) {
+                continue;
+            }
+            let ImportForm::From {
+                level,
+                module,
+                name,
+                ..
+            } = &spec.form
+            else {
+                continue;
+            };
+            let Some(base) = Self::anchor(package.as_deref(), *level, module) else {
+                continue; // B-08: reaches past the top level; nothing to name
+            };
+            return vec![Fqn::new(format!("{base}#{name}"))];
+        }
+        Vec::new()
     }
 
     fn index_keys(&self, _cfg: &PyProject, _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
@@ -1195,7 +1422,7 @@ impl Resolver<PyLang> for PyResolver {
                     name,
                     alias,
                 } => {
-                    let Some(base) = Self::anchor(&scope, *level, module) else {
+                    let Some(base) = Self::anchor(scope.package.as_deref(), *level, module) else {
                         continue;
                     };
                     let bound = alias.clone().unwrap_or_else(|| name.clone());
@@ -1208,10 +1435,12 @@ impl Resolver<PyLang> for PyResolver {
                         },
                     );
                 }
-                ImportForm::Star { level, module } => match Self::anchor(&scope, *level, module) {
-                    Some(base) => scope.stars.push(base),
-                    None => scope.star_unanchored = true,
-                },
+                ImportForm::Star { level, module } => {
+                    match Self::anchor(scope.package.as_deref(), *level, module) {
+                        Some(base) => scope.stars.push(base),
+                        None => scope.star_unanchored = true,
+                    }
+                }
             }
         }
 
@@ -1260,14 +1489,15 @@ impl Resolver<PyLang> for PyResolver {
     fn link_kinds(&self) -> &'static [RefKind] {
         // F3: `self.m()` resolves against the enclosing class's MRO, which
         // needs the base-class references *resolved first*, and bases live in
-        // other files. Python is therefore not stratifiable into two phases.
+        // other files. Python is therefore not stratifiable into two phases,
+        // and the driver runs this one between them: every `class C(B)` in the
+        // event is resolved against definitions alone, and the relation it
+        // leaves is what `class_member_candidates` walks when it reaches a
+        // class this file does not declare.
         //
-        // The driver does not call this method today, so declaring it changes
-        // nothing on its own — it states the requirement so the gap is a
-        // recorded fact rather than a silent one. Until the driver drives it,
-        // `class_member_candidates` expands bases declared in *this* file
-        // transitively and gives a base declared elsewhere exactly one probe,
-        // recording the shortfall as `UnindexedSupertype`.
+        // A base that placed outside the repository, or at no definition, is
+        // still the floor it always was — the row records that it is short and
+        // the miss below it stays `UnindexedSupertype`.
         &[RefKind::Inherit]
     }
 

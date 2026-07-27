@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -61,6 +61,13 @@ const CANDIDATES: MultimapTableDefinition<&[u8; 16], (&str, &[u8])> =
 const FILES: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("files");
 const DEF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("def_owned");
 const REF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("ref_owned");
+/// File → the supertypes each type it declares was placed at.
+///
+/// Keyed by file, like every other half, because that is what makes it
+/// replaceable: a file re-scanned states its hierarchy afresh, and a file
+/// forgotten takes its rows with it. Two files declaring one identity — legal
+/// under a source-set twin — both keep their row and the reader merges them.
+const SUPERS: TableDefinition<&str, &[u8]> = TableDefinition::new("supers");
 
 type NodeTable<'txn> = redb::Table<'txn, &'static [u8; 16], &'static [u8]>;
 type RefTable<'txn> = redb::Table<'txn, (&'static str, &'static [u8]), &'static [u8]>;
@@ -100,6 +107,29 @@ pub enum NodeRecord {
         fqn: String,
         /// [`crate::model::DefKind`] code.
         kind: u8,
+        /// [`crate::model::DefFacets`] bits: what the declaration *is* beyond
+        /// what a reference can do with it.
+        ///
+        /// Stored because a resolver cannot branch on a fact the graph does
+        /// not give back, and a resolver that has to infer one — "the
+        /// constructor lookup missed, so the supertype must have been an
+        /// interface" — is making a statement about its own search rather
+        /// than about the declaration.
+        ///
+        /// Re-derived from the declaration sites by [`resettle`] alongside
+        /// `kind`, and from the *same* site: two files may declare one FQN
+        /// and disagree, and a record holding one file's kind beside
+        /// another's facets would describe a declaration nobody wrote.
+        facets: u16,
+        /// What this identity forwards to, when it is an alias — a re-export,
+        /// an export rename, a module-level import binding. Empty for every
+        /// ordinary definition, and empty too for an alias key that stands
+        /// for a *set* without forwarding, which is how Java spells an
+        /// overload key.
+        ///
+        /// Re-derived from the declaration sites by [`resettle`], never
+        /// written directly, so forgetting a file forgets its targets.
+        targets: Vec<NodeId>,
         /// Every site declaring it, sorted by `(file, line)`.
         declarations: Vec<DeclSite>,
     },
@@ -137,20 +167,44 @@ pub enum NodeRecord {
 /// itself never moved.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub enum NodePayload {
-    /// A definition, by its [`crate::model::DefKind`] code.
-    Definition(u8),
+    /// A definition, by its [`crate::model::DefKind`] code and its
+    /// [`crate::model::DefFacets`] bits.
+    ///
+    /// The facets are here and not only on the record because this type is
+    /// what wakes probers: `class T` rewritten to `interface T` moves no
+    /// identity at all — the FQN is the same — and a resolver that branched
+    /// on the facet answered a question that just changed. A facet a
+    /// resolver may read and the invalidation index may not see is a warm
+    /// scan that disagrees with a cold one.
+    Definition(u8, u16),
     /// A package, by the name its files declare — what an unaliased import
     /// of it binds.
     Package(Option<String>),
     /// A dependency outside the repository, by its package string.
     External(String),
+    /// An alias, by its [`crate::model::DefKind`] code, its
+    /// [`crate::model::DefFacets`] bits, and what it forwards to.
+    ///
+    /// The targets ride the *site* and not only the record because
+    /// [`resettle`] re-derives a record from the sites that survive: an alias
+    /// whose declaring file is forgotten must lose its targets with it, and a
+    /// record-only field would strand them. Changing where an alias points is
+    /// also a change of meaning under a stable identity, which is exactly
+    /// what this type exists to wake probers on.
+    Alias(u8, u16, Vec<NodeId>),
 }
 
 impl NodeRecord {
     /// The part of this record a resolver's answer can depend on.
     pub fn payload(&self) -> NodePayload {
         match self {
-            NodeRecord::Definition { kind, .. } => NodePayload::Definition(*kind),
+            NodeRecord::Definition {
+                kind,
+                facets,
+                targets,
+                ..
+            } if !targets.is_empty() => NodePayload::Alias(*kind, *facets, targets.clone()),
+            NodeRecord::Definition { kind, facets, .. } => NodePayload::Definition(*kind, *facets),
             NodeRecord::Package { name, .. } => NodePayload::Package(name.clone()),
             NodeRecord::External { package, .. } => NodePayload::External(package.clone()),
         }
@@ -338,6 +392,54 @@ pub struct FileDefs {
     pub nodes: Vec<(NodeId, NodeRecord)>,
 }
 
+/// One type's direct supertypes, as the supertype phase placed them.
+///
+/// The storage mirror of [`crate::lang::Supertypes`], and the reason it is a
+/// record rather than a bare list: "declares nothing above it" and "declares
+/// something this scan could not place" are different facts about the same
+/// empty list, and a resolver reading them as one either invents a complete
+/// closure or refuses to believe one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub struct SuperRecord {
+    /// FQNs of the supertypes that resolved to a definition in this
+    /// repository, in declaration order.
+    pub supers: Vec<String>,
+    /// Whether every supertype the type declares is in `supers`.
+    pub complete: bool,
+}
+
+impl SuperRecord {
+    /// Fold another file's row for the same identity into this one.
+    ///
+    /// Union rather than overwrite, and `complete` is an *and*: a source-set
+    /// twin that names a base the other does not still names it, and a row
+    /// that was short stays short however many files agree with the rest.
+    pub fn merge(&mut self, other: SuperRecord) {
+        for fqn in other.supers {
+            if !self.supers.contains(&fqn) {
+                self.supers.push(fqn);
+            }
+        }
+        self.complete &= other.complete;
+    }
+}
+
+/// Everything the supertype phase writes, one entry per file.
+#[derive(Debug, Clone, Default)]
+pub struct SuperBatch {
+    /// One entry per file the event covers.
+    pub files: Vec<FileSupers>,
+}
+
+/// One file's supertype half.
+#[derive(Debug, Clone, Default)]
+pub struct FileSupers {
+    /// Repo-relative path.
+    pub path: String,
+    /// One row per type the file declares, by identity.
+    pub types: Vec<(NodeId, SuperRecord)>,
+}
+
 /// Everything phase 2 writes, one entry per file, applied in one transaction.
 #[derive(Debug, Clone, Default)]
 pub struct RefBatch {
@@ -439,6 +541,8 @@ pub struct Snapshot {
     pub edges: BTreeSet<(NodeId, NodeId, u8)>,
     /// The candidate index: probed identity → the rows that probed it.
     pub candidates: BTreeMap<NodeId, BTreeSet<RefKey>>,
+    /// The supertype half, by the file that declared it.
+    pub supers: BTreeMap<String, Vec<(NodeId, SuperRecord)>>,
 }
 
 /// Handle on the on-disk graph.
@@ -589,6 +693,105 @@ impl Store {
         Ok(colliding)
     }
 
+    /// Replace the supertype half of every file in the batch, in one
+    /// transaction.
+    ///
+    /// A file with no types to state is *removed* rather than written empty:
+    /// most files declare no type at all, and a row per file would be a table
+    /// the size of the tree carrying nothing. Removal is also what keeps a
+    /// warm store byte-identical to a cold one, which the snapshot oracle
+    /// compares.
+    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            for file in &batch.files {
+                if file.types.is_empty() {
+                    supers
+                        .remove(file.path.as_str())
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+                let mut rows = file.types.clone();
+                rows.sort_by_key(|row| row.0);
+                let bytes = encode(&rows)?;
+                supers
+                    .insert(file.path.as_str(), bytes.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// The whole supertype relation, merged across the files that state it.
+    ///
+    /// The map a resolver probes through [`crate::lang::SymbolProbe`]. Two
+    /// files declaring one identity contribute both their supertypes, and the
+    /// merged row is complete only if both were — the same conservatism the
+    /// per-file record uses, applied where the rows meet.
+    pub fn supertype_index(&self) -> Result<HashMap<NodeId, SuperRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        let mut out: HashMap<NodeId, SuperRecord> = HashMap::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            let rows: Vec<(NodeId, SuperRecord)> = decode(value.value())?;
+            for (id, record) in rows {
+                let merged = merge_supers(out.remove(&id), record);
+                out.insert(id, merged);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The supertype rows these files state, merged, as they stand right now.
+    ///
+    /// Read before the supertype phase writes and again after, and compared:
+    /// a type whose supertypes moved changes what every member lookup below
+    /// it can reach, under an identity that never moved at all. That is the
+    /// same invalidation [`Store::declared_nodes`] performs for a definition's
+    /// payload, asked about the other half of what an identity means.
+    pub fn declared_supers(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<NodeId, SuperRecord>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        let mut out: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
+        for path in paths {
+            let Some(guard) = table.get(path.as_str()).map_err(|e| e.to_string())? else {
+                continue;
+            };
+            let rows: Vec<(NodeId, SuperRecord)> = decode(guard.value())?;
+            for (id, record) in rows {
+                let merged = merge_supers(out.remove(&id), record);
+                out.insert(id, merged);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every definition's canonical name, by identity.
+    ///
+    /// The supertype phase resolves a base-class reference to a `NodeId` and
+    /// has to write down a *name*: a member key is built from the owning
+    /// type's FQN, and a 128-bit hash cannot be turned back into one. Only
+    /// definitions are here — a base that placed at a package or an external
+    /// node is not a type this graph can walk into, and leaving it out is what
+    /// makes the row's `complete` flag false rather than a dangling name.
+    pub fn definition_fqns(&self) -> Result<HashMap<NodeId, String>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = HashMap::new();
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            if let NodeRecord::Definition { fqn, .. } = decode(value.value())? {
+                out.insert(*key.value(), fqn);
+            }
+        }
+        Ok(out)
+    }
+
     /// Replace the phase-2 half of every file in the batch, in one
     /// transaction, and record each file's content hash.
     pub fn apply_refs(&self, batch: &RefBatch) -> Result<(), String> {
@@ -664,6 +867,7 @@ impl Store {
             let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
             let mut def_owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut ref_owned = txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+            let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
             for path in paths {
                 forget_ref_half(
                     &mut nodes, &mut refs, &mut edges, &mut rev, &mut cands, &ref_owned, path,
@@ -675,6 +879,7 @@ impl Store {
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
+                supers.remove(path.as_str()).map_err(|e| e.to_string())?;
                 files.remove(path.as_str()).map_err(|e| e.to_string())?;
             }
         }
@@ -753,9 +958,18 @@ impl Store {
 
     /// The symbol table a resolver probes: one typed entry per identity.
     ///
-    /// Facets are not stored — no shared code branches on them and no
-    /// resolver has yet needed one out of the graph — so every definition
-    /// answers with the empty set rather than a guess.
+    /// Facets come straight off the record. Still nothing *shared* branches
+    /// on them — that is what keeps them a bitset rather than a [`DefKind`]
+    /// variant each — but the owning resolver may, and could not before they
+    /// were stored.
+    ///
+    /// A definition carrying alias targets answers as an alias rather than as
+    /// a definition, because that is what it *is*: the kind says only that a
+    /// re-export was written, and the targets say what it names. One target
+    /// is an [`Entry::Alias`], several an [`Entry::Set`], and none leaves the
+    /// definition speaking for itself — which is how an alias key that
+    /// forwards to nothing, such as Java's overload key, keeps its old
+    /// answer.
     pub fn symbol_entries(&self) -> Result<HashMap<NodeId, Entry>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(NODES).map_err(|e| e.to_string())?;
@@ -764,10 +978,19 @@ impl Store {
             let (key, value) = entry.map_err(|e| e.to_string())?;
             let record: NodeRecord = decode(value.value())?;
             let typed = match record {
-                NodeRecord::Definition { kind, .. } => Entry::Definition {
+                // An alias forwarding to exactly one identity is an
+                // `Entry::Alias`; to several, an `Entry::Set` — a star export
+                // taken from four modules is a name set, not a single
+                // forward, and the resolver has to see the difference to tell
+                // a genuine ambiguity from a chain it can walk.
+                NodeRecord::Definition { targets, .. } if targets.len() == 1 => {
+                    Entry::Alias { target: targets[0] }
+                }
+                NodeRecord::Definition { targets, .. } if targets.len() > 1 => Entry::Set(targets),
+                NodeRecord::Definition { kind, facets, .. } => Entry::Definition {
                     kind: DefKind::from_code(kind)
                         .ok_or_else(|| format!("stored node kind {kind} has no variant"))?,
-                    facets: DefFacets::default(),
+                    facets: DefFacets::from_bits(facets),
                 },
                 NodeRecord::Package { .. } => Entry::Container,
                 NodeRecord::External { .. } => Entry::External,
@@ -867,6 +1090,7 @@ impl Store {
             rows: BTreeMap::new(),
             edges: BTreeSet::new(),
             candidates: BTreeMap::new(),
+            supers: BTreeMap::new(),
         };
         let files = txn.open_table(FILES).map_err(|e| e.to_string())?;
         for entry in files.iter().map_err(|e| e.to_string())? {
@@ -906,6 +1130,13 @@ impl Store {
                 rows.insert(RefKey::join(file, encoded)?);
             }
             snapshot.candidates.insert(*key.value(), rows);
+        }
+        let supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+        for entry in supers.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            snapshot
+                .supers
+                .insert(key.value().to_string(), decode(value.value())?);
         }
         Ok(snapshot)
     }
@@ -962,6 +1193,7 @@ fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.delete_table(FILES).map_err(|e| e.to_string())?;
     txn.delete_table(DEF_OWNED).map_err(|e| e.to_string())?;
     txn.delete_table(REF_OWNED).map_err(|e| e.to_string())?;
+    txn.delete_table(SUPERS).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -976,6 +1208,7 @@ fn create_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.open_table(FILES).map_err(|e| e.to_string())?;
     txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
     txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+    txn.open_table(SUPERS).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -987,6 +1220,15 @@ fn decode<T: Decode<()>>(bytes: &[u8]) -> Result<T, String> {
     let (value, _) = bincode::decode_from_slice(bytes, config::standard())
         .map_err(|e: bincode::error::DecodeError| e.to_string())?;
     Ok(value)
+}
+
+/// Fold one file's supertype row into whatever another file already said.
+fn merge_supers(existing: Option<SuperRecord>, incoming: SuperRecord) -> SuperRecord {
+    let Some(mut held) = existing else {
+        return incoming;
+    };
+    held.merge(incoming);
+    held
 }
 
 fn read_node<T: ReadableTable<&'static [u8; 16], &'static [u8]>>(
@@ -1032,13 +1274,40 @@ fn write_owned<T: Encode>(
 fn resettle(record: &mut NodeRecord) {
     let sites = record.declarations().to_vec();
     match record {
-        NodeRecord::Definition { kind, .. } => {
-            if let Some(k) = sites.iter().find_map(|s| match s.payload {
-                NodePayload::Definition(k) => Some(k),
+        NodeRecord::Definition {
+            kind,
+            facets,
+            targets,
+            ..
+        } => {
+            // Kind and facets come out of one site together: they are two
+            // halves of what a single file said this declaration is, and
+            // taking them from different sites would state a declaration no
+            // file wrote.
+            if let Some((k, f)) = sites.iter().find_map(|s| match s.payload {
+                NodePayload::Definition(k, f) => Some((k, f)),
+                NodePayload::Alias(k, f, _) => Some((k, f)),
                 _ => None,
             }) {
                 *kind = k;
+                *facets = f;
             }
+            // Every surviving site's targets, in site order. A union and not
+            // a first-wins pick: two files may legitimately declare one alias
+            // key — that is what a star export re-exported from two places
+            // is — and dropping either would make the walk miss a name the
+            // corpus really does export.
+            let mut merged: Vec<NodeId> = Vec::new();
+            for site in &sites {
+                if let NodePayload::Alias(_, _, ts) = &site.payload {
+                    for t in ts {
+                        if !merged.contains(t) {
+                            merged.push(*t);
+                        }
+                    }
+                }
+            }
+            *targets = merged;
         }
         NodeRecord::Package { name, .. } => {
             *name = sites.iter().find_map(|s| match &s.payload {
@@ -1209,7 +1478,7 @@ mod tests {
         DeclSite {
             file: file.to_string(),
             line,
-            payload: NodePayload::Definition(0),
+            payload: NodePayload::Definition(0, 0),
         }
     }
 
@@ -1238,6 +1507,8 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#Foo".into(),
                         kind: 0,
+                        facets: 0,
+                        targets: Vec::new(),
                         declarations: vec![site("pkg/a.go", 3)],
                     },
                 )],
@@ -1382,6 +1653,8 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#plat".into(),
                         kind: 0,
+                        facets: 0,
+                        targets: Vec::new(),
                         declarations: vec![site(path, line)],
                     },
                 ),

@@ -11,9 +11,10 @@
 //! Nothing here reads a source file. Manifests are resolver inputs, exactly as
 //! `go.mod` is: the extractor still sees one file and no configuration.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::model::NodeId;
 use crate::track_ecma::json::{Json, parse};
 use crate::track_ecma::lang::ModuleKind;
 
@@ -161,6 +162,15 @@ pub struct EcmaConfig {
     pub ts_projects: Vec<TsProject>,
     /// A fingerprint of every manifest fact above.
     pub digest: Vec<u8>,
+    /// Every module the store holds, by identity, so a star re-export's
+    /// target can be re-entered by path.
+    ///
+    /// Learned from the store between the two phases, never read from a
+    /// manifest, and so deliberately outside [`EcmaConfig::digest`]: it
+    /// changes as the scan learns rather than as the project does. A cold
+    /// scan fills it from what phase 1 has just written, which is why
+    /// following a star works on the first run and not only the second.
+    pub module_paths: HashMap<NodeId, String>,
 }
 
 impl EcmaConfig {
@@ -320,6 +330,7 @@ pub fn build(root: &Path) -> EcmaConfig {
         scopes,
         ts_projects,
         digest,
+        module_paths: HashMap::new(),
     }
 }
 

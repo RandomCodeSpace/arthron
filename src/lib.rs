@@ -94,6 +94,13 @@ pub enum UnresolvedReason {
     /// The project's layout could not be determined, so the failure is
     /// arthron's own inference rather than a missing definition.
     ProjectLayoutUnknown,
+    /// An alias chain re-entered a key it had already visited, or ran past the
+    /// hop ceiling, so the walk was cut.
+    ///
+    /// A distinct reason from `NoMatchingDefinition` on purpose: the lookup
+    /// table was *not* complete — the walk stopped itself — and saying the
+    /// name is absent would blame the corpus for a bound this resolver chose.
+    AliasCycle,
 }
 
 /// The result of resolving a single reference.

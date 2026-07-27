@@ -692,13 +692,19 @@ fn params_from_list(list: &SgNode) -> Params {
 
 /// Facets from a declaration's written modifiers (M-10).
 ///
-/// **A core-shape gap, stated plainly.** JLS §6.6.1 has four access levels
-/// and [`DefFacets`] has one bit for them, so `public` is recorded and
-/// `protected`, package-private and `private` are indistinguishable here. The
-/// consequence is a candidate set that is never *too small* — the resolver
-/// cannot filter a package-private member out of another package's candidate
-/// list — so the failure mode is `AmbiguousOverload`, which is honest, rather
-/// than a wrong edge.
+/// **A core-shape gap, narrowed.** JLS §6.6.1 has four access levels and
+/// [`DefFacets`] has two bits that speak about them: `public` is
+/// [`DefFacets::EXPORTED`] and `private` is [`DefFacets::PRIVATE`], leaving
+/// `protected` and package-private indistinguishable from each other. Those
+/// two are the ones a subtype *does* inherit (§8.2), so the gap costs a
+/// candidate set that is never too small — the resolver cannot filter a
+/// package-private member out of another package's list — and the failure
+/// mode stays `AmbiguousOverload`, which is honest, rather than a wrong edge.
+///
+/// `private` is the level that had to be separated, because it is the one
+/// that changes what a *closure* contains: §8.2 does not inherit a private
+/// member into a subclass at all, so a walk that returned one produced an
+/// edge to a body the subclass cannot name.
 fn modifier_facets(node: &SgNode) -> DefFacets {
     let mut facets = DefFacets::RUNTIME;
     let Some(modifiers) = node.children().find(|c| c.kind() == "modifiers") else {
@@ -707,6 +713,7 @@ fn modifier_facets(node: &SgNode) -> DefFacets {
     for token in modifiers.children() {
         facets = match &*token.kind() {
             "public" => facets.union(DefFacets::EXPORTED),
+            "private" => facets.union(DefFacets::PRIVATE),
             "static" => facets.union(DefFacets::STATIC),
             "abstract" => facets.union(DefFacets::ABSTRACT),
             _ => facets,

@@ -22,22 +22,31 @@
 //!   that lands on the alias reports `AmbiguousOverload`; one that misses has
 //!   found "not declared on this type" and may walk on. See
 //!   [`crate::track_java::fqn`].
-//! * **No supertype-closure phase (H-01).** `link_kinds` is likewise never
-//!   driven, and nothing in the store enumerates a type's supertypes — the
-//!   probe answers one identity at a time. So the closure is walked *only for
-//!   types the file being resolved declares*, where `extends`/`implements` are
-//!   a single-file fact ([`TypeDecl`]). Everything beyond that is
-//!   [`UnresolvedReason::UnindexedSupertype`], which is B-05's own reason and
-//!   is expected to be a large, honest floor rather than a rate to be gamed
-//!   down.
+//! * **The supertype closure is two facts, not one (H-01).** For a type the
+//!   file being resolved declares, `extends`/`implements` are a single-file
+//!   fact ([`TypeDecl`]) and the walk reads them straight off the scope. For
+//!   every other type they come from the driver's supertype phase, which
+//!   resolved that file's `Inherit` references before any member reference ran
+//!   and left the relation in the store — [`JavaResolver::lookup`] walks it
+//!   one hop at a time, so a member declared three files above a receiver is
+//!   found.
+//!
+//!   What stays is genuinely unreachable rather than merely unbuilt: §4.3.2
+//!   puts `java.lang.Object` above every class and no scan of a repository
+//!   indexes it, so a member found nowhere in the closure is still
+//!   [`UnresolvedReason::UnindexedSupertype`] — B-05's own reason, and an
+//!   honest floor rather than a rate to be gamed down.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::lang::{
-    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, Supertypes,
+    SymbolProbe,
 };
-use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id};
+use crate::model::{
+    DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
+};
 use crate::track_java::JavaLang;
 use crate::track_java::extract::{Binding, BindingKind, ErasedType, JavaHeader, TypeDecl};
 use crate::track_java::fqn;
@@ -198,6 +207,19 @@ impl Probes<'_> {
         let id = node_id(JavaLang::DOMAIN, fqn);
         self.seen.push(id);
         self.table.probe(&id)
+    }
+
+    /// Ask the table what a type sits under, recording the *type's* identity.
+    ///
+    /// Recorded through the same log as any other lookup, and that is the
+    /// whole reason this method exists rather than a direct call: what a type
+    /// extends is part of what its identity means, so a reference that read it
+    /// has to be woken when it changes — exactly as one that read a
+    /// definition's kind is.
+    fn supers(&mut self, fqn: &str) -> Option<Supertypes> {
+        let id = node_id(JavaLang::DOMAIN, fqn);
+        self.seen.push(id);
+        self.table.supertypes(&id)
     }
 }
 
@@ -848,6 +870,41 @@ impl JavaResolver {
     /// edge.
     const NAME_PROBE_ARITY: u32 = 8;
 
+    /// The most types one member lookup walks before it gives up.
+    ///
+    /// The `seen` set already makes the walk terminate; this bounds what it
+    /// *costs*, which a cycle guard does not: a hierarchy is as wide as the
+    /// corpus makes it and every reference pays for the whole of it. A walk
+    /// cut here is a short walk, so it reports exactly what an unreadable
+    /// supertype reports — never a wrong edge, and never `NoMatchingDefinition`
+    /// on a search that did not finish. Sixty-four is far above commons-lang's
+    /// deepest closure and cheap to raise if a corpus ever reaches it.
+    const MAX_SUPERTYPES: usize = 64;
+
+    /// The supertypes the store holds for a type this file does not declare,
+    /// as walk entries.
+    ///
+    /// Entered with no nesting path: their own supertypes come from the same
+    /// relation and never from this file, which is the whole difference
+    /// between a closure and a single hop.
+    ///
+    /// Reversed, because the caller's queue is a stack and the relation is in
+    /// declaration order. §8.1.4 puts `extends` before `implements`, so the
+    /// first entry is the superclass, and §8.4.8 has a superclass method beat
+    /// a superinterface's default — reversing here is what pops it first, the
+    /// same order the in-file walk builds by pushing the superclass last.
+    fn indexed_supers(type_fqn: &str, p: &mut Probes<'_>) -> Vec<(String, Option<Vec<String>>)> {
+        let Some(supers) = p.supers(type_fqn) else {
+            return Vec::new();
+        };
+        supers
+            .fqns
+            .into_iter()
+            .rev()
+            .map(|fqn| (fqn.into_string(), None))
+            .collect()
+    }
+
     /// Every declaration of `name` this resolver can see on `owner` and the
     /// supertypes it can read.
     ///
@@ -876,6 +933,7 @@ impl JavaResolver {
                 return group;
             }
         };
+        let start = fqn_start.clone();
         let mut keys = vec![name.to_string()];
         for argc in 0..=Self::NAME_PROBE_ARITY {
             keys.push(fqn::arity_key(name, argc));
@@ -903,6 +961,11 @@ impl JavaResolver {
                         claimed.insert(key.clone());
                         group.ambiguous = true;
                     }
+                    // §8.2 again: a supertype's private member is not a
+                    // member of this type, so it neither claims the key nor
+                    // joins the group whose size decides `AmbiguousOverload`.
+                    Some(Entry::Definition { facets, .. })
+                        if type_fqn != start && facets.contains(DefFacets::PRIVATE) => {}
                     Some(Entry::Definition { .. }) => {
                         claimed.insert(key.clone());
                         group
@@ -912,8 +975,13 @@ impl JavaResolver {
                     _ => {}
                 }
             }
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                group.unindexed = true;
+                break;
+            }
             let Some(path) = local else {
                 group.unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
                 continue;
             };
             let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
@@ -978,6 +1046,17 @@ impl JavaResolver {
     /// not modelled: nothing at a call site says whether the target is
     /// static, so the candidate set can only be too large, and a set that is
     /// too large ends `AmbiguousOverload` rather than at a wrong edge.
+    ///
+    /// A hit on a *class* is the answer as soon as it is met: every non-
+    /// interface the walk can reach sits on the receiver's superclass chain,
+    /// which is linear and drained before any interface, so the first one is
+    /// the nearest one. A hit on an interface is not, and §9.4.1 says why —
+    /// a declaration is inherited only when no subinterface in the same set
+    /// redeclares it, and neither the order two interfaces are written in nor
+    /// which side of a file boundary they came from decides that. Interface
+    /// hits are therefore collected and then filtered by
+    /// [`JavaResolver::most_specific`]; the walk stops early only on the
+    /// receiver's own type, where nothing can be more specific.
     fn lookup(
         &self,
         cfg: &JavaConfig,
@@ -994,7 +1073,8 @@ impl JavaResolver {
         };
         let mut unindexed = false;
         let mut seen: HashSet<String> = HashSet::new();
-        let mut queue: Vec<(String, Option<Vec<String>>)> = vec![(fqn_start, local_start)];
+        let mut inherited: Vec<(String, NodeId)> = Vec::new();
+        let mut queue: Vec<(String, Option<Vec<String>>)> = vec![(fqn_start.clone(), local_start)];
         while let Some((type_fqn, local)) = queue.pop() {
             if !seen.insert(type_fqn.clone()) {
                 continue;
@@ -1005,18 +1085,35 @@ impl JavaResolver {
                         kind: DefKind::Alias,
                         ..
                     }) => return Member::Ambiguous,
+                    // §8.2: a private member is not inherited, so a
+                    // supertype's is not a candidate here at all. Skipped and
+                    // not returned — the walk carries on to whatever the
+                    // subtype really can name, which is what the compiler
+                    // does. On the receiver's own type it is an ordinary
+                    // member and the facet says nothing.
+                    Some(Entry::Definition { facets, .. })
+                        if type_fqn != fqn_start && facets.contains(DefFacets::PRIVATE) => {}
                     Some(Entry::Definition { .. }) => {
                         let id = node_id(JavaLang::DOMAIN, &fqn::member_fqn(&type_fqn, key));
-                        return Member::Found(id);
+                        if type_fqn == fqn_start || !Self::declares_interface(&type_fqn, p) {
+                            return Member::Found(id);
+                        }
+                        inherited.push((type_fqn.clone(), id));
+                        break;
                     }
                     _ => {}
                 }
             }
-            // Only a type this file declares states its own supertypes. For
-            // anything else the closure is unreachable — the probe answers
-            // one identity at a time and nothing enumerates.
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                unindexed = true;
+                break;
+            }
+            // A type this file declares states its own supertypes; for any
+            // other, the supertype phase placed them and this walks on
+            // through what it placed (H-01).
             let Some(path) = local else {
                 unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
                 continue;
             };
             let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
@@ -1039,7 +1136,78 @@ impl JavaResolver {
                 }
             }
         }
-        Member::Missing { unindexed }
+        match Self::most_specific(&inherited, p) {
+            Some(id) => Member::Found(id),
+            None => Member::Missing { unindexed },
+        }
+    }
+
+    /// The one interface declaration a class actually inherits (§9.4.1).
+    ///
+    /// A declaration is struck out when some *other* interface that declared
+    /// the same member extends it: that subinterface overrides it, and only
+    /// the override is inherited. `C implements Alpha, Beta` with
+    /// `Beta extends Alpha` therefore answers `Beta`, whichever order the
+    /// two are written in and whichever side of a file boundary they were
+    /// read from — `javac` on that tree agrees.
+    ///
+    /// Several may survive: unrelated interfaces declaring one signature is
+    /// legal, and §15.12.2.1 leaves the compiler to pick among declarations
+    /// that are equally specific. Walk order picks here, for the same reason
+    /// it always did — the call really does reach a body, and reporting it
+    /// unresolvable would trade a slightly-wrong edge for no edge at all.
+    fn most_specific(hits: &[(String, NodeId)], p: &mut Probes<'_>) -> Option<NodeId> {
+        let (_, first) = hits.first()?;
+        if hits.len() == 1 {
+            return Some(*first);
+        }
+        for (type_fqn, id) in hits {
+            let overridden = hits
+                .iter()
+                .any(|(other, _)| other != type_fqn && Self::reaches_supertype(other, type_fqn, p));
+            if !overridden {
+                return Some(*id);
+            }
+        }
+        Some(*first)
+    }
+
+    /// Whether `sub` reaches `sup` through the stored supertype relation.
+    ///
+    /// Bounded by [`JavaResolver::MAX_SUPERTYPES`] like every other closure
+    /// walk here, and for the same reason: a cut walk answers `false`, which
+    /// keeps the earlier hit rather than inventing a later one.
+    fn reaches_supertype(sub: &str, sup: &str, p: &mut Probes<'_>) -> bool {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue = vec![sub.to_string()];
+        while let Some(type_fqn) = queue.pop() {
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                return false;
+            }
+            if !seen.insert(type_fqn.clone()) {
+                continue;
+            }
+            for (fqn, _) in Self::indexed_supers(&type_fqn, p) {
+                if fqn == sup {
+                    return true;
+                }
+                queue.push(fqn);
+            }
+        }
+        false
+    }
+
+    /// Whether a type this repository declares is an interface (§9.1),
+    /// annotation types included (§9.6).
+    ///
+    /// Probed rather than inferred, so the read is logged: an outcome that
+    /// depends on this facet has to be woken when the facet moves, which is
+    /// what carrying it in [`crate::store::NodePayload`] arranges.
+    fn declares_interface(type_fqn: &str, p: &mut Probes<'_>) -> bool {
+        matches!(
+            p.get(type_fqn),
+            Some(Entry::Definition { facets, .. }) if facets.contains(DefFacets::INTERFACE)
+        )
     }
 
     /// Turn a member lookup into an outcome, with the honest miss.
@@ -1497,16 +1665,31 @@ impl JavaResolver {
                 }
             }
         };
-        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
         // C-05 / §15.9.5.1: `new Iface(){…}` declares an anonymous class that
         // *implements* the interface and extends `Object`, so the constructor
-        // it invokes is `Object#<init>()`. Every in-repo class carries a
-        // constructor at this point — D-10 synthesizes §8.8.9's implicit one
-        // — so a creation site with a class body whose owner is in-repo and
-        // whose constructor is missing has named an interface.
-        if scope
+        // it invokes is `Object#<init>()` and never one of `Iface`'s.
+        //
+        // Which of the two shapes this is turns on a property of the named
+        // type, so it is read off the type: [`DefFacets::INTERFACE`], which
+        // the store now carries. The rule used to be inferred from the search
+        // instead — "every in-repo class carries a constructor (D-10
+        // synthesizes §8.8.9's implicit one), so a missing constructor means
+        // an interface" — and that inference is false for every other way the
+        // lookup can miss. `new Base(1){…}` against a class with no
+        // one-argument constructor, or a creation of a name nothing places at
+        // all, were both answered `java.lang`: a claim about a package,
+        // resting on the resolver's own failure to find something.
+        //
+        // Read before `select` consumes the owner, and only for a site that
+        // writes a class body: a creation with no body cannot be C-05 at all,
+        // and probing anyway would put an identity in this reference's
+        // candidate set that its outcome does not depend on.
+        let on_interface = scope
             .anonymous_body_at(r.span.byte_start, r.span.byte_end)
             .is_some()
+            && self.interface_owner(&owner, p);
+        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
+        if on_interface
             && matches!(
                 settled,
                 Outcome::Unresolved(
@@ -1517,6 +1700,25 @@ impl JavaResolver {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
         }
         settled
+    }
+
+    /// Whether a placed owner is a type this repository declares *as an
+    /// interface* (§9.1), annotation types included (§9.6).
+    ///
+    /// Probed rather than carried on [`Owner`] so the read is logged: the
+    /// outcome now depends on this identity's facets, and a reference that
+    /// read them has to be woken when they move — which is exactly what
+    /// putting them in [`crate::store::NodePayload`] arranges. A type outside
+    /// the repository answers `false`, because nothing in this graph says what
+    /// it is and guessing is what this replaces.
+    fn interface_owner(&self, owner: &Owner, p: &mut Probes<'_>) -> bool {
+        let Owner::InRepo { fqn, .. } = owner else {
+            return false;
+        };
+        matches!(
+            p.get(fqn),
+            Some(Entry::Definition { facets, .. }) if facets.contains(DefFacets::INTERFACE)
+        )
     }
 
     /// I-01 … I-08: every import form, plus a module directive.
@@ -1763,12 +1965,18 @@ impl Resolver<JavaLang> for JavaResolver {
         build_scope(cfg, file)
     }
 
-    /// Empty, and not because Java has nothing to drive to a fixed point:
-    /// H-01's supertype closure is exactly that, and the driver never calls
-    /// this. The in-file closure in [`JavaResolver::lookup`] is what stands
-    /// in, and `UnindexedSupertype` is what the rest honestly costs.
+    /// H-01: `extends` and `implements`. The driver resolves these before any
+    /// member reference, and [`JavaResolver::lookup`] walks the relation it
+    /// leaves — so a member declared three files above the receiver's type is
+    /// reachable, where before it was one probe and a floor.
+    ///
+    /// One kind and not two: a `permits` clause names *subtypes*, and the
+    /// extractor already emits those as plain type uses (see
+    /// `supertype_heads`). Were they `Inherit`, this phase would walk member
+    /// lookup *down* the hierarchy into declarations the receiver's type does
+    /// not have.
     fn link_kinds(&self) -> &'static [RefKind] {
-        &[]
+        &[RefKind::Inherit]
     }
 
     fn resolve(

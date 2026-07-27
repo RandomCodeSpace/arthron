@@ -467,3 +467,288 @@ fn going_live_leaves_go_alone() {
         "Python reports a line of its own",
     );
 }
+
+/// B-12, one hop further than the façade.
+///
+/// `pkg/__init__.py` doing `from .core import Foo` makes `pkg.Foo` a real
+/// declaration site — an attribute of `pkg` at runtime — and the store now
+/// carries what that site forwards to. A reference to `pkg.Foo` therefore
+/// lands on the class in `pkg/core.py` rather than stopping at the façade,
+/// which is the difference between a call graph that crosses a package
+/// boundary and one that stops at its front door.
+#[test]
+fn a_reexport_facade_reaches_the_definition_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pkg/__init__.py", "from .core import Foo\n");
+    write(root, "pkg/core.py", "class Foo:\n    pass\n");
+    write(root, "app.py", "from pkg import Foo\n\nFoo()\n");
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app.py", RefKind::Call, "Foo"),
+        resolved("pkg.core#Foo"),
+        "the alias `pkg#Foo` forwards, and the edge follows it",
+    );
+}
+
+/// E-01 across three files: `self.m()` reaches a member declared two classes
+/// up, each class in its own module.
+///
+/// One class per file is the whole point. A hierarchy inside one file is
+/// linearized from `PyScope::bases` and needs no supertype phase; a base
+/// declared elsewhere used to get exactly one probe and then
+/// `UnindexedSupertype`.
+#[test]
+fn self_dot_m_reaches_a_member_two_modules_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "class A:\n    def base(self):\n        return 1\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        "from .a import A\n\n\nclass B(A):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        concat!(
+            "from .b import B\n",
+            "\n",
+            "\n",
+            "class C(B):\n",
+            "    def go(self):\n",
+            "        return self.base()\n",
+            "\n",
+            "    def gone(self):\n",
+            "        return self.absent()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app/c.py", RefKind::Call, "self.base"),
+        resolved("app.a#A.base"),
+        "the MRO crosses two module boundaries",
+    );
+    // The closure is now complete — `A` declares no base at all — so the miss
+    // is about the member and not about an unreadable supertype. Saying
+    // `UnindexedSupertype` here would name a piece of work that is done.
+    assert_reason(
+        &outcome(&rows, "app/c.py", RefKind::Call, "self.absent"),
+        "NoMatchingDefinition",
+        "a fully enumerated MRO that lacks the name",
+    );
+}
+
+/// A base outside the repository leaves the closure short, and the reason has
+/// to keep saying so: `UnindexedSupertype` is the honest answer whenever one
+/// link in the chain was never indexed.
+#[test]
+fn an_external_base_two_modules_up_stays_unindexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "pyproject.toml",
+        "[project]\nname = \"fixture\"\ndependencies = [\"requests>=2.0\"]\n",
+    );
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "import requests\n\n\nclass A(requests.Session):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        concat!(
+            "from .a import A\n",
+            "\n",
+            "\n",
+            "class C(A):\n",
+            "    def go(self):\n",
+            "        return self.absent()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_reason(
+        &outcome(&rows, "app/c.py", RefKind::Call, "self.absent"),
+        "UnindexedSupertype",
+        "`A` extends a class this scan never indexed",
+    );
+}
+
+/// A cycle in the class graph terminates. Illegal Python, and the store can
+/// still hold it — two modules that import each other's class as a base.
+#[test]
+fn a_cyclic_class_hierarchy_terminates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "from .b import B\n\n\nclass A(B):\n    pass\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        concat!(
+            "from .a import A\n",
+            "\n",
+            "\n",
+            "class B(A):\n",
+            "    def go(self):\n",
+            "        return self.absent()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    match outcome(&rows, "app/b.py", RefKind::Call, "self.absent") {
+        StoredOutcome::Unresolved(_) => {}
+        other => panic!("a class cycle must not invent an edge, got {other:?}"),
+    }
+}
+
+/// Two façades that import from each other terminate, and terminate on a
+/// node. A Python re-export cycle is a real (if pathological) import graph,
+/// not a reason to drop a reference or to hang.
+#[test]
+fn a_facade_cycle_terminates_on_a_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pkg/__init__.py", "from .core import Foo\n");
+    write(root, "pkg/core.py", "from pkg import Foo\n");
+    write(root, "app.py", "from pkg import Foo\n\nFoo()\n");
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    match outcome(&rows, "app.py", RefKind::Call, "Foo") {
+        StoredOutcome::Resolved(_) => {}
+        other => panic!("a façade cycle must still name a node, got {other:?}"),
+    }
+}
+
+/// The diamond §3.3.3 linearizes: `D(B, C)` with `B(A)` and `C(A)`, `C`
+/// overriding a member `A` declares. Python's MRO is `D, B, C, A`, so
+/// `self.m()` inside `D` reaches `C.m`.
+///
+/// A depth-first walk of the bases reaches `A` through `B` before it ever
+/// looks at `C`, and answers `A.m` — a resolved edge to a definition the
+/// interpreter never calls. Every class here lives in its own module, so the
+/// walk crosses the file boundary and reads the supertype relation the
+/// driver placed rather than this file's own `bases`.
+#[test]
+fn a_diamond_resolves_the_member_the_mro_actually_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "class A:\n    def m(self):\n        return 'a'\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        "from .a import A\n\n\nclass B(A):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        "from .a import A\n\n\nclass C(A):\n    def m(self):\n        return 'c'\n",
+    );
+    write(
+        root,
+        "app/d.py",
+        concat!(
+            "from .b import B\n",
+            "from .c import C\n",
+            "\n",
+            "\n",
+            "class D(B, C):\n",
+            "    def go(self):\n",
+            "        return self.m()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app/d.py", RefKind::Call, "self.m"),
+        resolved("app.c#C.m"),
+        "C3 puts C before A, so the override is what the call reaches",
+    );
+}
+
+/// The same linearization decides where `super()` starts: after `D` in `D`'s
+/// own MRO, which is `B, C, A`. `B` declares nothing, so `super().m()` in `D`
+/// reaches `C.m` — the cooperative-`super` case that makes the order load
+/// bearing rather than cosmetic.
+#[test]
+fn super_follows_the_linearization_and_not_the_first_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "class A:\n    def m(self):\n        return 'a'\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        "from .a import A\n\n\nclass B(A):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        "from .a import A\n\n\nclass C(A):\n    def m(self):\n        return 'c'\n",
+    );
+    write(
+        root,
+        "app/d.py",
+        concat!(
+            "from .b import B\n",
+            "from .c import C\n",
+            "\n",
+            "\n",
+            "class D(B, C):\n",
+            "    def m(self):\n",
+            "        return super().m()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app/d.py", RefKind::Call, "super().m"),
+        resolved("app.c#C.m"),
+        "super() starts after D in D's MRO, and C precedes A there",
+    );
+}

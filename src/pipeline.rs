@@ -15,6 +15,13 @@
 //! hits and misses alike — is what names them. Those files are re-read and
 //! re-resolved in the same event, so the store an incremental scan leaves is
 //! the store a cold scan of the same tree would have built.
+//!
+//! Between the two phases sits a third, for the languages that declare one:
+//! the supertype relation. It is the first fact here derived from *two* files
+//! at once — a type's bases live in its own file, and what those bases declare
+//! lives in theirs — so it is stored per file like every other half, and an
+//! edit that moves it wakes the references that read it, by exactly the index
+//! a definition edit uses.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -23,14 +30,14 @@ use std::path::{Path, PathBuf};
 use crate::Outcome;
 use crate::extract_go::GoExtractor;
 use crate::lang::{
-    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, SymbolProbe,
+    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, Supertypes, SymbolProbe,
 };
-use crate::model::{DefKind, Definition, Fqn, NodeId, Reference, node_id, reason_code};
+use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, node_id, reason_code};
 use crate::registry::REGISTRY;
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
-    DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
-    Report, Store, StoredOutcome,
+    DeclSite, DefBatch, FileDefs, FileRefs, FileSupers, NodePayload, NodeRecord, RefBatch, RefKey,
+    RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
 };
 
 /// One file this event re-reads, extracted.
@@ -54,6 +61,29 @@ impl SymbolProbe for HashMap<NodeId, Entry> {
     }
 }
 
+/// The symbol table plus the supertype relation, as phase 2 probes it.
+///
+/// Two maps and not one because they are filled by different phases: the
+/// entries are what phase 1 stored, and the supertypes are what phase 1.5
+/// derived from them. A resolver sees one table and cannot tell.
+struct Symbols {
+    entries: HashMap<NodeId, Entry>,
+    supers: HashMap<NodeId, SuperRecord>,
+}
+
+impl SymbolProbe for Symbols {
+    fn probe(&self, id: &NodeId) -> Option<Entry> {
+        self.entries.get(id).cloned()
+    }
+
+    fn supertypes(&self, id: &NodeId) -> Option<Supertypes> {
+        self.supers.get(id).map(|record| Supertypes {
+            fqns: record.supers.iter().map(Fqn::new).collect(),
+            complete: record.complete,
+        })
+    }
+}
+
 /// One file's phase-2 facts, accumulated while its references resolve.
 #[derive(Default)]
 struct RefAcc {
@@ -68,11 +98,23 @@ struct RefAcc {
 /// files whose content hash differs from the store — an empty store makes
 /// that every file, which is the entire cold/warm distinction.
 ///
-/// The event then widens once, and only once: the identities the changed and
-/// deleted files stopped or started declaring name the rows that probed
-/// them, those rows name their files, and those files are re-resolved too.
-/// Re-reading a file whose bytes did not move cannot change what it
-/// declares, so nothing it does can widen the set again.
+/// The event then widens, at most twice, and never again after that.
+///
+/// First on definitions: the identities the changed and deleted files stopped
+/// or started declaring name the rows that probed them, those rows name their
+/// files, and those files are re-resolved too. Re-reading a file whose bytes
+/// did not move cannot change what it *declares*, so that round cannot widen
+/// itself.
+///
+/// Then on supertypes, for a language that has them. What a type extends is
+/// not in its identity and not in its payload — rewriting an `extends` clause
+/// moves neither — and it decides every member lookup that walks through that
+/// type. So the supertype phase compares the rows it just derived with the
+/// ones it replaced and wakes the files that consulted an identity whose row
+/// moved. That round cannot widen either: which identities exist is settled by
+/// the definition phase, and a file's supertypes are a function of its own
+/// bytes and that set, so a file this round wakes re-derives exactly the rows
+/// it already holds.
 pub fn scan<L: Language>(
     root: &Path,
     db_path: &Path,
@@ -181,6 +223,16 @@ pub fn scan<L: Language>(
     let mut event_paths: Vec<String> = changed.iter().map(|f| f.rel_path.clone()).collect();
     event_paths.extend(deleted.iter().cloned());
     let declared_before = store.declared_nodes(&event_paths)?;
+    // The other half of what an identity means, read at the same moment and
+    // for the same reason: a type whose supertypes move changes what every
+    // member lookup below it reaches, while the type's own id and payload sit
+    // perfectly still. A language with no link kinds has no such half.
+    let links = rs.link_kinds();
+    let mut supers_before = if links.is_empty() {
+        BTreeMap::new()
+    } else {
+        store.declared_supers(&event_paths)?
+    };
 
     store.forget_files(&deleted)?;
 
@@ -222,7 +274,8 @@ pub fn scan<L: Language>(
         .collect::<BTreeSet<NodeId>>()
         .into_iter()
         .collect();
-    let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &changed, &owned)?
+    let covered: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+    let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &covered, &owned)?
         .into_iter()
         .map(|(rel, path)| scan_file(ex, &path, rel))
         .collect::<Result<_, String>>()?;
@@ -239,16 +292,88 @@ pub fn scan<L: Language>(
     let colliding = store.apply_defs(&def_batch)?;
     let merged = mergeable_count(rs, &colliding, &event_defs);
 
-    // Phase 2: resolve every reference in the changed set and in every file
-    // the changed set woke. The container names phase 1 just wrote are part
-    // of the scope every file is resolved against, so the config is
-    // refreshed before any scope is built.
-    let probe = store.symbol_entries()?;
-    rs.learn_containers(&mut cfg, &store.package_names()?);
-    let mut ref_batch = RefBatch {
-        files: Vec::with_capacity(changed.len() + waking.len()),
+    // The container names phase 1 just wrote are part of the scope every file
+    // is resolved against, so the config is refreshed before any scope is
+    // built — by phase 1.5 as much as by phase 2.
+    let mut probe = Symbols {
+        entries: store.symbol_entries()?,
+        supers: HashMap::new(),
     };
-    for file in changed.iter().chain(waking.iter()) {
+    rs.learn_containers(&mut cfg, &store.package_names()?);
+
+    // Phase 1.5: the supertype relation. Runs after the definition phase has
+    // been *applied*, because a base-class name is placed against the
+    // definition table and the changed files' stale definitions are only gone
+    // once `apply_defs` has replaced them — an overlay could add this event's
+    // definitions but never take the previous event's away, and resolving a
+    // base against one of those is a wrong edge rather than a missing one.
+    let mut roused: Vec<ScannedFile<L>> = Vec::new();
+    if !links.is_empty() {
+        // A woken file's bytes did not move and its supertypes still can: the
+        // base it names may have become a definition since it was last
+        // scanned, which is the very reason it was woken.
+        let waking_paths: Vec<String> = waking.iter().map(|f| f.rel_path.clone()).collect();
+        for (id, record) in store.declared_supers(&waking_paths)? {
+            supers_before
+                .entry(id)
+                .and_modify(|held| held.merge(record.clone()))
+                .or_insert(record);
+        }
+        let fqns = store.definition_fqns()?;
+        let mut super_batch = SuperBatch {
+            files: Vec::with_capacity(changed.len() + waking.len()),
+        };
+        for file in changed.iter().chain(waking.iter()) {
+            super_batch
+                .files
+                .push(phase_supers(rs, &cfg, file, &probe, &fqns, links));
+        }
+        let mut supers_now: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
+        for file in &super_batch.files {
+            for (id, record) in &file.types {
+                supers_now
+                    .entry(*id)
+                    .and_modify(|held| held.merge(record.clone()))
+                    .or_insert_with(|| record.clone());
+            }
+        }
+        store.apply_supers(&super_batch)?;
+
+        // The same widening the definition phase performs, for the same
+        // reason and with the same over-approximation: a type whose
+        // supertypes moved changes the answer for member references in files
+        // nobody edited, and the candidate index names them because
+        // consulting the relation at an identity *is* a probe of it.
+        //
+        // This cannot widen a third time. Which identities exist is settled
+        // by `apply_defs`, and a file's supertypes are a function of its own
+        // bytes and that set, so a file this round wakes re-derives exactly
+        // the rows it already holds.
+        let moved: Vec<NodeId> = supers_before
+            .keys()
+            .chain(supers_now.keys())
+            .filter(|id| supers_before.get(*id) != supers_now.get(*id))
+            .copied()
+            .collect::<BTreeSet<NodeId>>()
+            .into_iter()
+            .collect();
+        let mut covered: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+        covered.extend(waking.iter().map(|f| f.rel_path.as_str()));
+        roused = wake_files(&store, &moved, &covered, &owned)?
+            .into_iter()
+            .map(|(rel, path)| scan_file(ex, &path, rel))
+            .collect::<Result<_, String>>()?;
+        // Their phase-1 half is already stored and their bytes did not move,
+        // so there is nothing to re-assert: only their references are stale.
+        probe.supers = store.supertype_index()?;
+    }
+
+    // Phase 2: resolve every reference in the changed set and in every file
+    // this event woke, in either round.
+    let mut ref_batch = RefBatch {
+        files: Vec::with_capacity(changed.len() + waking.len() + roused.len()),
+    };
+    for file in changed.iter().chain(waking.iter()).chain(roused.iter()) {
         ref_batch.files.push(phase_two(rs, &cfg, file, &probe));
     }
     store.apply_refs(&ref_batch)?;
@@ -270,14 +395,15 @@ pub fn scan<L: Language>(
 /// left for a later dedupe: the file is being resolved anyway, and letting it
 /// in a second time would make the event replace the same half twice, which
 /// is correct only for as long as every pass writes a file's half in full.
-/// That is a property to keep, not one to depend on.
-fn wake_files<L: Language>(
+/// That is a property to keep, not one to depend on. `already` is that set,
+/// and it grows as the event does — the supertype phase can widen it a second
+/// time, and the files the first widening chose must not come back.
+fn wake_files(
     store: &Store,
     touched: &[NodeId],
-    changed: &[ScannedFile<L>],
+    already: &HashSet<&str>,
     owned: &BTreeMap<String, PathBuf>,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
-    let already: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
     let mut out = BTreeMap::new();
     for key in store.rows_for(touched)? {
         if already.contains(key.file.as_str()) {
@@ -330,10 +456,20 @@ fn phase_one<L: Language>(
         let id = node_id(L::DOMAIN, fqn.as_str());
         // An empty name means "this file does not say", which is not the
         // same as naming the empty string.
+        let targets: Vec<NodeId> = rs
+            .def_alias_targets(cfg, &file.facts.header, def, probe)
+            .iter()
+            .map(|t| node_id(L::DOMAIN, t.as_str()))
+            // A self-referential alias is not a forward, and storing it would
+            // hand the resolver a one-step cycle to detect at every probe.
+            .filter(|t| *t != id)
+            .collect();
         let payload = if def.kind == DefKind::Module {
             NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
+        } else if targets.is_empty() {
+            NodePayload::Definition(def.kind.code(), def.facets.bits())
         } else {
-            NodePayload::Definition(def.kind.code())
+            NodePayload::Alias(def.kind.code(), def.facets.bits(), targets.clone())
         };
         let declarations = vec![DeclSite {
             file: file.rel_path.clone(),
@@ -349,6 +485,8 @@ fn phase_one<L: Language>(
             _ => NodeRecord::Definition {
                 fqn: fqn.into_string(),
                 kind: def.kind.code(),
+                facets: def.facets.bits(),
+                targets,
                 declarations,
             },
         };
@@ -358,6 +496,86 @@ fn phase_one<L: Language>(
     FileDefs {
         path: file.rel_path.clone(),
         nodes,
+    }
+}
+
+/// One file's supertype half: what each type it declares sits under.
+///
+/// Every type gets a row, including one that declares nothing above it —
+/// "nothing above it" is what makes a member lookup below it a complete
+/// search, and it is not the same fact as this scan holding no opinion.
+///
+/// A supertype reference is filed under its nearest nameable encloser, named
+/// by the same [`Resolver::def_fqn`] that named the definitions, so the
+/// relation and the node it hangs on cannot drift apart. Anything the
+/// resolver did not place at a *definition* — an external base, a package, an
+/// unresolved name — leaves the row short and says so, because a resolver
+/// that reads a short row as a complete one turns "I could not see it" into
+/// "it is not there".
+fn phase_supers<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    file: &ScannedFile<L>,
+    probe: &dyn SymbolProbe,
+    fqns: &HashMap<NodeId, String>,
+    kinds: &[RefKind],
+) -> FileSupers {
+    let mut rows: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
+    let complete = || SuperRecord {
+        supers: Vec::new(),
+        complete: true,
+    };
+    for def in &file.facts.defs {
+        if def.kind != DefKind::Type {
+            continue;
+        }
+        if let Some(fqn) = rs.def_fqn(cfg, &file.facts.header, &def.owner, def, probe) {
+            rows.entry(node_id(L::DOMAIN, fqn.as_str()))
+                .or_insert_with(complete);
+        }
+    }
+    let linking: Vec<&Reference> = file
+        .facts
+        .refs
+        .iter()
+        .filter(|r| kinds.contains(&r.kind))
+        .collect();
+    if linking.is_empty() {
+        return FileSupers {
+            path: file.rel_path.clone(),
+            types: rows.into_iter().collect(),
+        };
+    }
+    let scope = rs.scope(cfg, &file.facts, probe);
+    for r in linking {
+        let Some(encloser) = r.enclosing.as_ref().filter(|e| e.kind == DefKind::Type) else {
+            continue; // not a fact about a type, so no type's closure moves
+        };
+        let Some(src) = encloser
+            .as_definition()
+            .and_then(|d| rs.def_fqn(cfg, &file.facts.header, &d.owner, &d, probe))
+            .map(|fqn| node_id(L::DOMAIN, fqn.as_str()))
+        else {
+            continue; // the subtype is not nameable, so nothing can consult it
+        };
+        let row = rows.entry(src).or_insert_with(complete);
+        match rs.resolve(cfg, &scope, r, probe).outcome {
+            Outcome::Resolved(id) => match fqns.get(&id) {
+                Some(fqn) => {
+                    if !row.supers.contains(fqn) {
+                        row.supers.push(fqn.clone());
+                    }
+                }
+                // Resolved, but not to a definition — a package or a module.
+                // Nothing to walk into, and the closure below is short.
+                None => row.complete = false,
+            },
+            _ => row.complete = false,
+        }
+    }
+    FileSupers {
+        path: file.rel_path.clone(),
+        types: rows.into_iter().collect(),
     }
 }
 

@@ -115,20 +115,69 @@ pub enum Entry {
     Container,
     /// A dependency outside this repository.
     External,
-    /// An alias: the identity forwards to another.
+    /// An alias: the identity forwards to exactly one other.
+    ///
+    /// A re-export, an export rename, a module-level import binding. The
+    /// alias is still a node — a reference really does name it, and the
+    /// barrel's own outgoing edge starts there — so a resolver that cannot
+    /// follow the forward may answer with the alias itself and still be
+    /// telling the truth.
     Alias {
         /// What it forwards to.
         target: NodeId,
     },
-    /// An index key standing for a set of definitions — an overload set, a
-    /// star-export name set.
+    /// An index key standing for several identities: an overload set, or the
+    /// modules a star export forwards.
+    ///
+    /// The members are not all definitions. `export * from './a'` puts a
+    /// *module* here, because the names it supplies are a fact about that
+    /// module rather than about the key — the resolver re-enters it and looks
+    /// the name up there.
     Set(Vec<NodeId>),
+}
+
+/// What one type declares as its direct supertypes, as the supertype phase
+/// placed them.
+///
+/// Direct and not transitive on purpose. A resolver that walks the relation
+/// one hop at a time reads the identity of every type on the way, and those
+/// reads land in the candidate index — which is what makes an edit to a base
+/// class three levels up wake the member reference that depended on it. A
+/// pre-computed closure would answer in one read and leave the intermediate
+/// types unrecorded, so an incremental scan would stop matching a cold one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supertypes {
+    /// The supertypes that resolved to a definition in this repository, in
+    /// the order the type declared them.
+    pub fqns: Vec<Fqn>,
+    /// Whether every supertype the type declares is in [`Supertypes::fqns`].
+    ///
+    /// `false` when one was external, unresolved, or not a definition. The
+    /// closure below this type is then short, and a resolver that reports a
+    /// miss under it must say so rather than claim the name is absent.
+    pub complete: bool,
 }
 
 /// The resolver's view of the symbol table: one lookup per candidate.
 pub trait SymbolProbe {
     /// What the graph holds under this identity, if anything.
     fn probe(&self, id: &NodeId) -> Option<Entry>;
+
+    /// The direct supertypes of a type identity.
+    ///
+    /// `None` when this scan holds no supertype fact for the identity: it is
+    /// not a type, or the language declares no [`Resolver::link_kinds`] and
+    /// the driver therefore ran no supertype phase over it. A type that
+    /// declares no supertype at all answers `Some` with an empty, complete
+    /// list — "nothing above it" and "nothing known about it" are different
+    /// facts, and a resolver that confuses them either invents a complete
+    /// closure or refuses to believe one.
+    ///
+    /// Defaulted so a table that carries no such fact — the plain symbol map
+    /// a unit test hands a resolver — is still a [`SymbolProbe`].
+    fn supertypes(&self, _id: &NodeId) -> Option<Supertypes> {
+        None
+    }
 }
 
 /// A membership-only probe: a set knows presence, not kind.
@@ -212,6 +261,28 @@ pub trait Resolver<L: Language>: Send + Sync {
         probe: &dyn SymbolProbe,
     ) -> Option<Fqn>;
 
+    /// What this definition forwards to, when it is an alias.
+    ///
+    /// Runs in the definition phase, beside [`Resolver::def_fqn`] and with
+    /// the same inputs, because an alias's target is part of what the
+    /// identity *means* and the symbol table has to carry it before any
+    /// reference is resolved against it. That is also why the answer is an
+    /// [`Fqn`] and not an edge: the extractor emitted only raw text — a
+    /// specifier and a name — and turning raw text into an identity is the
+    /// resolver's job in either phase.
+    ///
+    /// Empty for every ordinary definition, and empty too for an alias key
+    /// that stands for a set without forwarding to it.
+    fn def_alias_targets(
+        &self,
+        _cfg: &L::Config,
+        _header: &L::Header,
+        _def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        Vec::new()
+    }
+
     /// Extra keys in the [`NodeId`] keyspace this definition must be
     /// reachable under. Empty when a definition is reachable only by its FQN.
     fn index_keys(&self, cfg: &L::Config, fqn: &Fqn, def: &Definition) -> Vec<NodeId>;
@@ -223,8 +294,23 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// the probe, because import binding is not per-file derivable.
     fn scope(&self, cfg: &L::Config, file: &FileFacts<L>, probe: &dyn SymbolProbe) -> L::Scope;
 
-    /// Reference kinds that must be driven to a fixed point before ordinary
-    /// resolution. Empty when none are.
+    /// Reference kinds the driver resolves *before* ordinary resolution, to
+    /// build the supertype relation every member lookup then reads. Empty
+    /// when the language has none.
+    ///
+    /// The driver runs this phase between the definition phase and the
+    /// reference phase, once, against definitions alone. That is deliberate
+    /// and not a shortcut: a base-class name is placed by the definition
+    /// table, so the relation cannot depend on itself and no fixed point is
+    /// needed. Where a base name *would* need the closure to be placed, the
+    /// phase misses it and marks the type's [`Supertypes::complete`] false —
+    /// an under-approximation that says so, which is the honest shape for a
+    /// bound.
+    ///
+    /// Only a reference whose nearest nameable encloser is the *subtype*
+    /// contributes: the driver files the resolved target under the same
+    /// identity [`Resolver::def_fqn`] gave that encloser, so the relation and
+    /// the node it hangs on cannot drift apart.
     fn link_kinds(&self) -> &'static [RefKind];
 
     /// The only place an [`Outcome`] is produced. Never drops.

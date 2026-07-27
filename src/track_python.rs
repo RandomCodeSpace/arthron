@@ -73,12 +73,15 @@
 //!   unreachable in this track rather than a bucket the corpus fills; when the
 //!   framework rule lands it is the reason the *variable* form must take, and
 //!   a guessed target is never the alternative.
-//! - **Cross-file supertypes.** A base class declared in another file gets one
-//!   probe and no expansion, because the symbol table answers whether an
-//!   identity exists and never what its bases are. The shortfall is
-//!   [`crate::UnresolvedReason::UnindexedSupertype`], and closing it needs the
-//!   phase 1.5 that [`crate::lang::Resolver::link_kinds`] describes and the
-//!   driver does not yet run.
+//! - **Cross-file supertypes.** Closed. The driver resolves this track's
+//!   [`crate::lang::Resolver::link_kinds`] — `class C(B)` — before any member
+//!   reference and leaves the relation in the store, so a base declared in
+//!   another module is expanded transitively rather than probed once. What
+//!   remains is what the relation itself says is short: a base that placed
+//!   outside the repository, or at no definition at all, still leaves
+//!   [`crate::UnresolvedReason::UnindexedSupertype`] below it. A chain that is
+//!   *complete* and lacks the name is `NoMatchingDefinition`, which is the
+//!   same answer an all-in-one-file hierarchy has always given.
 //! - **Star-import chains.** `from x import *` re-exports the names `x`
 //!   itself imported, transitively (B-10), so a source that star-imports in
 //!   turn passes that chain on. The chain is followed one hop: the probes run
@@ -86,8 +89,9 @@
 //!   facts and a membership-only symbol table cannot see the second hop. A
 //!   miss under any star import is therefore
 //!   [`crate::UnresolvedReason::WildcardImport`] and not
-//!   `NoMatchingDefinition` — the weaker claim is the true one, and closing
-//!   the gap needs the same phase 1.5 as the supertype shortfall above.
+//!   `NoMatchingDefinition` — the weaker claim is the true one. Closing it
+//!   needs a module-facts pass of its own: the supertype phase settles what a
+//!   *class* sits under, not what a module re-exports.
 //! - **Re-export chains.** `from pkg import Foo` where `pkg/__init__.py`
 //!   re-exports `Foo` resolves to the alias node in `pkg/__init__.py` — a real
 //!   declaration site, one hop short of the definition, because the store does

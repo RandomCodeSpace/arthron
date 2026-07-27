@@ -272,7 +272,7 @@ impl DefKind {
 
 /// Declaration attributes that no shared `match` branches on.
 ///
-/// A bitset rather than a dependency: eleven flags do not justify a crate,
+/// A bitset rather than a dependency: a dozen flags do not justify a crate,
 /// and the alternative — one [`DefKind`] variant per attribute — makes every
 /// shared `match` language-specific.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -302,6 +302,16 @@ impl DefFacets {
     pub const SYNTHETIC: DefFacets = DefFacets(1 << 9);
     /// A constant enumeration, inlined at every use site.
     pub const CONST_ENUM: DefFacets = DefFacets(1 << 10);
+    /// Visible only inside the declaration that wrote it, and so **not
+    /// inherited** by anything below it.
+    ///
+    /// The negation of [`DefFacets::EXPORTED`] cannot say this: "not public"
+    /// covers three of JLS §6.6.1's four levels, and only the narrowest of
+    /// them takes a member out of a subtype's inherited set. A resolver
+    /// reading this bit removes a candidate; a resolver reading its absence
+    /// learns nothing, which is the honest asymmetry — a language that does
+    /// not set it is a language whose closures are unchanged.
+    pub const PRIVATE: DefFacets = DefFacets(1 << 11);
 
     /// The raw bits, for storage.
     pub fn bits(self) -> u16 {
@@ -535,6 +545,7 @@ pub fn reason_code(r: &UnresolvedReason) -> u8 {
         UnresolvedReason::AmbiguousOverload => 15,
         UnresolvedReason::AmbiguousName => 16,
         UnresolvedReason::ProjectLayoutUnknown => 17,
+        UnresolvedReason::AliasCycle => 18,
     }
 }
 
@@ -559,6 +570,7 @@ pub fn reason_from_code(c: u8) -> Option<UnresolvedReason> {
         15 => UnresolvedReason::AmbiguousOverload,
         16 => UnresolvedReason::AmbiguousName,
         17 => UnresolvedReason::ProjectLayoutUnknown,
+        18 => UnresolvedReason::AliasCycle,
         _ => return None,
     })
 }
@@ -584,6 +596,7 @@ pub fn reason_name(c: u8) -> &'static str {
         15 => "AmbiguousOverload",
         16 => "AmbiguousName",
         17 => "ProjectLayoutUnknown",
+        18 => "AliasCycle",
         _ => "Unknown",
     }
 }
@@ -704,13 +717,13 @@ mod tests {
 
     #[test]
     fn reason_codes_round_trip() {
-        for c in 0u8..=17 {
+        for c in 0u8..=18 {
             let r = reason_from_code(c).expect("code maps to a variant");
             assert_eq!(reason_code(&r), c);
             assert_ne!(reason_name(c), "Unknown");
         }
-        assert_eq!(reason_from_code(18), None);
-        assert_eq!(reason_name(18), "Unknown");
+        assert_eq!(reason_from_code(19), None);
+        assert_eq!(reason_name(19), "Unknown");
     }
 
     #[test]

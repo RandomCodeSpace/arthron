@@ -3,7 +3,8 @@
 
 use std::path::Path;
 
-use arthron::model::{Domain, Lang, NodeId, node_id};
+use arthron::lang::Entry;
+use arthron::model::{DefFacets, DefKind, Domain, Lang, NodeId, node_id};
 use arthron::store::{
     DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
     SCHEMA_VERSION, Store, StoredOutcome,
@@ -16,7 +17,31 @@ use redb::{Database, TableDefinition};
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 fn site(file: &str, line: u32) -> DeclSite {
-    site_of(file, line, NodePayload::Definition(0))
+    site_of(file, line, NodePayload::Definition(0, 0))
+}
+
+/// A definition site that also states what the declaration *is*, beyond its
+/// kind.
+fn faceted_site(file: &str, line: u32, kind: DefKind, facets: DefFacets) -> DeclSite {
+    site_of(
+        file,
+        line,
+        NodePayload::Definition(kind.code(), facets.bits()),
+    )
+}
+
+/// One node a single file declares, with its facets on both halves.
+fn faceted(fqn: &str, file: &str, kind: DefKind, facets: DefFacets) -> (NodeId, NodeRecord) {
+    (
+        go(fqn),
+        NodeRecord::Definition {
+            fqn: fqn.to_string(),
+            kind: kind.code(),
+            facets: facets.bits(),
+            targets: Vec::new(),
+            declarations: vec![faceted_site(file, 2, kind, facets)],
+        },
+    )
 }
 
 fn site_of(file: &str, line: u32, payload: NodePayload) -> DeclSite {
@@ -42,6 +67,8 @@ fn definition(fqn: &str, file: &str, line: u32) -> (NodeId, NodeRecord) {
         NodeRecord::Definition {
             fqn: fqn.to_string(),
             kind: 0,
+            facets: 0,
+            targets: Vec::new(),
             declarations: vec![site(file, line)],
         },
     )
@@ -304,6 +331,86 @@ fn a_row_key_identical_but_for_its_file_is_a_different_row() {
             .contains_key(&key("pkg/c.go", "m/pkg#Caller", "Foo"))
     );
     assert_eq!(after.candidates[&go("m/pkg#Foo")].len(), 1);
+}
+
+#[test]
+fn a_definitions_facets_reach_the_symbol_table() {
+    // The whole of stage 3's premise: a resolver can only branch on a facet
+    // the graph gives back. Before this the store answered every definition
+    // with the empty set, so "this supertype is an interface" was a question
+    // no resolver could ask and every caller had to guess at.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+    let facets = DefFacets::INTERFACE
+        .union(DefFacets::ABSTRACT)
+        .union(DefFacets::EXPORTED);
+    store
+        .apply_defs(&DefBatch {
+            files: vec![FileDefs {
+                path: "src/Iface.java".into(),
+                nodes: vec![faceted(
+                    "com.acme#Iface",
+                    "src/Iface.java",
+                    DefKind::Type,
+                    facets,
+                )],
+            }],
+        })
+        .expect("apply defs");
+
+    assert_eq!(
+        store.symbol_entries().unwrap().get(&go("com.acme#Iface")),
+        Some(&Entry::Definition {
+            kind: DefKind::Type,
+            facets,
+        }),
+    );
+}
+
+#[test]
+fn a_forgotten_twin_takes_its_facets_with_its_kind() {
+    // Facets are re-derived from the surviving sites exactly as the kind is,
+    // and from the *same* site: two files may declare one FQN and disagree,
+    // and a record that took its kind from one and its facets from the other
+    // would describe a declaration neither file wrote. A union would do
+    // precisely that — `Function|STATIC` merged with `Type|INTERFACE` is a
+    // static interface function.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+    let first = DefFacets::STATIC;
+    let second = DefFacets::INTERFACE;
+    store
+        .apply_defs(&DefBatch {
+            files: vec![
+                FileDefs {
+                    path: "pkg/a.go".into(),
+                    nodes: vec![faceted("m/pkg#plat", "pkg/a.go", DefKind::Function, first)],
+                },
+                FileDefs {
+                    path: "pkg/b.go".into(),
+                    nodes: vec![faceted("m/pkg#plat", "pkg/b.go", DefKind::Type, second)],
+                },
+            ],
+        })
+        .expect("apply defs");
+    assert_eq!(
+        store.symbol_entries().unwrap().get(&go("m/pkg#plat")),
+        Some(&Entry::Definition {
+            kind: DefKind::Function,
+            facets: first,
+        }),
+        "sites sort by (file, line), so `pkg/a.go` answers for both halves",
+    );
+
+    store.forget_files(&["pkg/a.go".into()]).expect("forget");
+    assert_eq!(
+        store.symbol_entries().unwrap().get(&go("m/pkg#plat")),
+        Some(&Entry::Definition {
+            kind: DefKind::Type,
+            facets: second,
+        }),
+        "the surviving site answers for both halves, never one each",
+    );
 }
 
 #[test]
