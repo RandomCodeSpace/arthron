@@ -303,24 +303,29 @@ fn phase_one<L: Language>(
             continue; // not nameable, so not a node
         };
         let id = node_id(L::DOMAIN, fqn.as_str());
+        // An empty name means "this file does not say", which is not the
+        // same as naming the empty string.
+        let payload = if def.kind == DefKind::Module {
+            NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
+        } else {
+            NodePayload::Definition(def.kind.code())
+        };
         let declarations = vec![DeclSite {
             file: file.rel_path.clone(),
             line: def.span.line,
+            payload: payload.clone(),
         }];
-        let record = if def.kind == DefKind::Module {
-            // An empty name means "this file does not say", which is not
-            // the same as naming the empty string.
-            NodeRecord::Package {
+        let record = match payload {
+            NodePayload::Package(name) => NodeRecord::Package {
                 import_path: fqn.into_string(),
-                name: (!def.name.is_empty()).then(|| def.name.clone()),
+                name,
                 declarations,
-            }
-        } else {
-            NodeRecord::Definition {
+            },
+            _ => NodeRecord::Definition {
                 fqn: fqn.into_string(),
                 kind: def.kind.code(),
                 declarations,
-            }
+            },
         };
         nodes.push((id, record));
         event_defs.entry(id).or_default().push(def.clone());
@@ -442,10 +447,11 @@ fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
             (
                 id,
                 NodeRecord::External {
-                    package,
+                    package: package.clone(),
                     declarations: vec![DeclSite {
                         file: path.to_string(),
                         line,
+                        payload: NodePayload::External(package),
                     }],
                 },
             )

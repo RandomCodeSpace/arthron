@@ -69,13 +69,22 @@ type CandidateTable<'txn> =
     redb::MultimapTable<'txn, &'static [u8; 16], (&'static str, &'static [u8])>;
 type BytesTable<'txn> = redb::Table<'txn, &'static str, &'static [u8]>;
 
-/// Where a node is declared: one file, one line.
+/// Where a node is declared: one file, one line, and what that file said.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub struct DeclSite {
     /// Repo-relative path of the declaring file.
     pub file: String,
     /// 1-based line of the declaration.
     pub line: u32,
+    /// What *this* file declared the node to be.
+    ///
+    /// A record carries one kind and one name; two files may declare one
+    /// FQN and disagree — build-configuration-exclusive twins are legal Go
+    /// and may declare `plat` as a func in one file and a type in the
+    /// other. Keeping each file's answer beside its site is what lets the
+    /// record be re-derived when a file is forgotten, instead of stranding
+    /// the departing file's answer on the survivor.
+    pub payload: NodePayload,
 }
 
 /// A stored node: something a reference can name.
@@ -126,7 +135,7 @@ pub enum NodeRecord {
 /// definition's kind, the name an unaliased import of a package binds — and
 /// that has to wake the references that probed it even though the identity
 /// itself never moved.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub enum NodePayload {
     /// A definition, by its [`crate::model::DefKind`] code.
     Definition(u8),
@@ -975,29 +984,55 @@ fn write_owned<T: Encode>(
     Ok(())
 }
 
-/// Fold `incoming` into `existing`: declaration sites accumulate.
+/// Re-derive a record's own kind or name from its declaration sites.
 ///
-/// A package name already known is not cleared by a file that declares
-/// none. The narrow limitation this leaves: a file that *drops* its package
-/// clause while a sibling still declares the package leaves the old name in
-/// place until the sibling is re-scanned. That input is not valid Go, and
-/// the fix is to store a name per site rather than to guess.
+/// A record carries one answer; its sites carry what each file actually
+/// said. Taking the answer from the *first* site — sites are sorted by
+/// `(file, line)` — makes it a function of the surviving set alone, which
+/// is the property that matters: a store that forgot a file must hold what
+/// a cold scan of what is left would build, and last-write-wins cannot,
+/// because the last writer may be the file that just went.
+///
+/// A package takes the first site that *names* it: a file with no package
+/// clause declares no name and must not erase the one its siblings declare.
+fn resettle(record: &mut NodeRecord) {
+    let sites = record.declarations().to_vec();
+    match record {
+        NodeRecord::Definition { kind, .. } => {
+            if let Some(k) = sites.iter().find_map(|s| match s.payload {
+                NodePayload::Definition(k) => Some(k),
+                _ => None,
+            }) {
+                *kind = k;
+            }
+        }
+        NodeRecord::Package { name, .. } => {
+            *name = sites.iter().find_map(|s| match &s.payload {
+                NodePayload::Package(n) => n.clone(),
+                _ => None,
+            });
+        }
+        NodeRecord::External { package, .. } => {
+            if let Some(p) = sites.iter().find_map(|s| match &s.payload {
+                NodePayload::External(p) => Some(p.clone()),
+                _ => None,
+            }) {
+                *package = p;
+            }
+        }
+    }
+}
+
+/// Fold `incoming` into `existing`: declaration sites accumulate, and the
+/// record's own answer is re-derived from the set they form.
 fn merge_node(existing: NodeRecord, incoming: NodeRecord) -> NodeRecord {
-    let known_name = match &existing {
-        NodeRecord::Package { name, .. } => name.clone(),
-        _ => None,
-    };
     let mut sites = existing.into_declarations();
     let mut merged = incoming;
-    if let NodeRecord::Package { name, .. } = &mut merged
-        && name.is_none()
-    {
-        *name = known_name;
-    }
     sites.append(merged.declarations_mut());
     sites.sort();
     sites.dedup();
     *merged.declarations_mut() = sites;
+    resettle(&mut merged);
     merged
 }
 
@@ -1009,6 +1044,7 @@ fn upsert_node(table: &mut NodeTable<'_>, id: &NodeId, record: NodeRecord) -> Re
             let sites = fresh.declarations_mut();
             sites.sort();
             sites.dedup();
+            resettle(&mut fresh);
             fresh
         }
     };
@@ -1023,7 +1059,9 @@ fn upsert_node(table: &mut NodeTable<'_>, id: &NodeId, record: NodeRecord) -> Re
 /// declares it any more.
 ///
 /// The conditional is the whole point: file-granular invalidation must not
-/// delete a node another file still declares.
+/// delete a node another file still declares. Neither may it leave the
+/// departing file's answer behind — hence the [`resettle`], which re-derives
+/// the record from the sites that remain.
 fn drop_site(table: &mut NodeTable<'_>, id: &NodeId, path: &str) -> Result<(), String> {
     let Some(mut record) = read_node(table, id)? else {
         return Ok(());
@@ -1032,6 +1070,7 @@ fn drop_site(table: &mut NodeTable<'_>, id: &NodeId, path: &str) -> Result<(), S
     if record.declarations().is_empty() {
         table.remove(id).map_err(|e| e.to_string())?;
     } else {
+        resettle(&mut record);
         let bytes = encode(&record)?;
         table
             .insert(id, bytes.as_slice())
@@ -1136,6 +1175,7 @@ mod tests {
         DeclSite {
             file: file.to_string(),
             line,
+            payload: NodePayload::Definition(0),
         }
     }
 

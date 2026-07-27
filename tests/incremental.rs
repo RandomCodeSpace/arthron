@@ -209,6 +209,27 @@ fn deleting_a_file_lands_the_same_state_as_a_cold_scan() {
 }
 
 #[test]
+fn deleting_one_of_two_files_declaring_one_fqn_lands_a_cold_scans_store() {
+    // Build-configuration-exclusive twins legitimately declare one FQN, and
+    // nothing stops them declaring it as different kinds. The node keeps the
+    // newest writer's kind and accumulates both declaration sites, while
+    // forgetting a file removes its site and nothing else — so deleting the
+    // file whose kind won leaves that kind attached to the survivor, which
+    // never declared it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "go.mod", "module example.com/m\n\ngo 1.22\n");
+    write(root, "p/a_darwin.go", "package p\n\ntype plat struct{}\n");
+    write(root, "p/a_linux.go", "package p\n\nfunc plat() {}\n");
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+
+    fs::remove_file(root.join("p/a_linux.go")).unwrap();
+    scan_go(root, &db).expect("second scan");
+    assert_matches_cold(root, &db);
+}
+
+#[test]
 fn renaming_a_file_lands_the_same_state_as_a_cold_scan() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

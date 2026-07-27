@@ -5,7 +5,7 @@ use std::path::Path;
 
 use arthron::model::{Domain, Lang, NodeId, node_id};
 use arthron::store::{
-    DeclSite, DefBatch, FileDefs, FileRefs, NodeRecord, RefBatch, RefKey, RefRecord,
+    DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
     SCHEMA_VERSION, Store, StoredOutcome,
 };
 use redb::{Database, TableDefinition};
@@ -16,10 +16,20 @@ use redb::{Database, TableDefinition};
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 fn site(file: &str, line: u32) -> DeclSite {
+    site_of(file, line, NodePayload::Definition(0))
+}
+
+fn site_of(file: &str, line: u32, payload: NodePayload) -> DeclSite {
     DeclSite {
         file: file.to_string(),
         line,
+        payload,
     }
+}
+
+/// The site [`package`] declares, for asserting on what a package node kept.
+fn pkg_site(file: &str) -> DeclSite {
+    site_of(file, 1, NodePayload::Package(Some("pkg".to_string())))
 }
 
 fn go(fqn: &str) -> NodeId {
@@ -38,12 +48,16 @@ fn definition(fqn: &str, file: &str, line: u32) -> (NodeId, NodeRecord) {
 }
 
 fn package(import_path: &str, file: &str) -> (NodeId, NodeRecord) {
+    // The site carries what this file declared, and the record's own name is
+    // re-derived from its sites — so a package fixture whose site claimed a
+    // definition would come back out of the store with no name at all.
+    let name = "pkg".to_string();
     (
         go(import_path),
         NodeRecord::Package {
             import_path: import_path.to_string(),
-            name: Some("pkg".to_string()),
-            declarations: vec![site(file, 1)],
+            name: Some(name.clone()),
+            declarations: vec![site_of(file, 1, NodePayload::Package(Some(name)))],
         },
     )
 }
@@ -313,7 +327,7 @@ fn a_node_two_files_declare_survives_one_of_them_being_forgotten() {
     let record = store.node(&go("m/pkg")).unwrap().expect("the package node");
     assert_eq!(
         record.declarations(),
-        [site("pkg/a.go", 1), site("pkg/b.go", 1)],
+        [pkg_site("pkg/a.go"), pkg_site("pkg/b.go")],
     );
 
     store.forget_files(&["pkg/a.go".into()]).expect("forget");
@@ -321,7 +335,7 @@ fn a_node_two_files_declare_survives_one_of_them_being_forgotten() {
         .node(&go("m/pkg"))
         .unwrap()
         .expect("a package one file still declares is still a node");
-    assert_eq!(record.declarations(), [site("pkg/b.go", 1)]);
+    assert_eq!(record.declarations(), [pkg_site("pkg/b.go")]);
 
     // The last declaration goes, and the node with it.
     store.forget_files(&["pkg/b.go".into()]).expect("forget");
