@@ -2,7 +2,7 @@
 //!
 //! Rust is a **tier-2** language here: the extractor emits definitions,
 //! structure and import references, and nothing else. So this resolver
-//! answers exactly one question, 782 times over the measured corpus — *what
+//! answers exactly one question, 1073 times over the measured corpus — *what
 //! does this path name?* — and its rate is an **import-resolution rate**, not
 //! a call-graph one. There is no call site to dispatch and no receiver whose
 //! type would have to be inferred, which is why the two reasons that dominate
@@ -32,26 +32,54 @@
 //! # What the rate cannot reach, recorded rather than left to be found
 //!
 //! - **A name re-exported through a glob.** `pub use x::*` forwards a set
-//!   this scan never enumerates, so a later `use` of one of those names is
-//!   [`UnresolvedReason::WildcardImport`] — the weaker claim, and the true
-//!   one. Saying `NoMatchingDefinition` there would blame the corpus for a
-//!   bound this resolver chose.
+//!   this scan never enumerates, so a later `use` of one of those names
+//!   misses — and it misses as [`UnresolvedReason::NoMatchingDefinition`],
+//!   which is the stronger claim than the truth.
+//!   [`UnresolvedReason::WildcardImport`] is the weaker and truer one, and
+//!   nothing here can reach it: the extractor writes no node for a glob (see
+//!   [`crate::track_rust::extract`], which says why), so the resolver has no
+//!   fact to probe and cannot tell a name a glob forwards from a name that is
+//!   simply absent. Recorded as a shortfall rather than papered over — the
+//!   measured corpus contains no `pub use …::*` at all, so a corpus that has
+//!   one is what would earn the distinction.
 //! - **An alias chain past its first hop.** `pub use crate::a::B;` makes `B`
 //!   a real declaration site in that module, and a `use` naming it resolves
-//!   *to the alias*, one hop short of the definition. Walking *through* one —
+//!   *to the alias*, one hop short of the definition — a truthful answer, and
+//!   the last one this track can give. Walking *through* one —
 //!   `grep::searcher::Searcher`, where `searcher` is `pub extern crate
 //!   grep_searcher as searcher` — would need the alias's FQN, and
-//!   [`crate::lang::Entry::Alias`] carries an identity instead. The corpus
-//!   has one such path.
+//!   [`crate::lang::Entry::Alias`] carries a [`NodeId`] instead: a hash of
+//!   that FQN, with no name left to compose `Searcher` onto. So this track's
+//!   alias-hop ceiling is **zero**, where `track_ecma` and `track_python` set
+//!   sixteen and walk, and a path that continues past an alias runs past the
+//!   ceiling on its first hop — which is the clause of
+//!   [`UnresolvedReason::AliasCycle`] this track fires, never the loop one.
+//!   11 of the corpus's 13 unresolved references are exactly this. Following
+//!   them needs the store to carry an alias's *name* beside its identity,
+//!   which is a design change and not a resolver one.
 //! - **`#[cfg]`.** 40 of the corpus's `mod` declarations are conditional, and
 //!   every one of them is read. The union over configurations is the honest
 //!   superset: a module declared under one platform and not another exists in
 //!   the graph either way, and only a declaration whose file is absent under
 //!   *every* configuration misses.
 //! - **Macro-expanded items.** A `macro_rules!` body that declares items
-//!   declares nothing this track sees, so a path into one is
-//!   [`UnresolvedReason::Generated`] — the definition is produced by a
-//!   generator not expanded here.
+//!   declares nothing this track sees, so a path into one misses — as
+//!   [`UnresolvedReason::NoMatchingDefinition`], not
+//!   [`UnresolvedReason::Generated`]. Separating the two needs evidence that
+//!   a generator produced the name, and the only evidence this scan holds is
+//!   that the name is absent, which is what a genuine miss looks like too.
+//!   Claiming `Generated` on the strength of a nearby `macro_rules!` would
+//!   put a guess in a column that carries facts.
+//! - **A non-`pub` module-scope `use`.** It binds a name in its module all
+//!   the same, and a `super::` path from a child module may name it; the
+//!   extractor binds an alias for `pub` re-exports only (again, see
+//!   [`crate::track_rust::extract`]), so the binding is not in the graph.
+//!   Both of the corpus's [`UnresolvedReason::NoMatchingDefinition`] rows are
+//!   this and nothing else — `crates/printer/src/standard.rs:1751` and
+//!   `crates/regex/src/strip.rs:125`, each a `use super::{…}` naming a
+//!   private import binding in the parent module — so that reason's count is
+//!   two, and not the zero its own definition ("in a corpus that compiles
+//!   this should mean *our* bug") would want.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -227,27 +255,34 @@ fn place(
             }
             (base, &segments[hops..])
         }
+        // Uniform paths: since the 2018 edition a `use` path may also begin at
+        // an item of the module it is written in, and one reference in the
+        // measured corpus does — `use FastMatchResult::*` over an enum beside
+        // it. The local reading is tried *first*, because a crate name reaches
+        // a `use` path through the extern prelude and a prelude loses to a
+        // declaration written in the module: `mod serde;` beside a registry
+        // `serde` dependency binds the module, and so does `mod lib_one;`
+        // beside a `path = "…"` dependency keyed `lib_one`. Taking the
+        // dependency there would be a *wrong* edge counted `Resolved`, which
+        // is worse than a miss.
+        //
+        // It is kept only when it *lands*: a first segment that is neither
+        // anything in this module nor a declared crate is an unknown package,
+        // and saying so is more useful than saying a name is absent.
         TargetRoot::Name => match segments.first() {
             Some(first) if first == "crate" => (scope.crate_root.clone(), &segments[1..]),
-            Some(first) => match crate_base(cfg, scope, first) {
-                Ok(root) => (root, &segments[1..]),
-                // Uniform paths: since the 2018 edition a `use` path may also
-                // begin at an item of the module it is written in, and one
-                // reference in the measured corpus does — `use
-                // FastMatchResult::*` over an enum beside it. Tried only after
-                // the dependency tables have all missed, and only kept when it
-                // *lands*: a first segment that is neither a declared crate
-                // nor anything in this module is an unknown package, and
-                // saying so is more useful than saying a name is absent.
-                Err(placed) => {
-                    let base = join_module(&scope.module, site_chain);
-                    let (uniform, probed) = walk(&base, segments, shape, probe, &mut candidates);
-                    return match uniform {
-                        Placed::Node(fqn) => (Placed::Node(fqn), probed),
-                        _ => (placed, probed),
-                    };
+            Some(first) => {
+                let local = join_module(&scope.module, site_chain);
+                let (uniform, probed) = walk(&local, segments, shape, probe, &mut candidates);
+                candidates = probed;
+                if let Placed::Node(fqn) = uniform {
+                    return (Placed::Node(fqn), candidates);
                 }
-            },
+                match crate_base(cfg, scope, first) {
+                    Ok(root) => (root, &segments[1..]),
+                    Err(placed) => return (placed, candidates),
+                }
+            }
             None => {
                 return (
                     Placed::Missing(UnresolvedReason::ModuleNotFound),
@@ -372,6 +407,11 @@ fn walk(
         // nothing to compose the next segment onto, and a cold scan has not
         // even placed the forward yet. Both shapes stop here, so the reason
         // is the same on a cold store and a warm one.
+        //
+        // This track's alias-hop ceiling is zero, for the reason the module
+        // docs give, so the reason below is `AliasCycle`'s "ran past the hop
+        // ceiling" clause and never its loop one: no chain is walked, so no
+        // chain can re-enter itself.
         let is_alias = matches!(entry, Entry::Alias { .. })
             || matches!(
                 entry,
@@ -662,6 +702,82 @@ mod tests {
 
     fn resolved(fqn: &str) -> Outcome<NodeId, String> {
         Outcome::Resolved(node_id(Domain::Rust, fqn))
+    }
+
+    /// A two-package workspace: the root's library, plus a `path = …` sibling
+    /// keyed `sibling`.
+    fn with_sibling() -> RsWorkspace {
+        use crate::track_rust::project::{Package, Target};
+        RsWorkspace {
+            packages: vec![
+                Package {
+                    dir: String::new(),
+                    name: "app".into(),
+                    deps: [("sibling".to_string(), Dep::Local("crates/sibling".into()))]
+                        .into_iter()
+                        .collect(),
+                },
+                Package {
+                    dir: "crates/sibling".into(),
+                    name: "sibling".into(),
+                    deps: Default::default(),
+                },
+            ],
+            targets: vec![
+                Target {
+                    root: "crates/sibling/src/lib.rs".into(),
+                    package: 1,
+                    kind: TargetKind::Lib,
+                },
+                Target {
+                    root: "src/lib.rs".into(),
+                    package: 0,
+                    kind: TargetKind::Lib,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_path_dependency_is_what_its_name_reaches_when_nothing_local_answers() {
+        assert_eq!(
+            outcome_of(
+                &with_sibling(),
+                "src/lib.rs",
+                "use sibling::Thing;\n",
+                &[
+                    "crates/sibling/src/lib.rs",
+                    "crates/sibling/src/lib.rs#Thing"
+                ],
+                "sibling::Thing",
+            ),
+            resolved("crates/sibling/src/lib.rs#Thing"),
+        );
+    }
+
+    #[test]
+    fn a_module_written_beside_a_path_dependency_of_the_same_name_wins() {
+        // A crate name reaches a `use` path through the extern prelude, and a
+        // prelude loses to a declaration written in the module: rustc binds
+        // `mod sibling;`, and both readings are in the table here, so the
+        // resolver has to choose the same one. Taking the dependency would be
+        // a wrong edge counted `Resolved`, which reads as success.
+        assert_eq!(
+            outcome_of(
+                &with_sibling(),
+                "src/lib.rs",
+                "mod sibling;\nuse sibling::Thing;\n",
+                &[
+                    "src/lib.rs",
+                    "src/lib.rs::sibling",
+                    "src/lib.rs::sibling#Thing",
+                    "crates/sibling/src/lib.rs",
+                    "crates/sibling/src/lib.rs#Thing",
+                ],
+                "sibling::Thing",
+            ),
+            resolved("src/lib.rs::sibling#Thing"),
+        );
     }
 
     #[test]

@@ -36,7 +36,22 @@
 //!   to `x`, which resolves, and it binds no alias here, because the names it
 //!   forwards are a fact about `x` rather than about this file. A later `use`
 //!   of one of those names therefore misses honestly instead of resolving
-//!   through a set nobody built.
+//!   through a set nobody built. Nothing is written for the glob *itself*
+//!   either, which is why the resolver cannot answer such a miss with
+//!   [`crate::UnresolvedReason::WildcardImport`]: with no probeable trace of
+//!   the glob, "a name a glob forwards" and "a name that is absent" are the
+//!   same observation.
+//! - **A non-`pub` module-scope `use` binds nothing.** Only a `pub` one binds
+//!   an alias, because only a `pub` one is a name another module may write a
+//!   path to. It is still a binding *inside* its own module, though, and a
+//!   `use super::Name` from a child module really does reach it — so those
+//!   references miss. Both of the measured corpus's
+//!   [`crate::UnresolvedReason::NoMatchingDefinition`] rows are exactly this
+//!   shape. Binding one unconditionally is not the fix: an alias node is
+//!   reachable by FQN from anywhere, so a private import binding published as
+//!   one would let unrelated modules resolve through a name Rust does not
+//!   give them — a wrong edge in place of a missing one. Visibility has to
+//!   reach the resolver first.
 
 use std::sync::OnceLock;
 

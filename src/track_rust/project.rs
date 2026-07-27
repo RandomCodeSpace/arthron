@@ -187,18 +187,30 @@ impl RsWorkspace {
             }
         }
 
+        // Parsed up front, and all of them, because a member's dependency
+        // table is not readable on its own: `{ workspace = true }` states the
+        // dependency in the workspace root's manifest instead, and that
+        // manifest is another entry of this same set.
+        let tables: BTreeMap<String, toml::Table> = dirs
+            .iter()
+            .map(|dir| {
+                let text =
+                    std::fs::read_to_string(root.join(manifest_path(dir))).unwrap_or_default();
+                (dir.clone(), text.parse().unwrap_or_default())
+            })
+            .collect();
+
         let mut packages = Vec::with_capacity(dirs.len());
         let mut targets = Vec::new();
         for dir in &dirs {
-            let text = std::fs::read_to_string(root.join(manifest_path(dir))).unwrap_or_default();
-            let table: toml::Table = text.parse().unwrap_or_default();
+            let table = &tables[dir];
             let index = packages.len();
             packages.push(Package {
                 dir: dir.clone(),
-                name: str_at(&table, &["package", "name"]).unwrap_or_default(),
-                deps: dependencies(&table, dir),
+                name: str_at(table, &["package", "name"]).unwrap_or_default(),
+                deps: dependencies(table, dir, workspace_deps(&tables, dir)),
             });
-            collect_targets(root, &table, dir, index, &mut targets);
+            collect_targets(root, table, dir, index, &mut targets);
         }
         targets.sort_by(|a, b| (&a.root, a.kind).cmp(&(&b.root, b.kind)));
         targets.dedup_by(|a, b| a.root == b.root);
@@ -418,16 +430,63 @@ fn bool_at(table: &toml::Table, path: &[&str]) -> Option<bool> {
     value.as_bool()
 }
 
+/// The `[workspace.dependencies]` table a manifest inherits from, paired with
+/// the directory its `path = …` entries are relative to.
+///
+/// Cargo resolves `{ workspace = true }` against the *workspace root* — the
+/// nearest manifest at or above the member that carries a `[workspace]`
+/// table — and a `path` stated there is relative to *that* manifest, not to
+/// the member's. `None` when no manifest above declares a workspace, or when
+/// the one that does inherits nothing out.
+///
+/// The nearest ancestor is Cargo's own default and the only rule implemented.
+/// A member that names a different root with `package.workspace = "…"` would
+/// inherit from that one instead; no manifest in the measured corpus does,
+/// and guessing at it blind is what the rest of this module refuses to do.
+fn workspace_deps<'a>(
+    tables: &'a BTreeMap<String, toml::Table>,
+    dir: &str,
+) -> Option<(&'a toml::Table, &'a str)> {
+    let mut at = dir;
+    loop {
+        if let Some((root, table)) = tables.get_key_value(at)
+            && table.contains_key("workspace")
+        {
+            // Workspaces do not nest, so the nearest one is the only one:
+            // a root that states no `[workspace.dependencies]` inherits
+            // nothing out rather than deferring to something further up.
+            let deps = table
+                .get("workspace")
+                .and_then(toml::Value::as_table)
+                .and_then(|w| w.get("dependencies"))
+                .and_then(toml::Value::as_table)?;
+            return Some((deps, root.as_str()));
+        }
+        at = match at.rsplit_once('/') {
+            Some((parent, _)) => parent,
+            None if at.is_empty() => return None,
+            None => "",
+        };
+    }
+}
+
 /// Every dependency a manifest declares, from all four places one can sit:
 /// `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and the
 /// per-target tables under `[target.'cfg(…)']`. All four bind a name a `use`
 /// path may root at, so leaving one out turns a real dependency into an
 /// unknown package.
-fn dependencies(table: &toml::Table, dir: &str) -> BTreeMap<String, Dep> {
+///
+/// `inherited` is what [`workspace_deps`] found, because a spec may state
+/// nothing but `workspace = true` and leave the rest to the workspace root.
+fn dependencies<'a>(
+    table: &'a toml::Table,
+    dir: &'a str,
+    inherited: Option<(&'a toml::Table, &'a str)>,
+) -> BTreeMap<String, Dep> {
     let mut out = BTreeMap::new();
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(t) = table.get(key).and_then(toml::Value::as_table) {
-            collect_deps(t, dir, &mut out);
+            collect_deps(t, dir, inherited, &mut out);
         }
     }
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
@@ -435,7 +494,7 @@ fn dependencies(table: &toml::Table, dir: &str) -> BTreeMap<String, Dep> {
             let Some(cfg) = cfg.as_table() else { continue };
             for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
                 if let Some(t) = cfg.get(key).and_then(toml::Value::as_table) {
-                    collect_deps(t, dir, &mut out);
+                    collect_deps(t, dir, inherited, &mut out);
                 }
             }
         }
@@ -443,17 +502,42 @@ fn dependencies(table: &toml::Table, dir: &str) -> BTreeMap<String, Dep> {
     out
 }
 
-fn collect_deps(table: &toml::Table, dir: &str, out: &mut BTreeMap<String, Dep>) {
+fn collect_deps<'a>(
+    table: &'a toml::Table,
+    dir: &'a str,
+    inherited: Option<(&'a toml::Table, &'a str)>,
+    out: &mut BTreeMap<String, Dep>,
+) {
     for (name, spec) in table {
+        let spec = spec.as_table();
+        // `foo = { workspace = true }` — the ordinary way to name a sibling
+        // crate since Cargo 1.64 — states the `path` nowhere but in the
+        // workspace root's `[workspace.dependencies]`, under this same key.
+        // Reading only the member's own table would leave no `path` to find
+        // and file an in-repository crate as `External`, which sits outside
+        // *both* terms of the resolution rate: the reference would vanish
+        // from the measurement rather than fail in it.
+        let (spec, base) = match spec
+            .and_then(|t| t.get("workspace"))
+            .and_then(toml::Value::as_bool)
+        {
+            Some(true) => match inherited {
+                Some((deps, root)) => (deps.get(name).and_then(toml::Value::as_table), root),
+                // Inheritance with nothing to inherit from. Cargo rejects the
+                // manifest outright, so there is no `path` this could read and
+                // no directory it could be relative to.
+                None => (None, dir),
+            },
+            _ => (spec, dir),
+        };
         // The *key* is the name source code uses. `package = "memmap2"` under
         // the key `memmap` renames the crate, and `use memmap::…` is what the
         // source then writes.
         let dep = match spec
-            .as_table()
             .and_then(|t| t.get("path"))
             .and_then(toml::Value::as_str)
         {
-            Some(path) => Dep::Local(normalise(dir, path)),
+            Some(path) => Dep::Local(normalise(base, path)),
             None => Dep::External,
         };
         out.insert(name.replace('-', "_"), dep);
@@ -606,7 +690,7 @@ log = "0.4"
 "#
         .parse()
         .expect("parses");
-        let deps = dependencies(&table, "crates/searcher");
+        let deps = dependencies(&table, "crates/searcher", None);
         // The rename's key is what `use memmap::…` writes, not `memmap2`.
         assert_eq!(deps.get("memmap"), Some(&Dep::External));
         assert!(!deps.contains_key("memmap2"));
@@ -616,6 +700,78 @@ log = "0.4"
             Some(&Dep::Local("crates/matcher".into()))
         );
         assert_eq!(deps.get("log"), Some(&Dep::External));
+    }
+
+    #[test]
+    fn an_inherited_dependency_reads_the_workspace_roots_spec_and_its_directory() {
+        let member: toml::Table = r#"
+[dependencies]
+lib-one = { workspace = true }
+lib-two = { workspace = true, features = ["x"] }
+log = { workspace = true }
+absent = { workspace = true }
+"#
+        .parse()
+        .expect("parses");
+        let root: toml::Table = r#"
+[workspace.dependencies]
+lib-one = { path = "crates/one" }
+lib-two = { version = "0.1", path = "vendor/two" }
+log = "0.4"
+"#
+        .parse()
+        .expect("parses");
+        let inherited = root
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|w| w.get("dependencies"))
+            .and_then(toml::Value::as_table)
+            .expect("a workspace dependency table");
+        let deps = dependencies(&member, "crates/member", Some((inherited, "")));
+        // The `path` is relative to the workspace root's directory, never to
+        // the member's — reading it against the member would point at
+        // `crates/member/crates/one`, which is nothing.
+        assert_eq!(deps.get("lib_one"), Some(&Dep::Local("crates/one".into())));
+        assert_eq!(deps.get("lib_two"), Some(&Dep::Local("vendor/two".into())));
+        // A registry dependency inherits as one.
+        assert_eq!(deps.get("log"), Some(&Dep::External));
+        // Inheriting a name the root never states is a manifest Cargo
+        // rejects; there is no directory here to invent for it.
+        assert_eq!(deps.get("absent"), Some(&Dep::External));
+        // And with no workspace above at all, the same member states no path.
+        let alone = dependencies(&member, "crates/member", None);
+        assert_eq!(alone.get("lib_one"), Some(&Dep::External));
+    }
+
+    #[test]
+    fn the_workspace_root_is_the_nearest_manifest_at_or_above_that_declares_one() {
+        let mut tables: BTreeMap<String, toml::Table> = BTreeMap::new();
+        tables.insert(
+            String::new(),
+            r#"
+[workspace]
+members = ["crates/one"]
+
+[workspace.dependencies]
+a = { path = "crates/one" }
+"#
+            .parse()
+            .expect("parses"),
+        );
+        tables.insert(
+            "crates/one".to_string(),
+            "[package]\nname = \"one\"\n".parse().expect("parses"),
+        );
+        // From a member, and from the root itself — a root package inherits
+        // from its own `[workspace]` table.
+        for dir in ["crates/one", ""] {
+            let (deps, root) = workspace_deps(&tables, dir).expect("a workspace at or above");
+            assert_eq!(root, "", "from {dir:?}");
+            assert!(deps.contains_key("a"), "from {dir:?}");
+        }
+        // Nothing above declares a workspace: nothing to inherit.
+        tables.remove("");
+        assert!(workspace_deps(&tables, "crates/one").is_none());
     }
 
     #[test]
@@ -632,7 +788,7 @@ d = "1"
 "#
         .parse()
         .expect("parses");
-        let deps = dependencies(&table, "");
+        let deps = dependencies(&table, "", None);
         for name in ["a", "b", "c", "d"] {
             assert!(deps.contains_key(name), "{name} was not read");
         }

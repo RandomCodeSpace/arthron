@@ -282,5 +282,112 @@ fn a_stray_file_no_manifest_reaches_is_its_own_root_rather_than_a_panic() {
     assert_eq!(tally.external, 1, "`std` still leaves the repository");
     // `mod other;` names a module `other.rs` would declare under `loose.rs`,
     // which it does not: each file is its own root when nothing reaches it.
-    assert_eq!(tally.resolved + tally.unresolved_total(), 1);
+    // Asserted as the outcome, not as a sum — a sum of one holds whether the
+    // reference resolved or missed, which is the one thing this test is for.
+    assert_eq!(tally.resolved, 0, "`mod other;` reaches no module");
+    assert_eq!(
+        rows(&db).get(&("loose.rs".to_string(), "mod other".to_string())),
+        Some(&"unresolved:ModuleNotFound".to_string()),
+    );
+}
+
+#[test]
+fn a_dependency_inherited_from_the_workspace_root_still_points_into_the_repository() {
+    // `foo = { workspace = true }` has been the ordinary way to name a
+    // sibling crate since Cargo 1.64, and it states the `path` nowhere but in
+    // the workspace root's `[workspace.dependencies]`. Reading only the
+    // member's own table leaves no `path` to find, and the crate is filed
+    // `External` — outside *both* terms of the resolution rate, so the
+    // reference leaves the measurement rather than failing in it. Written as
+    // a pair, because the inherited spelling and the inline one describe the
+    // same repository and may not disagree.
+    for inherited in [false, true] {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let root = scratch.path();
+        let (root_manifest, member_manifest) = if inherited {
+            (
+                "[workspace]\nmembers = [\"crates/one\", \"crates/two\"]\n\n\
+                 [workspace.dependencies]\nlib-one = { path = \"crates/one\" }\n",
+                "[package]\nname = \"lib-two\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nlib-one = { workspace = true }\n",
+            )
+        } else {
+            (
+                "[workspace]\nmembers = [\"crates/one\", \"crates/two\"]\n",
+                "[package]\nname = \"lib-two\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nlib-one = { path = \"../one\" }\n",
+            )
+        };
+        write(root, "Cargo.toml", root_manifest);
+        write(
+            root,
+            "crates/one/Cargo.toml",
+            "[package]\nname = \"lib-one\"\nedition = \"2024\"\n",
+        );
+        write(root, "crates/one/src/lib.rs", "pub struct Exported;\n");
+        write(root, "crates/two/Cargo.toml", member_manifest);
+        write(root, "crates/two/src/lib.rs", "use lib_one::Exported;\n");
+
+        let db = root.join("graph.redb");
+        let report = scan_rust(root, &db).expect("the workspace scans");
+        let tally = report
+            .per_lang
+            .get(&Lang::Rust.code())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            rows(&db).get(&(
+                "crates/two/src/lib.rs".to_string(),
+                "lib_one::Exported".to_string()
+            )),
+            Some(&"crates/one/src/lib.rs#Exported".to_string()),
+            "inherited = {inherited}",
+        );
+        assert_eq!(tally.external, 0, "inherited = {inherited}");
+    }
+}
+
+#[test]
+fn a_module_written_beside_a_dependency_of_the_same_name_wins_the_way_rustc_gives_it() {
+    // A crate name reaches a `use` path through the extern prelude, and a
+    // prelude loses to a declaration written in the module. So `mod lib_one;`
+    // beside a `path = …` dependency keyed `lib_one` binds the *module*, and
+    // taking the dependency would be a wrong edge counted `Resolved` — worse
+    // than a miss, because a wrong edge still reads as success.
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let root = scratch.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nedition = \"2024\"\n\n\
+         [[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n\n\
+         [dependencies]\nlib_one = { path = \"crates/one\" }\nserde = \"1\"\n",
+    );
+    write(
+        root,
+        "crates/one/Cargo.toml",
+        "[package]\nname = \"lib_one\"\nedition = \"2024\"\n",
+    );
+    write(root, "crates/one/src/lib.rs", "pub struct Local;\n");
+    write(root, "src/lib_one.rs", "pub struct Local;\n");
+    write(root, "src/serde.rs", "pub struct Thing;\n");
+    write(
+        root,
+        "src/main.rs",
+        "mod lib_one;\nmod serde;\n\
+         use lib_one::Local;\nuse serde::Thing;\nfn main() {}\n",
+    );
+
+    let db = root.join("graph.redb");
+    scan_rust(root, &db).expect("the workspace scans");
+    let rows = rows(&db);
+    let got = |raw: &str| {
+        rows.get(&("src/main.rs".to_string(), raw.to_string()))
+            .unwrap_or_else(|| panic!("no row for `{raw}`; rows: {rows:#?}"))
+            .as_str()
+    };
+    // The in-repository dependency, and the registry one, both lose to the
+    // module written beside them.
+    assert_eq!(got("lib_one::Local"), "src/main.rs::lib_one#Local");
+    assert_eq!(got("serde::Thing"), "src/main.rs::serde#Thing");
 }
