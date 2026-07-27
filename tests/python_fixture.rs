@@ -649,3 +649,106 @@ fn a_facade_cycle_terminates_on_a_node() {
         other => panic!("a façade cycle must still name a node, got {other:?}"),
     }
 }
+
+/// The diamond §3.3.3 linearizes: `D(B, C)` with `B(A)` and `C(A)`, `C`
+/// overriding a member `A` declares. Python's MRO is `D, B, C, A`, so
+/// `self.m()` inside `D` reaches `C.m`.
+///
+/// A depth-first walk of the bases reaches `A` through `B` before it ever
+/// looks at `C`, and answers `A.m` — a resolved edge to a definition the
+/// interpreter never calls. Every class here lives in its own module, so the
+/// walk crosses the file boundary and reads the supertype relation the
+/// driver placed rather than this file's own `bases`.
+#[test]
+fn a_diamond_resolves_the_member_the_mro_actually_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "class A:\n    def m(self):\n        return 'a'\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        "from .a import A\n\n\nclass B(A):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        "from .a import A\n\n\nclass C(A):\n    def m(self):\n        return 'c'\n",
+    );
+    write(
+        root,
+        "app/d.py",
+        concat!(
+            "from .b import B\n",
+            "from .c import C\n",
+            "\n",
+            "\n",
+            "class D(B, C):\n",
+            "    def go(self):\n",
+            "        return self.m()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app/d.py", RefKind::Call, "self.m"),
+        resolved("app.c#C.m"),
+        "C3 puts C before A, so the override is what the call reaches",
+    );
+}
+
+/// The same linearization decides where `super()` starts: after `D` in `D`'s
+/// own MRO, which is `B, C, A`. `B` declares nothing, so `super().m()` in `D`
+/// reaches `C.m` — the cooperative-`super` case that makes the order load
+/// bearing rather than cosmetic.
+#[test]
+fn super_follows_the_linearization_and_not_the_first_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app/__init__.py", "");
+    write(
+        root,
+        "app/a.py",
+        "class A:\n    def m(self):\n        return 'a'\n",
+    );
+    write(
+        root,
+        "app/b.py",
+        "from .a import A\n\n\nclass B(A):\n    pass\n",
+    );
+    write(
+        root,
+        "app/c.py",
+        "from .a import A\n\n\nclass C(A):\n    def m(self):\n        return 'c'\n",
+    );
+    write(
+        root,
+        "app/d.py",
+        concat!(
+            "from .b import B\n",
+            "from .c import C\n",
+            "\n",
+            "\n",
+            "class D(B, C):\n",
+            "    def m(self):\n",
+            "        return super().m()\n",
+        ),
+    );
+
+    let db = root.join("graph.redb");
+    scan_python(root, &db).expect("scan succeeds");
+    let rows = outcomes(&db);
+
+    assert_eq!(
+        outcome(&rows, "app/d.py", RefKind::Call, "super().m"),
+        resolved("app.c#C.m"),
+        "super() starts after D in D's MRO, and C precedes A there",
+    );
+}

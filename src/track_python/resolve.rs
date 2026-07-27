@@ -312,21 +312,26 @@ impl PyResolver {
         out.extend(cfg.module_fqns(&scope.root, &join_dotted(module, rest)));
     }
 
-    /// Ordered candidates for a member below a class, own class first and then
-    /// its bases in declaration order (E-01, E-14).
+    /// Ordered candidates for a member below a class: every class in its
+    /// linearization, in linearization order (E-01, E-14).
     ///
-    /// The MRO is walked as far as the graph can be read, which is now both
-    /// sides of a file boundary: bases declared in this file are expanded from
-    /// [`PyScope::bases`], and a base declared elsewhere is expanded from the
-    /// supertype relation the driver's phase 1.5 left in the store (see
+    /// The order is §3.3.3's C3 and not a walk of the bases, because those
+    /// two disagree on exactly the shape inheritance exists for. `D(B, C)`
+    /// with `B(A)` and `C(A)`, `C` overriding a member of `A`: depth-first
+    /// reaches `A` through `B` and answers `A.m`, and the interpreter calls
+    /// `C.m`. Both answers are a resolved edge, so the difference never shows
+    /// up in a rate — it shows up as a call graph that points at a definition
+    /// the program does not run.
+    ///
+    /// The linearization is built as far as the graph can be read, which is
+    /// both sides of a file boundary: bases declared in this file come from
+    /// [`PyScope::bases`], and a base declared elsewhere from the supertype
+    /// relation the driver's phase 1.5 left in the store (see
     /// [`Resolver::link_kinds`] below). What remains unreadable — a base that
     /// resolved outside the repository, or to no definition at all — is
     /// recorded as [`Walk::unindexed_supertype`] rather than smoothed over,
     /// because a chain that is short and a chain that is complete give the
     /// same empty answer and only one of them means the name is absent.
-    // Recursive: the four trailing parameters are this walk's own state, and
-    // threading them reads better than a struct that would exist only here.
-    #[allow(clippy::too_many_arguments)]
     fn class_member_candidates(
         cfg: &PyProject,
         scope: &PyScope,
@@ -335,47 +340,86 @@ impl PyResolver {
         member: &[String],
         out: &mut Vec<String>,
         walk: &mut Walk,
-        seen: &mut HashSet<String>,
-        depth: usize,
     ) {
-        if member.is_empty() || depth > MRO_DEPTH || !seen.insert(class_fqn.to_string()) {
+        if member.is_empty() {
             return;
         }
-        out.push(format!("{class_fqn}.{}", member.join(".")));
+        let joined = member.join(".");
+        let mut memo = HashMap::new();
+        for class in Self::linearize(cfg, scope, probe, class_fqn, walk, &mut memo, 0) {
+            out.push(format!("{class}.{joined}"));
+        }
+    }
+
+    /// The C3 linearization of a class (§3.3.3), starting with the class
+    /// itself.
+    ///
+    /// `memo` is both the answer cache and the cycle guard: the key is
+    /// claimed with a one-element placeholder *before* the bases are read, so
+    /// a hierarchy that names itself as its own ancestor — which no legal
+    /// Python program does — terminates instead of recursing. [`MRO_DEPTH`]
+    /// bounds what the walk costs on a hierarchy that is merely deep.
+    fn linearize(
+        cfg: &PyProject,
+        scope: &PyScope,
+        probe: &dyn SymbolProbe,
+        class_fqn: &str,
+        walk: &mut Walk,
+        memo: &mut HashMap<String, Vec<String>>,
+        depth: usize,
+    ) -> Vec<String> {
+        if let Some(done) = memo.get(class_fqn) {
+            return done.clone();
+        }
+        if depth > MRO_DEPTH {
+            return vec![class_fqn.to_string()];
+        }
+        memo.insert(class_fqn.to_string(), vec![class_fqn.to_string()]);
+        let bases = Self::direct_bases(cfg, scope, probe, class_fqn, walk);
+        let mut lists: Vec<Vec<String>> = bases
+            .iter()
+            .map(|base| Self::linearize(cfg, scope, probe, base, walk, memo, depth + 1))
+            .collect();
+        lists.push(bases);
+        let mut mro = vec![class_fqn.to_string()];
+        mro.extend(c3_merge(lists));
+        memo.insert(class_fqn.to_string(), mro.clone());
+        mro
+    }
+
+    /// The direct bases of a class, in declaration order.
+    ///
+    /// Cross-file the answer is the supertype relation the driver placed, and
+    /// reading it is a read of *this class's* identity — recorded, so that
+    /// rewriting its `class C(B)` line wakes the reference that depended on
+    /// it. In-file it is this scope's own `bases`, each resolved through the
+    /// same name lookup any other reference uses.
+    ///
+    /// An empty list means two different things and the walk flags say which:
+    /// a class that states no base at all is fully enumerated — `object` is
+    /// not a node either way — while a base that could not be read leaves the
+    /// chain short and sets [`Walk::unindexed_supertype`].
+    fn direct_bases(
+        cfg: &PyProject,
+        scope: &PyScope,
+        probe: &dyn SymbolProbe,
+        class_fqn: &str,
+        walk: &mut Walk,
+    ) -> Vec<String> {
         let Some(owner) = class_fqn
             .strip_prefix(&scope.module)
             .and_then(|rest| rest.strip_prefix('#'))
         else {
-            // Declared in another file: its bases are the driver's to state,
-            // and reading them here is a read of *this class's* identity —
-            // recorded, so that rewriting its `class C(B)` line wakes this
-            // reference.
+            // Declared in another file: its bases are the driver's to state.
             let id = node_id(Domain::Python, class_fqn);
             walk.consulted.push(id);
             let Some(supers) = probe.supertypes(&id) else {
                 // No supertype fact at all: not a class this scan indexed.
                 walk.unindexed_supertype = true;
-                return;
+                return Vec::new();
             };
-            // A base that resolved outside the repository leaves the chain
-            // short, and `object` is not a node either way — but a class that
-            // states no base at all *is* fully enumerated, exactly as one
-            // declared in this file with no `bases` entry is.
             walk.unindexed_supertype |= !supers.complete;
-            for base in supers.fqns {
-                Self::class_member_candidates(
-                    cfg,
-                    scope,
-                    probe,
-                    base.as_str(),
-                    member,
-                    out,
-                    walk,
-                    seen,
-                    depth + 1,
-                );
-            }
-            return;
+            return supers.fqns.into_iter().map(Fqn::into_string).collect();
         };
         if !scope.classes.contains(owner) {
             // Not a class this file declares — an attribute of one, or a name
@@ -384,8 +428,9 @@ impl PyResolver {
             // node, but `register.tag` is a member of whatever `mk()`
             // returned.
             walk.opaque_root = true;
-            return;
+            return Vec::new();
         }
+        let mut out = Vec::new();
         for base in scope.bases.get(owner).map(Vec::as_slice).unwrap_or(&[]) {
             if base.root != TargetRoot::Name {
                 walk.unindexed_supertype = true;
@@ -406,20 +451,9 @@ impl PyResolver {
             if base_fqns.is_empty() {
                 walk.unindexed_supertype = true;
             }
-            for base_fqn in base_fqns.iter().filter(|f| f.contains('#')) {
-                Self::class_member_candidates(
-                    cfg,
-                    scope,
-                    probe,
-                    base_fqn,
-                    member,
-                    out,
-                    walk,
-                    seen,
-                    depth + 1,
-                );
-            }
+            out.extend(base_fqns.into_iter().filter(|f| f.contains('#')));
         }
+        out
     }
 
     /// Ordered candidates for a dotted name read in this file's module block.
@@ -452,9 +486,8 @@ impl PyResolver {
                         if rest.is_empty() {
                             out.push(base);
                         } else {
-                            let mut seen = HashSet::new();
                             Self::class_member_candidates(
-                                cfg, scope, probe, &base, rest, out, walk, &mut seen, 0,
+                                cfg, scope, probe, &base, rest, out, walk,
                             );
                         }
                     }
@@ -473,9 +506,8 @@ impl PyResolver {
                             if rest.is_empty() {
                                 out.push(base);
                             } else {
-                                let mut seen = HashSet::new();
                                 Self::class_member_candidates(
-                                    cfg, scope, probe, &base, rest, out, walk, &mut seen, 0,
+                                    cfg, scope, probe, &base, rest, out, walk,
                                 );
                             }
                         }
@@ -574,18 +606,7 @@ impl PyResolver {
         // list can host a member.
         for type_fqn in type_fqns.iter().filter(|f| f.contains('#')) {
             walk.root_typed = true;
-            let mut seen = HashSet::new();
-            Self::class_member_candidates(
-                cfg,
-                scope,
-                probe,
-                type_fqn,
-                &segments[1..],
-                out,
-                walk,
-                &mut seen,
-                0,
-            );
+            Self::class_member_candidates(cfg, scope, probe, type_fqn, &segments[1..], out, walk);
         }
     }
 
@@ -883,7 +904,6 @@ impl PyResolver {
         let class_fqn = format!("{}#{owner}", scope.module);
         let mut candidates = Vec::new();
         let mut walk = Walk::default();
-        let mut seen = HashSet::new();
         Self::class_member_candidates(
             cfg,
             scope,
@@ -892,8 +912,6 @@ impl PyResolver {
             segments,
             &mut candidates,
             &mut walk,
-            &mut seen,
-            0,
         );
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
@@ -974,40 +992,21 @@ impl PyResolver {
                 unresolved(UnresolvedReason::DynamicDispatch)
             };
         }
-        let mut candidates = Vec::new();
+        // §3.3.2.1 starts the lookup *after* this class in the MRO, so the
+        // candidates are its own linearization minus its head — not each base
+        // walked separately, which would put a base's own ancestor ahead of
+        // the sibling base that overrides it and answer with a definition the
+        // interpreter skips.
+        let class_fqn = format!("{}#{owner}", scope.module);
         let mut walk = Walk::default();
-        for base in bases {
-            if base.root != TargetRoot::Name {
-                walk.unindexed_supertype = true;
-                continue;
-            }
-            let mut base_fqns = Vec::new();
-            let mut base_walk = Walk::default();
-            Self::name_candidates(
-                cfg,
-                scope,
-                probe,
-                &base.segments,
-                &mut base_fqns,
-                &mut base_walk,
-            );
-            walk.unindexed_supertype |= base_walk.unindexed_supertype;
-            walk.consulted.append(&mut base_walk.consulted);
-            for base_fqn in base_fqns.iter().filter(|f| f.contains('#')) {
-                let mut seen = HashSet::new();
-                Self::class_member_candidates(
-                    cfg,
-                    scope,
-                    probe,
-                    base_fqn,
-                    segments,
-                    &mut candidates,
-                    &mut walk,
-                    &mut seen,
-                    0,
-                );
-            }
-        }
+        let mut memo = HashMap::new();
+        let mro = Self::linearize(cfg, scope, probe, &class_fqn, &mut walk, &mut memo, 0);
+        let joined = segments.join(".");
+        let candidates: Vec<String> = mro
+            .iter()
+            .skip(1)
+            .map(|class| format!("{class}.{joined}"))
+            .collect();
         let mut probed = Vec::new();
         if let Some(id) = Self::probe_in_order(probe, &candidates, &mut probed) {
             return with_walk(Outcome::Resolved(id), &walk, probed);
@@ -1068,6 +1067,39 @@ impl PyResolver {
                 );
                 with_walk(outcome, &walk, probed)
             }
+        }
+    }
+}
+
+/// C3's `merge` (§3.3.3): repeatedly take the head of the first list whose
+/// head appears in no *tail*, and strike it from every list.
+///
+/// A hierarchy with no consistent linearization is a `TypeError` the
+/// interpreter raises at class creation, so no program that runs reaches the
+/// fallback. When it is reached anyway — a broken file, or a chain this build
+/// read only half of — the first remaining head is taken instead. That keeps
+/// the answer ordered and the loop finite, which is a resolver's obligation
+/// on input that cannot run; deciding the program is invalid is not.
+///
+/// Striking the head from *every* list rather than only from the fronts it
+/// leads is the same thing for a consistent hierarchy — a good head is in no
+/// tail — and it is what guarantees progress when the hierarchy is not.
+fn c3_merge(mut lists: Vec<Vec<String>>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        lists.retain(|list| !list.is_empty());
+        let Some(first) = lists.first() else {
+            return out;
+        };
+        let head = lists
+            .iter()
+            .map(|list| &list[0])
+            .find(|cand| !lists.iter().any(|other| other[1..].contains(cand)))
+            .unwrap_or(&first[0])
+            .clone();
+        out.push(head.clone());
+        for list in &mut lists {
+            list.retain(|class| *class != head);
         }
     }
 }
