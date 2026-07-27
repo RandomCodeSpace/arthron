@@ -1,62 +1,63 @@
-//! The Java track. **Extractor built; resolver not.** Owns `.java` once it
-//! goes live.
+//! The Java track. **Live.** Owns `.java`.
 //!
-//! [`TRACK`] is still registered with `scan: None`, so the driver runs nothing
-//! for Java, [`crate::registry::Track::owns_extension`] answers `false` for
-//! `java`, and a scan of a tree full of Java sources reads none of them. The
-//! seam exists; the resolver does not.
+//! [`TRACK`] is registered with `scan: Some(scan_java)`, so the driver runs
+//! Java, [`crate::registry::Track::owns_extension`] answers `true` for `java`,
+//! and a scan of a tree of Java sources reads every one of them.
 //!
 //! # What is here
 //!
-//! [`JavaLang`] and [`extract`] — one file in, [`crate::model::Definition`]
-//! and [`crate::model::Reference`] records out, never an edge. The design
-//! contract is the Java case study; every case identifier in this track's
-//! comments (`P-01`, `I-04`, `M-05`, `X-02`, …) names a numbered case in it.
+//! [`JavaLang`], [`extract`] and [`resolve`] — one file in,
+//! [`crate::model::Definition`] and [`crate::model::Reference`] records out,
+//! never an edge; then one resolver that owns every link. The design contract
+//! is the Java case study; every case identifier in this track's comments
+//! (`P-01`, `I-04`, `M-05`, `X-02`, …) names a numbered case in it.
 //!
-//! # Going live
+//! # The three layers
 //!
-//! Every step below happens inside this file or under `src/track_java/`.
-//! Nothing in `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another
-//! track is touched, which is what lets this track and the EcmaScript and
-//! Python tracks be built at the same time without conflicting.
+//! 1. [`fqn`] — the FQN grammar, the one place a Java identity string is
+//!    built. Both the extractor (for overload grouping) and the resolver (for
+//!    every node name and every candidate) read it, so a definition's identity
+//!    and the candidate a reference probes for it cannot drift apart.
+//! 2. [`extract`] — [`extract::JavaExtractor`], one file in, records out. It
+//!    is handed a path and a source string and nothing else, so it has nothing
+//!    it could link against.
+//! 3. [`resolve`] — [`resolve::JavaResolver`], the only place a Java
+//!    [`crate::Outcome`] is produced. Every reference ends `Resolved`,
+//!    `External`, or `Unresolved(reason)`; nothing is dropped, and a reference
+//!    whose *type* name is bound by a type parameter or a local class ends
+//!    `Unresolved(LocalBinding)`, which is reported beside `External` and
+//!    excluded from both terms of the rate.
 //!
-//! 1. ~~**Submodules, nested.**~~ Done: [`extract`].
-//! 2. ~~**A [`crate::lang::Language`] impl.**~~ Done: [`JavaLang`].
-//! 3. ~~**An extractor** implementing [`crate::lang::Extractor`].~~ Done:
-//!    [`extract::JavaExtractor`].
-//! 4. **A resolver** implementing [`crate::lang::Resolver`]: the one place a
-//!    Java [`crate::Outcome`] is produced, and the only layer that links.
-//!    Every reference ends `Resolved`, `External`, or `Unresolved(reason)`;
-//!    nothing is dropped, and a reference bound by a local, parameter or
-//!    catch parameter ends `Unresolved(LocalBinding)`, which is reported
-//!    beside `External` and excluded from both terms of the rate. It fills in
-//!    [`JavaScope`] and [`JavaConfig`], which are empty until it exists.
-//! 5. **Honest reasons.** Java's floor is real: a call on a receiver whose
-//!    type is not stated in the file is
-//!    [`crate::UnresolvedReason::NeedsReceiverType`] or
-//!    [`crate::UnresolvedReason::NeedsTypeInference`], and a large such floor
-//!    is the correct first measurement. It is not to be moved into
-//!    `LocalBinding` or `External`, both of which leave the rate's
-//!    denominator and would raise the number without linking anything.
-//! 6. **An entry point** with the shape of [`crate::registry::TrackScan`]:
-//!    `fn scan_java(root, db) -> Result<Report, String>`, whose body is
-//!    `crate::pipeline::scan::<JavaLang>(root, db, &JavaExtractor, &JavaResolver)`.
-//! 7. **Flip the switch here**: `scan: None` becomes `scan: Some(scan_java)`.
-//!    That single edit is what enables the language.
-//! 8. **A baseline.** Record `baselines/<corpus>.txt` with `arthron gate
-//!    --rebase` and let the ratchet hold it. The rate is Java's own — it is
-//!    never added to Go's, and no combined number is ever reported.
+//! # Honest reasons
+//!
+//! Java's floor is real: a call on a receiver whose type is not stated in the
+//! file is [`crate::UnresolvedReason::NeedsReceiverType`] or
+//! [`crate::UnresolvedReason::NeedsTypeInference`], a member of an
+//! in-repository type that no indexed supertype declares is
+//! [`crate::UnresolvedReason::UnindexedSupertype`], and a large such floor is
+//! the correct first measurement. None of it is to be moved into
+//! `LocalBinding` or `External`, both of which leave the rate's denominator
+//! and would raise the number without linking anything.
 //!
 //! Two tracks live at once share one store. That is safe because a scan
 //! forgets only files carrying an extension the running track owns, and
 //! extension ownership is a partition (see [`Lang::for_extension`]); Java's
-//! rows survive a Go scan and Go's survive a Java one.
+//! rows survive a Go scan and Go's survive a Java one. The manifest fence is
+//! per-language and Java's config digest is empty, so Java never invalidates
+//! anything.
 
 pub mod extract;
+pub mod fqn;
+pub mod resolve;
+
+use std::path::Path;
 
 use crate::lang::Language;
 use crate::model::{Domain, Lang};
 use crate::registry::Track;
+use crate::store::Report;
+
+pub use resolve::{JavaConfig, JavaResolver, JavaScope};
 
 /// Java, as the shared driver sees it.
 pub struct JavaLang;
@@ -81,7 +82,7 @@ impl Language for JavaLang {
     /// is real `.java` on disk and the members it declares are named from
     /// hand-written source. `skip_dirs` is a flat list of names and cannot
     /// state an exception, so the build-output rule belongs in the resolver's
-    /// `owns_file`, which sees the whole path.
+    /// [`crate::lang::Resolver::owns_file`], which sees the whole path.
     fn skip_dirs() -> &'static [&'static str] {
         &[".gradle", ".mvn", ".git"]
     }
@@ -91,32 +92,25 @@ impl Language for JavaLang {
     type Config = JavaConfig;
 }
 
-/// The Java resolver's per-file scope.
+/// Scan a repository's Java. The entry point [`TRACK`] holds.
 ///
-/// Empty until the resolver lands. What goes here is the case study's §9
-/// scope chain: compilation unit (five import forms, the implicit
-/// `java.lang.*`, same-package) → type (+ supertype closure, member types,
-/// enclosing chain) → method → block.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct JavaScope;
+/// The body is the shared driver, instantiated: nothing Java-specific happens
+/// here, because everything Java-specific is behind the two trait objects.
+pub fn scan_java(root: &Path, db_path: &Path) -> Result<Report, String> {
+    crate::pipeline::scan::<JavaLang>(
+        root,
+        db_path,
+        &extract::JavaExtractor,
+        &resolve::JavaResolver,
+    )
+}
 
-/// Java's project layout: source roots, declared packages, and — optionally —
-/// a dependency oracle.
-///
-/// Empty until the resolver lands. `deps` is optional by design (B-04): Maven
-/// POMs are statically parseable, Gradle build scripts are programs and are
-/// not, so a Java project may have no `go.mod` equivalent at all and
-/// `External` is decided by absence from the indexed definition set rather
-/// than by a manifest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct JavaConfig;
-
-/// Java's registration. `scan: None`: the track owns no file and contributes
-/// nothing to a scan until the resolver lands.
+/// Java's registration. Live: the track owns `.java` and contributes its own
+/// rate, which is never added to Go's.
 pub const TRACK: Track = Track {
     name: "java",
     langs: &[Lang::Java],
-    scan: None,
+    scan: Some(scan_java),
 };
 
 #[cfg(test)]
@@ -124,13 +118,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn java_is_registered_but_not_live() {
-        assert!(!TRACK.is_enabled());
+    fn java_is_live_and_owns_only_java_files() {
+        assert!(TRACK.is_enabled());
         assert_eq!(TRACK.langs, [Lang::Java]);
-        // The language owns `.java`; the disabled track does not, so no walk
-        // reads one.
         assert!(Lang::Java.owns_extension("java"));
-        assert!(!TRACK.owns_extension("java"));
+        assert!(TRACK.owns_extension("java"));
+        // Extension ownership is a partition: the Java track never reads a
+        // file another track owns, which is what lets both be live at once.
+        assert!(!TRACK.owns_extension("go"));
     }
 
     #[test]

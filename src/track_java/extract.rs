@@ -29,7 +29,7 @@
 //! occurrence-ordered, so using it as a NodeId input would make inserting one
 //! anonymous class re-key every later one).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::lang::{Extractor, FileFacts};
@@ -39,6 +39,7 @@ use crate::model::{
 };
 use crate::sg::{Rules, SgNode, SourceTree, span_of};
 use crate::track_java::JavaLang;
+use crate::track_java::fqn;
 
 /// The embedded Java extraction rules.
 const JAVA_RULES: &str = include_str!("../rules/java.yml");
@@ -161,6 +162,23 @@ pub struct Binding {
     pub end: u32,
 }
 
+/// One type declared in this file, with the supertypes it names.
+///
+/// H-01: member lookup cannot start until `extends`/`implements` have been
+/// resolved, and the *names* are a single-file fact. Recording them here is
+/// how the resolver reaches an inherited member without an edge table it
+/// cannot read — see [`crate::track_java::resolve`] for how far that gets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeDecl {
+    /// Nesting path, outermost first: `["Outer", "Inner"]`.
+    pub path: Vec<String>,
+    /// The `extends` clause of a class (§8.1.4), as written and split on `.`.
+    pub superclass: Option<Vec<String>>,
+    /// `implements` on a class (§8.1.5), or `extends` on an interface
+    /// (§9.1.3) — both name supertypes whose members are inherited.
+    pub interfaces: Vec<Vec<String>>,
+}
+
 /// Per-file Java facts only the Java resolver reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JavaHeader {
@@ -183,6 +201,16 @@ pub struct JavaHeader {
     pub imports: Vec<Import>,
     /// Every name this file binds, with extents and declared types (X-02).
     pub bindings: Vec<Binding>,
+    /// Every type this file declares, in declaration order.
+    pub types: Vec<TypeDecl>,
+    /// Every [`crate::track_java::fqn::overload_group`] two or more callables
+    /// in this file compete for (M-01).
+    ///
+    /// A Java type's members are all declared in one compilation unit, so
+    /// this is complete for every type in it — which is what lets
+    /// [`crate::lang::Resolver::def_fqn`] choose between the arity key and
+    /// the signature form without seeing another file.
+    pub overloaded: HashSet<String>,
 }
 
 impl JavaHeader {
@@ -1106,13 +1134,26 @@ fn head_of<'r>(node: &SgNode<'r>) -> Option<SgNode<'r>> {
     }
 }
 
-/// The head nodes of a type declaration's `extends` and `implements` clauses.
+/// Which clause named a supertype. §8.4.8's asymmetry — a class does not
+/// inherit `static` methods from a superinterface — and `super.m()`'s meaning
+/// both turn on the difference, so the two are kept apart rather than merged
+/// into one list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperRole {
+    /// A class's `extends` (§8.1.4): the single superclass.
+    Superclass,
+    /// `implements` (§8.1.5), or an interface's `extends` (§9.1.3).
+    Interface,
+}
+
+/// The head nodes of a type declaration's `extends` and `implements` clauses,
+/// each with the clause that named it.
 ///
 /// H-01: these are the references member lookup cannot start without, so they
 /// are [`RefKind::Inherit`] rather than plain type uses. `permits` is
 /// deliberately absent — it names *subtypes*, which is a type use and not a
 /// supertype.
-fn supertype_heads<'r>(node: &SgNode<'r>) -> Vec<SgNode<'r>> {
+fn supertype_heads<'r>(node: &SgNode<'r>) -> Vec<(SuperRole, SgNode<'r>)> {
     let mut heads = Vec::new();
     let clauses = node.children().filter(|c| {
         matches!(
@@ -1121,13 +1162,18 @@ fn supertype_heads<'r>(node: &SgNode<'r>) -> Vec<SgNode<'r>> {
         )
     });
     for clause in clauses {
+        let role = if clause.kind() == "superclass" {
+            SuperRole::Superclass
+        } else {
+            SuperRole::Interface
+        };
         for child in clause.children().filter(|c| c.is_named()) {
             let entries: Vec<SgNode> = if child.kind() == "type_list" {
                 child.children().filter(|c| c.is_named()).collect()
             } else {
                 vec![child]
             };
-            heads.extend(entries.iter().filter_map(head_of));
+            heads.extend(entries.iter().filter_map(head_of).map(|h| (role, h)));
         }
     }
     heads
@@ -1191,18 +1237,18 @@ fn synthesize_members(node: &SgNode, owner: &[String], defs: &mut Vec<Definition
             }
             // §8.10.4: the canonical constructor, unless one is written —
             // compact or explicit, both of which have the component arity.
-            let types: Vec<String> = node
+            let component_types: Vec<String> = node
                 .field("parameters")
                 .map(|p| params_from_list(&p).types)
                 .unwrap_or_default();
-            if !declares_constructor_arity(&body, types.len()) {
+            if !declares_constructor_arity(&body, component_types.len()) {
                 let name = owner.last().cloned().unwrap_or_default();
                 defs.push(synthetic(
                     DefKind::Constructor,
                     &name,
-                    &owner[..owner.len().saturating_sub(1)],
+                    owner,
                     exported,
-                    types,
+                    component_types,
                     header_span,
                 ));
             }
@@ -1254,7 +1300,7 @@ fn synthesize_members(node: &SgNode, owner: &[String], defs: &mut Vec<Definition
                 defs.push(synthetic(
                     DefKind::Constructor,
                     &name,
-                    &owner[..owner.len().saturating_sub(1)],
+                    owner,
                     DefFacets::default(),
                     Vec::new(),
                     header_span,
@@ -1270,7 +1316,7 @@ fn synthesize_members(node: &SgNode, owner: &[String], defs: &mut Vec<Definition
                 defs.push(synthetic(
                     DefKind::Constructor,
                     &name,
-                    &owner[..owner.len().saturating_sub(1)],
+                    owner,
                     exported,
                     Vec::new(),
                     header_span,
@@ -1290,6 +1336,7 @@ fn collect_definitions(
     node: &SgNode,
     defs: &mut Vec<Definition>,
     inherit_heads: &mut HashSet<(usize, usize)>,
+    types: &mut Vec<TypeDecl>,
 ) {
     let kind = node.kind();
     if is_type_declaration(&kind) {
@@ -1299,9 +1346,18 @@ fn collect_definitions(
         let (Some(owner), Some(name)) = (owner_chain(node), node.field("name")) else {
             return;
         };
-        for head in supertype_heads(node) {
+        let mut decl = TypeDecl::default();
+        for (role, head) in supertype_heads(node) {
             let range = head.range();
             inherit_heads.insert((range.start, range.end));
+            let segments = name_segments(&head);
+            if segments.is_empty() {
+                continue;
+            }
+            match role {
+                SuperRole::Superclass => decl.superclass = Some(segments),
+                SuperRole::Interface => decl.interfaces.push(segments),
+            }
         }
         let name = name.text().to_string();
         let mut facets = modifier_facets(node)
@@ -1323,6 +1379,8 @@ fn collect_definitions(
         ));
         let mut own = owner;
         own.push(name);
+        decl.path.clone_from(&own);
+        types.push(decl);
         synthesize_members(node, &own, defs);
         return;
     }
@@ -1926,6 +1984,71 @@ fn collect_references(
     }
 }
 
+/// Split every callable this file declares into overload groups, name the
+/// groups that are shared, and give each one a node.
+///
+/// M-01: two overloads are two definitions and must be two nodes. M-04: a
+/// call site knows only the callee's name and argument count, so the identity
+/// it can construct is `type.name/argc` — which two overloads of one arity
+/// cannot both own. So neither takes it: both fall back to the signature form
+/// and the shared key becomes a [`DefKind::Alias`] node standing for the set.
+/// A call landing on it has found an ambiguity to report rather than a target
+/// to guess at.
+///
+/// Complete per type by construction: §7.6 and §8.1 put every member of a
+/// type in one compilation unit, so a file sees every declaration that could
+/// compete for one of its own types' keys.
+///
+/// Returns the shared keys, which [`crate::lang::Resolver::def_fqn`] reads to
+/// decide which form a definition's FQN takes.
+fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for def in defs.iter() {
+        if let Some(key) = group_key(def) {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    let shared: HashSet<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(key, _)| key)
+        .collect();
+    let mut aliases: Vec<Definition> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for def in defs.iter() {
+        let Some(key) = group_key(def) else { continue };
+        if !shared.contains(&key) || !seen.insert(key) {
+            continue;
+        }
+        aliases.push(java_def(
+            DefKind::Alias,
+            fqn::callable_of(def).key(),
+            def.owner.clone(),
+            DeclSpace::Value,
+            DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
+            None,
+            def.span,
+        ));
+    }
+    defs.extend(aliases);
+    shared
+}
+
+/// The overload group a definition competes in, or `None` when it is not a
+/// callable and competes in none.
+fn group_key(def: &Definition) -> Option<String> {
+    if !matches!(def.kind, DefKind::Method | DefKind::Constructor) {
+        return None;
+    }
+    let callable = fqn::callable_of(def);
+    Some(fqn::overload_group(
+        &def.owner,
+        &callable.name,
+        callable.count(),
+        callable.varargs,
+    ))
+}
+
 /// Extract all facts from one Java source file.
 ///
 /// Two passes over one match list, and the order is load-bearing: a
@@ -1943,6 +2066,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<JavaLang> {
     let mut defs: Vec<Definition> = Vec::new();
     let mut refs: Vec<Reference> = Vec::new();
     let mut inherit_heads: HashSet<(usize, usize)> = HashSet::new();
+    let mut types: Vec<TypeDecl> = Vec::new();
     let mut container_span = Span {
         byte_start: 0,
         byte_end: 0,
@@ -1952,8 +2076,10 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<JavaLang> {
     for (_, node) in &matched {
         collect_header(node, &mut header, &mut refs, &mut container_span);
         collect_bindings(node, &mut header.bindings);
-        collect_definitions(node, &mut defs, &mut inherit_heads);
+        collect_definitions(node, &mut defs, &mut inherit_heads, &mut types);
     }
+    header.types = types;
+    header.overloaded = mark_overload_sets(&mut defs);
     for (_, node) in &matched {
         collect_references(source, node, &header, &inherit_heads, &mut refs);
     }
