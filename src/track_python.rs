@@ -116,7 +116,7 @@ pub mod stdlib;
 pub const TRACK: Track = Track {
     name: "python",
     langs: &[Lang::Python],
-    scan: Some(resolve::scan_python),
+    scan: Some(resolve::scan_python_with),
 };
 
 #[cfg(test)]

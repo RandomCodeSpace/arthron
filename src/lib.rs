@@ -2,8 +2,9 @@
 //! the references between them into a verified graph.
 //!
 //! **Status: early.** Scanning, the [`gate`] and the [`query`] surface all
-//! work, across every tier-1 language; the watch surface is not built yet.
-//! The API is pre-1.0 and will change.
+//! work, across every tier-1 language, in a report for a person or a [`json`]
+//! document for a script; the watch surface is not built yet. The API is
+//! pre-1.0 and will change.
 //!
 //! # The contract
 //!
@@ -168,8 +169,10 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
     Some(resolved as f64 / total as f64)
 }
 
+pub mod config;
 pub mod extract_go;
 pub mod gate;
+pub mod json;
 pub mod lang;
 pub mod model;
 pub mod pipeline;

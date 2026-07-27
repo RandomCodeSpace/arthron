@@ -100,11 +100,22 @@ impl Language for JavaLang {
 /// The body is the shared driver, instantiated: nothing Java-specific happens
 /// here, because everything Java-specific is behind the two trait objects.
 pub fn scan_java(root: &Path, db_path: &Path) -> Result<Report, String> {
+    scan_java_with(root, db_path, &crate::config::FileFilter::none())
+}
+
+/// [`scan_java`] under a repository's include/exclude globs. What [`TRACK`]
+/// holds.
+pub fn scan_java_with(
+    root: &Path,
+    db_path: &Path,
+    filter: &crate::config::FileFilter,
+) -> Result<Report, String> {
     crate::pipeline::scan::<JavaLang>(
         root,
         db_path,
         &extract::JavaExtractor,
         &resolve::JavaResolver,
+        filter,
     )
 }
 
@@ -113,7 +124,7 @@ pub fn scan_java(root: &Path, db_path: &Path) -> Result<Report, String> {
 pub const TRACK: Track = Track {
     name: "java",
     langs: &[Lang::Java],
-    scan: Some(scan_java),
+    scan: Some(scan_java_with),
 };
 
 #[cfg(test)]

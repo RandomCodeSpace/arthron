@@ -6,11 +6,13 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use arthron::config::Config;
 use arthron::gate::{
     Baseline, Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
 };
+use arthron::json;
 use arthron::model::{Lang, reason_name};
-use arthron::pipeline::scan_repo;
+use arthron::pipeline::scan_repo_with;
 use arthron::query::{
     DEFAULT_IMPACT_DEPTH, Impact, Match, NameIndex, NodeKind, RefSite, definition, impact,
     references,
@@ -46,12 +48,20 @@ struct Cli {
 enum Command {
     /// Build (or refresh) the graph for a repository and print per-language
     /// resolution rates.
+    ///
+    /// Settings may also come from `arthron.toml` at the repository root; a
+    /// flag given here wins over the file.
+    #[command(after_long_help = json::CONFIG_HELP)]
     Scan {
         /// Repository root.
         path: PathBuf,
-        /// Database file (default: <path>/.arthron/graph.redb).
+        /// Database file (default: the config's `db`, else
+        /// <path>/.arthron/graph.redb).
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Print one JSON document instead of the report.
+        #[arg(long, long_help = json::HELP)]
+        json: bool,
     },
     /// Scan a corpus and compare its counts against a committed baseline.
     ///
@@ -59,6 +69,13 @@ enum Command {
     /// or I/O error. The baseline's `corpus` and `commit` fields are
     /// provenance: printed, never verified — a vendored corpus snapshot
     /// carries no git metadata to check them against.
+    ///
+    /// `arthron.toml` at the corpus root is read for its globs and its
+    /// `[tracks]` table, so a gate measures the file set a scan measures. Its
+    /// `db` key is deliberately ignored: a gate is only meaningful against a
+    /// cold store, and a config that pointed it at a warm one would move the
+    /// number without moving the graph.
+    #[command(after_long_help = json::CONFIG_HELP)]
     Gate {
         /// Corpus root.
         path: PathBuf,
@@ -84,6 +101,9 @@ enum Command {
         /// Defaults to the value already in the baseline file, or "unknown".
         #[arg(long)]
         commit: Option<String>,
+        /// Print one JSON document instead of the report and the verdict.
+        #[arg(long, long_help = json::HELP)]
+        json: bool,
     },
     /// Ask the stored graph about a name.
     ///
@@ -100,9 +120,13 @@ enum Command {
     Query {
         #[command(subcommand)]
         verb: QueryVerb,
-        /// Database file (default: .arthron/graph.redb).
+        /// Database file (default: the config's `db`, else
+        /// .arthron/graph.redb).
         #[arg(long, global = true)]
         db: Option<PathBuf>,
+        /// Print one JSON document instead of the report.
+        #[arg(long, global = true, long_help = json::HELP)]
+        json: bool,
     },
 }
 
@@ -132,25 +156,7 @@ enum QueryVerb {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { path, db } => {
-            let db_path = db.unwrap_or_else(|| path.join(".arthron/graph.redb"));
-            if let Some(parent) = db_path.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                eprintln!("arthron: creating {}: {e}", parent.display());
-                return ExitCode::FAILURE;
-            }
-            match scan_repo(&path, &db_path) {
-                Ok(report) => {
-                    print_report(&report);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("arthron: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Command::Scan { path, db, json } => run_scan(&path, db, json),
         Command::Gate {
             path,
             language,
@@ -158,6 +164,7 @@ fn main() -> ExitCode {
             db,
             rebase,
             commit,
+            json,
         } => run_gate(
             &path,
             &language,
@@ -165,10 +172,80 @@ fn main() -> ExitCode {
             db.as_deref(),
             rebase,
             commit.as_deref(),
+            json,
         ),
-        Command::Query { verb, db } => {
-            let db_path = db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB));
-            run_query(&verb, &db_path)
+        Command::Query { verb, db, json } => {
+            // The query has no path argument, so its configuration is the
+            // working directory's — the repository you are standing in, which
+            // is the one whose graph `.arthron/graph.redb` names.
+            let root = PathBuf::from(".");
+            let config = match Config::load(&root) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("arthron: {e}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            };
+            let db_path = db
+                .or_else(|| config.db_path(&root))
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DB));
+            run_query(&verb, &db_path, json)
+        }
+    }
+}
+
+/// Build or refresh a repository's graph and report what it now holds.
+fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
+    let config = match Config::load(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    // The flag wins over the file: a person naming a store on the command
+    // line has said something more specific than the repository has.
+    let db_path = db
+        .or_else(|| config.db_path(path))
+        .unwrap_or_else(|| path.join(".arthron/graph.redb"));
+    if let Some(parent) = db_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("arthron: creating {}: {e}", parent.display());
+        return ExitCode::FAILURE;
+    }
+    match scan_repo_with(path, &db_path, &config) {
+        Ok(report) => {
+            if as_json {
+                print_json(&json::scan(&report), ExitCode::SUCCESS)
+            } else {
+                print_report(&report);
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print one JSON document and exit with `answered`, or say why it could not
+/// be rendered.
+///
+/// A serialisation failure is [`EXIT_USAGE`] and not a silent empty line: the
+/// run measured something, and a caller must never read "no output" as "no
+/// findings". `answered` is the code the *answer* carries — a gate failure or
+/// an ambiguous query is a document and a non-zero exit at the same time.
+fn print_json(doc: &serde_json::Value, answered: ExitCode) -> ExitCode {
+    match json::render(doc) {
+        Ok(text) => {
+            println!("{text}");
+            answered
+        }
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            ExitCode::from(EXIT_USAGE)
         }
     }
 }
@@ -205,6 +282,7 @@ fn run_gate(
     db: Option<&Path>,
     rebase: bool,
     commit: Option<&str>,
+    as_json: bool,
 ) -> ExitCode {
     let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
         let known: Vec<&str> = Lang::ALL.iter().map(|l| l.name()).collect();
@@ -213,6 +291,16 @@ fn run_gate(
             known.join(", ")
         );
         return ExitCode::from(EXIT_USAGE);
+    };
+    // The corpus's own config decides the file set and which tracks run, so
+    // the gate measures what a scan of the same tree measures. Its `db` key is
+    // not read: see the command's help.
+    let config = match Config::load(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("arthron: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
     };
     // Read the baseline before scanning. A malformed file is a usage error,
     // and finding that out after a multi-minute scan helps nobody.
@@ -267,14 +355,16 @@ fn run_gate(
     // Every enabled track, then one language's tally out of the result: the
     // gate is per language and a baseline names the one it measures, so
     // scanning the whole registry never turns into gating a combined number.
-    let report = match scan_repo(path, &db_path) {
+    let report = match scan_repo_with(path, &db_path, &config) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    print_report(&report);
+    if !as_json {
+        print_report(&report);
+    }
 
     let tally = report
         .per_lang
@@ -288,27 +378,85 @@ fn run_gate(
         unresolved: tally.unresolved_total(),
     };
 
+    let shown = baseline_path.display().to_string();
     if rebase {
-        write_baseline(
+        let written = match write_baseline(
             baseline_path,
             path,
             lang,
             &measured,
             existing.as_ref(),
             commit,
-        )
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("arthron: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        if as_json {
+            let doc = json::gate(&json::GateOutput {
+                language: lang.name(),
+                baseline_path: &shown,
+                corpus: &written.corpus,
+                commit: &written.commit,
+                report: &report,
+                // The baseline side of a re-base is what was just written,
+                // which is the measured side. Reporting the counts it
+                // replaced would read as a comparison that never happened.
+                baseline: written.counts,
+                measured,
+                verdict: None,
+            });
+            print_json(&doc, ExitCode::SUCCESS)
+        } else {
+            println!(
+                "gate: wrote {shown} at {} ({})",
+                written.commit, written.corpus,
+            );
+            ExitCode::SUCCESS
+        }
     } else {
         let Some(baseline) = existing else {
-            eprintln!(
-                "arthron: {} does not exist; record it with --rebase",
-                baseline_path.display(),
-            );
+            eprintln!("arthron: {shown} does not exist; record it with --rebase",);
             return ExitCode::from(EXIT_USAGE);
         };
-        report_verdict(&baseline, &measured, baseline_path)
+        let verdict = evaluate(&baseline, &measured);
+        if as_json {
+            let doc = json::gate(&json::GateOutput {
+                language: lang.name(),
+                baseline_path: &shown,
+                corpus: &baseline.corpus,
+                commit: &baseline.commit,
+                report: &report,
+                baseline: baseline.counts,
+                measured,
+                verdict: Some(&verdict),
+            });
+            print_json(&doc, verdict_exit(&verdict))
+        } else {
+            report_verdict(&baseline, &verdict, &measured, baseline_path)
+        }
     }
 }
 
+/// The exit code a verdict carries.
+///
+/// One function so the two output modes cannot disagree about whether a run
+/// passed — the JSON document and the exit code are read by the same script.
+fn verdict_exit(verdict: &GateVerdict) -> ExitCode {
+    match verdict {
+        GateVerdict::Pass { .. } => ExitCode::SUCCESS,
+        GateVerdict::Fail(_) => ExitCode::from(EXIT_GATE_FAILED),
+        GateVerdict::Error(_) => ExitCode::from(EXIT_USAGE),
+    }
+}
+
+/// Write the baseline this run measured, and hand back what was written.
+///
+/// Returns the record rather than an exit code so both output modes report the
+/// same file: the text line and the JSON document are rendered from this one
+/// value instead of each re-deriving it.
 fn write_baseline(
     baseline_path: &Path,
     corpus: &Path,
@@ -316,15 +464,14 @@ fn write_baseline(
     measured: &Counts,
     existing: Option<&Baseline>,
     commit: Option<&str>,
-) -> ExitCode {
+) -> Result<Baseline, String> {
     // A baseline of all zeros looks exactly as authoritative as a correct
     // one, and every later gate run would bless it. Refuse.
     if measured.total() == 0 {
-        eprintln!(
-            "arthron: refusing to write {}: this scan counted no references at all",
+        return Err(format!(
+            "refusing to write {}: this scan counted no references at all",
             baseline_path.display(),
-        );
-        return ExitCode::from(EXIT_USAGE);
+        ));
     }
     let corpus = corpus.display().to_string();
     let commit = commit
@@ -333,11 +480,10 @@ fn write_baseline(
         .unwrap_or_else(|| "unknown".to_string());
     for (field, value) in [("corpus", &corpus), ("commit", &commit)] {
         if !is_renderable(value) {
-            eprintln!(
-                "arthron: `{field}` contains a quote or a newline, which this baseline \
+            return Err(format!(
+                "`{field}` contains a quote or a newline, which this baseline \
                  format cannot represent: {value:?}",
-            );
-            return ExitCode::from(EXIT_USAGE);
+            ));
         }
     }
     let baseline = Baseline {
@@ -349,38 +495,30 @@ fn write_baseline(
     };
     if let Some(parent) = baseline_path.parent()
         && !parent.as_os_str().is_empty()
-        && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("arthron: creating {}: {e}", parent.display());
-        return ExitCode::from(EXIT_USAGE);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    match std::fs::write(baseline_path, render_baseline(&baseline)) {
-        Ok(()) => {
-            println!(
-                "gate: wrote {} at {} ({})",
-                baseline_path.display(),
-                baseline.commit,
-                baseline.corpus,
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("arthron: writing {}: {e}", baseline_path.display());
-            ExitCode::from(EXIT_USAGE)
-        }
-    }
+    std::fs::write(baseline_path, render_baseline(&baseline))
+        .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
+    Ok(baseline)
 }
 
-fn report_verdict(baseline: &Baseline, measured: &Counts, baseline_path: &Path) -> ExitCode {
+fn report_verdict(
+    baseline: &Baseline,
+    verdict: &GateVerdict,
+    measured: &Counts,
+    baseline_path: &Path,
+) -> ExitCode {
     println!(
         "gate: {} ({} at {})",
         baseline_path.display(),
         baseline.corpus,
         baseline.commit,
     );
-    match evaluate(baseline, measured) {
+    match verdict {
         GateVerdict::Pass { improved } => {
-            if improved {
+            if *improved {
                 println!(
                     "gate: pass — {} improved to {}; lock it in with --rebase",
                     show_rate(&baseline.counts),
@@ -392,7 +530,7 @@ fn report_verdict(baseline: &Baseline, measured: &Counts, baseline_path: &Path) 
             ExitCode::SUCCESS
         }
         GateVerdict::Fail(failures) => {
-            for failure in &failures {
+            for failure in failures {
                 eprintln!("gate: FAIL — {failure}");
             }
             ExitCode::from(EXIT_GATE_FAILED)
@@ -452,7 +590,7 @@ fn print_report(report: &arthron::store::Report) {
 /// Width of the label column, matching [`print_report`]'s.
 const LABEL: usize = 12;
 
-fn run_query(verb: &QueryVerb, db_path: &Path) -> ExitCode {
+fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
     let store = match ReadStore::open(db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -467,22 +605,23 @@ fn run_query(verb: &QueryVerb, db_path: &Path) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    let name = match verb {
-        QueryVerb::Def { name } | QueryVerb::Refs { name } => name,
-        QueryVerb::Impact { name, .. } => name,
+    let (verb_name, name) = match verb {
+        QueryVerb::Def { name } => ("def", name),
+        QueryVerb::Refs { name } => ("refs", name),
+        QueryVerb::Impact { name, .. } => ("impact", name),
     };
-    let node = match select(&index, name) {
+    let node = match select(&index, verb_name, name, as_json) {
         Ok(m) => m,
         Err(code) => return code,
     };
 
     let outcome = match verb {
-        QueryVerb::Def { .. } => show_definition(&store, &node),
-        QueryVerb::Refs { .. } => show_references(&store, &node),
-        QueryVerb::Impact { depth, .. } => show_impact(&store, &node, *depth),
+        QueryVerb::Def { .. } => show_definition(&store, &node, name, as_json),
+        QueryVerb::Refs { .. } => show_references(&store, &node, name, as_json),
+        QueryVerb::Impact { depth, .. } => show_impact(&store, &node, name, *depth, as_json),
     };
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
@@ -494,30 +633,38 @@ fn run_query(verb: &QueryVerb, db_path: &Path) -> ExitCode {
 ///
 /// Both failures print to stdout and exit 1: an ambiguous name *is* an
 /// answer — here are the nodes, pick one — and burying it on stderr would
-/// hide the list a person needs in order to re-run.
-fn select(index: &NameIndex, name: &str) -> Result<Match, ExitCode> {
+/// hide the list a person needs in order to re-run. Under `--json` they are
+/// documents for the same reason.
+fn select(index: &NameIndex, verb: &str, name: &str, as_json: bool) -> Result<Match, ExitCode> {
     let mut hits = index.lookup(name);
-    match hits.len() {
-        1 => Ok(hits.remove(0)),
-        0 => {
-            // An empty graph and a name that is not in a populated one are
-            // different facts, and only one of them means "fix the name".
-            if index.is_empty() {
-                println!("no match for {name:?} — the store holds no nodes; run `arthron scan`");
-            } else {
-                println!("no match for {name:?}");
-            }
-            Err(ExitCode::from(EXIT_NO_ANSWER))
+    if hits.len() == 1 {
+        return Ok(hits.remove(0));
+    }
+    let no_answer = ExitCode::from(EXIT_NO_ANSWER);
+    if as_json {
+        let doc = if hits.is_empty() {
+            json::query_no_match(verb, name)
+        } else {
+            json::query_ambiguous(verb, name, &hits)
+        };
+        return Err(print_json(&doc, no_answer));
+    }
+    if hits.is_empty() {
+        // An empty graph and a name that is not in a populated one are
+        // different facts, and only one of them means "fix the name".
+        if index.is_empty() {
+            println!("no match for {name:?} — the store holds no nodes; run `arthron scan`");
+        } else {
+            println!("no match for {name:?}");
         }
-        n => {
-            println!("ambiguous: {n} matches for {name:?}");
-            let width = hits.iter().map(|m| m.name.len()).max().unwrap_or(0);
-            for m in &hits {
-                println!("  {:<width$}  {}", m.name, kind_name(m.kind));
-            }
-            Err(ExitCode::from(EXIT_NO_ANSWER))
+    } else {
+        println!("ambiguous: {} matches for {name:?}", hits.len());
+        let width = hits.iter().map(|m| m.name.len()).max().unwrap_or(0);
+        for m in &hits {
+            println!("  {:<width$}  {}", m.name, kind_name(m.kind));
         }
     }
+    Err(no_answer)
 }
 
 /// A node kind as the report style spells it.
@@ -530,12 +677,23 @@ fn kind_name(kind: NodeKind) -> String {
     }
 }
 
-fn show_definition(store: &ReadStore, node: &Match) -> Result<(), String> {
+fn show_definition(
+    store: &ReadStore,
+    node: &Match,
+    query: &str,
+    as_json: bool,
+) -> Result<ExitCode, String> {
     let Some(def) = definition(store, &node.id)? else {
         // The index came from the node table, so this is unreachable short of
         // the store changing underneath — which a read-only open forbids.
         return Err(format!("{}: the node vanished between reads", node.name));
     };
+    if as_json {
+        return Ok(print_json(
+            &json::query_definition(query, &def),
+            ExitCode::SUCCESS,
+        ));
+    }
     println!("{:<LABEL$} {}", "definition", def.node.name);
     println!("{:<LABEL$} {}", "kind", kind_name(def.node.kind));
     if def.declarations.is_empty() {
@@ -556,17 +714,28 @@ fn show_definition(store: &ReadStore, node: &Match) -> Result<(), String> {
             kind_name(target.kind)
         );
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-fn show_references(store: &ReadStore, node: &Match) -> Result<(), String> {
+fn show_references(
+    store: &ReadStore,
+    node: &Match,
+    query: &str,
+    as_json: bool,
+) -> Result<ExitCode, String> {
     let sites = references(store, &node.id)?;
+    if as_json {
+        return Ok(print_json(
+            &json::query_references(query, node, &sites),
+            ExitCode::SUCCESS,
+        ));
+    }
     if sites.is_empty() {
         println!(
             "{:<LABEL$} {} — no stored row resolves here",
             "references", node.name
         );
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     let occurrences: u64 = sites.iter().map(|s| u64::from(s.count)).sum();
     println!(
@@ -593,11 +762,24 @@ fn show_references(store: &ReadStore, node: &Match) -> Result<(), String> {
             outcome_name(&site.outcome),
         );
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-fn show_impact(store: &ReadStore, node: &Match, depth: u32) -> Result<(), String> {
-    let Impact { layers, truncated } = impact(store, &node.id, depth)?;
+fn show_impact(
+    store: &ReadStore,
+    node: &Match,
+    query: &str,
+    depth: u32,
+    as_json: bool,
+) -> Result<ExitCode, String> {
+    let found = impact(store, &node.id, depth)?;
+    if as_json {
+        return Ok(print_json(
+            &json::query_impact(query, node, depth, &found),
+            ExitCode::SUCCESS,
+        ));
+    }
+    let Impact { layers, truncated } = found;
     let total: usize = layers.iter().map(Vec::len).sum();
     println!(
         "{:<LABEL$} {} — depth {depth}, {total} node(s)",
@@ -621,7 +803,7 @@ fn show_impact(store: &ReadStore, node: &Match, depth: u32) -> Result<(), String
             "truncated"
         );
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The widest of a set of column values, for aligned output.

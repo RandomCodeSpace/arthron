@@ -22,14 +22,19 @@
 
 use std::path::Path;
 
+use crate::config::FileFilter;
 use crate::model::Lang;
 use crate::store::Report;
 
-/// A track's scan entry point: `(repository root, database path)`.
+/// A track's scan entry point:
+/// `(repository root, database path, include/exclude filter)`.
 ///
-/// Deliberately the same signature the driver already had for Go, so a track
-/// going live is a function pointer and not a new abstraction.
-pub type TrackScan = fn(&Path, &Path) -> Result<Report, String>;
+/// The filter is compiled once per run from the repository's `arthron.toml`
+/// and handed to every track, because which files a scan reads is the
+/// repository's decision and not a language's. A track that wants the
+/// unfiltered walk passes [`FileFilter::none`]; the two-argument entry points
+/// each track also exposes do exactly that.
+pub type TrackScan = fn(&Path, &Path, &FileFilter) -> Result<Report, String>;
 
 /// One language track's registration.
 pub struct Track {

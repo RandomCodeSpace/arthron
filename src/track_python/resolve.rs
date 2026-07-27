@@ -1535,13 +1535,24 @@ fn bind(bindings: &mut HashMap<String, Vec<Bind>>, name: &str, value: Bind) {
     }
 }
 
-/// The Python track's scan entry point.
+/// The Python track's scan entry point, reading every `.py` the walk finds.
 pub fn scan_python(root: &Path, db: &Path) -> Result<crate::store::Report, String> {
+    scan_python_with(root, db, &crate::config::FileFilter::none())
+}
+
+/// [`scan_python`] under a repository's include/exclude globs. What
+/// [`crate::track_python::TRACK`] holds.
+pub fn scan_python_with(
+    root: &Path,
+    db: &Path,
+    filter: &crate::config::FileFilter,
+) -> Result<crate::store::Report, String> {
     crate::pipeline::scan::<PyLang>(
         root,
         db,
         &crate::track_python::extract::PyExtractor,
         &PyResolver,
+        filter,
     )
 }
 

@@ -120,8 +120,23 @@ use crate::track_ecma::resolve::{JS_RESOLVER, TS_RESOLVER};
 /// keys the tallies by language, so JavaScript's line is already in it and no
 /// combined EcmaScript number exists to return.
 pub fn scan_ecma(root: &Path, db_path: &Path) -> Result<Report, String> {
-    scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER)?;
-    scan::<TsLang>(root, db_path, &TsExtractor, &TS_RESOLVER)
+    scan_ecma_with(root, db_path, &crate::config::FileFilter::none())
+}
+
+/// [`scan_ecma`] under a repository's include/exclude globs. What [`TRACK`]
+/// holds.
+///
+/// One filter for both passes: the repository decides which files exist for
+/// this scan, and the two languages of one track must never disagree about
+/// that — a `.ts` file excluded from the TypeScript pass but present for the
+/// JavaScript one would resolve differently depending on which ran.
+pub fn scan_ecma_with(
+    root: &Path,
+    db_path: &Path,
+    filter: &crate::config::FileFilter,
+) -> Result<Report, String> {
+    scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER, filter)?;
+    scan::<TsLang>(root, db_path, &TsExtractor, &TS_RESOLVER, filter)
 }
 
 /// The EcmaScript family's registration.
@@ -131,7 +146,7 @@ pub fn scan_ecma(root: &Path, db_path: &Path) -> Result<Report, String> {
 pub const TRACK: Track = Track {
     name: "ecma",
     langs: &[Lang::JavaScript, Lang::TypeScript],
-    scan: Some(scan_ecma),
+    scan: Some(scan_ecma_with),
 };
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ use crate::registry::Track;
 pub const TRACK: Track = Track {
     name: "go",
     langs: &[Lang::Go],
-    scan: Some(crate::pipeline::scan_go),
+    scan: Some(crate::pipeline::scan_go_with),
 };
 
 #[cfg(test)]

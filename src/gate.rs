@@ -120,6 +120,21 @@ pub enum GateFailure {
     },
 }
 
+impl GateFailure {
+    /// The check's stable name, for machine output.
+    ///
+    /// Separate from [`fmt::Display`], which writes a sentence for a person
+    /// and is free to be reworded. This is the string a script branches on,
+    /// so it never changes without moving [`crate::json::SCHEMA`].
+    pub fn check(&self) -> &'static str {
+        match self {
+            GateFailure::RateRegressed { .. } => "rate_regressed",
+            GateFailure::LocalBindingDrift { .. } => "local_binding_drift",
+            GateFailure::ExternalDrift { .. } => "external_drift",
+        }
+    }
+}
+
 impl fmt::Display for GateFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
