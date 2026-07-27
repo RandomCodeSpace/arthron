@@ -4,6 +4,145 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — The Java review round: an erased type frame is still a frame
+
+An adversarial review of the Java track produced eleven findings. Every one
+was reproduced by a test written before its fix and none was rebutted; the
+Java resolution rate moved from **0.6525 to 0.6640** on commons-lang
+(resolved 38,388 → 38,940, unresolved 20,440 → 19,708, external 68,582 →
+68,333, local-binding 2,048 → 2,062). What follows is what changed shape, not
+the list — the commits carry that.
+
+**An anonymous or local class is not a node, and it is still a scope.** This
+was the round's only wrong-edge finding and the only one that mattered more
+than the rate. The extractor walks past an anonymous `class_body` when it
+looks for a reference's edge source, which is right — the anonymous class has
+no canonical name (§6.7) so the edge must start at the nameable member around
+it. The resolver then read that same answer back as "the type chain this site
+sits in", which is a different question with a different answer: §15.8.3's
+`this`, §15.11.2's `super` and §15.12.1's unqualified invocation all search
+the innermost enclosing *type declaration*, and the anonymous class is one.
+So `super.m()` inside `new Base(){…}` resolved against the *enclosing named
+class's* `extends` clause and produced an edge to a method on an unrelated
+type; an unqualified `m()` that the anonymous class itself declares linked to
+the enclosing class's same-named method; `this.f` linked to the enclosing
+class's field. Three wrong edges from one erasure, and wrong edges are worse
+than misses.
+
+The fix records the frames the node rule erases — anonymous class bodies,
+enum-constant bodies, local classes, and any type declared inside one — with
+their byte extent, the supertype they name, and the member keys they declare.
+Edge *sourcing* is untouched. A member the frame declares itself is
+`LocalBinding`: it is real, and it is by design not a node, which is the same
+judgement the node rule already makes for the local class it belongs to. A
+member the frame *inherits* now resolves to the supertype that declares it,
+which the erasure had been hiding — the fix recovers more edges than it
+removes. *Rejected:* declining outright on every `this`/`super`/unqualified
+reference inside such a frame, which the review proposed; it removes the
+wrong edges and the right ones together. *Rejected:* a flag on `Encloser`
+saying the innermost frame was erased — that is a core change, and the
+extents are a per-file fact the track can carry itself.
+
+**§6.5.5.1 tier 1 says "including inherited ones", and it meant it.** Simple
+type-name resolution consulted only the types the *file* declares, so `State`
+inside `class Sub extends Base` — with `Base` indexed, in the same package,
+one `extends` hop away — was `NoMatchingDefinition`. That is the one bucket
+reserved for meaning *our* bug, so a missing feature was being reported as a
+missing definition. Tier 1 now walks the enclosing types' supertype closure
+for a member type, the same closure member lookup already walks, reachable
+for the same reason and no further (H-01). Largest single contributor to
+commons-lang's `NoMatchingDefinition`, which fell 298 → 161.
+
+**A receiver typed by a type variable is a lookup, not a failure (X-07).** The
+declared type of `T value` is `T`, which named no type, so `value.tag()` was
+`NoMatchingDefinition` while the type use `T` one line up was `LocalBinding` —
+the same fact classified two ways, and the one that left the denominator was
+the one that inflated. The extractor now records a type parameter's *bound*,
+which is written in the same file, and the receiver resolves against it; an
+unbounded parameter erases to `Object` (§4.6) and its members are external.
+
+**A member name is not a member.** A method reference (C-08) and a
+single-static import (I-04) both name a *member name* rather than one
+declaration, and neither site states an arity — so the resolver probed the
+bare name, which is the *field* key, and reported `AmbiguousOverload`
+whatever came back. Zero method references resolved in all of commons-lang,
+and an import naming something absent was indistinguishable from one naming
+five overloads. Both now walk the member-name group by arity to a bounded
+depth: one declaration is one edge, two or more is the discrimination
+`AmbiguousOverload` names, none is the same honest miss any other member
+lookup reports. The bound is 8; commons-lang measures identically at 2, 4, 6,
+8 and 12, because a name someone types at a call site is short. *Rejected:*
+probing to §8.4.1's real ceiling of 255 — half a thousand probes per import,
+recorded in the invalidation index, for answers the corpus says are not
+there. *Not fixed, and recorded as a core gap:* the case study's §13 names
+`TargetTyped` for exactly this shape and `UnresolvedReason` has no such
+variant, so a method reference whose overload set is genuinely plural still
+reports `AmbiguousOverload` — "we compared candidates and could not choose"
+about a set that has no arity to compare at.
+
+**A name is attributed the same way in value position as in type position.**
+`java.util.List` was `External`; `java.util.Objects.requireNonNull(…)` was
+`AmbiguousName`, three lines from the code that decides the first. §6.5.5
+gives both the same split — last segment a simple type name, qualifier the
+thing that names it — so both now take it. And the split now asks a question
+it never asked: if the qualifier *is* a package this repository declares, the
+symbol table's opinion is complete and the type is absent, which is
+`NoMatchingDefinition`. Calling that `External` let a definition that should
+exist here leave both terms of the rate. Measured on commons-lang: the first
+moves six occurrences (`AmbiguousName` 6 → 0), the second moves **none at
+all** — a library that writes no fully qualified names and has no sibling
+module is exactly where neither bites. Both are routine in a Maven reactor,
+which is the layout P-02 and P-06 exist for, so they are fixed on the
+argument rather than on this corpus's evidence. *Rejected:* treating any
+*prefix* match against a declared package as in-repo — `com.acme.ext.Foo`
+with `com.acme` declared and `com.acme.ext` a separate artifact is genuinely
+external.
+
+**Two identical branches, one of them throwing away a resolvable lookup.**
+`field.tag()` resolved and `this.field.tag()` reported `NeedsTypeInference` —
+documented as "the receiver is a name with no declared or annotated type",
+about a name whose type is written on line 3. `this.f.m()` now reads the same
+declared-type environment (X-02) the bare form does.
+
+**C-05: `new Iface(){…}` invokes `Object#<init>()`.** An anonymous class
+implementing an interface does not invoke a constructor of the interface
+(§15.9.5.1) — and every in-repo class carries one at probe time, because
+§8.8.9's implicit constructor is synthesized (D-10). So a creation site with
+a class body whose owner is in-repo and whose constructor is missing has
+named an interface, and the honest target is external. Measured: 108
+occurrences, 107 of them out of `UnindexedSupertype`.
+
+**A reference is a site in one file, and recovery invents sites.**
+tree-sitter's error recovery read a `type_identifier` out of a fuzz-corpus
+string literal whose control bytes break the literal: one row, 405
+occurrences, `External("$$")`. The extractor already knew `ERROR` nodes occur
+— it detects them to recover JEP 511's module imports — but nothing stopped a
+reference from being emitted inside one. The gate baseline was defending 405
+references that do not exist, which is the whole reason this is recorded
+rather than filed as a nit: **a baseline that defends phantoms is not a
+baseline.** Ancestors only; an `ERROR` elsewhere in a file says nothing about
+a node that parsed.
+
+**`NeedsReceiverType` was documented as Java's honest floor and is
+structurally absent.** Its definition is the case where the receiver's type
+*is* stated and *is* in the repository — which this resolver looks up rather
+than reports (X-02). Two comments claiming otherwise were wrong; the reason
+is correct and the code that never emits it is correct.
+
+**Cost, measured.** Cold scan of commons-lang on this machine went 3.4 s /
+288 MB to 3.8 s / 337 MB — the extra probes, which the invalidation index
+records because it must. The 512 MB ceiling is hard and holds with room;
+timing is a target and this spends 13% of it. The tier-1 supertype walk skips
+the type's own member types (`file_types` has already answered for those) and
+costs nothing at all for a type that names no supertype.
+
+**One writer for the baseline.** `arthron gate --language java --rebase`
+records it, since #10 gave the command a language. The `#[ignore]`d test that
+used to render the file itself is gone: two writers can disagree, and the one
+that wrote the file would not be the one the gate compares against.
+
+---
+
 ## 2026-07-27 — Seven adversarial-review findings, and two reserved characters
 
 An adversarial review of the phase-2 core produced seven findings. Each was

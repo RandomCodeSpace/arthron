@@ -1,0 +1,66 @@
+# Java extraction rules.
+#
+# One rule, not one per construct, and deliberately so: `Rules::matches` runs
+# `find_all` once per compiled rule, so a rule per node kind would walk every
+# file thirty times. A single `any:` of kinds is one pre-order traversal, and
+# the order it yields is document order — which is what the extractor needs,
+# because a binding environment has to be collected before the references
+# sitting inside it can be asked whether they name a local.
+#
+# The list is an inventory of the grammar surface this extractor reads, and
+# nothing here decides what a node *means*. `type_identifier` is on it because
+# every Java type use is one; whether a particular one is a supertype, a
+# declared local's type, or a segment of a scoped name is decided in Rust,
+# where the ancestor chain is available.
+#
+# Kinds deliberately absent:
+#   array_creation_expression - `new int[10]` names no constructor (C-07).
+#   identifier                - a bare name in expression position is a local,
+#                               a field or a label and the three are not
+#                               distinguishable at the node; emitting them
+#                               would put guesses in the denominator.
+id: java-node
+language: java
+rule:
+  any:
+    # Compilation-unit header (P-01, P-05, I-01..I-05, I-08).
+    - kind: package_declaration
+    - kind: module_declaration
+    - kind: requires_module_directive
+    - kind: exports_module_directive
+    - kind: import_declaration
+    # Type declarations (D-03, D-04, T-01..T-05).
+    - kind: class_declaration
+    - kind: interface_declaration
+    - kind: enum_declaration
+    - kind: record_declaration
+    - kind: annotation_type_declaration
+    # Member declarations (D-05..D-09).
+    - kind: enum_constant
+    - kind: field_declaration
+    - kind: constant_declaration
+    - kind: method_declaration
+    - kind: constructor_declaration
+    - kind: compact_constructor_declaration
+    - kind: annotation_type_element_declaration
+    # Binding environments (N-05, N-06, X-02, X-03).
+    - kind: formal_parameter
+    - kind: spread_parameter
+    - kind: lambda_expression
+    - kind: local_variable_declaration
+    - kind: catch_formal_parameter
+    - kind: resource
+    - kind: enhanced_for_statement
+    - kind: instanceof_expression
+    - kind: type_pattern
+    - kind: type_parameter
+    # Reference sites (M-04, C-01, C-03, C-08, N-04, H-01).
+    - kind: method_invocation
+    - kind: object_creation_expression
+    - kind: explicit_constructor_invocation
+    - kind: method_reference
+    - kind: annotation
+    - kind: marker_annotation
+    - kind: field_access
+    - kind: type_identifier
+    - kind: scoped_type_identifier
