@@ -19,10 +19,12 @@
 //! Every step happens inside this file or under `src/track_ecma/`. Nothing in
 //! `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track moves.
 //!
-//! 1. **Submodules, nested.** `mod extract;`, `mod resolve;` here resolve to
-//!    `src/track_ecma/extract.rs` and `src/track_ecma/resolve.rs`; `lib.rs`
-//!    already declares `track_ecma`.
-//! 2. **Two [`crate::lang::Language`] impls, not one.** The shared driver
+//! 1. **Submodules, nested.** *Landed.* [`lang`] resolves to
+//!    `src/track_ecma/lang.rs`; `lib.rs` already declares `track_ecma`, so
+//!    nothing shared moved. `mod extract;` and `mod resolve;` join it the
+//!    same way.
+//! 2. **Two [`crate::lang::Language`] impls, not one.** *Landed* as
+//!    [`lang::JsLang`] and [`lang::TsLang`]. The shared driver
 //!    tags every stored row with `L::LANG`, so a single impl can only report
 //!    a single rate — and this track owes two. Supply `JsLang` and `TsLang`
 //!    with the *same* `DOMAIN`, `Header`, `Scope` and `Config` types and the
@@ -71,6 +73,8 @@
 //! Sharing the store with a live Go track is safe: a scan forgets only files
 //! carrying an extension the running track owns, and extension ownership is a
 //! partition (see [`Lang::for_extension`]).
+
+pub mod lang;
 
 use crate::model::Lang;
 use crate::registry::Track;
