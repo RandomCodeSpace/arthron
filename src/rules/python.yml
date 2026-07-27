@@ -1,0 +1,54 @@
+id: module
+language: python
+rule:
+  kind: module
+---
+id: import
+language: python
+rule:
+  kind: import_statement
+---
+id: import-from
+language: python
+rule:
+  kind: import_from_statement
+---
+id: import-future
+language: python
+rule:
+  kind: future_import_statement
+---
+id: def-function
+language: python
+rule:
+  kind: function_definition
+---
+id: def-class
+language: python
+rule:
+  kind: class_definition
+---
+id: assign
+language: python
+rule:
+  kind: assignment
+---
+id: augassign
+language: python
+rule:
+  kind: augmented_assignment
+---
+id: type-alias
+language: python
+rule:
+  kind: type_alias_statement
+---
+id: ref-decorator
+language: python
+rule:
+  kind: decorator
+---
+id: ref-call
+language: python
+rule:
+  kind: call

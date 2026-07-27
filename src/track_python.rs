@@ -56,6 +56,9 @@
 use crate::model::Lang;
 use crate::registry::Track;
 
+pub mod extract;
+pub mod lang;
+
 /// Python's registration. `scan: None`: the track owns no file and
 /// contributes nothing to a scan until the work above lands.
 pub const TRACK: Track = Track {
