@@ -28,10 +28,11 @@ The result of resolving one reference: `Resolved`, `External`, or `Unresolved`
 with a reason. There is no way to express "dropped".
 
 **LocalBinding**:
-The outcome of a reference that names a local — a parameter, local variable,
-or receiver. Locals are not nodes, so this outcome is caused by policy, not by
-a resolver gap; it is reported beside `External` and excluded from both terms
-of the resolution rate.
+The reason carried by a reference that names a local — a parameter, local
+variable, or receiver. Locals are not nodes, so this reason is caused by
+policy, not by a resolver gap; it is reported beside `External` and excluded
+from both terms of the resolution rate. A reason rather than a fourth
+`Outcome` variant: the three-variant contract is not widened.
 _Avoid_: unresolved local
 
 **Node**:

@@ -1,262 +1,543 @@
 //! The two-phase scan. Cold indexing is this same code with an empty store.
+//!
+//! Generic over [`Language`]: every per-language type is an associated type
+//! this module moves and never inspects, so no language's manifest, scope,
+//! or naming convention is named here.
+//!
+//! Each phase writes its own half of every file's facts, and each half
+//! replaces only itself. That is what makes a re-scan of one file an edit
+//! rather than an append, and it is the whole reason the store is addressed
+//! per file.
+//!
+//! An event is not only the files whose bytes moved. A definition that
+//! appears or disappears changes the answer for references in files nobody
+//! edited, and the candidate index — every identity every reference probed,
+//! hits and misses alike — is what names them. Those files are re-read and
+//! re-resolved in the same event, so the store an incremental scan leaves is
+//! the store a cold scan of the same tree would have built.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Outcome;
-use crate::extract_go::{FileFacts, extract};
-use crate::model::{Lang, NodeId, RefKind, node_id, reason_code};
-use crate::resolve_go::{
-    FileScope, GoResolver, INIT_FUNC, Resolution, file_scope, import_binding,
-    is_external_test_package, is_init_func, package_path_for_file, parse_go_mod,
+use crate::extract_go::GoExtractor;
+use crate::lang::{
+    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, SymbolProbe,
 };
-use crate::store::{Batch, NodeRecord, RefRecord, Report, Store, StoredOutcome};
+use crate::model::{DefKind, Definition, Fqn, NodeId, Reference, node_id, reason_code};
+use crate::resolve_go::{GoLang, GoResolver};
+use crate::store::{
+    DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
+    Report, Store, StoredOutcome,
+};
 
-/// One changed file, extracted.
-struct ChangedFile {
+/// One file this event re-reads, extracted.
+///
+/// Either its bytes moved, or an identity it referenced did — both mean the
+/// same thing to the store: replace this file's halves with what this event
+/// says they are.
+struct ScannedFile<L: Language> {
     rel_path: String,
-    rel_dir: String,
     hash: [u8; 32],
-    facts: FileFacts,
+    facts: FileFacts<L>,
+}
+
+/// The store's symbol table, as a resolver probes it.
+///
+/// Lives here rather than beside the trait because the driver is the layer
+/// that loads it: a resolver receives a probe, never a table.
+impl SymbolProbe for HashMap<NodeId, Entry> {
+    fn probe(&self, id: &NodeId) -> Option<Entry> {
+        self.get(id).cloned()
+    }
+}
+
+/// One file's phase-2 facts, accumulated while its references resolve.
+#[derive(Default)]
+struct RefAcc {
+    rows: HashMap<RefKey, RefRecord>,
+    edges: BTreeSet<(NodeId, NodeId, u8)>,
+    candidates: BTreeSet<(NodeId, RefKey)>,
+    /// External identity → (package string, first line reaching it).
+    externals: BTreeMap<NodeId, (String, u32)>,
 }
 
 /// Walk, extract, resolve, store, report. The changed set is exactly the
 /// files whose content hash differs from the store — an empty store makes
 /// that every file, which is the entire cold/warm distinction.
-pub fn scan(root: &Path, db_path: &Path) -> Result<Report, String> {
-    let go_mod =
-        fs::read_to_string(root.join("go.mod")).map_err(|e| format!("reading go.mod: {e}"))?;
-    let module =
-        parse_go_mod(&go_mod).ok_or_else(|| "go.mod has no module directive".to_string())?;
-    let resolver = GoResolver { module };
+///
+/// The event then widens once, and only once: the identities the changed and
+/// deleted files stopped or started declaring name the rows that probed
+/// them, those rows name their files, and those files are re-resolved too.
+/// Re-reading a file whose bytes did not move cannot change what it
+/// declares, so nothing it does can widen the set again.
+pub fn scan<L: Language>(
+    root: &Path,
+    db_path: &Path,
+    ex: &dyn Extractor<L>,
+    rs: &dyn Resolver<L>,
+) -> Result<Report, String> {
+    let paths = source_files::<L>(root)?;
+    let mut index = FileIndex {
+        files: Vec::with_capacity(paths.len()),
+    };
+    for path in &paths {
+        index.files.push(rel_path(root, path)?);
+    }
+    index.files.sort();
+    let mut cfg = rs.config(root, &index).map_err(|e| e.message)?;
     let store = Store::open(db_path)?;
 
-    // Collect the changed set.
-    let mut changed = Vec::new();
-    for path in go_files(root)? {
-        let rel = path
-            .strip_prefix(root)
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let source = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("reading {rel}: {e}")),
-        };
+    // The manifest is a scan input the walk never hashes, and it decides
+    // every identity in the graph. Fingerprinting it *before* the config
+    // learns anything from the store is what keeps the comparison about the
+    // project rather than about what the last scan happened to know.
+    store.fence_config(&rs.config_digest(&cfg))?;
+
+    // Every container name the store already holds. Binding an unaliased
+    // import needs a fact out of the *imported* container's source, so a
+    // scan that touches one file must still know the names of the packages
+    // it did not touch.
+    rs.learn_containers(&mut cfg, &store.package_names()?);
+
+    // Collect the changed set, in walk order, and everything the walk
+    // reached and this scan owns.
+    let mut owned: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut changed: Vec<ScannedFile<L>> = Vec::new();
+    for path in &paths {
+        let rel = rel_path(root, path)?;
+        if !rs.owns_file(&cfg, &rel) {
+            continue; // governed by another project; not this scan's file
+        }
+        let source = read_source(path, &rel)?;
         let hash = *blake3::hash(source.as_bytes()).as_bytes();
+        owned.insert(rel.clone(), path.clone());
         if store.file_hash(&rel)? == Some(hash) {
             continue; // unchanged: not in this event's changed set
         }
-        let rel_dir = match rel.rsplit_once('/') {
-            Some((dir, _)) => dir.to_string(),
-            None => String::new(),
-        };
-        changed.push(ChangedFile {
+        let facts = ex.extract(&rel, &source);
+        changed.push(ScannedFile {
             rel_path: rel,
-            rel_dir,
             hash,
-            facts: extract(&source),
+            facts,
         });
     }
 
-    // Declared package names, keyed by import path. An unaliased import
-    // binds the imported package's declared name, which is a fact in that
-    // package's source rather than in the path — so it is knowable only
-    // here, the one layer that sees every package. The store supplies the
-    // packages this event did not touch; a changed file overrides it,
-    // being the newer evidence.
-    let mut package_names = store.package_names()?;
-    let mut named_here: HashSet<String> = HashSet::new();
+    // A file the store knows and this walk did not reach is gone: deleted,
+    // renamed, or no longer owned because a nested manifest appeared above
+    // it. All three mean the same thing to the graph, and dropping its facts
+    // before anything is written is what keeps a stale node from surviving
+    // as a resolution target.
+    let deleted: Vec<String> = store
+        .known_files()?
+        .into_iter()
+        .filter(|known| !owned.contains_key(known))
+        .collect();
+
+    // The container names this event's own files decide, folded in before
+    // phase 1 rather than after it. The store answers for the files this
+    // event did not touch and cannot answer for the ones it did — on a cold
+    // scan it answers nothing at all — so without this phase 1 builds
+    // identities from names phase 2 then disagrees with.
+    let mut event_names: HashMap<String, String> = HashMap::new();
     for file in &changed {
-        let Some(declared) = file.facts.package.as_deref() else {
-            continue; // no package clause: nothing declared to record
-        };
-        let pkg_path = resolver.package_path(&file.rel_dir);
-        if is_external_test_package(declared, dir_package_name(&package_names, &pkg_path)) {
-            continue; // a package of its own, and one nothing may import
-        }
-        if named_here.insert(pkg_path.clone()) {
-            package_names.insert(pkg_path, declared.to_string());
+        if let Some((path, name)) = rs.declared_container(&cfg, &file.facts.header) {
+            event_names.insert(path, name);
         }
     }
+    rs.learn_containers(&mut cfg, &event_names);
 
-    // The package a file's definitions and same-package candidates belong
-    // to. Its directory's, except for an external test file, which is its
-    // own package. Recomputed per phase from facts fixed above, so both
-    // phases cannot disagree about where a file's definitions went.
-    let pkg_path_of = |file: &ChangedFile| -> String {
-        let dir_pkg = resolver.package_path(&file.rel_dir);
-        let dir_name = dir_package_name(&package_names, &dir_pkg);
-        package_path_for_file(&dir_pkg, file.facts.package.as_deref(), dir_name)
+    // What this event's own files declared before it ran, read before a
+    // single fact is written. After phase 1 has rewritten the ownership
+    // records this comparison is against itself, and the affected set comes
+    // out empty — which every test whose caller sits in the changed file
+    // would still pass.
+    let mut event_paths: Vec<String> = changed.iter().map(|f| f.rel_path.clone()).collect();
+    event_paths.extend(deleted.iter().cloned());
+    let declared_before = store.declared_nodes(&event_paths)?;
+
+    store.forget_files(&deleted)?;
+
+    // Phase 1: definition and container nodes for the changed set.
+    let probe = store.symbol_entries()?;
+    // The definitions this event declared, by identity. Two of them under
+    // one identity is the only case the language can be asked about.
+    let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
+    let mut def_batch = DefBatch {
+        files: Vec::with_capacity(changed.len()),
     };
-
-    // Phase 1: definitions and package nodes for the changed set.
-    let mut phase1 = Batch::default();
-    let mut seen_pkgs: HashMap<String, ()> = HashMap::new();
     for file in &changed {
-        let pkg_path = pkg_path_of(file);
-        if seen_pkgs.insert(pkg_path.clone(), ()).is_none() {
-            phase1.nodes.push((
-                node_id(Lang::Go, &pkg_path),
-                NodeRecord::Package {
-                    // An external test package is absent from
-                    // `package_names` — nothing may import it — so the file
-                    // that declares it is what names it.
-                    name: package_names
-                        .get(&pkg_path)
-                        .cloned()
-                        .or_else(|| file.facts.package.clone()),
-                    import_path: pkg_path.clone(),
-                },
-            ));
-        }
-        for def in &file.facts.defs {
-            if is_init_func(def) {
-                continue; // nothing can name it, so it is not a node
-            }
-            let fqn = GoResolver::def_fqn(&pkg_path, def);
-            phase1.nodes.push((
-                node_id(Lang::Go, &fqn),
-                NodeRecord::Definition {
-                    fqn,
-                    kind: def.kind.code(),
-                    file: file.rel_path.clone(),
-                    line: def.span.line,
-                },
-            ));
-        }
+        def_batch
+            .files
+            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
     }
-    store.apply(&phase1)?;
+    let declared_now: BTreeMap<NodeId, NodePayload> = def_batch
+        .files
+        .iter()
+        .flat_map(|f| f.nodes.iter().map(|(id, rec)| (*id, rec.payload())))
+        .collect();
 
-    // Phase 2: resolve every reference in the changed set.
-    let symbols = store.definition_ids()?;
-    let mut phase2 = Batch::default();
-    for file in &changed {
-        phase2.files.push((file.rel_path.clone(), file.hash));
-        let scope: FileScope =
-            file_scope(&resolver, pkg_path_of(file), &file.facts, &package_names);
-        let pkg_node = node_id(Lang::Go, &scope.pkg_path);
-        let mut rows: HashMap<(String, u8, String), RefRecord> = HashMap::new();
-
-        let record = |raw: String,
-                      kind: RefKind,
-                      line: u32,
-                      src: NodeId,
-                      res: Resolution,
-                      rows: &mut HashMap<(String, u8, String), RefRecord>,
-                      batch: &mut Batch| {
-            let key = (file.rel_path.clone(), kind.code(), raw);
-            for cand in &res.candidates {
-                batch.candidates.push((*cand, key.clone()));
-            }
-            let stored = match &res.outcome {
-                Outcome::Resolved(id) => {
-                    batch.edges.push((src, *id, kind.code()));
-                    StoredOutcome::Resolved(*id)
-                }
-                Outcome::External(pkg) => StoredOutcome::External(pkg.clone()),
-                Outcome::Unresolved(reason) => StoredOutcome::Unresolved(reason_code(reason)),
-            };
-            rows.entry(key)
-                .and_modify(|r| r.count += 1)
-                .or_insert(RefRecord {
-                    outcome: stored,
-                    count: 1,
-                    first_line: line,
-                    lang: Lang::Go.code(),
-                });
-        };
-
-        for imp in &file.facts.imports {
-            let res = resolver.resolve_import(&imp.path, &symbols);
-            record(
-                imp.path.clone(),
-                RefKind::Import,
-                imp.span.line,
-                pkg_node,
-                res,
-                &mut rows,
-                &mut phase2,
-            );
-        }
-        for call in &file.facts.calls {
-            let res = resolver.resolve_call(call, &scope, &symbols);
-            let src = match call.enclosing.as_deref() {
-                // `init` is not a node, so a call inside one hangs off the
-                // package itself — the same source a package-level
-                // initialiser's calls get.
-                None | Some(INIT_FUNC) => pkg_node,
-                Some(name) => node_id(Lang::Go, &format!("{}.{name}", scope.pkg_path)),
-            };
-            record(
-                call.raw_target.clone(),
-                RefKind::Call,
-                call.span.line,
-                src,
-                res,
-                &mut rows,
-                &mut phase2,
-            );
-        }
-        for ((f, kind, raw), rec) in rows {
-            phase2.refs.push((f, kind, raw, rec));
-        }
+    // The identities this event started declaring, stopped declaring, or
+    // changed the meaning of. The third case is not the same as the first
+    // two: a package's node is its import path, which its directory
+    // decides, so rewriting a `package` clause moves no identity at all and
+    // still changes what every unaliased import of it binds. Comparing
+    // payloads rather than bare ids is what makes that an event.
+    //
+    // An over-approximation on purpose: an id another, unchanged file also
+    // declares still exists, so waking its probers is wasted work rather
+    // than a wrong answer, and the narrower test is an existence check the
+    // candidate index does not need in order to be correct.
+    let touched: Vec<NodeId> = declared_before
+        .keys()
+        .chain(declared_now.keys())
+        .filter(|id| declared_before.get(*id) != declared_now.get(*id))
+        .copied()
+        .collect::<BTreeSet<NodeId>>()
+        .into_iter()
+        .collect();
+    let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &changed, &owned)?
+        .into_iter()
+        .map(|(rel, path)| scan_file(ex, &path, rel))
+        .collect::<Result<_, String>>()?;
+    // Their definitions cannot have changed — their bytes did not — so this
+    // re-asserts an ownership record identical to the one already stored,
+    // and keeps every file this event writes phase-2 facts for covered by a
+    // phase-1 half.
+    for file in &waking {
+        def_batch
+            .files
+            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
     }
-    store.apply(&phase2)?;
 
-    store.report()
+    let colliding = store.apply_defs(&def_batch)?;
+    let merged = mergeable_count(rs, &colliding, &event_defs);
+
+    // Phase 2: resolve every reference in the changed set and in every file
+    // the changed set woke. The container names phase 1 just wrote are part
+    // of the scope every file is resolved against, so the config is
+    // refreshed before any scope is built.
+    let probe = store.symbol_entries()?;
+    rs.learn_containers(&mut cfg, &store.package_names()?);
+    let mut ref_batch = RefBatch {
+        files: Vec::with_capacity(changed.len() + waking.len()),
+    };
+    for file in changed.iter().chain(waking.iter()) {
+        ref_batch.files.push(phase_two(rs, &cfg, file, &probe));
+    }
+    store.apply_refs(&ref_batch)?;
+
+    let mut report = store.report()?;
+    report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
+    Ok(report)
 }
 
-/// The package name a directory is known to use: what a file in it
-/// declares, or — when no scan has reached one — what its import path
-/// suggests.
+/// The unchanged files holding a reference that probed one of `touched`.
 ///
-/// Telling `package foo_test` in the directory of package `foo` from a
-/// directory whose package genuinely is `foo_test` is what needs this.
-fn dir_package_name<'a>(names: &'a HashMap<String, String>, pkg_path: &'a str) -> &'a str {
-    names
-        .get(pkg_path)
-        .map_or_else(|| import_binding(pkg_path), String::as_str)
+/// Whole files, not individual rows: the index selects the file, and
+/// re-resolving one is a parse plus its references through the same per-file
+/// replace every changed file already uses. Patching single rows would need
+/// sub-file ownership of edges and candidate entries — more machinery, more
+/// ways to be subtly wrong, and no measured need.
+///
+/// A row whose file this event already re-read is dropped here rather than
+/// left for a later dedupe: the file is being resolved anyway, and letting it
+/// in a second time would make the event replace the same half twice, which
+/// is correct only for as long as every pass writes a file's half in full.
+/// That is a property to keep, not one to depend on.
+fn wake_files<L: Language>(
+    store: &Store,
+    touched: &[NodeId],
+    changed: &[ScannedFile<L>],
+    owned: &BTreeMap<String, PathBuf>,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let already: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+    let mut out = BTreeMap::new();
+    for key in store.rows_for(touched)? {
+        if already.contains(key.file.as_str()) {
+            continue;
+        }
+        // A row whose file the walk did not reach belongs to a deleted file,
+        // whose facts are already forgotten; nothing is left to re-resolve.
+        if let Some(path) = owned.get(&key.file) {
+            out.insert(key.file, path.clone());
+        }
+    }
+    Ok(out)
 }
 
-/// All `.go` files under root, skipping vendor/, testdata/, and any
-/// directory governed by a nested go.mod.
+/// Read one file and extract it, as the walk does for a changed file.
+fn scan_file<L: Language>(
+    ex: &dyn Extractor<L>,
+    path: &Path,
+    rel_path: String,
+) -> Result<ScannedFile<L>, String> {
+    let source = read_source(path, &rel_path)?;
+    let hash = *blake3::hash(source.as_bytes()).as_bytes();
+    let facts = ex.extract(&rel_path, &source);
+    Ok(ScannedFile {
+        rel_path,
+        hash,
+        facts,
+    })
+}
+
+fn read_source(path: &Path, rel_path: &str) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("reading {rel_path}: {e}"))
+}
+
+/// One file's phase-1 half: a node per nameable definition, and the
+/// definitions themselves, kept for the one question only the language can
+/// answer about two of them sharing an identity.
+fn phase_one<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    file: &ScannedFile<L>,
+    probe: &dyn SymbolProbe,
+    event_defs: &mut HashMap<NodeId, Vec<Definition>>,
+) -> FileDefs {
+    let mut nodes = Vec::with_capacity(file.facts.defs.len());
+    for def in &file.facts.defs {
+        let Some(fqn) = rs.def_fqn(cfg, &file.facts.header, &def.owner, def, probe) else {
+            continue; // not nameable, so not a node
+        };
+        let id = node_id(L::DOMAIN, fqn.as_str());
+        // An empty name means "this file does not say", which is not the
+        // same as naming the empty string.
+        let payload = if def.kind == DefKind::Module {
+            NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
+        } else {
+            NodePayload::Definition(def.kind.code())
+        };
+        let declarations = vec![DeclSite {
+            file: file.rel_path.clone(),
+            line: def.span.line,
+            payload: payload.clone(),
+        }];
+        let record = match payload {
+            NodePayload::Package(name) => NodeRecord::Package {
+                import_path: fqn.into_string(),
+                name,
+                declarations,
+            },
+            _ => NodeRecord::Definition {
+                fqn: fqn.into_string(),
+                kind: def.kind.code(),
+                declarations,
+            },
+        };
+        nodes.push((id, record));
+        event_defs.entry(id).or_default().push(def.clone());
+    }
+    FileDefs {
+        path: file.rel_path.clone(),
+        nodes,
+    }
+}
+
+/// One file's phase-2 half: every reference resolved against the scope its
+/// own header builds, and the rows, edges, external nodes and candidate
+/// entries that fall out.
+fn phase_two<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    file: &ScannedFile<L>,
+    probe: &dyn SymbolProbe,
+) -> FileRefs {
+    let scope = rs.scope(cfg, &file.facts, probe);
+    // The file's container stands in wherever a reference has no nameable
+    // encloser, which is where a package-level initialiser's calls belong.
+    let container = container_fqn::<L>(rs, cfg, &file.facts, probe);
+    let container_id = container
+        .as_ref()
+        .map(|fqn| node_id(L::DOMAIN, fqn.as_str()));
+    let container_name = container.as_ref().map_or("", Fqn::as_str);
+    let mut acc = RefAcc::default();
+
+    for r in &file.facts.refs {
+        let res = rs.resolve(cfg, &scope, r, probe);
+        // The source of an edge is the reference's nearest nameable
+        // encloser, named by the same function that names definitions — so
+        // an edge and the node it starts at cannot disagree.
+        let enclosing = r
+            .enclosing
+            .as_ref()
+            .and_then(|e| e.as_definition())
+            .and_then(|d| rs.def_fqn(cfg, &file.facts.header, &d.owner, &d, probe));
+        let (src, enclosing_name) = match &enclosing {
+            Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
+            None => (container_id, container_name),
+        };
+        let key = RefKey {
+            file: file.rel_path.clone(),
+            kind: r.kind.code(),
+            space: r.space.code(),
+            enclosing: enclosing_name.to_string(),
+            raw_target: r.raw_target.clone(),
+            argc: r.argc,
+            locally_bound: r.locally_bound,
+        };
+        record::<L>(key, r, src, res, &mut acc);
+    }
+    finish(acc, &file.rel_path, file.hash)
+}
+
+/// Scan a Go repository. What `main` and the integration tests call.
+pub fn scan_go(root: &Path, db_path: &Path) -> Result<Report, String> {
+    scan::<GoLang>(root, db_path, &GoExtractor, &GoResolver)
+}
+
+/// File one reference's resolution into this file's half: its row, its edge,
+/// the external node it reached, and every candidate it probed.
+fn record<L: Language>(
+    key: RefKey,
+    r: &Reference,
+    src: Option<NodeId>,
+    res: Resolution,
+    acc: &mut RefAcc,
+) {
+    for cand in &res.candidates {
+        acc.candidates.insert((*cand, key.clone()));
+    }
+    let stored = match &res.outcome {
+        Outcome::Resolved(id) => {
+            if let Some(src) = src {
+                acc.edges.insert((src, *id, r.kind.code()));
+            }
+            StoredOutcome::Resolved(*id)
+        }
+        Outcome::External(pkg) => {
+            // A dependency outside this repository is a node like any other,
+            // so a call into one is a real edge rather than a dead end. The
+            // `external:` prefix is unreachable by any candidate a resolver
+            // generates — no import path or FQN may contain a `:` — so
+            // growing the probe set this way cannot change one outcome.
+            let id = node_id(L::DOMAIN, &format!("external:{pkg}"));
+            if let Some(src) = src {
+                acc.edges.insert((src, id, r.kind.code()));
+            }
+            acc.externals
+                .entry(id)
+                .and_modify(|(_, line)| *line = (*line).min(r.span.line))
+                .or_insert_with(|| (pkg.clone(), r.span.line));
+            StoredOutcome::External(pkg.clone())
+        }
+        Outcome::Unresolved(reason) => StoredOutcome::Unresolved(reason_code(reason)),
+    };
+    acc.rows
+        .entry(key)
+        .and_modify(|row| row.count += 1)
+        .or_insert(RefRecord {
+            outcome: stored,
+            count: 1,
+            first_line: r.span.line,
+            lang: L::LANG.code(),
+        });
+}
+
+/// Close one file's accumulator into the half the store replaces.
+fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
+    let mut rows: Vec<(RefKey, RefRecord)> = acc.rows.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let nodes = acc
+        .externals
+        .into_iter()
+        .map(|(id, (package, line))| {
+            (
+                id,
+                NodeRecord::External {
+                    package: package.clone(),
+                    declarations: vec![DeclSite {
+                        file: path.to_string(),
+                        line,
+                        payload: NodePayload::External(package),
+                    }],
+                },
+            )
+        })
+        .collect();
+    FileRefs {
+        path: path.to_string(),
+        hash,
+        nodes,
+        rows,
+        edges: acc.edges.into_iter().collect(),
+        candidates: acc.candidates.into_iter().collect(),
+    }
+}
+
+/// How many of the identities the store flagged the language itself calls
+/// one entity rather than two.
+///
+/// Only a pair this event holds in full can be asked: a declaration stored
+/// by an earlier event kept its FQN, kind and sites, not its [`Definition`],
+/// so there is nothing to hand [`Resolver::mergeable`]. Those count as
+/// collisions, which is right for every language that answers `false`
+/// unconditionally and wrong for the first that does not — and the fix at
+/// that point is to store enough of the definition to ask, not to soften the
+/// count.
+fn mergeable_count<L: Language>(
+    rs: &dyn Resolver<L>,
+    colliding: &[NodeId],
+    event_defs: &HashMap<NodeId, Vec<Definition>>,
+) -> u64 {
+    let mut merged = 0;
+    for id in colliding {
+        let Some(defs) = event_defs.get(id) else {
+            continue;
+        };
+        if defs.len() >= 2 && defs.windows(2).all(|pair| rs.mergeable(&pair[0], &pair[1])) {
+            merged += 1;
+        }
+    }
+    merged
+}
+
+/// The container a file's definitions live in, when it names one.
+fn container_fqn<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    facts: &FileFacts<L>,
+    probe: &dyn SymbolProbe,
+) -> Option<Fqn> {
+    let def = facts.defs.iter().find(|d| d.kind == DefKind::Module)?;
+    rs.def_fqn(cfg, &facts.header, &def.owner, def, probe)
+}
+
+/// A path under `root`, as a repo-relative `/`-separated string.
+fn rel_path(root: &Path, path: &Path) -> Result<String, String> {
+    Ok(path
+        .strip_prefix(root)
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+/// Every file under `root` a language owns by extension, skipping the
+/// directories it never descends into.
 ///
 /// Public because the completeness assertion — every extracted reference has
 /// exactly one stored outcome — has to count references over *this* file set.
 /// A second copy of these rules in a test would drift, and the first thing it
 /// would hide is a file the scan silently never read.
-pub fn go_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn source_files<L: Language>(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root).build() {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|e| e != "go") {
+        let owned = path
+            .extension()
+            .is_some_and(|ext| L::extensions().iter().any(|want| ext == *want));
+        if !owned || !path.is_file() {
             continue;
         }
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
-        let skip = rel.components().any(|c| {
+        let skipped = rel.components().any(|c| {
             let c = c.as_os_str();
-            c == "vendor" || c == "testdata"
+            L::skip_dirs().iter().any(|dir| c == *dir)
         });
-        if skip {
-            continue;
-        }
-        // Nested module: an ancestor dir (excluding root) with its own go.mod.
-        let mut dir = path.parent();
-        let mut nested = false;
-        while let Some(d) = dir {
-            if d == root {
-                break;
-            }
-            if d.join("go.mod").is_file() {
-                nested = true;
-                break;
-            }
-            dir = d.parent();
-        }
-        if !nested {
+        if !skipped {
             out.push(path.to_path_buf());
         }
     }

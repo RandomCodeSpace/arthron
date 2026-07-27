@@ -4,6 +4,274 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Seven adversarial-review findings, and two reserved characters
+
+An adversarial review of the phase-2 core produced seven findings. Each was
+reproduced by a test written before its fix; none was rebutted. Two corrupted
+the resolution rate directly, which is why the round is recorded here and not
+in commit messages alone.
+
+**A clause header does not bind its own right-hand side.** Go starts a
+declared identifier's scope at the end of its declaration, so `if x := x()`
+names the outer `x` on the right and the new one only in the body. The
+extractor read the whole clause as bound, moving real references into
+`LocalBinding` — excluded from *both* terms of the rate, so the bug raised
+the rate by deleting edges. The `statement_list` arm beside it already made
+the position check; the header arm did not.
+
+**A row key carries the extractor's binding verdict.** A block-local `x()`
+and the package-level `x()` after it agree on file, enclosing function, site
+text and arity, and resolve differently. One row carries one outcome, so they
+merged and both occurrences were attributed to whichever came first — while
+the resolved one still inserted its edge, leaving a `Resolved` edge whose row
+said `LocalBinding`. Count conservation never noticed: the totals summed, and
+only the rate moved.
+
+**`#` separates a container from its members; `!` marks an external test
+package.** A Go import path may carry a dot inside a path element
+(`gopkg.in/yaml.v3`, or any directory named `p.Foo`), so `{pkg}.{name}` gave
+the function `Foo` of package `example.com/m/p` and the package in directory
+`p.Foo` one identity and one node — the survivor a `Definition` carrying both
+files' declaration sites. `#` is forbidden in an import path and in an
+identifier alike, so a definition FQN carries exactly one and a container FQN
+carries none. *Rejected:* keeping `#test` for the external test package,
+because under the new grammar `{dir}#test` is exactly the FQN of a definition
+named `test`, and `func test()` is an ordinary unexported helper. *Rejected:*
+`:`, which would erode the invariant that no FQN contains one — the
+`external:` prefix rests on it. Two reserved characters, one job each.
+
+**The manifest is a scan input, so the store fences on a fingerprint of it.**
+`go.mod` has no extension the language owns and contributes no facts of its
+own, yet its module directive roots every FQN. Rewriting it renamed every
+node while no `.go` file's bytes moved, so the changed set came out empty and
+the store kept a graph no cold scan would build. A resolver now publishes a
+digest of what phase 0 read, and a different one wipes the store exactly as a
+schema change does. *Rejected:* folding the learned container names into the
+digest — the driver teaches those from the store as the scan runs, so the
+graph would be wiped on every scan.
+
+**Invalidation compares meaning, not only identity.** A package's node is its
+import path, which its directory decides, so rewriting a `package` clause
+moves no `NodeId` and still changes what every unaliased import of it binds.
+The touched set is now every identity whose payload differs on either side.
+Declaration sites stay out of that payload: they move on any edit above them
+and nothing resolves against them.
+
+**Both phases decide container identity with one set of names.** Phase 1 saw
+only what earlier scans stored and phase 2 what phase 1 had just written, and
+whether a file is an external test package is a question about exactly that
+difference. A directory whose production package is genuinely named
+`api_test` filed its in-package test under one namespace and sourced that
+file's edges at another.
+
+**A declaration site carries what its file declared.** Build-exclusive twins
+may declare one FQN as different kinds; the record kept the last writer's
+answer, and forgetting that file stranded the answer on the survivor. The
+record is re-derived from the sites that remain, first in `(file, line)`
+order — a function of the surviving set rather than of write order, which is
+what makes a warm store agree with a cold one. This is the per-site storage
+`merge_node` had already named as the fix and deferred.
+
+**The counts did not move.** Both corpora gate identically to the previous
+baseline — `go/codeiq` 84.8% (4467 / 6085 / 4276 / 799), `go/caddy` 62.4%
+(3006 / 9571 / 9425 / 1815), every column unchanged. Seven real bugs, and no
+triggering shape for any of them in either corpus, so the ratchet is
+untouched and the baselines are not re-based. A fix that moves no measurement
+is still a fix; a corpus that cannot see it is a gap in the corpus.
+
+Schema generation went to 5: the row key gained a field, declaration sites
+gained a payload, and every identity changed.
+
+---
+
+## 2026-07-27 — The gate is a command with an exit code, and a baseline it cannot game
+
+`arthron gate <corpus> --baseline <file> [--db <path>] [--rebase]` scans a
+corpus and compares its per-language counts against a committed baseline.
+Exit `0` pass, `1` regression, `2` usage or I/O error. Resolution rate is the
+primary gate and it now has a mechanism instead of a paragraph.
+
+**The baselines are measured, and here they are.** Release build, cold store,
+at the candidate-invalidation commit:
+
+| Corpus | resolved | external | local-binding | unresolved | rate |
+|---|---|---|---|---|---|
+| `go/codeiq` | 4467 | 6085 | 4276 | 799 | 84.8% |
+| `go/caddy` | 3006 | 9571 | 9425 | 1815 | 62.4% |
+
+Both totals conserve: `4467 + 6085 + 4276 + 799 = 15627` extracted references
+on the first corpus, `3006 + 9571 + 9425 + 1815 = 23817` on the second — the
+same totals as before the binding-environment fix moved references between
+categories. `--rebase` refuses to write a baseline whose four counts sum to
+zero, because an all-zero file looks exactly as authoritative as a correct one
+and every later run would bless it.
+
+**The rate is not stored, only its two terms are.** Comparison is exact
+rational arithmetic in `u128` — `now.resolved × was_denom` against
+`was.resolved × now_denom` — never floats. At corpus scale a float comparison
+is accurate enough; the reason to refuse it is that a stored rate can disagree
+with the counts beside it, and then the file no longer says one thing.
+*Rejected:* storing the rate as a third number.
+
+**`local_binding` and `external` drift fail the gate unconditionally.** Both
+sit outside *both* terms, so moving references into either raises the rate
+while deleting real edges — the exact shape of an over-approximating binding
+environment passing for a fix. Demonstrated: a baseline claiming a *lower*
+rate than the run measured still fails when its `local_binding` differs, so an
+"improvement" bought by reclassification cannot land silently. A capability
+that legitimately moves `external` re-bases; it never quietly compares.
+*Rejected:* a tolerance band on either count — a threshold is a budget, and a
+budget gets spent.
+
+**A zero denominator is an error, not a pass.** A rate of zero and the absence
+of any reference are different facts, and a gate that called the second one
+green would bless a total collapse.
+
+**The baseline format is flat TOML — `key = value`, `#` comments, no tables —
+read by a strict reader in this tree.** A table header, an unknown key, a
+duplicate key, a missing key, a non-numeric or overflowing count, or a format
+version this build does not know is an error, loudly. A baseline that silently
+reads as zeros is worse than no baseline.
+*Rejected:* `toml` + `serde` for six scalars, in a tree that has neither.
+
+**The default store is a fresh temporary one, deleted after the run.** A warm
+store would gate on whatever the previous run happened to leave behind.
+`--db` exists to keep the graph for inspection and is documented as such.
+
+**`corpus` and `commit` are provenance: printed, never verified.** A vendored
+corpus snapshot carries no git metadata to check them against, so a check
+would be theatre. What guards against a baseline recorded from the wrong run
+is that the regeneration command is a comment inside the file and the numbers
+are quoted here, where a mismatch is visible in review.
+
+---
+
+## 2026-07-27 — Candidate invalidation: an edit reaches the files it changed the answer for
+
+An edit that adds or removes a definition now re-resolves the references in
+**unchanged** files that probed that identity. Every reference records the
+identities it probed, hits *and* misses, and the misses are the point: a
+reference that looked for `pkg.Missing` and found nothing is exactly the one
+that must be woken when a later commit declares it.
+
+**Whole affected files are re-resolved, not individual rows.** The index
+selects the file; re-resolving one is a parse plus its references through the
+per-file replace every changed file already uses.
+*Rejected:* patching single rows — it needs sub-file ownership of edges and
+candidate entries, which is more machinery, more ways to be subtly wrong, and
+no measured need. Its oracle is already built, so it stays available as a
+later optimisation.
+
+**One round terminates.** Re-reading a file whose bytes did not move cannot
+change what it declares, so the woken set cannot widen the event again.
+*Rejected:* a fixed-point loop with an iteration cap — nothing in Go needs one,
+and a cap is a silent-truncation risk bought for a language that does not
+exist yet.
+
+**The affected set is selected from ownership read before the event writes
+anything.** Read it after phase 1 and the comparison is against itself: the
+set comes out empty, and every test whose caller happens to sit in the changed
+file still passes. It is a deliberate over-approximation — an identity another,
+unchanged file also declares is woken though it never disappeared — because
+waking too many files is wasted work and waking too few is a wrong answer.
+
+**An edge is a shared fact and now records which files produce it** (store
+schema 2 → 3). Two files of one package whose package-level references reach
+the same target produce the identical `(src, dst, kind)` triple; deleting one
+file used to take the other's edge with it. Nothing in the report notices —
+tallies are summed from per-file rows, never from the edge table — so only a
+whole-store comparison against a cold scan can see it. Found by exactly that
+comparison, at corpus scale, on a file the four-file fixtures could not model:
+one `Import` edge between two packages vanished when a file that was not its
+only producer was deleted. This is the never-drop rule applied where the key
+is not per-file, and it is the same rule a node's declaration sites already
+followed.
+*Rejected:* re-deriving surviving edges by scanning every file's ownership
+record on each delete — correct, and O(repo) per event.
+
+**The oracle is the deliverable, and it runs against both corpora.** After
+touch, delete and restore events, the incremental store is compared to a cold
+scan of the same tree — snapshot and report, every node, row, edge and
+candidate entry — **after each event, not once at the end**, because a delete
+followed by a restore puts every identity back and makes a store that went
+stale in between look correct again. Both corpora land byte-identical,
+including the one holding 28 FQNs that two files each declare.
+
+Counts are unchanged from the binding-environment entry below, which is the
+requirement: this stage moves no reference between categories. Release build,
+cold store: first corpus `4467 / 6085 / 4276 / 799`, rate 84.8%; second corpus
+`3006 / 9571 / 9425 / 1815`, rate 62.4%, 28 FQN collisions.
+
+---
+
+## 2026-07-27 — Go binding environments: the false-edge fix, measured
+
+The shadowing bug the road-to-27 entry described is closed. The extractor now
+computes one file-local fact per reference — *some enclosing binder binds the
+root of this target* — and the resolver turns it into `LocalBinding`, reported
+on its own line beside `External` and outside both terms of the rate.
+
+**The extractor states the fact; the resolver owns the outcome.** A `bool` is
+all that crosses the boundary, because every Go binder for a value name is
+decidable from one file's AST: parameters, named results and receivers bind
+the whole body; block, case and select statements bind from the end of their
+declaration to the end of their scope; `if`, `for`, `switch` and `select`
+headers bind their clause. `_` declares nothing, `=` in a range clause assigns
+rather than declares, and package level is not a binding environment at all.
+*Rejected:* suppressing these references in the extractor (a drop, and the one
+way to improve a rate without improving anything — it removes a category from
+the denominator by deleting it); a `RefTarget::Local` variant (only the *root*
+of `x.y.z()` is bound, and the member path is irrelevant to that).
+
+**Measured, both corpora, release build, cold store.** Conservation was
+checked first: `resolved + external + local-binding + unresolved` equals the
+extracted reference count exactly, so nothing was dropped on the way.
+
+| Corpus | | resolved | external | local-binding | unresolved | rate |
+|---|---|---|---|---|---|---|
+| Go, 15,627 refs | before | 4467 | 6085 | — | 5075 | 46.8% |
+| | after | 4467 | 6085 | 4276 | 799 | 84.8% |
+| Go, 23,817 refs | before | 3006 | 9583 | — | 11228 | 21.1% |
+| | after | 3006 | 9571 | 9425 | 1815 | 62.4% |
+
+**Every moved reference is accounted for by category.** On the first corpus:
+`NoMatchingDefinition` −128 and `NeedsTypeInference` −4148, summing to the
+4276 local bindings, with `resolved` and `external` **unchanged**. On the
+second: `NeedsTypeInference` −9133, `NoMatchingDefinition` −280 and
+`external` −12, summing to 9425, with `resolved` unchanged. The 12 that left
+`external` are the wrong edges the fix targets, and each was located in the
+source: a `log := …` shadowing `import log`, a parameter `hash hash.Hash`
+shadowing `import hash`, a named result `uuid` shadowing the `uuid` package, a
+`var time time.Time` shadowing `import time`, and eight more of the same
+shape. **Zero resolved references moved on either corpus** — the check that
+matters, because an over-wide binder would delete real edges while *raising*
+the rate, and the primary gate would reward it.
+
+**The rate rise is not a resolution improvement and must not be read as one.**
+It is a denominator that shrank by 4,276 and 9,413 references respectively.
+The gate that lands next fails on any `local-binding` drift for exactly this
+reason.
+
+**An external test package is `{dir}#test`, not `{dir}_test`.** `#` is
+forbidden in a Go module path, so the identity is one no real directory can
+claim; a directory literally named `foo_test` beside the external test package
+of `foo` previously shared its namespace, and a same-package candidate could
+cross between them. Classification also now requires the file to *be* a test
+file: `package foo_test` in a non-`_test.go` file is not an external test
+package, because the toolchain rejects that directory outright, so the suffix
+alone was never the rule.
+*Rejected:* a separate `Domain` for Go test packages — a domain is a
+language's identity space, and minting one per package flavour would make
+every probe between production and test code impossible, which is the opposite
+of what an external test package needs, since it imports the package under
+test.
+
+**Known and not fixed here:** a file named exactly `_test.go` is ignored by
+the Go toolchain and is not ignored by this walk. Fixing it changes the file
+set, which changes the denominator, so it belongs to its own commit.
+
+---
+
 ## 2026-07-27 — The road to 27 languages: core refactor first, ratified interface, staged corpora, frozen-core fanout
 
 Five language case studies (Java, JavaScript, TypeScript, Python, and a Go
