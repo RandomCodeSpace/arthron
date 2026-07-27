@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Runners ship rustup, so no third-party toolchain action is needed.
+      - name: Pin toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      # ast-grep-language builds 27 tree-sitter grammars from C; without a
+      # cache every run pays several minutes for dependencies that never change.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # -D on the clippy invocation, not RUSTFLAGS: a global RUSTFLAGS would
+      # also deny warnings inside dependencies, which we do not control.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The corpus lives in the private RandomCodeSpace/arthron-corpus and is
+      # not fetched here, so tests/corpus.rs skips. Everything else runs.
+      - name: Tests
+        run: cargo test --all-features
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Reads rust-version from Cargo.toml so the declared MSRV cannot drift
+      # away from what the dependency tree actually requires.
+      - name: Install declared MSRV toolchain
+        run: |
+          MSRV=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "Declared MSRV: $MSRV"
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup default "$MSRV"
+          rustc --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-msrv-
+
+      - name: Build
+        run: cargo check --all-targets --all-features
