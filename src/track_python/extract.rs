@@ -405,16 +405,39 @@ fn parameter_name(p: &SgNode) -> Option<String> {
 /// receiver (E-01/E-02).
 ///
 /// Three conditions, all needed: the name is `self` or `cls`, it is the first
-/// parameter of the nearest enclosing function, and that function is a method
-/// — a bare function whose first parameter is called `self` binds an ordinary
-/// local, and `RefTarget::This` would claim a class that does not exist.
+/// parameter of the **outermost** enclosing function, and that function is a
+/// method — a bare function whose first parameter is called `self` binds an
+/// ordinary local, and `RefTarget::This` would claim a class that does not
+/// exist.
+///
+/// Outermost, not nearest, and it has to be: `enclosing_definition` truncates
+/// its chain at the outermost function because nested `def`s and lambdas are
+/// not nodes, so a reference inside a closure already carries the enclosing
+/// class. Asking the nearest function instead made the two disagree for every
+/// `self.x` written inside a closure — the closure's first parameter is not
+/// `self`, so the reference stopped being a receiver and reached the resolver
+/// as an ordinary dotted name over a closed-over local, which is the
+/// type-inference floor with no candidate ever probed. `self` in a closure
+/// *is* the enclosing method's receiver; §4.2.1 makes it a free variable of
+/// the closure bound in exactly that scope.
+///
+/// Outermost *within the enclosing class*, though, which is why the walk stops
+/// at the first `class_definition`. A method of a class declared inside a
+/// function is still a method, and running past the class to that function
+/// would find a first parameter that is not `self` and demote a receiver whose
+/// class is lexically right there.
 fn is_receiver(node: &SgNode, name: &str) -> bool {
     if name != "self" && name != "cls" {
         return false;
     }
+    // `ancestors()` runs innermost-first, so the last callable yielded before
+    // the enclosing class is the outermost function inside that class — the
+    // same one `enclosing_definition` keeps.
     let Some(func) = node
         .ancestors()
-        .find(|a| matches!(&*a.kind(), "function_definition" | "lambda"))
+        .take_while(|a| a.kind() != "class_definition")
+        .filter(|a| matches!(&*a.kind(), "function_definition" | "lambda"))
+        .last()
     else {
         return false;
     };
@@ -432,6 +455,37 @@ fn is_receiver(node: &SgNode, name: &str) -> bool {
             )
         })
         .is_some_and(|a| a.kind() == "class_definition")
+}
+
+/// Whether this `globals()` call is being written through rather than read.
+///
+/// C-17 is about names entering a namespace with no static declaration site,
+/// so only a mutation counts. `globals()` is an ordinary dict, and the shapes
+/// that write it are a subscript on the left of an assignment or a `del`, and
+/// the dict methods that mutate in place.
+fn mutates_namespace(call: &SgNode) -> bool {
+    let mut up = call.ancestors();
+    let Some(parent) = up.next() else {
+        return false;
+    };
+    match &*parent.kind() {
+        // `globals()[k] = v`, `globals()[k] += v`, `del globals()[k]`. The
+        // range test is what keeps `v = globals()[k]` — a read — out.
+        "subscript" => up.next().is_some_and(|stmt| match &*stmt.kind() {
+            "assignment" | "augmented_assignment" => stmt
+                .field("left")
+                .is_some_and(|l| l.range().start == parent.range().start),
+            "delete_statement" => true,
+            _ => false,
+        }),
+        "attribute" => parent.field("attribute").is_some_and(|a| {
+            matches!(
+                &*a.text(),
+                "update" | "setdefault" | "pop" | "popitem" | "clear"
+            )
+        }),
+        _ => false,
+    }
 }
 
 /// Whether this `call` node is the `super()` of `super().m()` (E-03).
@@ -1547,10 +1601,25 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PyLang> {
                 let target = dotted_target(&function);
                 if target.root == TargetRoot::Name {
                     let head = target.segments.first().map(String::as_str);
-                    if matches!(head, Some("exec" | "eval" | "globals"))
-                        && target.segments.len() == 1
-                    {
-                        header.has_dynamic_namespace = true; // C-17
+                    if target.segments.len() == 1 {
+                        match head {
+                            // C-17. `exec` really can bind: at module level it
+                            // writes the module namespace.
+                            Some("exec") => header.has_dynamic_namespace = true,
+                            // `globals()` only when it is written *through*.
+                            // The flag reaches every single-segment miss in
+                            // the whole file, so setting it for a read
+                            // (`for k in globals():`, `globals().get(x)`)
+                            // hides genuinely missing definitions behind a
+                            // reason no one can falsify.
+                            Some("globals") if mutates_namespace(node) => {
+                                header.has_dynamic_namespace = true;
+                            }
+                            // `eval` is deliberately absent: §2 of the
+                            // builtins docs makes it an *expression*
+                            // evaluator, and an expression binds no name.
+                            _ => {}
+                        }
                     }
                     if target.segments.len() >= 2
                         && target.segments[target.segments.len() - 2] == "path"
@@ -2110,6 +2179,38 @@ mod tests {
         assert!(facts("exec(\"x = 1\")\n").header.has_dynamic_namespace);
         assert!(facts("globals()[\"x\"] = 1\n").header.has_dynamic_namespace);
         assert!(!facts("run(\"x\")\n").header.has_dynamic_namespace);
+        // C-17 is about names entering the namespace with no static site, so
+        // the flag has to mean a *write*. It reaches every single-segment miss
+        // in the whole file, so a read setting it would hide genuinely missing
+        // definitions behind a reason nobody can falsify.
+        assert!(
+            facts("globals().update(d)\n").header.has_dynamic_namespace,
+            "`globals().update` writes the namespace",
+        );
+        assert!(
+            facts("del globals()[\"x\"]\n").header.has_dynamic_namespace,
+            "`del globals()[k]` writes the namespace",
+        );
+        assert!(
+            !facts("eval(\"1\")\n").header.has_dynamic_namespace,
+            "`eval` evaluates an expression and returns it; it binds nothing",
+        );
+        assert!(
+            !facts("for name in globals():\n    pass\n")
+                .header
+                .has_dynamic_namespace,
+            "iterating `globals()` reads it",
+        );
+        assert!(
+            !facts("v = globals().get(\"x\")\n")
+                .header
+                .has_dynamic_namespace,
+            "`globals().get` reads it",
+        );
+        assert!(
+            !facts("v = globals()[\"k\"]\n").header.has_dynamic_namespace,
+            "a subscript on the right-hand side reads it",
+        );
         assert!(facts("sys.path.insert(0, \"x\")\n").header.mutates_sys_path);
         assert!(!facts("os.path.join(a, b)\n").header.mutates_sys_path);
     }

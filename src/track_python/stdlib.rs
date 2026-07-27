@@ -507,6 +507,52 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTINS.binary_search(&name).is_ok()
 }
 
+/// Everything `object` declares — `dir(object)` on CPython 3.11, sorted.
+///
+/// Frozen for the same reason [`STDLIB`] is: it names something outside every
+/// repository, so reading it from the running interpreter would make a scan
+/// depend on which Python happened to be installed.
+///
+/// Deliberately exactly `dir(object)` and not a name more: the only use is
+/// [`is_object_member`], and every name added here moves a `super()` call from
+/// the rate's denominator into `External`. Under-listing keeps a reference in
+/// the measurement; over-listing quietly removes it.
+pub const OBJECT_MEMBERS: &[&str] = &[
+    "__class__",
+    "__delattr__",
+    "__dir__",
+    "__doc__",
+    "__eq__",
+    "__format__",
+    "__ge__",
+    "__getattribute__",
+    "__getstate__",
+    "__gt__",
+    "__hash__",
+    "__init__",
+    "__init_subclass__",
+    "__le__",
+    "__lt__",
+    "__ne__",
+    "__new__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__repr__",
+    "__setattr__",
+    "__sizeof__",
+    "__str__",
+    "__subclasshook__",
+];
+
+/// Whether `object` itself declares this member (§3.3.2.1).
+///
+/// What a `super()` call in a class with no declared base can be answered
+/// against: the implicit base is `object`, and only a member `object` really
+/// has is a real target outside the repository.
+pub fn is_object_member(name: &str) -> bool {
+    OBJECT_MEMBERS.binary_search(&name).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

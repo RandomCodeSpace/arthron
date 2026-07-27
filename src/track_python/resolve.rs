@@ -62,7 +62,9 @@ use crate::track_python::project::{
     ModPlace, PyProject, extension_module_paths, infer_roots, package_dirs, parse_pyproject,
     parse_requirements, parse_setup_py,
 };
-use crate::track_python::stdlib::{BUILTINS_PACKAGE, is_builtin, is_stdlib, stdlib_package};
+use crate::track_python::stdlib::{
+    BUILTINS_PACKAGE, is_builtin, is_object_member, is_stdlib, stdlib_package,
+};
 use crate::{Outcome, UnresolvedReason};
 
 /// How deep the base-class walk goes before giving up.
@@ -488,6 +490,7 @@ impl PyResolver {
         cfg: &PyProject,
         scope: &PyScope,
         segments: &[String],
+        locally_bound: bool,
         walk: &Walk,
         probe: &dyn SymbolProbe,
         probed: &mut Vec<NodeId>,
@@ -498,7 +501,18 @@ impl PyResolver {
         let head = segments.first().map(String::as_str).unwrap_or("");
         // §4.2.2: builtins are the last scope searched, so this is reached
         // only after every binding and star candidate has missed (C-02).
-        if !scope.bindings.contains_key(head) && is_builtin(head) {
+        //
+        // `locally_bound` is asked first and `scope.bindings` second because
+        // they answer for different scopes and neither covers the other:
+        // §4.2.1 makes a name bound anywhere in a block local to that block,
+        // and `scope.bindings` is the *module* table, which never holds a
+        // local. Without the first test `filter = build_filter()` followed by
+        // `filter.apply()` would be answered by the builtin `filter` and leave
+        // both terms of the rate — the same escape `resolve_name` already
+        // refuses to allow through `LocalBinding`, arriving through a
+        // different door. The honest answer for a member of a local is the
+        // type of that local, which nobody wrote down.
+        if !locally_bound && !scope.bindings.contains_key(head) && is_builtin(head) {
             return Outcome::External(BUILTINS_PACKAGE.to_string());
         }
         // PEP 562: a module with `__getattr__` serves attributes that have no
@@ -791,10 +805,30 @@ impl PyResolver {
         }
         let bases = scope.bases.get(&owner).map(Vec::as_slice).unwrap_or(&[]);
         if bases.is_empty() {
-            // The implicit base is `object`, which is builtins and is real.
-            return Resolution {
-                outcome: Outcome::External(BUILTINS_PACKAGE.to_string()),
-                candidates: Vec::new(),
+            // The implicit base is `object` — but only for a member `object`
+            // actually declares. `super().__init__()` names a real thing
+            // outside the repository and is `External`.
+            //
+            // `super().check()` does not. A class with no declared base that
+            // calls a member `object` has never heard of is a cooperative
+            // mixin: §3.3.2.1 starts the lookup after this class in the MRO of
+            // `type(self)`, and every entry in that MRO arrives from a
+            // subclass this file does not name. `DynamicDispatch` is the same
+            // answer the multiple-base arm below gives, and for the same
+            // reason — the target is chosen at runtime.
+            //
+            // Getting this wrong runs the classification backwards with
+            // respect to certainty: with two bases the resolver knows more and
+            // keeps the reference in the denominator; with none it knows less,
+            // and `External` would drop it out of the rate altogether.
+            let object_member = segments.len() == 1 && is_object_member(segments[0].as_str());
+            return if object_member {
+                Resolution {
+                    outcome: Outcome::External(BUILTINS_PACKAGE.to_string()),
+                    candidates: Vec::new(),
+                }
+            } else {
+                unresolved(UnresolvedReason::DynamicDispatch)
             };
         }
         let mut candidates = Vec::new();
@@ -871,7 +905,15 @@ impl PyResolver {
         match Self::probe_in_order(probe, &candidates, &mut probed) {
             Some(id) => resolution(Outcome::Resolved(id), probed),
             None => {
-                let outcome = Self::miss(cfg, scope, segments, &walk, probe, &mut probed);
+                let outcome = Self::miss(
+                    cfg,
+                    scope,
+                    segments,
+                    r.locally_bound,
+                    &walk,
+                    probe,
+                    &mut probed,
+                );
                 resolution(outcome, probed)
             }
         }
@@ -1713,6 +1755,172 @@ mod tests {
         );
         assert_eq!(
             reason(&cfg, "pkg/mod.py", cooperative, &[], "super().run"),
+            UnresolvedReason::DynamicDispatch
+        );
+    }
+
+    #[test]
+    fn a_local_shadowing_a_builtin_does_not_leave_the_rate_as_external() {
+        // C-02, and the same anti-gaming property `resolve_name` protects when
+        // it refuses to call a dotted target `LocalBinding`: a reference whose
+        // root is a function-local must not leave *both* terms of the rate.
+        // `scope.bindings` is the module table and never holds a local, so the
+        // builtin fallback's guard could not see the shadowing on its own.
+        let cfg = project(&["pkg"]);
+        let shadowed = concat!(
+            "def build_filter():\n",
+            "    pass\n",
+            "\n",
+            "def apply(items):\n",
+            "    filter = build_filter()\n",
+            "    return filter.apply(items)\n",
+        );
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/mod.py",
+                shadowed,
+                &["pkg.mod#build_filter"],
+                "filter.apply"
+            ),
+            UnresolvedReason::NeedsTypeInference
+        );
+        // The guard must stay narrow. A bare builtin nobody shadowed is still
+        // a real name from a real namespace outside the repository.
+        assert_eq!(
+            outcome_of(&cfg, "pkg/mod.py", "len([])\n", &[], "len"),
+            Outcome::External(BUILTINS_PACKAGE.to_string())
+        );
+        // And so is a *dotted* target rooted at an unshadowed builtin.
+        assert_eq!(
+            outcome_of(
+                &cfg,
+                "pkg/mod.py",
+                "def f():\n    return object.__subclasshook__()\n",
+                &[],
+                "object.__subclasshook__"
+            ),
+            Outcome::External(BUILTINS_PACKAGE.to_string())
+        );
+    }
+
+    #[test]
+    fn a_receiver_inside_a_closure_is_still_the_methods_receiver() {
+        // E-01. `enclosing_definition` truncates the ancestor chain at the
+        // *outermost* function, so a reference inside a closure already
+        // carries the enclosing class. Deciding `self` against the *nearest*
+        // function instead disagreed with that: the closure's first parameter
+        // is not `self`, so the reference stopped being a receiver and fell
+        // into the type-inference floor without a single candidate probed.
+        // Nothing here is inferred — the class is lexically known.
+        let cfg = project(&["pkg"]);
+        let closure = concat!(
+            "class C:\n",
+            "    def helper(self):\n",
+            "        pass\n",
+            "    def run(self):\n",
+            "        def cb():\n",
+            "            return self.helper()\n",
+            "        return cb()\n",
+        );
+        assert_eq!(
+            outcome_of(
+                &cfg,
+                "pkg/mod.py",
+                closure,
+                &["pkg.mod#C.helper"],
+                "self.helper"
+            ),
+            resolved_to("pkg.mod#C.helper")
+        );
+        // A lambda body is the same story.
+        let lam = concat!(
+            "class C:\n",
+            "    def helper(self):\n",
+            "        pass\n",
+            "    def run(self):\n",
+            "        return lambda: self.helper()\n",
+        );
+        assert_eq!(
+            outcome_of(
+                &cfg,
+                "pkg/mod.py",
+                lam,
+                &["pkg.mod#C.helper"],
+                "self.helper"
+            ),
+            resolved_to("pkg.mod#C.helper")
+        );
+        // The guard that must survive: a *bare* function whose first parameter
+        // happens to be called `self` binds an ordinary local, and claiming a
+        // receiver would name a class that does not exist.
+        let bare = concat!(
+            "def run(self):\n",
+            "    def cb():\n",
+            "        return self.helper()\n",
+            "    return cb()\n",
+        );
+        assert_eq!(
+            reason(
+                &cfg,
+                "pkg/mod.py",
+                bare,
+                &["pkg.mod#C.helper"],
+                "self.helper"
+            ),
+            UnresolvedReason::NeedsTypeInference
+        );
+        // The other direction, and the reason "outermost" is scoped to the
+        // enclosing class: a method of a class declared *inside* a function is
+        // still a method, and its `self` is still a receiver. That class is
+        // not nameable from outside, so `enclosing_definition` collapses the
+        // whole thing onto `make` and the receiver's class cannot be named —
+        // which is what `NeedsReceiverType` says, and it says it more
+        // precisely than the type-inference floor would.
+        let in_function = concat!(
+            "def make():\n",
+            "    class C:\n",
+            "        def helper(self):\n",
+            "            pass\n",
+            "        def m(self):\n",
+            "            return self.helper()\n",
+            "    return C\n",
+        );
+        assert_eq!(
+            reason(&cfg, "pkg/mod.py", in_function, &[], "self.helper"),
+            UnresolvedReason::NeedsReceiverType
+        );
+    }
+
+    #[test]
+    fn super_in_a_base_less_class_is_external_only_for_a_member_object_has() {
+        // E-03, and the classification must not run backwards with respect to
+        // certainty. With two bases the answer below is `DynamicDispatch` and
+        // the reference stays in the denominator. With *no* declared base the
+        // resolver knows strictly less — a mixin's whole MRO arrives from a
+        // subclass it cannot see — so calling that `External` would drop the
+        // harder case out of both terms of the rate.
+        let cfg = project(&["pkg"]);
+        // `object` really does declare `__init__`, so this one is external and
+        // stays external: the target is real and outside the repository.
+        let dunder = concat!(
+            "class Plain:\n",
+            "    def __init__(self):\n",
+            "        super().__init__()\n",
+        );
+        assert_eq!(
+            outcome_of(&cfg, "pkg/mod.py", dunder, &[], "super().__init__"),
+            Outcome::External(BUILTINS_PACKAGE.to_string())
+        );
+        // `object` has no `check`. This is the cooperative-mixin shape, and
+        // the member is whatever follows this class in some subclass's MRO.
+        let mixin = concat!(
+            "class CheckMixin:\n",
+            "    def check(self, **kwargs):\n",
+            "        return super().check(**kwargs)\n",
+        );
+        assert_eq!(
+            reason(&cfg, "pkg/mod.py", mixin, &[], "super().check"),
             UnresolvedReason::DynamicDispatch
         );
     }

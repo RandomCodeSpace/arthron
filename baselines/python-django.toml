@@ -10,9 +10,9 @@
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
 corpus = "corpus/python/django"
-commit = "156eb4b"
+commit = "af67523"
 language = "python"
-resolved = 18789
-external = 13370
-local_binding = 827
-unresolved = 14035
+resolved = 18850
+external = 13326
+local_binding = 826
+unresolved = 14017
