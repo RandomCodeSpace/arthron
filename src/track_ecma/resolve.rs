@@ -82,7 +82,7 @@
 //!   the hop ceiling. It stopped *itself*, so blaming the corpus for a
 //!   missing definition would be a lie.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::lang::{Entry, FileFacts, FileIndex, LayoutError, Resolution, Resolver, SymbolProbe};
@@ -128,6 +128,16 @@ const MAX_ALIAS_HOPS: usize = 16;
 /// all name it: `class C { m(){} }` and `C.prototype.m = function(){}` are one
 /// identity across both eras of the language.
 pub const PROTOTYPE: &str = "prototype";
+
+/// The identity prefix a star export forwards to when this build cannot name
+/// the module at all — a missing file, a specifier no rule resolves.
+///
+/// It carries a `:`, so no module path and no FQN this resolver builds can
+/// equal it, which is exactly the property that makes it work: the target is
+/// never a key [`EcmaConfig::module_paths`] answers for, so
+/// [`EcmaResolver::walk_stars`] reads it as a branch it could not enumerate
+/// and never as a module to enter.
+const UNENUMERABLE_MODULE: &str = "unenumerable-module:";
 
 /// Escape a module path for the FQN grammar.
 fn escape_path(path: &str) -> String {
@@ -220,12 +230,20 @@ pub struct ResolvedModule {
 
 /// The bookkeeping one alias walk carries.
 ///
-/// Two lists, because a module reached twice means two different things. On
+/// Two sets, because a module reached twice means two different things. On
 /// the *current path* it is a cycle: the walk must stop and say so, or it
 /// never ends. On a *sibling* path it is a diamond — two barrels
 /// re-exporting one module, which is ordinary — and it already contributed
 /// whatever it had, so reporting it as a cycle would put a false reason on a
 /// perfectly normal module graph.
+///
+/// Both are membership questions and nothing else — no order is read off
+/// either — so both are hashed. A barrel with `N` star targets asked one
+/// name is `N` membership tests against a set that grows to `N`, and a linear
+/// scan made that quadratic *per reference* on a corpus where one barrel
+/// serves thousands of them. The candidate list stays a vector because its
+/// order is the record of what this reference read, which the invalidation
+/// index is built from.
 struct Walk<'a> {
     /// Which declaration table every probe reads. Invariant: the reference's
     /// space does not change because the walk crossed a module.
@@ -235,10 +253,10 @@ struct Walk<'a> {
     segments: &'a [String],
     /// Every identity probed, in probe order, hits and misses alike.
     candidates: Vec<NodeId>,
-    /// Modules on the current path, pushed on entry and popped on exit.
-    path: Vec<NodeId>,
+    /// Modules on the current path, inserted on entry and removed on exit.
+    path: HashSet<NodeId>,
     /// Modules some earlier branch already walked.
-    explored: Vec<NodeId>,
+    explored: HashSet<NodeId>,
 }
 
 /// One local name an import introduced, with the module it reads from.
@@ -476,8 +494,8 @@ impl EcmaResolver {
             candidates: module.candidates.clone(),
             // The module the walk starts in is already on the path: `a`
             // starring `b` starring `a` has to end, and it ends here.
-            path: vec![module_id(path)],
-            explored: Vec::new(),
+            path: HashSet::from([module_id(path)]),
+            explored: HashSet::new(),
         };
         let outcome = self.lookup_exported(cfg, path, probe, &mut walk, 0);
         Resolution {
@@ -634,10 +652,10 @@ impl EcmaResolver {
                 unenumerable = true;
                 continue;
             };
-            walk.path.push(*target);
+            walk.path.insert(*target);
             let outcome = self.lookup_exported(cfg, &path, probe, walk, depth + 1);
-            walk.path.pop();
-            walk.explored.push(*target);
+            walk.path.remove(target);
+            walk.explored.insert(*target);
             match outcome {
                 Outcome::Resolved(id) => match found {
                     // Two stars reaching one definition is one answer, not a
@@ -1090,6 +1108,50 @@ impl EcmaResolver {
         }
     }
 
+    /// The identity one `export *` entry forwards to — always one, even when
+    /// the specifier leaves the repository.
+    ///
+    /// A star contributes the *module* it forwards and the walk re-enters
+    /// that module to look the name up there. When the module cannot be
+    /// entered, that fact is itself the answer and has to survive as a
+    /// target: a star entry contributing *nothing* left the alias node
+    /// indistinguishable from a fully enumerable one, so a barrel that
+    /// stars both `./local` and a dependency reported a name absent from
+    /// `./local` as `NoMatchingDefinition` — a search that read part of the
+    /// export set claiming it had read all of it.
+    ///
+    /// The identity a departing star contributes is never a module path:
+    /// both the external key and the un-nameable marker carry a `:`, which no
+    /// FQN this resolver builds may hold (see
+    /// `a_colon_in_a_file_name_cannot_forge_an_external_key`).
+    /// [`EcmaConfig::module_paths`] therefore never answers for one, and
+    /// [`EcmaResolver::walk_stars`] records it as the un-enumerable branch it
+    /// is. A local star alongside it still speaks: a name both a local and a
+    /// dependency star carried would be ambiguous and unusable under
+    /// `ResolveExport`, so a corpus that compiles cannot mean two answers
+    /// here.
+    fn star_target(&self, cfg: &EcmaConfig, header: &EcmaHeader, spec: &str) -> Fqn {
+        let unnameable = || Fqn::new(format!("{UNENUMERABLE_MODULE}{spec}"));
+        let kind = self.module_kind(cfg, header);
+        match specifier::resolve(cfg, &header.rel_path, spec, kind, self.dialect) {
+            Spec::Candidates { paths, fallback } => {
+                match paths.into_iter().find(|p| cfg.root.join(p).is_file()) {
+                    Some(path) => Fqn::new(escape_path(&path)),
+                    // Every candidate missed. A configured alias or a
+                    // `baseUrl` is an overlay on the `node_modules` walk, so
+                    // the declared dependency underneath it is still what the
+                    // star reaches — the same fallback `resolve_module` takes.
+                    None => match fallback {
+                        Some(package) => Fqn::new(format!("external:{package}")),
+                        None => unnameable(),
+                    },
+                }
+            }
+            Spec::External(package) => Fqn::new(format!("external:{package}")),
+            Spec::Unresolved(_) => unnameable(),
+        }
+    }
+
     /// What an export alias forwards to.
     ///
     /// The extractor emitted the alias node from an [`ExportEntry`] and kept
@@ -1100,8 +1162,11 @@ impl EcmaResolver {
     ///
     /// A star entry contributes the *module* it forwards, because its name
     /// set is not a fact about this file; the walk in `lookup_in_module`
-    /// re-enters that module and looks the name up there. Every other entry
-    /// contributes the single identity it names.
+    /// re-enters that module and looks the name up there. Every star entry
+    /// contributes one — see [`EcmaResolver::star_target`] — including the
+    /// ones that leave the repository, whose un-enumerability is a fact the
+    /// merged target list has to carry. Every other entry contributes the
+    /// single identity it names.
     fn alias_targets(&self, cfg: &EcmaConfig, header: &EcmaHeader, def: &Definition) -> Vec<Fqn> {
         // Only a module-level export alias forwards. A nested one is a member
         // of something, and members are not re-exported.
@@ -1121,10 +1186,10 @@ impl EcmaResolver {
             }
             match &entry.export_name {
                 // The bare star, and the CommonJS spread that stands for it.
-                // A spread carries no specifier and forwards nothing this
-                // build can name, so it contributes no target and the node
-                // stays a bare marker — which keeps `WildcardImport` true for
-                // exactly the case that still cannot be enumerated.
+                // A spread carries no specifier at all — not even one this
+                // build could fail to name — so it contributes no target and
+                // the node stays a bare marker, which keeps `WildcardImport`
+                // true for exactly the case that names nothing to enter.
                 None => {
                     if !is_star {
                         continue;
@@ -1132,9 +1197,7 @@ impl EcmaResolver {
                     let Some(spec) = entry.module_request.as_deref() else {
                         continue;
                     };
-                    if let Some(path) = self.alias_module(cfg, header, spec) {
-                        push(Fqn::new(escape_path(&path)));
-                    }
+                    push(self.star_target(cfg, header, spec));
                 }
                 Some(name) => {
                     if is_star || name != &def.name {

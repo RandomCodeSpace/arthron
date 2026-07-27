@@ -323,3 +323,80 @@ fn a_star_cycle_is_reported_not_hung() {
         "a star cycle must terminate with an honest reason, got {got:?}",
     );
 }
+
+/// A barrel that stars a dependency alongside a local module cannot list the
+/// dependency's exports. A name the *local* module does not carry is
+/// therefore not "no module exports this" — the walk enumerated only part of
+/// the set, and the reason has to say so.
+///
+/// The star entry that forwards outside the repository used to contribute
+/// nothing at all, which left the alias node looking like a fully enumerable
+/// one-target star and turned a half-finished search into a confident
+/// `NoMatchingDefinition`.
+#[test]
+fn a_star_from_a_dependency_leaves_the_name_set_un_enumerable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    pkg(root);
+    write(
+        root,
+        "src/local.ts",
+        "export function parse(s: string) { return s }\n",
+    );
+    write(
+        root,
+        "src/index.ts",
+        "export * from './local.js'\nexport * from 'dependency'\n",
+    );
+    write(
+        root,
+        "src/main.ts",
+        "import { stringify } from './index.js'\n\
+         export function run() { return stringify() }\n",
+    );
+
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "src/main.ts", "stringify", "src/main.ts#value:run"),
+        "unresolved WildcardImport",
+        "a dependency star is a part of the export set this build cannot list",
+    );
+}
+
+/// The local half of the same barrel still resolves. Recording the
+/// dependency star as un-enumerable must not cost the names that *are*
+/// knowable: a program where both stars carried `parse` would not compile,
+/// so the local hit is the only answer a compiling corpus can mean.
+#[test]
+fn a_dependency_star_does_not_cost_the_local_stars_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    pkg(root);
+    write(
+        root,
+        "src/local.ts",
+        "export function parse(s: string) { return s }\n",
+    );
+    write(
+        root,
+        "src/index.ts",
+        "export * from './local.js'\nexport * from 'dependency'\n",
+    );
+    write(
+        root,
+        "src/main.ts",
+        "import { parse } from './index.js'\nexport function run() { return parse('x') }\n",
+    );
+
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "src/main.ts", "parse", "src/main.ts#value:run"),
+        "resolved src/local.ts#value:parse",
+    );
+}
