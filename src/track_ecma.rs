@@ -130,7 +130,7 @@ pub fn scan_ecma(root: &Path, db_path: &Path) -> Result<Report, String> {
 pub const TRACK: Track = Track {
     name: "ecma",
     langs: &[Lang::JavaScript, Lang::TypeScript],
-    scan: None,
+    scan: Some(scan_ecma),
 };
 
 #[cfg(test)]
@@ -139,14 +139,23 @@ mod tests {
     use crate::model::Domain;
 
     #[test]
-    fn ecma_is_registered_but_not_live() {
-        assert!(!TRACK.is_enabled());
+    fn ecma_is_live_and_owns_exactly_its_four_extensions() {
+        assert!(TRACK.is_enabled());
         for ext in ["js", "mjs", "cjs", "ts"] {
             assert_eq!(
                 Lang::for_extension(ext).map(Lang::domain),
                 Some(Domain::EcmaScript)
             );
-            assert!(!TRACK.owns_extension(ext));
+            assert!(TRACK.owns_extension(ext), "`.{ext}` is unowned");
+        }
+        // `.d.ts` needs no rule of its own: its extension *is* `ts`.
+        assert!(TRACK.owns_extension("ts"));
+        // And nothing beyond them. `.tsx`/`.jsx` are real EcmaScript code
+        // that no `Lang` owns in this build — recorded as a core gap, and
+        // reported as `TierTwoLanguage` when a specifier reaches one, never
+        // silently claimed here.
+        for ext in ["go", "java", "py", "tsx", "jsx", "mts", "cts"] {
+            assert!(!TRACK.owns_extension(ext), "ecma claims `.{ext}`");
         }
     }
 
