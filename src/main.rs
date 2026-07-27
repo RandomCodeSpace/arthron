@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use arthron::model::{Lang, reason_name};
-use arthron::pipeline::scan;
+use arthron::pipeline::scan_go;
 use arthron::resolution_rate;
 use arthron::store::LangTally;
 
@@ -42,7 +42,7 @@ fn main() -> ExitCode {
                 eprintln!("arthron: creating {}: {e}", parent.display());
                 return ExitCode::FAILURE;
             }
-            match scan(&path, &db_path) {
+            match scan_go(&path, &db_path) {
                 Ok(report) => {
                     print_report(&report);
                     ExitCode::SUCCESS
@@ -66,10 +66,7 @@ fn print_report(report: &arthron::store::Report) {
     lang_codes.insert(Lang::Go.code());
     for lang_code in lang_codes {
         let tally = report.per_lang.get(&lang_code).unwrap_or(&empty);
-        let lang = match lang_code {
-            0 => "go",
-            _ => "unknown",
-        };
+        let lang = Lang::from_code(lang_code).map_or("unknown", Lang::name);
         let unresolved = tally.unresolved_total();
         let rate = match resolution_rate(tally.resolved, unresolved) {
             Some(r) => format!("{:.1}%", r * 100.0),

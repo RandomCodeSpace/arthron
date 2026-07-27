@@ -30,16 +30,17 @@
 /// Every unresolved reference carries one of these. They are the signal for
 /// where language support is thin — aggregated, they drive the resolution-rate
 /// quality gate that ranks above performance in this project.
+/// The variants are ordered by their stable storage code, which
+/// [`model::reason_code`] fixes and which is never renumbered. Adding a
+/// reason appends a code; a reason earns its own variant only when its fix
+/// is a different piece of work from every existing variant's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UnresolvedReason {
     /// The call target is chosen at runtime; no static target exists.
     DynamicDispatch,
-    /// The definition is produced by a macro or code generator not expanded here.
-    MacroGenerated,
-    /// The target can only be found by inferring the type of an expression
-    /// (for example a method call on a variable), and this tool does not yet
-    /// perform type inference for the language.
-    NeedsTypeInference,
+    /// The definition is produced by a generator not expanded here — a macro,
+    /// an annotation processor, a metaclass, or a codegen step.
+    Generated,
     /// The target names a package outside the repository that was not indexed.
     UnknownPackage,
     /// The language is supported structurally, but not for call-graph resolution.
@@ -48,8 +49,51 @@ pub enum UnresolvedReason {
     /// resolution is tiered, and this reason marks the difference honestly
     /// rather than inventing an edge.
     TierTwoLanguage,
-    /// The reference was understood but matched no definition anywhere.
+    /// The reference was understood, the lookup table was complete, and the
+    /// name is absent. In a corpus that compiles this should mean *our* bug,
+    /// and should sit near zero.
     NoMatchingDefinition,
+    /// The receiver is a name with no declared or annotated type, so finding
+    /// the target needs type inference this tool does not yet perform.
+    NeedsTypeInference,
+    /// The target is bound by a local, parameter, named result, receiver,
+    /// catch parameter, or closure variable — by design not a node.
+    ///
+    /// Policy-caused, not a language-support failure: reported on its own
+    /// line beside `External` and excluded from both terms of the resolution
+    /// rate.
+    LocalBinding,
+    /// `x.M()` where `x` has a declared or annotated type stated in this file
+    /// and that type is in the repository. Declared-type lookup, not inference.
+    NeedsReceiverType,
+    /// The selector's operand is an expression rather than a name:
+    /// `f().M()`, `m[k].M()`.
+    NeedsExpressionType,
+    /// The receiver type is known and in-repository, the member is in no
+    /// indexed supertype, and at least one supertype is external or unindexed.
+    UnindexedSupertype,
+    /// Two sources supply one name and the language calls the result ambiguous.
+    AmbiguousExport,
+    /// An on-demand or star import whose source's export set could not be
+    /// enumerated.
+    WildcardImport,
+    /// The module path is not a literal.
+    DynamicModuleSpecifier,
+    /// The specifier is a literal and resolved to no module under the
+    /// configured resolution.
+    ModuleNotFound,
+    /// The container exists and the member exists, but the container does not
+    /// export it.
+    NotExported,
+    /// Owner and member name resolved; two or more declarations are applicable
+    /// at the site's arity, or the discriminating type is unavailable.
+    AmbiguousOverload,
+    /// A multi-segment qualifier whose container/type/member split could not
+    /// be determined.
+    AmbiguousName,
+    /// The project's layout could not be determined, so the failure is
+    /// arthron's own inference rather than a missing definition.
+    ProjectLayoutUnknown,
 }
 
 /// The result of resolving a single reference.
@@ -106,6 +150,7 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
 }
 
 pub mod extract_go;
+pub mod lang;
 pub mod model;
 pub mod pipeline;
 pub mod resolve_go;

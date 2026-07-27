@@ -289,7 +289,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lang, node_id};
+    use crate::model::{Domain, Lang, node_id};
 
     fn open_temp() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -300,8 +300,8 @@ mod tests {
     #[test]
     fn batch_round_trips() {
         let (_dir, store) = open_temp();
-        let def = node_id(Lang::Go, "m/pkg.Foo");
-        let caller = node_id(Lang::Go, "m/pkg.Bar");
+        let def = node_id(Domain::Go, "m/pkg.Foo");
+        let caller = node_id(Domain::Go, "m/pkg.Bar");
         let batch = Batch {
             files: vec![("pkg/a.go".into(), [7u8; 32])],
             nodes: vec![(
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn report_sums_counts_by_language_and_reason() {
         let (_dir, store) = open_temp();
-        let def = node_id(Lang::Go, "m/pkg.Foo");
+        let def = node_id(Domain::Go, "m/pkg.Foo");
         let rec = |outcome, count| RefRecord {
             outcome,
             count,

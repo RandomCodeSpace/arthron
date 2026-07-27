@@ -3,8 +3,8 @@
 use std::fs;
 
 use arthron::UnresolvedReason;
-use arthron::model::{Lang, NodeId, RefKind, node_id, reason_code};
-use arthron::pipeline::scan;
+use arthron::model::{Domain, Lang, NodeId, RefKind, node_id, reason_code};
+use arthron::pipeline::scan_go;
 use arthron::store::{NodeRecord, Store};
 
 fn write(root: &std::path::Path, rel: &str, content: &str) {
@@ -15,7 +15,7 @@ fn write(root: &std::path::Path, rel: &str, content: &str) {
 
 /// The node id a Go FQN would have, for identity assertions.
 fn go(fqn: &str) -> NodeId {
-    node_id(Lang::Go, fqn)
+    node_id(Domain::Go, fqn)
 }
 
 /// The stored record for a Go FQN, or `None` when nothing was stored.
@@ -61,7 +61,7 @@ fn scan_reports_honest_per_language_counts() {
     fixture(dir.path());
     let db = dir.path().join("graph.redb");
 
-    let report = scan(dir.path(), &db).expect("scan succeeds");
+    let report = scan_go(dir.path(), &db).expect("scan succeeds");
     let go = &report.per_lang[&Lang::Go.code()];
 
     // Calls: util.Parse + helper resolved. Imports: example.com/app/util
@@ -97,7 +97,7 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
 
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
-    let report = scan(dir.path(), &dir.path().join("graph.redb")).expect("scan succeeds");
+    let report = scan_go(dir.path(), &dir.path().join("graph.redb")).expect("scan succeeds");
     let go = &report.per_lang[&Lang::Go.code()];
 
     assert_eq!(
@@ -139,7 +139,7 @@ fn an_unaliased_internal_import_binds_the_declared_package_name() {
     );
     let db = root.join("graph.redb");
 
-    let report = scan(root, &db).expect("scan succeeds");
+    let report = scan_go(root, &db).expect("scan succeeds");
     let tally = &report.per_lang[&Lang::Go.code()];
     // The import and the call, both resolved; nothing left over.
     assert_eq!(tally.resolved, 2);
@@ -176,7 +176,7 @@ fn init_is_not_a_node_and_its_calls_belong_to_the_package() {
     );
     let db = root.join("graph.redb");
 
-    let report = scan(root, &db).expect("scan succeeds");
+    let report = scan_go(root, &db).expect("scan succeeds");
     let tally = &report.per_lang[&Lang::Go.code()];
     // Both `setup()` calls resolve — one row per file.
     assert_eq!(tally.resolved, 2);
@@ -219,7 +219,7 @@ fn an_external_test_package_gets_its_own_namespace() {
     );
     let db = root.join("graph.redb");
 
-    let report = scan(root, &db).expect("scan succeeds");
+    let report = scan_go(root, &db).expect("scan succeeds");
     let tally = &report.per_lang[&Lang::Go.code()];
     // helperT(), graph.Build(), and the import of the production package.
     assert_eq!(tally.resolved, 3);
@@ -284,7 +284,7 @@ fn a_declared_package_name_survives_a_scan_that_does_not_touch_that_package() {
     );
     let db = root.join("graph.redb");
 
-    let first = scan(root, &db).expect("first scan");
+    let first = scan_go(root, &db).expect("first scan");
     assert_eq!(first.per_lang[&Lang::Go.code()].resolved, 2);
 
     // Edit only the importing file. `utilx/util.go` keeps its hash, so it
@@ -294,7 +294,7 @@ fn a_declared_package_name_survives_a_scan_that_does_not_touch_that_package() {
         "server/server.go",
         &server("\t_ = s\n\treturn util.Parse(s)\n"),
     );
-    let second = scan(root, &db).expect("second scan");
+    let second = scan_go(root, &db).expect("second scan");
     let tally = &second.per_lang[&Lang::Go.code()];
     assert_eq!(tally.resolved, 2);
     assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
@@ -305,9 +305,9 @@ fn second_scan_of_unchanged_tree_reports_the_same() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let db = dir.path().join("graph.redb");
-    let first = scan(dir.path(), &db).expect("first scan");
+    let first = scan_go(dir.path(), &db).expect("first scan");
     // Warm path: every file hash matches, the changed set is empty, and
     // the report must come from the store, unchanged.
-    let second = scan(dir.path(), &db).expect("second scan");
+    let second = scan_go(dir.path(), &db).expect("second scan");
     assert_eq!(first.per_lang, second.per_lang);
 }

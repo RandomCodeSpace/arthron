@@ -4,7 +4,8 @@ use std::path::Path;
 
 use arthron::extract_go::extract;
 use arthron::model::{Lang, reason_name};
-use arthron::pipeline::{go_files, scan};
+use arthron::pipeline::{scan_go, source_files};
+use arthron::resolve_go::GoLang;
 
 /// Whether the corpus has been cloned in.
 ///
@@ -26,14 +27,19 @@ fn corpus_present(corpus: &Path) -> bool {
 /// a bug that loses one between the extractor and the store would lose it
 /// from both sides of the comparison and the assertion would pass. It shares
 /// only the two things it must in order to be comparing the same corpus at
-/// all — [`extract`], and [`go_files`] for the file set.
+/// all — [`extract`], and [`source_files`] for the file set.
 fn extracted_reference_count(corpus: &Path) -> u64 {
     let mut total = 0u64;
-    for path in go_files(corpus).expect("walking the corpus") {
+    for path in source_files::<GoLang>(corpus).expect("walking the corpus") {
+        let rel = path
+            .strip_prefix(corpus)
+            .expect("a walked path is under the corpus")
+            .to_string_lossy()
+            .replace('\\', "/");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let facts = extract(&source);
-        total += facts.imports.len() as u64 + facts.calls.len() as u64;
+        let facts = extract(&rel, &source);
+        total += facts.refs.len() as u64;
     }
     total
 }
@@ -45,7 +51,7 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let report = scan(corpus, &dir.path().join("graph.redb")).expect("scan");
+    let report = scan_go(corpus, &dir.path().join("graph.redb")).expect("scan");
     let go = &report.per_lang[&Lang::Go.code()];
 
     let unresolved = go.unresolved_total();
@@ -84,7 +90,7 @@ fn every_corpus_reference_has_exactly_one_stored_outcome() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let report = scan(corpus, &dir.path().join("graph.redb")).expect("scan");
+    let report = scan_go(corpus, &dir.path().join("graph.redb")).expect("scan");
     let go = &report.per_lang[&Lang::Go.code()];
 
     let stored = go.resolved + go.external + go.unresolved_total();

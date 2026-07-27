@@ -1,0 +1,219 @@
+//! The extractor/resolver trait boundary the shared driver is generic over.
+//!
+//! The rule this module encodes: **shared code is generic over a
+//! [`Language`], and every per-language type is an associated type the
+//! shared code moves and never inspects.** `pipeline.rs` therefore names no
+//! language's manifest, scope, or naming convention.
+//!
+//! It also makes the project's first non-negotiable a *type-level*
+//! guarantee rather than a convention: [`Extractor::extract`] receives one
+//! path and one source string, so an extractor has nothing it could link
+//! against even if it wanted to. All linking happens in [`Resolver::resolve`],
+//! which is the only place an [`Outcome`] is produced.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use crate::Outcome;
+use crate::model::{DefFacets, DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, Reference};
+
+/// One language's contribution to the shared driver: the constants it is
+/// reported under and the three types only its own layers may read.
+pub trait Language: Sized + 'static {
+    /// The language records are attributed to in the report.
+    const LANG: Lang;
+    /// The identity space this language's nodes are hashed in.
+    const DOMAIN: Domain;
+
+    /// File extensions this language owns, without the dot: `["go"]`.
+    fn extensions() -> &'static [&'static str];
+
+    /// Directory names a scan never descends into.
+    fn skip_dirs() -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Per-file facts the extractor produces and only the resolver reads.
+    type Header;
+
+    /// The resolver's per-file scope. The core never inspects it.
+    type Scope;
+
+    /// Project-level configuration, built once per scan.
+    type Config;
+}
+
+/// Everything extracted from one file.
+pub struct FileFacts<L: Language> {
+    /// Language-private facts about the file itself.
+    pub header: L::Header,
+    /// Declarations the file makes.
+    pub defs: Vec<Definition>,
+    /// Sites in the file that name something possibly defined elsewhere.
+    pub refs: Vec<Reference>,
+}
+
+impl<L: Language> Default for FileFacts<L>
+where
+    L::Header: Default,
+{
+    fn default() -> Self {
+        FileFacts {
+            header: L::Header::default(),
+            defs: Vec::new(),
+            refs: Vec::new(),
+        }
+    }
+}
+
+/// One file in, records out. Forbidden from linking.
+pub trait Extractor<L: Language>: Send + Sync {
+    /// Extract one file, in isolation. The signature is the enforcement:
+    /// no probe, no config, no other file.
+    fn extract(&self, rel_path: &str, source: &str) -> FileFacts<L>;
+}
+
+/// The repo-relative paths a scan's walk found, sorted.
+pub struct FileIndex {
+    /// Repo-relative, `/`-separated paths.
+    pub files: Vec<String>,
+}
+
+/// A typed phase-0 failure: the project's layout could not be determined.
+///
+/// In the long run this is a per-file reason rather than a scan abort;
+/// today the driver surfaces it as an `Err` from the scan, which is what it
+/// already did, only typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutError {
+    /// What could not be determined.
+    pub message: String,
+}
+
+/// One classified reference plus every node identity read on the way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolution {
+    /// The single outcome. There is no way to express "dropped".
+    pub outcome: Outcome<NodeId, String>,
+    /// Every node identity this resolution read, hits and misses, in read
+    /// order. Feeds the candidate-set invalidation index, so it must list
+    /// exactly what was probed and nothing else.
+    pub candidates: Vec<NodeId>,
+}
+
+/// What the symbol table holds under one node identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    /// A definition, with the facts a resolver may branch on.
+    Definition {
+        /// What a reference can do with it.
+        kind: DefKind,
+        /// Attributes the owning resolver reads.
+        facets: DefFacets,
+    },
+    /// A package or module.
+    Container,
+    /// A dependency outside this repository.
+    External,
+    /// An alias: the identity forwards to another.
+    Alias {
+        /// What it forwards to.
+        target: NodeId,
+    },
+    /// An index key standing for a set of definitions — an overload set, a
+    /// star-export name set.
+    Set(Vec<NodeId>),
+}
+
+/// The resolver's view of the symbol table: one lookup per candidate.
+pub trait SymbolProbe {
+    /// What the graph holds under this identity, if anything.
+    fn probe(&self, id: &NodeId) -> Option<Entry>;
+}
+
+/// A membership-only probe: a set knows presence, not kind.
+///
+/// [`Entry::Container`] is the honest answer for a set — it asserts the
+/// identity exists and nothing more. The Go resolver reads only presence,
+/// so this is sufficient today; a typed store replaces it rather than
+/// extending it.
+impl SymbolProbe for HashSet<NodeId> {
+    fn probe(&self, id: &NodeId) -> Option<Entry> {
+        self.contains(id).then_some(Entry::Container)
+    }
+}
+
+/// All of one language's linking decisions. Never drops.
+pub trait Resolver<L: Language>: Send + Sync {
+    /// Phase 0: work out the project's layout. Manifest parsing is
+    /// resolver-internal; the core only moves the result.
+    fn config(&self, root: &Path, files: &FileIndex) -> Result<L::Config, LayoutError>;
+
+    /// Fold container names the store already holds into the config.
+    ///
+    /// Binding an unaliased import needs a fact out of the *imported*
+    /// container's source, so it is not per-file derivable; the driver is
+    /// the only layer that sees every container, and this is how it hands
+    /// them over without inspecting [`Language::Config`]. A language whose
+    /// bindings are per-file derivable ignores the call.
+    fn learn_containers(&self, cfg: &mut L::Config, names: &HashMap<String, String>);
+
+    /// Whether this file belongs to the scan at all. Go excludes files
+    /// governed by a nested manifest; the core never learns why.
+    fn owns_file(&self, cfg: &L::Config, rel_path: &str) -> bool;
+
+    /// Canonical FQN for a definition, or `None` when it is not nameable —
+    /// the caller then emits no node, and references inside it source at the
+    /// file's container.
+    ///
+    /// Takes the probe because building an FQN is itself a resolution step
+    /// in some languages and a pure function in others.
+    fn def_fqn(
+        &self,
+        cfg: &L::Config,
+        header: &L::Header,
+        owner: &[String],
+        def: &Definition,
+        probe: &dyn SymbolProbe,
+    ) -> Option<Fqn>;
+
+    /// Extra keys in the [`NodeId`] keyspace this definition must be
+    /// reachable under. Empty when a definition is reachable only by its FQN.
+    fn index_keys(&self, cfg: &L::Config, fqn: &Fqn, def: &Definition) -> Vec<NodeId>;
+
+    /// Two definitions share an FQN: language semantics, or corruption?
+    fn mergeable(&self, a: &Definition, b: &Definition) -> bool;
+
+    /// Build the per-file scope. Runs after the definition phase and sees
+    /// the probe, because import binding is not per-file derivable.
+    fn scope(&self, cfg: &L::Config, file: &FileFacts<L>, probe: &dyn SymbolProbe) -> L::Scope;
+
+    /// Reference kinds that must be driven to a fixed point before ordinary
+    /// resolution. Empty when none are.
+    fn link_kinds(&self) -> &'static [RefKind];
+
+    /// The only place an [`Outcome`] is produced. Never drops.
+    fn resolve(
+        &self,
+        cfg: &L::Config,
+        scope: &L::Scope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Domain, node_id};
+
+    #[test]
+    fn a_set_probe_answers_presence_and_nothing_more() {
+        let known = node_id(Domain::Go, "m/pkg.Foo");
+        let unknown = node_id(Domain::Go, "m/pkg.Bar");
+        let mut table: HashSet<NodeId> = HashSet::new();
+        table.insert(known);
+        assert_eq!(table.probe(&known), Some(Entry::Container));
+        assert_eq!(table.probe(&unknown), None);
+    }
+}
