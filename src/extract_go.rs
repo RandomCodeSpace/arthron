@@ -166,10 +166,10 @@ pub fn extract(source: &str) -> FileFacts {
                     .field_children("name")
                     .map(|n| n.text().to_string())
                     .collect();
-                if names.is_empty() {
-                    if let Some(name) = node.field("name") {
-                        names.push(name.text().to_string());
-                    }
+                if names.is_empty()
+                    && let Some(name) = node.field("name")
+                {
+                    names.push(name.text().to_string());
                 }
                 for name in names {
                     facts.defs.push(Definition {

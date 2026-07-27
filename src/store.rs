@@ -8,10 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use bincode::{Decode, Encode, config};
-use redb::{
-    Database, MultimapTableDefinition, ReadableDatabase, ReadableTable,
-    TableDefinition,
-};
+use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::model::NodeId;
 
@@ -125,7 +122,8 @@ impl Store {
             txn.open_table(REFS).map_err(|e| e.to_string())?;
             txn.open_table(EDGES).map_err(|e| e.to_string())?;
             txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
-            txn.open_multimap_table(CANDIDATES).map_err(|e| e.to_string())?;
+            txn.open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
             txn.open_table(FILES).map_err(|e| e.to_string())?;
         }
         txn.commit().map_err(|e| e.to_string())?;
@@ -138,13 +136,17 @@ impl Store {
         {
             let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
             for (path, hash) in &batch.files {
-                files.insert(path.as_str(), hash).map_err(|e| e.to_string())?;
+                files
+                    .insert(path.as_str(), hash)
+                    .map_err(|e| e.to_string())?;
             }
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
             for (id, record) in &batch.nodes {
                 let bytes = bincode::encode_to_vec(record, config::standard())
                     .map_err(|e| e.to_string())?;
-                nodes.insert(id, bytes.as_slice()).map_err(|e| e.to_string())?;
+                nodes
+                    .insert(id, bytes.as_slice())
+                    .map_err(|e| e.to_string())?;
             }
             let mut refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
             for (file, kind, raw, record) in &batch.refs {
@@ -156,11 +158,15 @@ impl Store {
             let mut edges = txn.open_table(EDGES).map_err(|e| e.to_string())?;
             let mut rev = txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
             for (src, dst, kind) in &batch.edges {
-                edges.insert((src, dst, *kind), ()).map_err(|e| e.to_string())?;
-                rev.insert((dst, src, *kind), ()).map_err(|e| e.to_string())?;
+                edges
+                    .insert((src, dst, *kind), ())
+                    .map_err(|e| e.to_string())?;
+                rev.insert((dst, src, *kind), ())
+                    .map_err(|e| e.to_string())?;
             }
-            let mut cands =
-                txn.open_multimap_table(CANDIDATES).map_err(|e| e.to_string())?;
+            let mut cands = txn
+                .open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
             for (cand, (file, kind, raw)) in &batch.candidates {
                 cands
                     .insert(cand, (file.as_str(), *kind, raw.as_str()))
@@ -210,8 +216,7 @@ impl Store {
                 StoredOutcome::Resolved(_) => tally.resolved += u64::from(record.count),
                 StoredOutcome::External(_) => tally.external += u64::from(record.count),
                 StoredOutcome::Unresolved(reason) => {
-                    *tally.unresolved.entry(reason).or_default() +=
-                        u64::from(record.count);
+                    *tally.unresolved.entry(reason).or_default() += u64::from(record.count);
                 }
             }
         }
@@ -278,9 +283,24 @@ mod tests {
         };
         let batch = Batch {
             refs: vec![
-                ("a.go".into(), 0, "Foo".into(), rec(StoredOutcome::Resolved(def), 3)),
-                ("a.go".into(), 0, "x.Close".into(), rec(StoredOutcome::Unresolved(5), 2)),
-                ("b.go".into(), 1, "fmt".into(), rec(StoredOutcome::External("std:fmt".into()), 1)),
+                (
+                    "a.go".into(),
+                    0,
+                    "Foo".into(),
+                    rec(StoredOutcome::Resolved(def), 3),
+                ),
+                (
+                    "a.go".into(),
+                    0,
+                    "x.Close".into(),
+                    rec(StoredOutcome::Unresolved(5), 2),
+                ),
+                (
+                    "b.go".into(),
+                    1,
+                    "fmt".into(),
+                    rec(StoredOutcome::External("std:fmt".into()), 1),
+                ),
             ],
             ..Batch::default()
         };

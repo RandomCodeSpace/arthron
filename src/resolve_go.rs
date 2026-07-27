@@ -7,15 +7,14 @@
 
 use std::collections::HashMap;
 
-use crate::model::{DefKind, Definition, Lang, NodeId, RefTarget, Reference, node_id};
 use crate::extract_go::FileFacts;
+use crate::model::{DefKind, Definition, Lang, NodeId, RefTarget, Reference, node_id};
 use crate::{Outcome, UnresolvedReason};
 
 /// Go's universe-scope builtin functions.
 const GO_BUILTINS: &[&str] = &[
-    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag",
-    "len", "make", "max", "min", "new", "panic", "print", "println",
-    "real", "recover",
+    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max",
+    "min", "new", "panic", "print", "println", "real", "recover",
 ];
 
 /// Facts parsed from a `go.mod` file.
@@ -43,17 +42,18 @@ pub fn parse_go_mod(src: &str) -> Option<GoModule> {
             in_require_block = true;
         } else if in_require_block && line == ")" {
             in_require_block = false;
-        } else if in_require_block {
-            if let Some(dep) = line.split_whitespace().next() {
-                requires.push(dep.to_string());
-            }
-        } else if let Some(rest) = line.strip_prefix("require ") {
-            if let Some(dep) = rest.split_whitespace().next() {
-                requires.push(dep.to_string());
-            }
+        } else if in_require_block && let Some(dep) = line.split_whitespace().next() {
+            requires.push(dep.to_string());
+        } else if let Some(rest) = line.strip_prefix("require ")
+            && let Some(dep) = rest.split_whitespace().next()
+        {
+            requires.push(dep.to_string());
         }
     }
-    Some(GoModule { path: path?, requires })
+    Some(GoModule {
+        path: path?,
+        requires,
+    })
 }
 
 /// The resolver's view of the symbol table: one membership probe per
@@ -93,7 +93,9 @@ pub struct FileScope {
 
 /// Build a [`FileScope`] from a file's extracted facts.
 pub fn file_scope(module: &GoModule, rel_dir: &str, facts: &FileFacts) -> FileScope {
-    let resolver = GoResolver { module: module.clone() };
+    let resolver = GoResolver {
+        module: module.clone(),
+    };
     let mut imports = HashMap::new();
     let mut dot_imports = Vec::new();
     for imp in &facts.imports {
@@ -109,7 +111,11 @@ pub fn file_scope(module: &GoModule, rel_dir: &str, facts: &FileFacts) -> FileSc
             }
         }
     }
-    FileScope { pkg_path: resolver.package_path(rel_dir), imports, dot_imports }
+    FileScope {
+        pkg_path: resolver.package_path(rel_dir),
+        imports,
+        dot_imports,
+    }
 }
 
 /// All Go linking decisions. Owns the module facts; sees every file's scope.
@@ -162,7 +168,10 @@ impl GoResolver {
             } else {
                 Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
             };
-            return Resolution { outcome, candidates: vec![id] };
+            return Resolution {
+                outcome,
+                candidates: vec![id],
+            };
         }
         if Self::is_stdlib(path) {
             return Resolution {
@@ -203,8 +212,7 @@ impl GoResolver {
                     };
                 }
                 // Same package first, then internal dot-imports, in order.
-                let mut candidates =
-                    vec![node_id(Lang::Go, &format!("{}.{name}", scope.pkg_path))];
+                let mut candidates = vec![node_id(Lang::Go, &format!("{}.{name}", scope.pkg_path))];
                 for dot in &scope.dot_imports {
                     if self.is_internal(dot) {
                         candidates.push(node_id(Lang::Go, &format!("{dot}.{name}")));
@@ -232,7 +240,10 @@ impl GoResolver {
                         } else {
                             Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
                         };
-                        Resolution { outcome, candidates: vec![id] }
+                        Resolution {
+                            outcome,
+                            candidates: vec![id],
+                        }
                     }
                     Some(path) => Resolution {
                         outcome: Outcome::External(path.clone()),
@@ -272,7 +283,11 @@ mod tests {
             raw_target: String::new(),
             target,
             enclosing: None,
-            span: Span { byte_start: 0, byte_end: 0, line: 1 },
+            span: Span {
+                byte_start: 0,
+                byte_end: 0,
+                line: 1,
+            },
         }
     }
 
@@ -336,11 +351,26 @@ mod tests {
         let r = GoResolver { module: module() };
         let helper = node_id(Lang::Go, "example.com/app/server.helper");
         let mut table = HashSet::new();
-        let miss = r.resolve_call(&call(RefTarget::Plain { name: "helper".into() }), &scope(), &table);
-        assert_eq!(miss.outcome, Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition));
+        let miss = r.resolve_call(
+            &call(RefTarget::Plain {
+                name: "helper".into(),
+            }),
+            &scope(),
+            &table,
+        );
+        assert_eq!(
+            miss.outcome,
+            Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
+        );
         assert_eq!(miss.candidates, vec![helper]); // the miss is recorded
         table.insert(helper);
-        let hit = r.resolve_call(&call(RefTarget::Plain { name: "helper".into() }), &scope(), &table);
+        let hit = r.resolve_call(
+            &call(RefTarget::Plain {
+                name: "helper".into(),
+            }),
+            &scope(),
+            &table,
+        );
         assert_eq!(hit.outcome, Outcome::Resolved(helper));
     }
 
@@ -359,19 +389,31 @@ mod tests {
         let mut table = HashSet::new();
         table.insert(target);
         let internal = r.resolve_call(
-            &call(RefTarget::Qualified { qualifier: "util".into(), name: "Parse".into() }),
+            &call(RefTarget::Qualified {
+                qualifier: "util".into(),
+                name: "Parse".into(),
+            }),
             &scope(),
             &table,
         );
         assert_eq!(internal.outcome, Outcome::Resolved(target));
         let external = r.resolve_call(
-            &call(RefTarget::Qualified { qualifier: "errors".into(), name: "Wrap".into() }),
+            &call(RefTarget::Qualified {
+                qualifier: "errors".into(),
+                name: "Wrap".into(),
+            }),
             &scope(),
             &table,
         );
-        assert_eq!(external.outcome, Outcome::External("github.com/pkg/errors".into()));
+        assert_eq!(
+            external.outcome,
+            Outcome::External("github.com/pkg/errors".into())
+        );
         let variable = r.resolve_call(
-            &call(RefTarget::Qualified { qualifier: "conn".into(), name: "Close".into() }),
+            &call(RefTarget::Qualified {
+                qualifier: "conn".into(),
+                name: "Close".into(),
+            }),
             &scope(),
             &table,
         );

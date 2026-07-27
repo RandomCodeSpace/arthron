@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Outcome;
 use crate::extract_go::{FileFacts, extract};
 use crate::model::{Lang, NodeId, RefKind, node_id, reason_code};
 use crate::resolve_go::{FileScope, GoResolver, Resolution, file_scope, parse_go_mod};
 use crate::store::{Batch, NodeRecord, RefRecord, Report, Store, StoredOutcome};
-use crate::Outcome;
 
 /// One changed file, extracted.
 struct ChangedFile {
@@ -22,11 +22,13 @@ struct ChangedFile {
 /// files whose content hash differs from the store — an empty store makes
 /// that every file, which is the entire cold/warm distinction.
 pub fn scan(root: &Path, db_path: &Path) -> Result<Report, String> {
-    let go_mod = fs::read_to_string(root.join("go.mod"))
-        .map_err(|e| format!("reading go.mod: {e}"))?;
-    let module = parse_go_mod(&go_mod)
-        .ok_or_else(|| "go.mod has no module directive".to_string())?;
-    let resolver = GoResolver { module: module.clone() };
+    let go_mod =
+        fs::read_to_string(root.join("go.mod")).map_err(|e| format!("reading go.mod: {e}"))?;
+    let module =
+        parse_go_mod(&go_mod).ok_or_else(|| "go.mod has no module directive".to_string())?;
+    let resolver = GoResolver {
+        module: module.clone(),
+    };
     let store = Store::open(db_path)?;
 
     // Collect the changed set.
@@ -49,7 +51,12 @@ pub fn scan(root: &Path, db_path: &Path) -> Result<Report, String> {
             Some((dir, _)) => dir.to_string(),
             None => String::new(),
         };
-        changed.push(ChangedFile { rel_path: rel, rel_dir, hash, facts: extract(&source) });
+        changed.push(ChangedFile {
+            rel_path: rel,
+            rel_dir,
+            hash,
+            facts: extract(&source),
+        });
     }
 
     // Phase 1: definitions and package nodes for the changed set.
@@ -60,7 +67,9 @@ pub fn scan(root: &Path, db_path: &Path) -> Result<Report, String> {
         if seen_pkgs.insert(pkg_path.clone(), ()).is_none() {
             phase1.nodes.push((
                 node_id(Lang::Go, &pkg_path),
-                NodeRecord::Package { import_path: pkg_path.clone() },
+                NodeRecord::Package {
+                    import_path: pkg_path.clone(),
+                },
             ));
         }
         for def in &file.facts.defs {
@@ -104,9 +113,7 @@ pub fn scan(root: &Path, db_path: &Path) -> Result<Report, String> {
                     StoredOutcome::Resolved(*id)
                 }
                 Outcome::External(pkg) => StoredOutcome::External(pkg.clone()),
-                Outcome::Unresolved(reason) => {
-                    StoredOutcome::Unresolved(reason_code(reason))
-                }
+                Outcome::Unresolved(reason) => StoredOutcome::Unresolved(reason_code(reason)),
             };
             rows.entry(key)
                 .and_modify(|r| r.count += 1)

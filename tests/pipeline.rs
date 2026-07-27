@@ -2,9 +2,9 @@
 
 use std::fs;
 
+use arthron::UnresolvedReason;
 use arthron::model::{Lang, reason_code};
 use arthron::pipeline::scan;
-use arthron::UnresolvedReason;
 
 fn write(root: &std::path::Path, rel: &str, content: &str) {
     let path = root.join(rel);
@@ -27,9 +27,9 @@ fn fixture(root: &std::path::Path) {
             "import (\n\t\"fmt\"\n\t\"example.com/app/util\"\n)\n\n",
             "func Serve(conn Conn) {\n",
             "\tfmt.Println(util.Parse(\"x\"))\n", // fmt → External, util.Parse → Resolved
-            "\thelper()\n",                        // → Resolved (same package)
-            "\tmissing()\n",                       // → NoMatchingDefinition
-            "\tconn.Close()\n",                    // → NeedsTypeInference
+            "\thelper()\n",                       // → Resolved (same package)
+            "\tmissing()\n",                      // → NoMatchingDefinition
+            "\tconn.Close()\n",                   // → NeedsTypeInference
             "}\n\n",
             "func helper() {}\n\n",
             "type Conn struct{}\n",

@@ -36,11 +36,11 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Scan { path, db } => {
             let db_path = db.unwrap_or_else(|| path.join(".arthron/graph.redb"));
-            if let Some(parent) = db_path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("arthron: creating {}: {e}", parent.display());
-                    return ExitCode::FAILURE;
-                }
+            if let Some(parent) = db_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!("arthron: creating {}: {e}", parent.display());
+                return ExitCode::FAILURE;
             }
             match scan(&path, &db_path) {
                 Ok(report) => {

@@ -21,7 +21,10 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
     let rate = arthron::resolution_rate(go.resolved, unresolved)
         .expect("the corpus has references to measure");
 
-    println!("resolved {} external {} unresolved {}", go.resolved, go.external, unresolved);
+    println!(
+        "resolved {} external {} unresolved {}",
+        go.resolved, go.external, unresolved
+    );
     for (code, count) in &go.unresolved {
         println!("  {}: {count}", reason_name(*code));
     }
@@ -31,5 +34,8 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
     // baseline on this exact code was 0.0%.
     assert!(rate > 0.0, "resolution rate must beat the 0% baseline");
     assert!(go.resolved > 0);
-    assert!(unresolved > 0, "a skeleton claiming 100% is lying somewhere");
+    assert!(
+        unresolved > 0,
+        "a skeleton claiming 100% is lying somewhere"
+    );
 }
