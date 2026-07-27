@@ -44,7 +44,9 @@ use crate::lang::{
     Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, Supertypes,
     SymbolProbe,
 };
-use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id};
+use crate::model::{
+    DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
+};
 use crate::track_java::JavaLang;
 use crate::track_java::extract::{Binding, BindingKind, ErasedType, JavaHeader, TypeDecl};
 use crate::track_java::fqn;
@@ -1562,16 +1564,31 @@ impl JavaResolver {
                 }
             }
         };
-        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
         // C-05 / §15.9.5.1: `new Iface(){…}` declares an anonymous class that
         // *implements* the interface and extends `Object`, so the constructor
-        // it invokes is `Object#<init>()`. Every in-repo class carries a
-        // constructor at this point — D-10 synthesizes §8.8.9's implicit one
-        // — so a creation site with a class body whose owner is in-repo and
-        // whose constructor is missing has named an interface.
-        if scope
+        // it invokes is `Object#<init>()` and never one of `Iface`'s.
+        //
+        // Which of the two shapes this is turns on a property of the named
+        // type, so it is read off the type: [`DefFacets::INTERFACE`], which
+        // the store now carries. The rule used to be inferred from the search
+        // instead — "every in-repo class carries a constructor (D-10
+        // synthesizes §8.8.9's implicit one), so a missing constructor means
+        // an interface" — and that inference is false for every other way the
+        // lookup can miss. `new Base(1){…}` against a class with no
+        // one-argument constructor, or a creation of a name nothing places at
+        // all, were both answered `java.lang`: a claim about a package,
+        // resting on the resolver's own failure to find something.
+        //
+        // Read before `select` consumes the owner, and only for a site that
+        // writes a class body: a creation with no body cannot be C-05 at all,
+        // and probing anyway would put an identity in this reference's
+        // candidate set that its outcome does not depend on.
+        let on_interface = scope
             .anonymous_body_at(r.span.byte_start, r.span.byte_end)
             .is_some()
+            && self.interface_owner(&owner, p);
+        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
+        if on_interface
             && matches!(
                 settled,
                 Outcome::Unresolved(
@@ -1582,6 +1599,25 @@ impl JavaResolver {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
         }
         settled
+    }
+
+    /// Whether a placed owner is a type this repository declares *as an
+    /// interface* (§9.1), annotation types included (§9.6).
+    ///
+    /// Probed rather than carried on [`Owner`] so the read is logged: the
+    /// outcome now depends on this identity's facets, and a reference that
+    /// read them has to be woken when they move — which is exactly what
+    /// putting them in [`crate::store::NodePayload`] arranges. A type outside
+    /// the repository answers `false`, because nothing in this graph says what
+    /// it is and guessing is what this replaces.
+    fn interface_owner(&self, owner: &Owner, p: &mut Probes<'_>) -> bool {
+        let Owner::InRepo { fqn, .. } = owner else {
+            return false;
+        };
+        matches!(
+            p.get(fqn),
+            Some(Entry::Definition { facets, .. }) if facets.contains(DefFacets::INTERFACE)
+        )
     }
 
     /// I-01 … I-08: every import form, plus a module directive.

@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -107,6 +107,20 @@ pub enum NodeRecord {
         fqn: String,
         /// [`crate::model::DefKind`] code.
         kind: u8,
+        /// [`crate::model::DefFacets`] bits: what the declaration *is* beyond
+        /// what a reference can do with it.
+        ///
+        /// Stored because a resolver cannot branch on a fact the graph does
+        /// not give back, and a resolver that has to infer one — "the
+        /// constructor lookup missed, so the supertype must have been an
+        /// interface" — is making a statement about its own search rather
+        /// than about the declaration.
+        ///
+        /// Re-derived from the declaration sites by [`resettle`] alongside
+        /// `kind`, and from the *same* site: two files may declare one FQN
+        /// and disagree, and a record holding one file's kind beside
+        /// another's facets would describe a declaration nobody wrote.
+        facets: u16,
         /// What this identity forwards to, when it is an alias — a re-export,
         /// an export rename, a module-level import binding. Empty for every
         /// ordinary definition, and empty too for an alias key that stands
@@ -153,15 +167,23 @@ pub enum NodeRecord {
 /// itself never moved.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub enum NodePayload {
-    /// A definition, by its [`crate::model::DefKind`] code.
-    Definition(u8),
+    /// A definition, by its [`crate::model::DefKind`] code and its
+    /// [`crate::model::DefFacets`] bits.
+    ///
+    /// The facets are here and not only on the record because this type is
+    /// what wakes probers: `class T` rewritten to `interface T` moves no
+    /// identity at all — the FQN is the same — and a resolver that branched
+    /// on the facet answered a question that just changed. A facet a
+    /// resolver may read and the invalidation index may not see is a warm
+    /// scan that disagrees with a cold one.
+    Definition(u8, u16),
     /// A package, by the name its files declare — what an unaliased import
     /// of it binds.
     Package(Option<String>),
     /// A dependency outside the repository, by its package string.
     External(String),
-    /// An alias, by its [`crate::model::DefKind`] code and what it forwards
-    /// to.
+    /// An alias, by its [`crate::model::DefKind`] code, its
+    /// [`crate::model::DefFacets`] bits, and what it forwards to.
     ///
     /// The targets ride the *site* and not only the record because
     /// [`resettle`] re-derives a record from the sites that survive: an alias
@@ -169,17 +191,20 @@ pub enum NodePayload {
     /// record-only field would strand them. Changing where an alias points is
     /// also a change of meaning under a stable identity, which is exactly
     /// what this type exists to wake probers on.
-    Alias(u8, Vec<NodeId>),
+    Alias(u8, u16, Vec<NodeId>),
 }
 
 impl NodeRecord {
     /// The part of this record a resolver's answer can depend on.
     pub fn payload(&self) -> NodePayload {
         match self {
-            NodeRecord::Definition { kind, targets, .. } if !targets.is_empty() => {
-                NodePayload::Alias(*kind, targets.clone())
-            }
-            NodeRecord::Definition { kind, .. } => NodePayload::Definition(*kind),
+            NodeRecord::Definition {
+                kind,
+                facets,
+                targets,
+                ..
+            } if !targets.is_empty() => NodePayload::Alias(*kind, *facets, targets.clone()),
+            NodeRecord::Definition { kind, facets, .. } => NodePayload::Definition(*kind, *facets),
             NodeRecord::Package { name, .. } => NodePayload::Package(name.clone()),
             NodeRecord::External { package, .. } => NodePayload::External(package.clone()),
         }
@@ -933,9 +958,10 @@ impl Store {
 
     /// The symbol table a resolver probes: one typed entry per identity.
     ///
-    /// Facets are not stored — no shared code branches on them and no
-    /// resolver has yet needed one out of the graph — so every definition
-    /// answers with the empty set rather than a guess.
+    /// Facets come straight off the record. Still nothing *shared* branches
+    /// on them — that is what keeps them a bitset rather than a [`DefKind`]
+    /// variant each — but the owning resolver may, and could not before they
+    /// were stored.
     ///
     /// A definition carrying alias targets answers as an alias rather than as
     /// a definition, because that is what it *is*: the kind says only that a
@@ -961,10 +987,10 @@ impl Store {
                     Entry::Alias { target: targets[0] }
                 }
                 NodeRecord::Definition { targets, .. } if targets.len() > 1 => Entry::Set(targets),
-                NodeRecord::Definition { kind, .. } => Entry::Definition {
+                NodeRecord::Definition { kind, facets, .. } => Entry::Definition {
                     kind: DefKind::from_code(kind)
                         .ok_or_else(|| format!("stored node kind {kind} has no variant"))?,
-                    facets: DefFacets::default(),
+                    facets: DefFacets::from_bits(facets),
                 },
                 NodeRecord::Package { .. } => Entry::Container,
                 NodeRecord::External { .. } => Entry::External,
@@ -1248,13 +1274,23 @@ fn write_owned<T: Encode>(
 fn resettle(record: &mut NodeRecord) {
     let sites = record.declarations().to_vec();
     match record {
-        NodeRecord::Definition { kind, targets, .. } => {
-            if let Some(k) = sites.iter().find_map(|s| match s.payload {
-                NodePayload::Definition(k) => Some(k),
-                NodePayload::Alias(k, _) => Some(k),
+        NodeRecord::Definition {
+            kind,
+            facets,
+            targets,
+            ..
+        } => {
+            // Kind and facets come out of one site together: they are two
+            // halves of what a single file said this declaration is, and
+            // taking them from different sites would state a declaration no
+            // file wrote.
+            if let Some((k, f)) = sites.iter().find_map(|s| match s.payload {
+                NodePayload::Definition(k, f) => Some((k, f)),
+                NodePayload::Alias(k, f, _) => Some((k, f)),
                 _ => None,
             }) {
                 *kind = k;
+                *facets = f;
             }
             // Every surviving site's targets, in site order. A union and not
             // a first-wins pick: two files may legitimately declare one alias
@@ -1263,7 +1299,7 @@ fn resettle(record: &mut NodeRecord) {
             // corpus really does export.
             let mut merged: Vec<NodeId> = Vec::new();
             for site in &sites {
-                if let NodePayload::Alias(_, ts) = &site.payload {
+                if let NodePayload::Alias(_, _, ts) = &site.payload {
                     for t in ts {
                         if !merged.contains(t) {
                             merged.push(*t);
@@ -1442,7 +1478,7 @@ mod tests {
         DeclSite {
             file: file.to_string(),
             line,
-            payload: NodePayload::Definition(0),
+            payload: NodePayload::Definition(0, 0),
         }
     }
 
@@ -1471,6 +1507,7 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#Foo".into(),
                         kind: 0,
+                        facets: 0,
                         targets: Vec::new(),
                         declarations: vec![site("pkg/a.go", 3)],
                     },
@@ -1616,6 +1653,7 @@ mod tests {
                     NodeRecord::Definition {
                         fqn: "m/pkg#plat".into(),
                         kind: 0,
+                        facets: 0,
                         targets: Vec::new(),
                         declarations: vec![site(path, line)],
                     },

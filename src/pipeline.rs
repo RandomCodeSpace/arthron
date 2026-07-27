@@ -467,9 +467,9 @@ fn phase_one<L: Language>(
         let payload = if def.kind == DefKind::Module {
             NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
         } else if targets.is_empty() {
-            NodePayload::Definition(def.kind.code())
+            NodePayload::Definition(def.kind.code(), def.facets.bits())
         } else {
-            NodePayload::Alias(def.kind.code(), targets.clone())
+            NodePayload::Alias(def.kind.code(), def.facets.bits(), targets.clone())
         };
         let declarations = vec![DeclSite {
             file: file.rel_path.clone(),
@@ -485,6 +485,7 @@ fn phase_one<L: Language>(
             _ => NodeRecord::Definition {
                 fqn: fqn.into_string(),
                 kind: def.kind.code(),
+                facets: def.facets.bits(),
                 targets,
                 declarations,
             },

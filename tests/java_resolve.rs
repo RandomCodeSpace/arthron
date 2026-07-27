@@ -492,6 +492,72 @@ public class UseIface {
     assert_eq!(scan.one("Iface", RefKind::New), "EXTERNAL jdk:java.lang");
 }
 
+/// C-05, read off a facet instead of guessed at.
+///
+/// `Iface` is declared in another file, so the only thing that can say it is
+/// an interface is the stored [`arthron::model::DefFacets`] — the guess this
+/// replaces was "the constructor lookup missed, so it must have been an
+/// interface", which is a statement about the *search* and not about the type.
+#[test]
+fn an_anonymous_creation_on_a_class_keeps_the_honest_miss() {
+    let scan = scan(&[
+        (
+            "com/acme/Base.java",
+            r#"package com.acme;
+public class Base {
+    public Base() { }
+}
+"#,
+        ),
+        (
+            "com/acme/UseBase.java",
+            r#"package com.acme;
+public class UseBase {
+    Object o = new Base(1) {
+        public String tag() { return "t"; }
+    };
+}
+"#,
+        ),
+    ]);
+    // `Base` is a class and declares no one-argument constructor, so
+    // §15.9.5.1 has nothing to say here: the site names a constructor that
+    // the search could not finish looking for, which is not the same fact as
+    // "the constructor invoked belongs to `java.lang.Object`". Externalising
+    // it moved the reference out of both rate terms on the strength of a
+    // guess.
+    assert_eq!(scan.one("Base", RefKind::New), "UnindexedSupertype");
+}
+
+/// The same rule at the other end: a name nothing places is not an interface
+/// either, and saying `java.lang` about it invented a package for it.
+#[test]
+fn an_anonymous_creation_on_an_unplaced_name_keeps_the_type_miss() {
+    let scan = scan(&[(
+        "com/acme/UseNowhere.java",
+        r#"package com.acme;
+public class UseNowhere {
+    Object o = new Nowhere() {
+        public String tag() { return "t"; }
+    };
+}
+"#,
+    )]);
+    assert_eq!(scan.one("Nowhere", RefKind::New), "NoMatchingDefinition");
+}
+
+/// The bound on the rule: a creation whose constructor *is* found keeps its
+/// edge, class body or no class body.
+#[test]
+fn an_anonymous_creation_on_a_class_still_reaches_its_constructor() {
+    let scan = scan(&anonymous_class_tree());
+    assert_eq!(
+        scan.one("Base", RefKind::New),
+        "RESOLVED com.acme#Base.<init>/0",
+        "D-10 synthesises §8.8.9's implicit constructor, and it is the target",
+    );
+}
+
 /// The three-level hierarchy the cross-file supertype cases are measured in.
 ///
 /// One type per file on purpose: `extends` is the only fact a file states
