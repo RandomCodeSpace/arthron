@@ -117,7 +117,36 @@ pub enum NodeRecord {
     },
 }
 
+/// The part of a [`NodeRecord`] a resolver's answer can depend on.
+///
+/// Declaration sites are deliberately absent: they move whenever a file is
+/// edited above them, and nothing resolves against them, so folding them in
+/// would wake every prober of every node in an edited file. What remains is
+/// what makes an identity *mean* something different than it did — a
+/// definition's kind, the name an unaliased import of a package binds — and
+/// that has to wake the references that probed it even though the identity
+/// itself never moved.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NodePayload {
+    /// A definition, by its [`crate::model::DefKind`] code.
+    Definition(u8),
+    /// A package, by the name its files declare — what an unaliased import
+    /// of it binds.
+    Package(Option<String>),
+    /// A dependency outside the repository, by its package string.
+    External(String),
+}
+
 impl NodeRecord {
+    /// The part of this record a resolver's answer can depend on.
+    pub fn payload(&self) -> NodePayload {
+        match self {
+            NodeRecord::Definition { kind, .. } => NodePayload::Definition(*kind),
+            NodeRecord::Package { name, .. } => NodePayload::Package(name.clone()),
+            NodeRecord::External { package, .. } => NodePayload::External(package.clone()),
+        }
+    }
+
     /// Every site declaring this node, sorted by `(file, line)`.
     pub fn declarations(&self) -> &[DeclSite] {
         match self {
@@ -705,23 +734,40 @@ impl Store {
         Ok(out)
     }
 
-    /// The node ids phase 1 owns for these files.
+    /// What phase 1 owns for these files, by identity and [`NodePayload`].
     ///
     /// Read *before* an event writes anything: it is the only record of what
     /// the event's own files declared beforehand, and comparing it with what
-    /// they declare afterwards is what selects the unchanged files an added
-    /// or removed definition has to wake. Read it after
-    /// [`Store::apply_defs`] and the comparison is against itself.
-    pub fn declared_nodes(&self, paths: &[String]) -> Result<BTreeSet<NodeId>, String> {
+    /// they declare afterwards is what selects the unchanged files this
+    /// event has to wake. Read it after [`Store::apply_defs`] and the
+    /// comparison is against itself.
+    ///
+    /// Carries the payload and not just the identity, because an identity
+    /// can stay put while its meaning moves: a package's node is its import
+    /// path, which its *directory* decides, so rewriting a `package` clause
+    /// changes no id at all — and changes what every unaliased import of it
+    /// binds.
+    pub fn declared_nodes(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<NodeId, NodePayload>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
-        let mut out = BTreeSet::new();
+        let owned_table = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
+        let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = BTreeMap::new();
         for path in paths {
-            let Some(guard) = table.get(path.as_str()).map_err(|e| e.to_string())? else {
+            let Some(guard) = owned_table.get(path.as_str()).map_err(|e| e.to_string())? else {
                 continue; // a file the store has no phase-1 half for
             };
             let owned: DefOwned = decode(guard.value())?;
-            out.extend(owned.nodes);
+            for id in owned.nodes {
+                // Owned but absent is not a contradiction to resolve here:
+                // there is simply no earlier meaning to compare against, and
+                // the identity still counts as one this event declares.
+                if let Some(record) = read_node(&nodes, &id)? {
+                    out.insert(id, record.payload());
+                }
+            }
         }
         Ok(out)
     }

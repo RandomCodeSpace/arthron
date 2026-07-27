@@ -28,8 +28,8 @@ use crate::lang::{
 use crate::model::{DefKind, Definition, Fqn, NodeId, Reference, node_id, reason_code};
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
-    DeclSite, DefBatch, FileDefs, FileRefs, NodeRecord, RefBatch, RefKey, RefRecord, Report, Store,
-    StoredOutcome,
+    DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
+    Report, Store, StoredOutcome,
 };
 
 /// One file this event re-reads, extracted.
@@ -159,20 +159,30 @@ pub fn scan<L: Language>(
             .files
             .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
     }
-    let declared_now: BTreeSet<NodeId> = def_batch
+    let declared_now: BTreeMap<NodeId, NodePayload> = def_batch
         .files
         .iter()
-        .flat_map(|f| f.nodes.iter().map(|(id, _)| *id))
+        .flat_map(|f| f.nodes.iter().map(|(id, rec)| (*id, rec.payload())))
         .collect();
 
-    // The identities this event started or stopped declaring. An
-    // over-approximation on purpose: an id another, unchanged file also
+    // The identities this event started declaring, stopped declaring, or
+    // changed the meaning of. The third case is not the same as the first
+    // two: a package's node is its import path, which its directory
+    // decides, so rewriting a `package` clause moves no identity at all and
+    // still changes what every unaliased import of it binds. Comparing
+    // payloads rather than bare ids is what makes that an event.
+    //
+    // An over-approximation on purpose: an id another, unchanged file also
     // declares still exists, so waking its probers is wasted work rather
     // than a wrong answer, and the narrower test is an existence check the
     // candidate index does not need in order to be correct.
     let touched: Vec<NodeId> = declared_before
-        .symmetric_difference(&declared_now)
+        .keys()
+        .chain(declared_now.keys())
+        .filter(|id| declared_before.get(*id) != declared_now.get(*id))
         .copied()
+        .collect::<BTreeSet<NodeId>>()
+        .into_iter()
         .collect();
     let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &changed, &owned)?
         .into_iter()

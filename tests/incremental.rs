@@ -265,6 +265,35 @@ fn renaming_the_module_lands_a_cold_scans_store() {
 }
 
 #[test]
+fn renaming_a_packages_declared_name_lands_a_cold_scans_store() {
+    // A package's node identity is its import path, which its *directory*
+    // decides — so rewriting the `package` clause changes no NodeId at all.
+    // What it does change is what an unaliased import of that package
+    // binds, and that is a fact every importer resolved against. An
+    // invalidation that compares identity sets cannot see a payload move
+    // under an identity that stayed put.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("cold scan");
+    assert!(calls(
+        &db,
+        "example.com/app/server.Serve",
+        "example.com/app/util.Parse",
+    ));
+
+    write(
+        root,
+        "util/util.go",
+        "package helper\n\nfunc Parse(s string) string { return s }\n",
+    );
+    scan_go(root, &db).expect("scan after the package rename");
+
+    assert_matches_cold(root, &db);
+}
+
+#[test]
 fn adding_a_definition_repoints_an_unresolved_caller_in_an_unchanged_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
