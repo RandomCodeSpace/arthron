@@ -8,7 +8,11 @@
 //! modules inside it, and a manifest reader that quietly stopped seeing a
 //! target would move every import of it into `External` — a bucket outside
 //! both terms of the resolution rate, where the reference vanishes rather than
-//! failing. Four of the tests below exist for exactly that failure.
+//! failing. Six of the tests below exist for exactly that failure, and two of
+//! them are about the *partial* read rather than the total one: a manifest
+//! that yields four targets out of five looks as read as one that yields all
+//! five, and the module it did not yield is then spelled the way `Foundation`
+//! is spelled.
 
 use std::collections::BTreeMap;
 
@@ -111,6 +115,86 @@ fn a_manifest_whose_target_list_cannot_be_read_launders_nothing_either() {
     assert_eq!(
         reasons(&tally),
         BTreeMap::from([("ProjectLayoutUnknown", 2)])
+    );
+}
+
+#[test]
+fn a_target_list_read_only_in_part_launders_nothing_into_external() {
+    // The hole the all-or-nothing guard left: this manifest states two
+    // targets, and one of them names itself with a `let`. One target is read,
+    // so "is the namespace known at all" answers yes — and `Gen` is a module
+    // of this repository, with its sources in this tree, that would otherwise
+    // be classified exactly the way `Foundation` is.
+    let tally = scan(&[
+        (
+            "Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\n\
+             let generated = \"Gen\"\n\
+             let package = Package(name: \"Demo\",\n\
+                 targets: [.target(name: \"Lib\", path: \"Sources/Lib\"),\n\
+                           .target(name: generated, path: \"Sources/Gen\")])\n",
+        ),
+        (
+            "Sources/Lib/A.swift",
+            "import Gen\nimport Foundation\npublic struct A {}\n",
+        ),
+        ("Sources/Gen/B.swift", "public struct G {}\n"),
+    ]);
+    assert_eq!(
+        tally.external, 0,
+        "a namespace read in part classified something as outside the package",
+    );
+    assert_eq!(tally.resolved, 0);
+    // `Gen`, `Foundation`, and the manifest's own `PackageDescription`: the
+    // price of the guard is paid by the two that really are outside, in the
+    // rate's denominator with a reason on them, rather than by the one that
+    // is not, in a bucket outside both terms.
+    assert_eq!(
+        reasons(&tally),
+        BTreeMap::from([("ProjectLayoutUnknown", 3)])
+    );
+}
+
+#[test]
+fn another_packages_manifest_in_the_tree_launders_nothing_either() {
+    // Same hole, no computed name needed: a nested SwiftPM package states
+    // targets in a manifest this reader does not read, built out of files
+    // this walk *does* read. `NestedLib` is in this repository by any measure
+    // that matters, and the root manifest has never heard of it.
+    let tally = scan(&[
+        (
+            "Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\n\
+             let package = Package(name: \"Demo\",\n\
+                 targets: [.target(name: \"Lib\", path: \"Sources/Lib\"),\n\
+                           .target(name: \"UsesNested\", path: \"Sources/UsesNested\")])\n",
+        ),
+        (
+            "Nested/Package.swift",
+            "// swift-tools-version: 6.0\nimport PackageDescription\n\
+             let package = Package(name: \"Nested\",\n\
+                 targets: [.target(name: \"NestedLib\", path: \"Sources/NestedLib\")])\n",
+        ),
+        ("Sources/Lib/A.swift", "public struct A {}\n"),
+        (
+            "Sources/UsesNested/U.swift",
+            "import NestedLib\nimport Lib\npublic struct U {}\n",
+        ),
+        ("Nested/Sources/NestedLib/N.swift", "public struct N {}\n"),
+    ]);
+    assert_eq!(tally.external, 0);
+    // A target the root manifest *does* state still resolves: the guard is
+    // about names the enumeration does not contain, not about the ones it
+    // does. Reading it as "give up on everything" would throw away the
+    // in-repository links this track exists to count.
+    assert_eq!(
+        tally.resolved, 1,
+        "import Lib is a target this package builds"
+    );
+    // `NestedLib`, and the two manifests' own `PackageDescription`.
+    assert_eq!(
+        reasons(&tally),
+        BTreeMap::from([("ProjectLayoutUnknown", 3)])
     );
 }
 

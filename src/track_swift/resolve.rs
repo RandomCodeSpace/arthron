@@ -7,9 +7,12 @@
 //! module namespace is not inferred — it is *stated*, and it is closed. Three
 //! rules follow, and each is a rule about where a name can possibly live:
 //!
-//! 1. **The manifest states no target this build could read.** Then arthron
-//!    does not know which modules the package builds, and neither "inside this
-//!    repository" nor "outside it" is a thing it may assert.
+//! 1. **The enumeration this build read is not whole.** Either the manifest
+//!    stated no target this reader could read, or it stated one it could not
+//!    — a `.target(name: computed)`, or a `Package.swift` of another package
+//!    nested in the tree. Then there is a module arthron cannot name, and
+//!    neither "inside this repository" nor "outside it" is a thing it may
+//!    assert about a name it does not recognise.
 //!    [`UnresolvedReason::ProjectLayoutUnknown`], which says exactly that: the
 //!    failure is arthron's own inference rather than a name that is absent.
 //! 2. **The first segment names a target.** The module is in this repository,
@@ -18,8 +21,8 @@
 //!    it. A miss is [`UnresolvedReason::NoMatchingDefinition`] — the lookup
 //!    really was complete, because every walked file of that target declares
 //!    the module — and in a package that compiles it means arthron's bug.
-//! 3. **The first segment names anything else.** The module is outside this
-//!    package: [`crate::Outcome::External`].
+//! 3. **The first segment names anything else, and rule 1 did not fire.** The
+//!    module is outside this package: [`crate::Outcome::External`].
 //!
 //! # Why "outside this package" is `External` here and `UnknownPackage` in Ruby
 //!
@@ -37,12 +40,19 @@
 //! from the tree. A name that is not one of them is outside the package by
 //! construction.
 //!
-//! That claim is only as good as having read the enumeration, which is why
-//! rule 1 comes first and is not a formality: with no target read, **nothing**
-//! is classified `External`. The corpus test pins the external set by name and
-//! the gate fails on drift in the `External` count, so a target this reader
-//! ever stops seeing shows up as a new external name and a moved bucket rather
-//! than as a reference that quietly left the measurement.
+//! That claim is only as good as having read the enumeration **whole**, which
+//! is why rule 1 is not a formality and why it is
+//! [`SwiftPackage::complete`] rather than `known` that it asks. With no target
+//! read, nothing is classified `External`; with four targets read out of five,
+//! nothing is either, because the fifth module is in this repository and would
+//! otherwise be spelled exactly the way `Foundation` is. The all-or-nothing
+//! version of this guard covered only the first case, and the partial read is
+//! the one a reader of a manifest is actually likely to hit.
+//!
+//! The corpus test pins the external set by name and the gate fails on drift
+//! in the `External` count, so a target this reader ever stops seeing shows up
+//! as a new external name and a moved bucket rather than as a reference that
+//! quietly left the measurement.
 //!
 //! # What has no reference at all
 //!
@@ -96,8 +106,8 @@ fn unresolved(reason: UnresolvedReason) -> Resolution {
 pub struct SwiftResolver;
 
 impl Resolver<SwiftLang> for SwiftResolver {
-    fn config(&self, root: &Path, _files: &FileIndex) -> Result<SwiftPackage, LayoutError> {
-        layout(root)
+    fn config(&self, root: &Path, files: &FileIndex) -> Result<SwiftPackage, LayoutError> {
+        layout(root, files)
     }
 
     fn config_digest(&self, cfg: &SwiftPackage) -> Vec<u8> {
@@ -208,14 +218,17 @@ impl Resolver<SwiftLang> for SwiftResolver {
         let Some(module) = segments.first() else {
             return unresolved(UnresolvedReason::DynamicModuleSpecifier);
         };
-        // Rule 1, and it comes first on purpose: without the manifest's target
-        // list this build cannot say a name is outside the package, so it does
-        // not get to move one into `External` — the bucket that sits outside
-        // both terms of the rate.
-        if !cfg.known() {
-            return unresolved(UnresolvedReason::ProjectLayoutUnknown);
-        }
         if !cfg.is_target(module) {
+            // Rule 1, and it guards rule 3 rather than standing beside it:
+            // "outside this package" is a claim about a *whole* enumeration,
+            // so a build that read none of the targets and a build that read
+            // all but one both have to decline to make it. Declining costs a
+            // reference in the rate's denominator; making it wrongly moves an
+            // in-repository module into `External`, outside both of its terms,
+            // where nothing can see it go.
+            if !cfg.complete() {
+                return unresolved(UnresolvedReason::ProjectLayoutUnknown);
+            }
             return Resolution {
                 outcome: crate::Outcome::External(module.clone()),
                 candidates: Vec::new(),
@@ -272,6 +285,7 @@ mod tests {
             manifests: vec!["Package.swift".to_string()],
             manifest: "Package.swift".to_string(),
             tools_version: "6.3".to_string(),
+            unread: Vec::new(),
             targets: targets
                 .iter()
                 .map(|(name, kind, dir)| Target {

@@ -62,9 +62,9 @@
 //!   `Dispatch`, `Security` and the rest are modules outside this package, and
 //!   the resolver may only say so because the manifest *enumerates* the
 //!   modules the package builds — see [`resolve`] for why that enumeration is
-//!   what separates this from Ruby's answer, and for the guard that stops an
-//!   unread manifest laundering the whole import surface into a bucket outside
-//!   both terms of the rate.
+//!   what separates this from Ruby's answer, and for the guard that stops a
+//!   manifest read in whole *or in part* from laundering the import surface
+//!   into a bucket outside both terms of the rate.
 //!
 //! # Known limits, recorded rather than left to be rediscovered
 //!
@@ -85,6 +85,30 @@
 //!   `#if` are read as written, so a member declared once per platform is
 //!   several declarations — which is why [`resolve`]'s `mergeable` answers
 //!   `false`.
+//! - **An extension head that is not an identifier is an owner segment as
+//!   written.** `extension [HTTPHeader]` and `extension Collection<String>`
+//!   file their members under `[HTTPHeader]` and `Collection<String>`, so
+//!   `Alamofire.[HTTPHeader].index(of:)` is a real identity in this graph and
+//!   `extension Collection` and `extension Collection<String>` are two of
+//!   them. The FQN grammar in [`lang`] promises only that a *module* name
+//!   carries no `.`; an owner segment may be any head Swift accepts.
+//!   Measured: 4 of the corpus's 194 extensions, pinned by
+//!   `tests/swift_corpus.rs`.
+//! - **A declaration inside a region the grammar could not parse is not
+//!   emitted.** A broken region states no owner chain arthron may be trusted
+//!   on, so the frame whitelist's default answer — "not a nameable
+//!   declaration" — is the one it gets. An `#if` inside a type body is *not*
+//!   such a region despite producing an empty error node: both arms stay
+//!   siblings in the body and are read as written. Measured: the corpus's 91
+//!   files hold 15 error nodes and 0 declarations under any of them.
+//! - **A nested SwiftPM package is not read.** A `Package*.swift` below the
+//!   repository root states targets built from files this walk does read, and
+//!   this reader reads neither the manifest nor the modules it names. The
+//!   consequence is deliberate and it is in the safe direction: while such a
+//!   manifest is in the tree, a name the root manifest does not state is
+//!   `ProjectLayoutUnknown` rather than `External`, so an in-repository
+//!   module cannot be laundered out of the rate — see [`resolve`]. Measured:
+//!   the corpus ships four manifests and all four are at the root.
 //! - **A constrained extension's `where` clause is not part of the identity.**
 //!   `extension AlamofireExtension where ExtendedType: URLSessionConfiguration`
 //!   and `… where ExtendedType == SecPolicy` each declare a static named

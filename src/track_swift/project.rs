@@ -39,10 +39,28 @@
 //! else — and if that leaves no target at all, the layout is *unknown* rather
 //! than empty, which is what stops an unread manifest from laundering every
 //! import in the package into `External`.
+//!
+//! # What went unread, recorded rather than rounded to zero
+//!
+//! "No target at all" is the total failure, and it is the easy one. The
+//! dangerous case is the *partial* one: a manifest that states five targets
+//! and spells one name with a `let` yields four readable targets, so the
+//! namespace looks known and the fifth module — in this repository, its
+//! sources in this tree — is then indistinguishable from `Foundation`.
+//!
+//! So every target declaration this reader saw and could not turn into a
+//! module is recorded in [`SwiftPackage::unread`], and so is every
+//! `Package*.swift` **below** the root, which states modules of another
+//! package that this reader does not read at all.
+//! [`SwiftPackage::complete`] is false while any of them stands, and the
+//! resolver may not say "outside this package" until it is true. The cost is
+//! borne in the right direction: names that really are outside land in
+//! `Unresolved` with a reason, which is inside the rate's denominator, rather
+//! than in-repository modules landing in a bucket outside both of its terms.
 
 use std::path::Path;
 
-use crate::lang::LayoutError;
+use crate::lang::{FileIndex, LayoutError};
 use crate::sg::{Rules, SgNode, SourceTree};
 use crate::track_swift::extract::string_literal;
 
@@ -184,6 +202,16 @@ pub struct SwiftPackage {
     pub tools_version: String,
     /// Every declared target, sorted by name.
     pub targets: Vec<Target>,
+    /// Every site that states modules this reader did not read, sorted:
+    /// `<manifest>#<n>` for the nth element of the read manifest's `targets:`
+    /// list that named no target this build could take, and the repo-relative
+    /// path of every `Package*.swift` below the root, each of which is
+    /// another package's manifest and is not read at all.
+    ///
+    /// Empty is the claim that the enumeration is whole — see
+    /// [`SwiftPackage::complete`], which is what the resolver asks before it
+    /// calls a name outside this package.
+    pub unread: Vec<String>,
 }
 
 /// The reserved prefix a module identity carries when no target claims the
@@ -196,16 +224,37 @@ pub struct SwiftPackage {
 pub const ORPHAN: char = '$';
 
 impl SwiftPackage {
-    /// Whether the module namespace is known at all.
+    /// Whether the module namespace is known **at all**.
     ///
     /// False when no manifest was found, and false when one was found but
-    /// stated no target this reader could read. Both mean the same thing: this
-    /// build cannot say which modules the package builds, so it may not say
-    /// that a name is outside it either. That is the whole guard against an
-    /// unread manifest laundering every import in the package into `External`,
-    /// where it would sit outside both terms of the resolution rate.
+    /// stated no target this reader could read. Both mean the same thing:
+    /// this build cannot say which modules the package builds.
+    ///
+    /// This is the floor and not the guard. A namespace can be known and
+    /// still have a hole in it — see [`SwiftPackage::complete`], which is
+    /// what the resolver asks and what the regression tests distinguish this
+    /// from, since a partial read is precisely the case that passes here and
+    /// must not pass there.
     pub fn known(&self) -> bool {
         !self.targets.is_empty()
+    }
+
+    /// Whether the module namespace is known **and** whole.
+    ///
+    /// [`SwiftPackage::known`] is the floor: with no target read at all this
+    /// build cannot say which modules the package builds. This is the
+    /// ceiling, and the gap between the two is exactly what a *partial* read
+    /// leaves behind — one unreadable `.target(name: computed)` among four
+    /// readable ones passes `known`, and the module it declares is then
+    /// spelled the same way `Foundation` is. `External` sits outside both
+    /// terms of the resolution rate, so that is an in-repository module
+    /// leaving the measurement rather than failing inside it.
+    ///
+    /// Only this answers the resolver's real question.
+    /// [`SwiftPackage::known`] remains the name for "is there a namespace at
+    /// all", which is the weaker claim the tests hold the two apart by.
+    pub fn complete(&self) -> bool {
+        self.known() && self.unread.is_empty()
     }
 
     /// Whether a module name is a target this package builds.
@@ -255,6 +304,13 @@ impl SwiftPackage {
             out.push('\n');
         }
         out.push('\u{1}');
+        // What went unread decides whether this build may say "outside this
+        // package" at all, so it is part of what the graph was built under.
+        for u in &self.unread {
+            out.push_str(u);
+            out.push('\n');
+        }
+        out.push('\u{1}');
         for t in &self.targets {
             out.push_str(t.kind.factory());
             out.push('\u{2}');
@@ -279,7 +335,14 @@ impl SwiftPackage {
 /// every import in it is [`crate::UnresolvedReason::ProjectLayoutUnknown`],
 /// which says the failure is arthron's own inference rather than a name that
 /// is absent.
-pub fn layout(root: &Path) -> Result<SwiftPackage, LayoutError> {
+///
+/// `files` is the walk's own index, and it is read for one thing: a
+/// `Package*.swift` **below** the root is another package's manifest, stating
+/// modules built from sources in this tree that this reader does not read.
+/// Recording them in [`SwiftPackage::unread`] is what stops one of those
+/// modules being called "outside this package". No extra walk and no second
+/// look at the disk — the index is already built when phase 0 runs.
+pub fn layout(root: &Path, files: &FileIndex) -> Result<SwiftPackage, LayoutError> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) => {
@@ -297,8 +360,7 @@ pub fn layout(root: &Path) -> Result<SwiftPackage, LayoutError> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name == BASE_MANIFEST || (name.starts_with(VERSIONED_PREFIX) && name.ends_with(".swift"))
-        {
+        if is_manifest(name) {
             manifests.push(name.to_string());
         }
     }
@@ -333,13 +395,36 @@ pub fn layout(root: &Path) -> Result<SwiftPackage, LayoutError> {
     };
     if let Some((_, name, version)) = chosen {
         let source = std::fs::read_to_string(root.join(&name)).unwrap_or_default();
-        let (pkg_name, targets) = read_manifest(&source);
+        let read = read_manifest(&source);
+        package.unread = read
+            .unread
+            .iter()
+            .map(|position| format!("{name}#{position}"))
+            .collect();
         package.manifest = name;
         package.tools_version = version;
-        package.name = pkg_name;
-        package.targets = targets;
+        package.name = read.name;
+        package.targets = read.targets;
     }
+    // Another package's manifest, inside this tree. Its targets are modules
+    // built from sources the walk read, and none of them is in the list above.
+    for rel in &files.files {
+        let Some((_, base)) = rel.rsplit_once('/') else {
+            continue; // no directory: a root manifest, already read or ranked
+        };
+        if is_manifest(base) {
+            package.unread.push(rel.clone());
+        }
+    }
+    package.unread.sort();
+    package.unread.dedup();
     Ok(package)
+}
+
+/// Whether a file name is a SwiftPM manifest: `Package.swift`, or one of the
+/// `Package@swift-<version>.swift` a package ships for older toolchains.
+fn is_manifest(name: &str) -> bool {
+    name == BASE_MANIFEST || (name.starts_with(VERSIONED_PREFIX) && name.ends_with(".swift"))
 }
 
 /// The `swift-tools-version` a manifest states, as written.
@@ -380,33 +465,61 @@ fn manifest_rules() -> &'static Rules {
     })
 }
 
-/// What one manifest declares: the package's name, and its targets.
-fn read_manifest(source: &str) -> (String, Vec<Target>) {
+/// What one manifest declares, and what of it this reader could not read.
+struct Manifest {
+    /// The declared package name, or `""` when none was stated as a literal.
+    name: String,
+    /// Every target read, sorted by name.
+    targets: Vec<Target>,
+    /// The 1-based position, in source order, of every element of the
+    /// `targets:` list that states a target this reader could not name.
+    ///
+    /// Positions rather than text: an element that cannot be read is a
+    /// computed expression, and its source is neither short nor stable, while
+    /// its place in the list is both. What matters downstream is only that
+    /// something was there — see [`SwiftPackage::complete`].
+    unread: Vec<usize>,
+}
+
+/// Read one manifest.
+fn read_manifest(source: &str) -> Manifest {
     let tree = SourceTree::parse_swift(source);
-    let mut name = String::new();
-    let mut targets: Vec<Target> = Vec::new();
+    let mut out = Manifest {
+        name: String::new(),
+        targets: Vec::new(),
+        unread: Vec::new(),
+    };
     for (_, node) in tree.matches(manifest_rules()) {
         if callee(&node).as_deref() != Some("Package") {
             continue;
         }
         let args = arguments(&node);
         if let Some(literal) = argument(&args, "name").as_ref().and_then(string_literal) {
-            name = literal;
+            out.name = literal;
         }
         // Only the elements of `targets:` declare a target. A `.target(name:)`
         // inside `dependencies:` names one instead, and reading it would mint
         // a module the package does not build.
+        //
+        // Every element is looked at, not only the ones that parse into a
+        // target: an element this reader skips is a module it does not know
+        // about, and skipping it silently is what would let the module be
+        // called "outside this package" a few lines later.
         if let Some(list) = argument(&args, "targets") {
-            for element in list.children().filter(|c| c.kind() == "call_expression") {
-                if let Some(target) = read_target(&element) {
-                    targets.push(target);
+            let elements = list
+                .children()
+                .filter(|c| !matches!(c.kind().as_ref(), "[" | "]" | ","));
+            for (position, element) in elements.enumerate() {
+                match read_target(&element) {
+                    Some(target) => out.targets.push(target),
+                    None => out.unread.push(position + 1),
                 }
             }
         }
         break;
     }
-    targets.sort_by(|a, b| a.name.cmp(&b.name));
-    (name, targets)
+    out.targets.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// One `.target(…)` element of a manifest's `targets:` list.
@@ -506,7 +619,9 @@ mod tests {
 
     #[test]
     fn a_manifest_states_its_package_and_its_targets() {
-        let (name, targets) = read_manifest(MANIFEST);
+        let read = read_manifest(MANIFEST);
+        let (name, targets) = (read.name, read.targets);
+        assert!(read.unread.is_empty(), "every element was read");
         assert_eq!(name, "Alamofire");
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].name, "Alamofire");
@@ -525,24 +640,30 @@ mod tests {
         // declare one. Reading it would put a module in the package that the
         // package does not build — and every import of a name that phantom
         // shadowed would resolve to nothing while looking resolved.
-        let (_, targets) = read_manifest(
+        let read = read_manifest(
             "// swift-tools-version: 5.9\nlet package = Package(name: \"P\",\n\
              targets: [.target(name: \"Real\", dependencies: [.target(name: \"Phantom\")])])\n",
         );
         assert_eq!(
-            targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            read.targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
             ["Real"],
         );
+        // And the nested one is not residue either: it was never a target
+        // declaration, so nothing about the enumeration went unread.
+        assert!(read.unread.is_empty());
     }
 
     #[test]
     fn a_target_with_no_path_gets_swiftpms_default_directory() {
-        let (_, targets) = read_manifest(
+        let read = read_manifest(
             "// swift-tools-version: 5.9\nlet package = Package(name: \"P\",\n\
              targets: [.target(name: \"Core\"), .testTarget(name: \"CoreTests\")])\n",
         );
-        assert_eq!(targets[0].dir, "Sources/Core");
-        assert_eq!(targets[1].dir, "Tests/CoreTests");
+        assert_eq!(read.targets[0].dir, "Sources/Core");
+        assert_eq!(read.targets[1].dir, "Tests/CoreTests");
     }
 
     #[test]
@@ -550,15 +671,86 @@ mod tests {
         // The guard against the cheapest way to raise a rate: with no target
         // read, "outside this package" is not a thing this build may assert,
         // so no import can be laundered into `External`.
-        let (_, targets) = read_manifest(
+        let read = read_manifest(
             "// swift-tools-version: 5.9\nlet package = Package(name: \"P\", targets: allTargets)\n",
         );
-        assert!(targets.is_empty());
+        assert!(read.targets.is_empty());
         let package = SwiftPackage {
-            targets,
+            targets: read.targets,
             ..SwiftPackage::default()
         };
         assert!(!package.known());
+        assert!(!package.complete());
+    }
+
+    #[test]
+    fn a_target_this_reader_cannot_name_is_recorded_rather_than_skipped() {
+        // The partial read, which is the dangerous one: four targets stated,
+        // three readable. `known()` answers true on the three, and without a
+        // record of the fourth the module it declares — in this repository,
+        // its sources in this tree — is spelled exactly the way `Foundation`
+        // is spelled.
+        let read = read_manifest(
+            "// swift-tools-version: 5.9\nlet generated = \"Gen\"\n\
+             let package = Package(name: \"P\", targets: [\n\
+                 .target(name: \"Lib\"),\n\
+                 .target(name: generated),\n\
+                 libraryTarget,\n\
+                 .target(name: \"Extra\")])\n",
+        );
+        assert_eq!(
+            read.targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Extra", "Lib"],
+        );
+        // Positions 2 and 3, in source order, of the four elements written.
+        assert_eq!(read.unread, [2, 3]);
+        let package = SwiftPackage {
+            targets: read.targets,
+            unread: read
+                .unread
+                .iter()
+                .map(|p| format!("Package.swift#{p}"))
+                .collect(),
+            ..SwiftPackage::default()
+        };
+        assert!(package.known(), "three targets were read");
+        assert!(
+            !package.complete(),
+            "a namespace with an unread declaration in it is not whole",
+        );
+    }
+
+    #[test]
+    fn another_packages_manifest_in_the_tree_leaves_the_namespace_incomplete() {
+        let dir = tempfile::tempdir().expect("scratch");
+        std::fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version: 6.0\n\
+             let package = Package(name: \"P\", targets: [.target(name: \"Lib\")])\n",
+        )
+        .expect("manifest");
+        let files = FileIndex {
+            files: vec![
+                "Package.swift".to_string(),
+                "Sources/Lib/A.swift".to_string(),
+                "Nested/Package.swift".to_string(),
+                "Nested/Sources/NestedLib/N.swift".to_string(),
+            ],
+        };
+        let cfg = layout(dir.path(), &files).expect("layout");
+        // The root manifest read cleanly, so the namespace is known…
+        assert!(cfg.known());
+        assert!(cfg.is_target("Lib"));
+        // …and it is still not whole: `Nested/Package.swift` builds modules
+        // out of files in this tree, and this reader reads none of them.
+        assert_eq!(cfg.unread, ["Nested/Package.swift"]);
+        assert!(!cfg.complete());
+        // A manifest at the root is the one already chosen among, never
+        // another package's.
+        assert_eq!(cfg.manifests, ["Package.swift"]);
     }
 
     #[test]
@@ -590,7 +782,7 @@ mod tests {
             )
             .expect("manifest");
         }
-        let cfg = layout(dir.path()).expect("layout");
+        let cfg = layout(dir.path(), &FileIndex { files: Vec::new() }).expect("layout");
         assert_eq!(cfg.manifest, "Package.swift");
         assert_eq!(cfg.tools_version, "6.3");
         assert_eq!(cfg.manifests.len(), 4);
@@ -600,7 +792,7 @@ mod tests {
     #[test]
     fn a_tree_with_no_manifest_has_no_module_namespace_at_all() {
         let dir = tempfile::tempdir().expect("scratch");
-        let cfg = layout(dir.path()).expect("layout");
+        let cfg = layout(dir.path(), &FileIndex { files: Vec::new() }).expect("layout");
         assert!(!cfg.known());
         assert!(cfg.manifests.is_empty());
         // Every file is then its own module, which is the honest floor: a
@@ -615,6 +807,7 @@ mod tests {
             manifest: "Package.swift".to_string(),
             tools_version: "6.3".to_string(),
             targets,
+            unread: Vec::new(),
         }
     }
 

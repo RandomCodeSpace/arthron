@@ -54,7 +54,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use arthron::gate::{Counts, GateVerdict, evaluate, parse_baseline};
-use arthron::model::{DefKind, Domain, Lang, RefKind, node_id, reason_name};
+use arthron::model::{DefFacets, DefKind, Domain, Lang, RefKind, node_id, reason_name};
 use arthron::query::{NodeKind, definition};
 use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_swift::extract::extract;
@@ -305,6 +305,22 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
         "Tests/BaseTestCase.swift",
         119,
     ),
+    // An extension head that is not an identifier becomes the owner segment
+    // it is written as — a recorded limit of the FQN grammar, pinned here so
+    // it stays a limit somebody chose rather than one somebody rediscovers.
+    // Four of the corpus's 194 extensions are this shape.
+    (
+        "Alamofire.[HTTPHeader].index(of:)",
+        NodeKind::Definition(DefKind::Method),
+        "Source/Core/HTTPHeaders.swift",
+        338,
+    ),
+    (
+        "Alamofire.Collection<String>.qualityEncoded()",
+        NodeKind::Definition(DefKind::Method),
+        "Source/Core/HTTPHeaders.swift",
+        436,
+    ),
     ("XCTest", NodeKind::External, "Tests/BaseTestCase.swift", 27),
     (
         "Foundation",
@@ -368,6 +384,7 @@ fn the_swift_track_drops_nothing_and_holds_its_baseline() {
     let mut kinds: BTreeMap<u8, u64> = BTreeMap::new();
     let mut testable = 0u64;
     let mut extensions = 0u64;
+    let mut static_types = 0u64;
     for rel in &owned {
         let source = std::fs::read_to_string(corpus.join(rel))
             .unwrap_or_else(|e| panic!("re-reading {rel}: {e}"));
@@ -401,6 +418,9 @@ fn the_swift_track_drops_nothing_and_holds_its_baseline() {
         assert_eq!(placeholder.name, "", "{rel} named its own module");
         for d in &facts.defs {
             *kinds.entry(d.kind.code()).or_default() += 1;
+            if d.kind == DefKind::Type && d.facets.contains(DefFacets::STATIC) {
+                static_types += 1;
+            }
         }
     }
     println!("             imports {modules:?}");
@@ -421,6 +441,17 @@ fn the_swift_track_drops_nothing_and_holds_its_baseline() {
          so nothing else here can see one",
     );
     assert_eq!(testable, TESTABLE);
+    // Swift has no `static` type declaration to write, so no type node may
+    // carry the facet. It is checked here because the census above counts by
+    // kind and cannot see a facet: `class Foo {}` carries the same `class`
+    // child that makes `class func` static, and reading the one as the other
+    // put a false fact on 174 of these 383 nodes with every test still green.
+    // Facets are stored and are part of a node's payload, so this is graph
+    // data rather than a display detail.
+    assert_eq!(
+        static_types, 0,
+        "a type declaration carries STATIC; Swift has no way to write one",
+    );
 
     let accounted =
         measured.resolved + measured.external + measured.local_binding + measured.unresolved;

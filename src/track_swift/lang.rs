@@ -22,7 +22,15 @@
 //!   type Foundation owns.
 //!
 //! A module name carries no `.` — SwiftPM target names are identifiers — so a
-//! module FQN and a member FQN can never be spelled the same way.
+//! module FQN and a member FQN can never be spelled the same way. That is the
+//! whole of the guarantee: an **owner** segment is whatever the declaration's
+//! head spells, and an extension's head need not be an identifier at all.
+//! `extension [HTTPHeader]` and `extension Collection<String>` really do give
+//! `Alamofire.[HTTPHeader].index(of:)` and
+//! `Alamofire.Collection<String>.qualityEncoded()`, and `extension Collection`
+//! is a third identity rather than the same one. See
+//! [`crate::track_swift`]'s known limits, and `tests/swift_corpus.rs`, which
+//! pins two of the four the measured corpus contains.
 
 use crate::lang::Language;
 use crate::model::{Domain, Lang};

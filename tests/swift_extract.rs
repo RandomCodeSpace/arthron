@@ -134,6 +134,47 @@ fn a_function_in_a_type_is_a_method_and_a_static_one_says_so() {
 }
 
 #[test]
+fn a_class_is_a_type_and_not_a_static_anything() {
+    // `class func` is `static`, and the keyword sits outside the modifier
+    // list — so the detector that reads it has to tell that keyword from the
+    // `class` in `class Foo {}`, which is the declaration's own kind. Reading
+    // the second as the first stamped `STATIC` on every class in the graph:
+    // 174 of the measured corpus's 383 type nodes carried the false fact, and
+    // no test could see it because the only `STATIC` assertion nearby is
+    // about methods inside a `struct`.
+    let facts = extract(
+        "Source/X.swift",
+        "public class Foo {\n  class func c() {}\n}\nfinal class Q {}\n\
+         struct S {}\nenum E {}\nactor A {}\nprotocol P {}\n",
+    );
+    let types: Vec<(&str, bool)> = facts
+        .defs
+        .iter()
+        .filter(|d| d.kind == DefKind::Type)
+        .map(|d| (d.name.as_str(), d.facets.contains(DefFacets::STATIC)))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("Foo", false),
+            ("Q", false),
+            ("S", false),
+            ("E", false),
+            ("A", false),
+            ("P", false),
+        ],
+    );
+    // And the member that really is one still says so, from inside the very
+    // class whose own keyword must not be read as its modifier.
+    let member = facts
+        .defs
+        .iter()
+        .find(|d| d.name == "c()")
+        .expect("the class func");
+    assert!(member.facets.contains(DefFacets::STATIC));
+}
+
+#[test]
 fn initialisers_deinitialisers_and_subscripts_are_named_not_skipped() {
     assert_eq!(
         written(

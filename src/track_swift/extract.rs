@@ -151,15 +151,21 @@ pub struct SwiftHeader {
 /// decision. Answering "no" for an unknown kind is what keeps a node from
 /// being invented for a declaration whose owner this file does not state.
 ///
-/// `ERROR` is on the list because tree-sitter emits an empty error node where
-/// a `#if` opens inside a type body. Both arms stay siblings in the body, so
-/// crossing it changes no owner — and a genuinely broken region cannot smuggle
-/// anything through, because a declaration is still matched by its own kind.
+/// `ERROR` is deliberately **not** on the list, and the reason is measured
+/// rather than assumed. tree-sitter does emit an error node where a `#if`
+/// opens inside a type body — the corpus has four, one per `#if` under a
+/// `class`, `enum`, `protocol` or `extension` body — but every one of them is
+/// *empty*: both arms of the `#if` stay siblings in the body, so no
+/// declaration is ever nested inside one and an entry for it would never be
+/// consulted. What is left is a region tree-sitter genuinely could not parse,
+/// and that region states no owner chain this file may be trusted on, so a
+/// declaration under one is not emitted — the whitelist's own default answer.
+/// Measured over the corpus's 91 files: 15 `ERROR` nodes, 0 declarations
+/// under any of them.
 const DECLARATION_FRAMES: &[&str] = &[
     "class_body",
     "enum_class_body",
     "protocol_body",
-    "ERROR",
     "source_file",
 ];
 
@@ -224,8 +230,15 @@ fn common_facets(node: &SgNode) -> DefFacets {
         }
     }
     // `class func` is `static` with an override; the keyword sits outside the
-    // modifier list.
-    if node.children().any(|c| c.kind() == "class") {
+    // modifier list. It is a modifier only where `class` is not the
+    // declaration's *own* kind: `class Foo {}` carries the very same child,
+    // and reading it as a modifier stamps `STATIC` on every class in the
+    // repository — a false fact on 174 of the corpus's 383 type nodes, which
+    // is what this guard measured before it existed.
+    let declares_a_class = node
+        .field("declaration_kind")
+        .is_some_and(|k| k.text() == "class");
+    if !declares_a_class && node.children().any(|c| c.kind() == "class") {
         facets = facets.union(DefFacets::STATIC);
     }
     facets
