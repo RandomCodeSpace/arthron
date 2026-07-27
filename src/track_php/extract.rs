@@ -534,6 +534,18 @@ impl Import {
 
 /// Every clause one `namespace_use_declaration` states.
 fn use_clauses(decl: &SgNode) -> Vec<Import> {
+    // A declaration the grammar did not understand states nothing.
+    //
+    // tree-sitter-php cannot parse a fully-qualified group — `use \A\{B};`,
+    // which PHP accepts — and recovers by reading the prefix `\A` as a
+    // *finished* clause and parking `\{B}` in an `ERROR` sibling. Emitting
+    // from that tree drops the import the source wrote and mints one it did
+    // not: `\A` alone is a namespace this repository may well declare, and
+    // the resolver's rule 2 would link it. Both halves of that are wrong
+    // edges, so nothing is emitted rather than a guess at the leaf.
+    if has_error(decl) {
+        return Vec::new();
+    }
     let mut decl_kind: Option<UseKind> = None;
     let mut prefix: Option<String> = None;
     let mut group: Option<SgNode> = None;
@@ -548,6 +560,7 @@ fn use_clauses(decl: &SgNode) -> Vec<Import> {
             _ => {}
         }
     }
+    let grouped = group.is_some();
     if let Some(group) = &group {
         clauses = group
             .children()
@@ -561,10 +574,23 @@ fn use_clauses(decl: &SgNode) -> Vec<Import> {
         prefix = None;
         decl_kind = decl_kind.or_else(|| clauses.first().and_then(clause_kind));
     }
-    let kind = decl_kind.unwrap_or(UseKind::Class);
     clauses
         .iter()
         .filter_map(|clause| {
+            // Which of the three symbol tables *this* clause reads.
+            //
+            // The group form is the one place PHP lets a single declaration
+            // name several: `use A\{function b, const C, D};` is a function,
+            // a constant and a class, and the grammar hangs each keyword on
+            // its own clause. The comma form carries at most one keyword for
+            // the whole declaration — which is why the branch above recovers
+            // it from the first clause and applies it to all of them.
+            let kind = if grouped {
+                clause_kind(clause).or(decl_kind)
+            } else {
+                decl_kind
+            }
+            .unwrap_or(UseKind::Class);
             let (name, alias) = clause_name(clause)?;
             let name = match &prefix {
                 Some(p) => format!("{p}\\{name}"),
@@ -578,6 +604,15 @@ fn use_clauses(decl: &SgNode) -> Vec<Import> {
             })
         })
         .collect()
+}
+
+/// Whether anything under this node is an error node.
+///
+/// Recursive because the grammar's recovery point is not fixed: a
+/// fully-qualified group parks its `ERROR` beside the clauses, and a
+/// truncated one nests it inside a clause.
+fn has_error(node: &SgNode) -> bool {
+    node.kind() == "ERROR" || node.children().any(|child| has_error(&child))
 }
 
 fn clause_kind(clause: &SgNode) -> Option<UseKind> {
@@ -610,5 +645,14 @@ fn clause_name(clause: &SgNode) -> Option<(String, Option<String>)> {
             _ => {}
         }
     }
-    Some((name?, alias))
+    // A trailing comma is legal in a group `use` from PHP 7.2 — `use A\{B, C,};`
+    // — and the grammar answers it with a zero-width clause holding an empty
+    // `name`. Taking it would mint a third reference from a two-leaf import,
+    // named `A\`, which the source never wrote: a name in neither term of
+    // the rate that still lands in its denominator.
+    let name = name?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, alias))
 }

@@ -201,6 +201,93 @@ fn a_group_use_expands_to_one_reference_per_leaf() {
 }
 
 #[test]
+fn a_group_use_reads_the_keyword_each_leaf_writes() {
+    // The group form is the one place a single `use` names several of PHP's
+    // three symbol tables, and the grammar hangs each keyword on its own
+    // clause. A reader that took only the declaration's keyword would call
+    // all three of these classes, and `use function A\b;` linking to the
+    // *class* `A\b` is the exact wrong edge the sigils exist to prevent.
+    assert_eq!(
+        refs("<?php\nnamespace N;\nuse A\\{function b, const C, D};\n"),
+        [
+            (
+                RefKind::Import,
+                DeclSpace::Value,
+                "function A\\b".to_string(),
+                "A\\b".to_string(),
+            ),
+            (
+                RefKind::Import,
+                DeclSpace::Value,
+                "const A\\C".to_string(),
+                "A\\C".to_string(),
+            ),
+            (
+                RefKind::Import,
+                DeclSpace::Type,
+                "A\\D".to_string(),
+                "A\\D".to_string(),
+            ),
+        ],
+    );
+    // An alias does not hide the keyword either: it is part of the literal
+    // text at the site, and `UseKind::of` reads it back off the front.
+    assert_eq!(
+        refs("<?php\nnamespace N;\nuse A\\{function b as bb};\n"),
+        [(
+            RefKind::Import,
+            DeclSpace::Value,
+            "function A\\b as bb".to_string(),
+            "A\\b".to_string(),
+        )],
+    );
+}
+
+#[test]
+fn a_trailing_comma_in_a_group_use_adds_no_leaf() {
+    // Legal PHP since 7.2, and the grammar answers it with a zero-width
+    // clause holding an empty `name`. Reading it emits a third reference
+    // from a two-leaf import, named `App\` — a name the source never wrote,
+    // sitting in the denominator of the rate.
+    assert_eq!(
+        refs("<?php\nnamespace N;\nuse App\\{Alpha, Beta,};\n"),
+        refs("<?php\nnamespace N;\nuse App\\{Alpha, Beta};\n"),
+    );
+    assert_eq!(
+        refs("<?php\nnamespace N;\nuse App\\{Alpha, Beta,};\n").len(),
+        2
+    );
+}
+
+#[test]
+fn a_use_the_grammar_could_not_parse_states_nothing() {
+    // `use \App\{Alpha};` is valid PHP and tree-sitter-php cannot parse it:
+    // it reads the prefix `\App` as a *finished* clause and parks `\{Alpha}`
+    // in an `ERROR` sibling. Emitting from that tree drops the import the
+    // source wrote and mints one it did not — and `App` alone is a namespace
+    // a repository may well declare, so the resolver's rule 2 links the
+    // phantom. Nothing is the only honest answer; a guess at the leaf is
+    // still a guess.
+    assert!(
+        refs("<?php\nnamespace N;\nuse \\App\\{Alpha};\n").is_empty(),
+        "{:?}",
+        refs("<?php\nnamespace N;\nuse \\App\\{Alpha};\n"),
+    );
+    // The guard is the declaration's own subtree and not the file's: a
+    // `use` the grammar *did* parse still states its import beside a class
+    // body that does not parse.
+    assert_eq!(
+        refs("<?php\nnamespace N;\nuse App\\Thing;\nclass C { public function f( "),
+        [(
+            RefKind::Import,
+            DeclSpace::Type,
+            "App\\Thing".to_string(),
+            "App\\Thing".to_string(),
+        )],
+    );
+}
+
+#[test]
 fn a_comma_separated_use_carries_its_keyword_to_every_clause() {
     // tree-sitter hangs the `function` keyword on the first clause alone;
     // PHP applies it to all of them. A reader of the second clause that
