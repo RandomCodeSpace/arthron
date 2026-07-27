@@ -75,6 +75,16 @@ impl SourceTree {
         Self::parse(SupportLang::Python, source)
     }
 
+    /// Parse PHP source.
+    ///
+    /// One grammar for the whole file, including the text outside `<?php`
+    /// tags: tree-sitter-php's `php` dialect reads a template file the way
+    /// the interpreter does, so an extractor never has to find the tags
+    /// itself.
+    pub fn parse_php(source: &str) -> Self {
+        Self::parse(SupportLang::Php, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -181,6 +191,16 @@ rule:
             &SourceTree::parse_typescript("declare interface Greeter { hi(): void }\n"),
             yaml,
             "interface_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_php() {
+        one_match(
+            &SourceTree::parse_php("<?php\nclass Greeter { public function hi() {} }\n"),
+            "id: t\nlanguage: php\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
             "Greeter",
         );
     }
