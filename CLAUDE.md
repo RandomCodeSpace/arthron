@@ -32,6 +32,11 @@ updating the design doc and saying why.
 
 ## Conventions
 
+Design and discussion sessions happen in the **main checkout**; their artifacts
+(specs, plans) live in `docs/superpowers/` — local, untracked, never committed.
+Implementation happens in **worktrees**. The public record is `docs/decisions.md`
+and `docs/evidence/` only.
+
 Rust. Record new decisions in `docs/decisions.md` — newest first, with what was
 rejected and why. New measurements go in `docs/evidence/` and must be executed,
 never estimated; if a benchmark turns out to be invalid, keep it with the reason.
