@@ -29,6 +29,17 @@
 //! A capability that turns `Unresolved` into `External` re-bases the baseline;
 //! it never quietly passes a comparison.
 //!
+//! **It does not compare the rate alone — it also fails when the rate's
+//! denominator shrinks.** A ratio cannot see a reference that stopped being
+//! emitted at all: drop one `Resolved` row from a corpus measured at 100% and
+//! `resolved / (resolved + unresolved)` is 100% still, and drop an
+//! `Unresolved` row from any corpus and the ratio *rises*. Either way an
+//! extractor that quietly stopped emitting passes a check named for the one
+//! contract it broke. `resolved + unresolved` may therefore grow — new
+//! references are how a track improves — and may never fall without a
+//! deliberate re-base, which together with the two equality checks above
+//! makes "the resolver never drops" a property the gate can actually observe.
+//!
 //! **It does not verify `corpus` or `commit`.** They are provenance, printed
 //! so a wrong baseline is visible in review. A vendored corpus snapshot
 //! carries no git metadata to check them against.
@@ -128,6 +139,15 @@ pub enum GateFailure {
         /// This run's count.
         now: u64,
     },
+    /// `resolved + unresolved` fell. References the baseline counted are not
+    /// being counted any more, in either term — which the rate itself cannot
+    /// see, because a ratio is blind to a row that left the fraction whole.
+    DenominatorShrank {
+        /// The baseline's `resolved + unresolved`.
+        was: u128,
+        /// This run's.
+        now: u128,
+    },
 }
 
 impl GateFailure {
@@ -141,6 +161,7 @@ impl GateFailure {
             GateFailure::RateRegressed { .. } => "rate_regressed",
             GateFailure::LocalBindingDrift { .. } => "local_binding_drift",
             GateFailure::ExternalDrift { .. } => "external_drift",
+            GateFailure::DenominatorShrank { .. } => "denominator_shrank",
         }
     }
 }
@@ -169,6 +190,13 @@ impl fmt::Display for GateFailure {
                 "external count drifted: {was} -> {now}; this bucket is outside both \
                  rate terms, so a change here moves the rate without linking \
                  anything — re-base deliberately if it is intended",
+            ),
+            GateFailure::DenominatorShrank { was, now } => write!(
+                f,
+                "the rate's denominator shrank: {was} -> {now}; references the \
+                 baseline counted are no longer counted in either term, which a \
+                 ratio cannot see — every reference is Resolved, External or \
+                 Unresolved, so re-base deliberately if fewer is intended",
             ),
         }
     }
@@ -223,6 +251,16 @@ pub fn evaluate(baseline: &Baseline, measured: &Measured) -> GateVerdict {
     let was_share = u128::from(was.resolved) * now_denom;
     if now_share < was_share {
         failures.push(GateFailure::RateRegressed { was, now });
+    }
+    // The rate is a ratio, and a ratio cannot see a reference that stopped
+    // being counted: a corpus at 100% keeps its rate when a `Resolved` row
+    // disappears, and any corpus *gains* rate when an `Unresolved` one does.
+    // Growth is how a track improves and passes; a fall is a drop and fails.
+    if now_denom < was_denom {
+        failures.push(GateFailure::DenominatorShrank {
+            was: was_denom,
+            now: now_denom,
+        });
     }
     if was.local_binding != now.local_binding {
         failures.push(GateFailure::LocalBindingDrift {
@@ -504,6 +542,9 @@ mod tests {
         // references out of `resolved` and into `local_binding`, which is
         // outside both terms — so the rate *rises* while edges are deleted.
         // Rate before: 4467/9542 = 46.8%. After: 4400/9075 = 48.5%.
+        //
+        // Two checks catch it, and both are the point: the references left
+        // the rate's denominator as well as landing in a gated bucket.
         let b = baseline(counts(4467, 6085, 12, 5075));
         let now = counts(4400, 6085, 479, 4675);
         let before = resolution_rate(b.counts.resolved, b.counts.unresolved).unwrap();
@@ -511,8 +552,71 @@ mod tests {
         assert!(after > before, "the fixture must make the rate rise");
         assert_eq!(
             evaluate(&b, &now),
-            GateVerdict::Fail(vec![GateFailure::LocalBindingDrift { was: 12, now: 479 }]),
+            GateVerdict::Fail(vec![
+                GateFailure::DenominatorShrank {
+                    was: 9542,
+                    now: 9075,
+                },
+                GateFailure::LocalBindingDrift { was: 12, now: 479 },
+            ]),
         );
+    }
+
+    #[test]
+    fn a_dropped_reference_fails_even_at_a_hundred_percent() {
+        // The hole a ratio leaves. A tier-2 baseline with nothing unresolved
+        // makes `resolved / (resolved + unresolved)` exactly 1, and it stays
+        // exactly 1 however many resolved references stop being emitted — so
+        // an extractor that quietly dropped an in-repository import would
+        // hold "100.0%" while breaking the one contract the rate exists to
+        // defend. `external` does not move, so no other check sees it either.
+        let b = baseline(counts(53, 36, 0, 0));
+        let now = counts(52, 36, 0, 0);
+        assert_eq!(
+            resolution_rate(b.counts.resolved, b.counts.unresolved),
+            resolution_rate(now.resolved, now.unresolved),
+            "the fixture must leave the rate untouched",
+        );
+        assert_eq!(
+            evaluate(&b, &now),
+            GateVerdict::Fail(vec![GateFailure::DenominatorShrank { was: 53, now: 52 }]),
+        );
+    }
+
+    #[test]
+    fn a_dropped_unresolved_reference_fails_instead_of_reading_as_an_improvement() {
+        // The other half, and the one no baseline value can protect against:
+        // deleting an `Unresolved` row raises the rate at every baseline.
+        // Before: 291/341 = 85.3%. After: 291/340 = 85.6%.
+        let b = baseline(counts(291, 1, 0, 50));
+        let now = counts(291, 1, 0, 49);
+        let before = resolution_rate(b.counts.resolved, b.counts.unresolved).unwrap();
+        let after = resolution_rate(now.resolved, now.unresolved).unwrap();
+        assert!(after > before, "the fixture must make the rate rise");
+        assert_eq!(
+            evaluate(&b, &now),
+            GateVerdict::Fail(vec![GateFailure::DenominatorShrank { was: 341, now: 340 }]),
+        );
+    }
+
+    #[test]
+    fn a_growing_denominator_is_not_a_drop() {
+        // New references are how a track improves. Landing them in `resolved`
+        // raises the rate and passes; landing them in `unresolved` lowers it
+        // and fails on the rate, never on this check.
+        let b = baseline(counts(4467, 6085, 12, 5075));
+        assert_eq!(
+            evaluate(&b, &counts(4500, 6085, 12, 5075)),
+            GateVerdict::Pass { improved: true },
+        );
+        match evaluate(&b, &counts(4467, 6085, 12, 5100)) {
+            GateVerdict::Fail(f) => assert_eq!(
+                f.iter().map(GateFailure::check).collect::<Vec<_>>(),
+                ["rate_regressed"],
+                "{f:?}",
+            ),
+            other => panic!("expected a rate regression, got {other:?}"),
+        }
     }
 
     #[test]
