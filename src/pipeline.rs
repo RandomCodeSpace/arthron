@@ -94,7 +94,7 @@ pub fn scan<L: Language>(
     // every identity in the graph. Fingerprinting it *before* the config
     // learns anything from the store is what keeps the comparison about the
     // project rather than about what the last scan happened to know.
-    store.fence_config(&rs.config_digest(&cfg))?;
+    store.fence_config(L::LANG, &rs.config_digest(&cfg))?;
 
     // Every container name the store already holds. Binding an unaliased
     // import needs a fact out of the *imported* container's source, so a
