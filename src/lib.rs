@@ -178,15 +178,34 @@ pub mod resolve_go;
 pub mod sg;
 pub mod store;
 
-// One module per language track. All four are declared here, live or not, so
-// that bringing a language up edits only that track's own file — see
-// `registry.rs` for the rule and each track's module docs for the steps. A
-// track added from now on nests its extractor and resolver under
-// `src/track_<name>/`, which is why this list does not grow either.
+// One module per language track. Every registered track is declared here,
+// live or not, so that bringing a language up edits only that track's own
+// file — see `registry.rs` for the rule and each track's module docs for the
+// steps. A track nests its extractor and resolver under `src/track_<name>/`,
+// which is why this list does not grow when one is built.
+//
+// The four tier-1 tracks, in committed order.
 pub mod track_ecma;
 pub mod track_go;
 pub mod track_java;
 pub mod track_python;
+
+// The ratified tier-2 tracks. All disabled: each carries `scan: None`, owns
+// no file, and reads nothing.
+pub mod track_bash;
+pub mod track_cpp;
+pub mod track_csharp;
+pub mod track_dart;
+pub mod track_elixir;
+pub mod track_haskell;
+pub mod track_hcl;
+pub mod track_kotlin;
+pub mod track_lua;
+pub mod track_php;
+pub mod track_ruby;
+pub mod track_rust;
+pub mod track_scala;
+pub mod track_swift;
 
 #[cfg(test)]
 mod tests {
