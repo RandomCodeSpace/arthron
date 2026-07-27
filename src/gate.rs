@@ -2,10 +2,20 @@
 //! that decides whether a scan may land.
 //!
 //! Resolution rate is the primary quality gate, ranked above performance,
-//! reported per tier-1 language and never aggregated. A regression fails the
-//! build. This module is the mechanism: [`parse_baseline`] reads a recorded
+//! reported per language and never aggregated. A regression fails the build.
+//! This module is the mechanism: [`parse_baseline`] reads a recorded
 //! measurement, [`evaluate`] compares a new one against it, and
 //! [`render_baseline`] writes a deliberate re-base.
+//!
+//! **One mechanism, two denominators.** A tier-1 language's rate is taken
+//! over calls, type uses and imports; a tier-2 language's track emits no call
+//! reference, so its rate is an import-resolution rate over a strictly
+//! smaller set — same outcome contract, same ratchet, different measurement
+//! (`docs/decisions.md`, 2026-07-27). Which one a number is comes from
+//! [`crate::model::Lang::tier`] and is printed on the report line and in
+//! `--json`; it is deliberately **not** a baseline field, because the
+//! baseline already names its language and a fact stored twice is a fact that
+//! can disagree with itself.
 //!
 //! Three things it deliberately does not do.
 //!

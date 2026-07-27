@@ -75,6 +75,30 @@ impl SourceTree {
         Self::parse(SupportLang::Python, source)
     }
 
+    /// Parse Ruby source.
+    ///
+    /// One grammar for every `.rb` file: a gemspec, a Rakefile and a library
+    /// file are the same language, and only the walk decides which of them a
+    /// scan reads.
+    pub fn parse_ruby(source: &str) -> Self {
+        Self::parse(SupportLang::Ruby, source)
+    }
+
+    /// Parse PHP source.
+    ///
+    /// One grammar for the whole file, including the text outside `<?php`
+    /// tags: tree-sitter-php's `php` dialect reads a template file the way
+    /// the interpreter does, so an extractor never has to find the tags
+    /// itself.
+    pub fn parse_php(source: &str) -> Self {
+        Self::parse(SupportLang::Php, source)
+    }
+
+    /// Parse Rust source.
+    pub fn parse_rust(source: &str) -> Self {
+        Self::parse(SupportLang::Rust, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -186,11 +210,41 @@ rule:
     }
 
     #[test]
+    fn parses_php() {
+        one_match(
+            &SourceTree::parse_php("<?php\nclass Greeter { public function hi() {} }\n"),
+            "id: t\nlanguage: php\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
     fn parses_python() {
         one_match(
             &SourceTree::parse_python("def hi():\n    pass\n"),
             "id: t\nlanguage: python\nrule:\n  kind: function_definition\n",
             "function_definition",
+            "hi",
+        );
+    }
+
+    #[test]
+    fn parses_ruby() {
+        one_match(
+            &SourceTree::parse_ruby("module Rack\n  class Request\n  end\nend\n"),
+            "id: t\nlanguage: ruby\nrule:\n  kind: module\n",
+            "module",
+            "Rack",
+        );
+    }
+
+    #[test]
+    fn parses_rust() {
+        one_match(
+            &SourceTree::parse_rust("fn hi() {}\n"),
+            "id: t\nlanguage: rust\nrule:\n  kind: function_item\n",
+            "function_item",
             "hi",
         );
     }

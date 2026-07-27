@@ -275,6 +275,12 @@ pub const HELP: &str = concat!(
     "                        has no name for is `unknown-<code>`\n",
     "    rate                resolved / (resolved + unresolved), or null when\n",
     "                        there is nothing to measure\n",
+    "    tier                1 when the rate is over calls, type uses and\n",
+    "                        imports; 2 when the track emits no call\n",
+    "                        reference and the rate is over imports alone.\n",
+    "                        Rates of different tiers are not comparable.\n",
+    "                        null for a stored language code this build has\n",
+    "                        no name for\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
     "  file_errors      [{ path, error }] — files the walk reached and could\n",
     "                   not read: no permission, not UTF-8, gone mid-walk, or\n",
@@ -436,8 +442,8 @@ fn languages(report: &Report) -> Value {
     for (code, tally) in &report.per_lang {
         // A stored code this build has no variant for still gets an entry:
         // dropping it would hide rows the store is holding.
-        let name = Lang::from_code(*code)
-            .map_or_else(|| format!("unknown-{code}"), |l| l.name().to_string());
+        let known = Lang::from_code(*code);
+        let name = known.map_or_else(|| format!("unknown-{code}"), |l| l.name().to_string());
         let unresolved = tally.unresolved_total();
         let mut reasons = Map::new();
         for (reason, count) in &tally.unresolved {
@@ -462,6 +468,12 @@ fn languages(report: &Report) -> Value {
                 "unresolved": unresolved,
                 "unresolved_reasons": Value::Object(reasons),
                 "rate": resolution_rate(tally.resolved, unresolved),
+                // The rate's own denominator, named. A tier-1 rate is taken
+                // over calls, type uses and imports; a tier-2 rate over
+                // imports alone. Two numbers under one key that were measured
+                // over different reference sets are only comparable if the
+                // document says they are different, so it says so.
+                "tier": known.map(Lang::tier),
             }),
         );
     }

@@ -80,6 +80,11 @@ fn languages() -> Value {
             "unresolved": 1,
             "unresolved_reasons": { "NeedsTypeInference": 1 },
             "rate": 0.75,
+            // Go is tier 1: the rate is over calls, type uses and imports. A
+            // tier-2 language's rate is over imports alone, and a reader
+            // comparing the two numbers has to be told that from the
+            // document rather than from the language's name.
+            "tier": 1,
         }
     })
 }

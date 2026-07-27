@@ -1,0 +1,49 @@
+id: use
+language: rust
+rule:
+  kind: use_declaration
+---
+id: extern-crate
+language: rust
+rule:
+  kind: extern_crate_declaration
+---
+id: def-mod
+language: rust
+rule:
+  kind: mod_item
+---
+id: def-function
+language: rust
+rule:
+  any:
+    - kind: function_item
+    - kind: function_signature_item
+---
+id: def-type
+language: rust
+rule:
+  any:
+    - kind: struct_item
+    - kind: enum_item
+    - kind: union_item
+    - kind: trait_item
+    - kind: type_item
+    - kind: associated_type
+---
+id: def-variant
+language: rust
+rule:
+  kind: enum_variant
+---
+id: def-const
+language: rust
+rule:
+  any:
+    - kind: const_item
+    - kind: static_item
+---
+id: def-macro
+language: rust
+rule:
+  kind: macro_definition
