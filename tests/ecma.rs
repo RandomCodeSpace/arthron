@@ -195,7 +195,9 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
     let table = rows(&db);
 
     let main = "packages/app/src/main.ts";
-    let run = "packages/app/src/main.ts#value:Derived.run";
+    // E3: an instance member lives on `C.prototype`, so that is where the
+    // edge out of it starts.
+    let run = "packages/app/src/main.ts#value:Derived.prototype.run";
 
     // --- A10: the alias resolves to workspace *source*, not to a guess.
     assert_eq!(
@@ -257,7 +259,7 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
     // inside.
     assert_eq!(
         row(&table, main, "this.area", run),
-        "resolved packages/app/src/main.ts#value:Derived.area",
+        "resolved packages/app/src/main.ts#value:Derived.prototype.area",
     );
     // --- F7: `super.m()` through the written heritage, into another file.
     assert_eq!(
@@ -265,9 +267,9 @@ fn a_typescript_workspace_resolves_across_files_and_reports_honest_reasons() {
             &table,
             main,
             "super.area",
-            "packages/app/src/main.ts#value:Derived.area"
+            "packages/app/src/main.ts#value:Derived.prototype.area"
         ),
-        "resolved packages/core/src/shapes.ts#value:Base.area",
+        "resolved packages/core/src/shapes.ts#value:Base.prototype.area",
     );
 
     // --- Externals: a declared dependency and a host global. Neither is a
@@ -596,4 +598,259 @@ fn every_reference_in_a_fixture_tree_has_exactly_one_stored_outcome() {
     let rows: u64 = snapshot.rows.values().map(|r| u64::from(r.count)).sum();
     assert_eq!(stored, rows, "every row is counted exactly once");
     assert!(counted > 0, "something was measured");
+}
+
+#[test]
+fn an_mjs_file_keeps_its_module_kind_into_the_second_phase() {
+    // A5/A6: `.mjs` is normatively ESM whatever the nearest `package.json`
+    // says, and ESM does no extension probing. The resolver's second phase
+    // receives only the scope, so the kind has to be carried on it —
+    // rebuilding a header from the path alone re-derived `Undecided`, sent
+    // the file back to a `package.json` with no `"type"`, and resolved its
+    // specifiers as CommonJS.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"nokind"}"#);
+    write(root, "util.js", "export function parse() {}\n");
+    write(root, "a.mjs", "import './util';\n");
+    write(root, "b.cjs", "require('./util');\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "a.mjs", "./util", "a.mjs"),
+        "unresolved ModuleNotFound",
+        "ESM resolves the specifier exactly or fails",
+    );
+    assert_eq!(
+        row(&table, "b.cjs", "./util", "b.cjs"),
+        "resolved util.js",
+        "CommonJS probes extensions, and this file is normatively CommonJS",
+    );
+}
+
+#[test]
+fn a_static_and_an_instance_member_of_one_name_reach_different_nodes() {
+    // The FQN carries the prototype, so `C.m()` and `new C().m()` are two
+    // identities. Without it both members hashed to one node, one silently
+    // won, and `this.m()` inside the instance method could reach the static
+    // one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"members"}"#);
+    write(
+        root,
+        "m.ts",
+        concat!(
+            "export class C {\n",
+            "  m(): void {}\n",
+            "  static m(): void {}\n",
+            "  run(): void { this.m() }\n",
+            "  static go(): void { this.m() }\n",
+            "}\n",
+            "C.m();\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "m.ts", "this.m", "m.ts#value:C.prototype.run"),
+        "resolved m.ts#value:C.prototype.m",
+        "`this` in an instance method is the prototype",
+    );
+    assert_eq!(
+        row(&table, "m.ts", "this.m", "m.ts#value:C.go"),
+        "resolved m.ts#value:C.m",
+        "`this` in a static method is the constructor",
+    );
+    assert_eq!(
+        row(&table, "m.ts", "C.m", "m.ts"),
+        "resolved m.ts#value:C.m",
+        "a qualified call names the static member",
+    );
+}
+
+#[test]
+fn this_walks_the_supertypes_this_build_indexed() {
+    // A member inherited from a class declared right beside it is not
+    // `UnindexedSupertype`: the supertype *is* indexed, and reporting it
+    // unindexed both loses a real edge and files it under a reason that is
+    // false. `UnindexedSupertype` still has to be reachable, or it would be
+    // a reason that never fires.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"supers"}"#);
+    write(
+        root,
+        "m.ts",
+        concat!(
+            "class B { m(): void {} }\n",
+            "export class C extends B { f(): void { this.m() } }\n",
+            "export class D extends B { g(): void { this.absent() } }\n",
+            "export class E extends Unknowable { h(): void { this.m() } }\n",
+            "export class F { k(): void { this.absent() } }\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "m.ts", "this.m", "m.ts#value:C.prototype.f"),
+        "resolved m.ts#value:B.prototype.m",
+    );
+    assert_eq!(
+        row(&table, "m.ts", "this.absent", "m.ts#value:D.prototype.g"),
+        "unresolved NoMatchingDefinition",
+        "the whole chain is indexed and the member is genuinely absent",
+    );
+    assert_eq!(
+        row(&table, "m.ts", "this.m", "m.ts#value:E.prototype.h"),
+        "unresolved UnindexedSupertype",
+        "a supertype this build never saw is where the member would be",
+    );
+    assert_eq!(
+        row(&table, "m.ts", "this.absent", "m.ts#value:F.prototype.k"),
+        "unresolved NoMatchingDefinition",
+        "no heritage at all is a complete lookup",
+    );
+}
+
+#[test]
+fn a_type_only_import_cannot_be_constructed_and_can_be_queried() {
+    // C17/C20. `import type` is elided at emit, so a site that survives
+    // erasure cannot name it — and a site that is erased too still can:
+    // `typeof X` is exactly what a type-only import is for.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"typeonly"}"#);
+    write(root, "m.ts", "export class C {}\n");
+    write(
+        root,
+        "use.ts",
+        concat!(
+            "import type { C } from './m.js';\n",
+            "export type Ctor = typeof C;\n",
+            "export function make(): void { new C() }\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "use.ts", "C", "use.ts#value:make"),
+        "unresolved NoMatchingDefinition",
+        "an erased binding has nothing to construct at runtime",
+    );
+    assert!(
+        outcomes(&table, "use.ts", "C", "use.ts#type:Ctor").contains(&"resolved m.ts#value:C"),
+        "`typeof X` reads the Value space from a type position",
+    );
+}
+
+#[test]
+fn an_import_type_node_resolves_its_member() {
+    // A23: the module is a literal and the member is written down, so
+    // `NeedsExpressionType` would claim a type had to be inferred when
+    // nothing did.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"importtype"}"#);
+    write(root, "m.ts", "export interface Foo { a: number }\n");
+    write(root, "use.ts", "export type T = import('./m.js').Foo;\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "use.ts", "import('./m.js').Foo", "use.ts#type:T"),
+        "resolved m.ts#type:Foo",
+    );
+}
+
+#[test]
+fn a_lowercase_jsx_element_is_external_and_a_component_is_not() {
+    // C26: `<div/>` is a host intrinsic — nothing in this repository is
+    // missing, which is exactly Node's builtin case one level over.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"jsx"}"#);
+    write(
+        root,
+        "app.js",
+        concat!(
+            "function Button(){}\n",
+            "export function App(){ return <div><Button /><Missing /></div> }\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "app.js", "div", "app.js#value:App"),
+        "external jsx:intrinsic",
+    );
+    assert_eq!(
+        row(&table, "app.js", "Button", "app.js#value:App"),
+        "resolved app.js#value:Button",
+    );
+    assert_eq!(
+        row(&table, "app.js", "Missing", "app.js#value:App"),
+        "unresolved NoMatchingDefinition",
+        "a capitalised element is a binding, and a missing one is a miss",
+    );
+}
+
+#[test]
+fn a_module_level_var_in_a_block_is_one_definition_two_calls_reach() {
+    // D3, end to end. Treating the block as the `var`'s scope emitted no
+    // definition, so the call inside became `LocalBinding` — outside both
+    // terms of the rate — and the call after it became
+    // `NoMatchingDefinition`. One binding, two wrong answers, and the first
+    // of them raised the rate.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"vars"}"#);
+    write(
+        root,
+        "index.js",
+        "{\n  var f = () => {};\n  f();\n}\nf();\n",
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        outcomes(&table, "index.js", "f", "index.js"),
+        ["resolved index.js#value:f"],
+        "both calls name the one module-level definition",
+    );
+}
+
+#[test]
+fn a_shadowed_require_stays_in_the_denominator() {
+    // C1: `require` is the module wrapper's *parameter*. A module-level
+    // declaration of that name shadows it, and reporting the call
+    // `External("node:fs")` moved a real reference out of both terms of the
+    // rate — the one way this gate can be cheated.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"shadow","type":"module"}"#);
+    write(root, "a.js", "const require = () => {};\nrequire('fs');\n");
+    write(root, "b.js", "require('fs');\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "a.js", "require", "a.js"),
+        "resolved a.js#value:require",
+        "the call names the binding this file declared",
+    );
+    assert_eq!(row(&table, "b.js", "fs", "b.js"), "external node:fs");
 }

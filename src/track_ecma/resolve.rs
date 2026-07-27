@@ -14,12 +14,17 @@
 //! ```
 //!
 //! `path` is the repo-relative, `/`-separated module path; `seg` is one
-//! identifier. Both are escaped (`%`→`%25`, `#`→`%23`; a `seg` additionally
-//! escapes `.`→`%2E` and `:`→`%3A`), so the single unescaped `#` is
-//! positional and a module FQN and a definition FQN can never collide in
+//! identifier. Both escape `%`→`%25`, `#`→`%23` and `:`→`%3A`, and a `seg`
+//! additionally escapes `.`→`%2E`, so the single unescaped `#` is positional
+//! and a module FQN and a definition FQN can never collide in
 //! `hash(domain, fqn)`. The escape matters even though it is rare: ES2022
 //! permits `export { x as "my-name" }` with any string, including one holding
-//! a `#`, and a hash collision is silent.
+//! a `#`, and a hash collision is silent. `:` is escaped in the *path* for a
+//! second reason that is not this grammar's: `crate::pipeline` keys an
+//! external package under `external:<pkg>` and rests that on no FQN
+//! containing a colon. A POSIX file name may hold one, so a repository with a
+//! file named `external:npm:foo.js` would otherwise hash that module node and
+//! the external package `npm:foo.js` to one identity.
 //!
 //! Four invariants, each of which the core forces rather than merely prefers:
 //!
@@ -83,9 +88,22 @@ use crate::{Outcome, UnresolvedReason};
 /// [`UnresolvedReason::UnindexedSupertype`] rather than looping.
 const MAX_SUPER_HOPS: usize = 4;
 
+/// The property every instance member of a class lives on.
+///
+/// A member FQN segment, and an unambiguous one: ES forbids a static class
+/// element named `prototype` (15.7 `ClassElementName` — `static prototype` is
+/// an early error), so `C.prototype.m` can only ever mean the instance member
+/// `m` of `C`, and `C.m` can only ever mean the static one. It is also
+/// literally where the language puts the method, which is why E3, E5 and E6
+/// all name it: `class C { m(){} }` and `C.prototype.m = function(){}` are one
+/// identity across both eras of the language.
+pub const PROTOTYPE: &str = "prototype";
+
 /// Escape a module path for the FQN grammar.
 fn escape_path(path: &str) -> String {
-    path.replace('%', "%25").replace('#', "%23")
+    path.replace('%', "%25")
+        .replace('#', "%23")
+        .replace(':', "%3A")
 }
 
 /// Escape one identifier segment for the FQN grammar.
@@ -115,6 +133,19 @@ pub fn split_space_tag(owner: &[String], fallback: DeclSpace) -> (DeclSpace, &[S
         Some(SPACE_TAG_NS) => (DeclSpace::Namespace, &owner[1..]),
         Some(SPACE_TAG_VALUE) => (DeclSpace::Value, &owner[1..]),
         _ => (fallback, owner),
+    }
+}
+
+/// Split a member-owner chain into the class's own path and whether the
+/// member sits on the prototype.
+///
+/// `["C", "prototype"]` is an instance member of `C`; `["C"]` is a static one.
+/// The distinction cannot live in [`crate::model::DefFacets`] — invariant 4 —
+/// so it lives here, where `Encloser::as_definition` preserves it.
+pub fn split_prototype(owner: &[String]) -> (&[String], bool) {
+    match owner.last().map(String::as_str) {
+        Some(PROTOTYPE) if owner.len() >= 2 => (&owner[..owner.len() - 1], true),
+        _ => (owner, false),
     }
 }
 
@@ -162,6 +193,10 @@ pub struct ResolvedModule {
 struct Binding {
     imported: ImportedName,
     module: ResolvedModule,
+    /// Which declaration table the binding landed in. C17: `import type { T }`
+    /// binds in the Type space only and is fully elided at emit, so a *value*
+    /// use of that name names nothing that exists at runtime.
+    space: DeclSpace,
 }
 
 /// The EcmaScript per-file scope: the binding table plus the facts about this
@@ -176,6 +211,16 @@ struct Binding {
 pub struct EcmaScope {
     /// This file's module path — the root of every FQN it contributes.
     module: String,
+    /// The file's module semantics, already decided against the nearest
+    /// `package.json`.
+    ///
+    /// Carried here because the scope is *all* the resolver's second phase
+    /// receives: rebuilding a header from the path alone would lose what the
+    /// file itself said, and A5/A6 make the kind decide candidate generation
+    /// — an ESM specifier resolves exactly or fails, a CommonJS one probes
+    /// extensions and index files. Losing it makes `a.mjs` probe like
+    /// CommonJS and invent edges Node would not create.
+    kind: ModuleKind,
     /// Local name → what it binds.
     bindings: HashMap<String, Binding>,
     /// Class name declared in this file → the names of its declared
@@ -305,6 +350,7 @@ impl EcmaResolver {
                     Binding {
                         imported: binding.imported.clone(),
                         module: module.clone(),
+                        space: binding.space,
                     },
                 );
             }
@@ -334,6 +380,7 @@ impl EcmaResolver {
 
         EcmaScope {
             module: header.rel_path.clone(),
+            kind: self.module_kind(cfg, header),
             bindings,
             supers,
         }
@@ -438,6 +485,22 @@ impl EcmaResolver {
         // 1. An imported binding. This is the mechanism, not an optimisation:
         //    `raw_target` does not contain the target's name (F2).
         if let Some(binding) = scope.bindings.get(head) {
+            // C17: an `import type` binding is elided from the emitted
+            // JavaScript, so a site that *survives* erasure — a call, a
+            // construction, a `class D extends B` — cannot name it, and
+            // following it into the exporting module would record a runtime
+            // edge for code TypeScript rejects. A site that is erased too may:
+            // C20's `typeof X` is a type query that reads the **Value** space
+            // from a type position, and it is exactly what a type-only import
+            // is for. So the binding's space gates the *runtime* references
+            // and only those; the reference's own space still says which table
+            // to read.
+            if binding.space == DeclSpace::Type
+                && space == DeclSpace::Value
+                && r.kind != RefKind::TypeUse
+            {
+                return unresolved(UnresolvedReason::NoMatchingDefinition);
+            }
             let rest = &segments[1..];
             let path: Vec<String> = match &binding.imported {
                 ImportedName::Named(exported) => {
@@ -539,16 +602,96 @@ impl EcmaResolver {
         (path.len() >= 2).then(|| &path[..path.len() - 1])
     }
 
-    /// F6: `this.m()` resolved against the lexically enclosing class.
+    /// Walk a class and its written supertypes, probing one member on each.
+    ///
+    /// `owner` is the member-owner chain the reference sits in, so its last
+    /// segment is [`PROTOTYPE`] for an instance member and the class itself
+    /// for a static one — which is precisely the difference between the two
+    /// lookups, and the reason staticness has to be in the chain rather than
+    /// in a facet the FQN cannot read.
+    ///
+    /// `skip_self` is `super.`: the same walk, starting one hop up.
+    ///
+    /// The walk follows only supertypes **this module declares**, checked by
+    /// probing the base's own identity. A base reached through an import
+    /// lives in a file whose members this scope cannot name, and stopping
+    /// there is what makes [`UnresolvedReason::UnindexedSupertype`] true when
+    /// it is reported: a supertype that *is* indexed is traversed, not blamed.
+    fn walk_members(
+        &self,
+        scope: &EcmaScope,
+        r: &Reference,
+        owner: &[String],
+        skip_self: bool,
+        probe: &dyn SymbolProbe,
+    ) -> Result<Resolution, (Vec<NodeId>, UnresolvedReason)> {
+        let (class_path, on_prototype) = split_prototype(owner);
+        let Some(class) = class_path.last().cloned() else {
+            return Err((Vec::new(), UnresolvedReason::NeedsReceiverType));
+        };
+        let container = &class_path[..class_path.len() - 1];
+        let mut candidates = Vec::new();
+        let mut current = class;
+        let mut hops = 0usize;
+        loop {
+            if !(skip_self && hops == 0) {
+                let mut path = container.to_vec();
+                path.push(current.clone());
+                if on_prototype {
+                    path.push(PROTOTYPE.to_string());
+                }
+                path.extend_from_slice(&r.target.segments);
+                let id = member_id(&scope.module, r.space, &path);
+                candidates.push(id);
+                if probe.probe(&id).is_some() {
+                    return Ok(Resolution {
+                        outcome: Outcome::Resolved(id),
+                        candidates,
+                    });
+                }
+            }
+            hops += 1;
+            // No written heritage: the lookup is complete and the member is
+            // absent, which is a different report from an unindexed base.
+            let Some(base) = scope
+                .supers
+                .get(&current)
+                .and_then(|bases| bases.first())
+                .and_then(|segments| segments.last())
+                .cloned()
+            else {
+                return Err((candidates, UnresolvedReason::NoMatchingDefinition));
+            };
+            if hops >= MAX_SUPER_HOPS || base == current {
+                return Err((candidates, UnresolvedReason::UnindexedSupertype));
+            }
+            let mut base_path = container.to_vec();
+            base_path.push(base.clone());
+            let base_id = member_id(&scope.module, DeclSpace::Value, &base_path);
+            candidates.push(base_id);
+            if probe.probe(&base_id).is_none() {
+                return Err((candidates, UnresolvedReason::UnindexedSupertype));
+            }
+            current = base;
+        }
+    }
+
+    /// F6: `this.m()` resolved against the lexically enclosing class and the
+    /// supertypes this module declares.
     ///
     /// **A decision, recorded rather than discovered.** `this` is dynamic — a
     /// method extracted and invoked elsewhere has a different receiver — so a
     /// hit here is the most likely target and not a proof, and
-    /// `Outcome::Resolved` means "verified". It is taken anyway, and narrowly:
-    /// only when the member is declared in the class the reference is
-    /// lexically inside, which is a lexical lookup and not type inference.
-    /// Widening it to the prototype chain of an unindexed supertype would be
-    /// the point at which the contract's meaning softened.
+    /// `Outcome::Resolved` means "verified". It is taken anyway, and both case
+    /// studies ask for it by name: the TypeScript study lists `this.m()` inside
+    /// class `C` among the "two cheap wins that are *not* type inference",
+    /// beside `super.m()`, and the JavaScript study asks for the choice to be
+    /// made explicitly rather than discovered. This is the explicit choice.
+    ///
+    /// It stays a *lexical* lookup: the class the reference is written inside,
+    /// then a bounded walk up heritage clauses written in this same file. A
+    /// receiver whose type is inferred rather than written never reaches here
+    /// — that is [`UnresolvedReason::NeedsReceiverType`], and it stays large.
     fn resolve_this(
         &self,
         scope: &EcmaScope,
@@ -561,27 +704,12 @@ impl EcmaResolver {
         if r.target.segments.is_empty() {
             return unresolved(UnresolvedReason::NeedsReceiverType);
         }
-        let mut path = owner.to_vec();
-        path.extend_from_slice(&r.target.segments);
-        let id = member_id(&scope.module, r.space, &path);
-        if probe.probe(&id).is_some() {
-            return Resolution {
-                outcome: Outcome::Resolved(id),
-                candidates: vec![id],
-            };
-        }
-        // The receiver type is known and in-repository and the member is not
-        // in it. If the class declares a supertype this build did not index,
-        // that is where the member is, and saying so is the honest report.
-        let class = owner.last().cloned().unwrap_or_default();
-        let reason = if scope.supers.contains_key(&class) {
-            UnresolvedReason::UnindexedSupertype
-        } else {
-            UnresolvedReason::NoMatchingDefinition
-        };
-        Resolution {
-            outcome: Outcome::Unresolved(reason),
-            candidates: vec![id],
+        match self.walk_members(scope, r, owner, false, probe) {
+            Ok(res) => res,
+            Err((candidates, reason)) => Resolution {
+                outcome: Outcome::Unresolved(reason),
+                candidates,
+            },
         }
     }
 
@@ -599,7 +727,8 @@ impl EcmaResolver {
         let Some(owner) = self.enclosing_owner(&r.enclosing) else {
             return unresolved(UnresolvedReason::NeedsReceiverType);
         };
-        let Some(class) = owner.last() else {
+        let (class_path, on_prototype) = split_prototype(owner);
+        let Some(class) = class_path.last().cloned() else {
             return unresolved(UnresolvedReason::NeedsReceiverType);
         };
         if r.target.segments.is_empty() {
@@ -607,36 +736,13 @@ impl EcmaResolver {
             // reference itself, which is already an edge of its own.
             return unresolved(UnresolvedReason::NeedsReceiverType);
         }
-        let mut candidates = Vec::new();
-        let mut current = class.clone();
-        for _ in 0..MAX_SUPER_HOPS {
-            let Some(bases) = scope.supers.get(&current) else {
-                break;
-            };
-            let Some(base) = bases.first().and_then(|segs| segs.last()) else {
-                break;
-            };
-            let mut path = vec![base.clone()];
-            path.extend_from_slice(&r.target.segments);
-            let id = member_id(&scope.module, r.space, &path);
-            candidates.push(id);
-            if probe.probe(&id).is_some() {
-                return Resolution {
-                    outcome: Outcome::Resolved(id),
-                    candidates,
-                };
-            }
-            // Only a base declared in this same file can be walked further;
-            // one that came through an import lives in another file whose
-            // heritage this scope does not hold.
-            if current == *base {
-                break;
-            }
-            current = base.clone();
-        }
+        let (mut candidates, reason) = match self.walk_members(scope, r, owner, true, probe) {
+            Ok(res) => return res,
+            Err(parts) => parts,
+        };
         // A base reached through an import: probe the member on the imported
         // definition before giving up.
-        if let Some(bases) = scope.supers.get(class)
+        if let Some(bases) = scope.supers.get(&class)
             && let Some(segs) = bases.first()
             && let Some(head) = segs.first()
             && let Some(binding) = scope.bindings.get(head)
@@ -648,23 +754,25 @@ impl EcmaResolver {
             };
             let mut path = vec![exported];
             path.extend_from_slice(&segs[1..]);
+            if on_prototype {
+                path.push(PROTOTYPE.to_string());
+            }
             path.extend_from_slice(&r.target.segments);
             let mut res = self.lookup_in_module(&binding.module, r.space, &path, probe);
-            let mut all = candidates;
-            all.append(&mut res.candidates);
+            candidates.append(&mut res.candidates);
             return match res.outcome {
                 Outcome::Resolved(id) => Resolution {
                     outcome: Outcome::Resolved(id),
-                    candidates: all,
+                    candidates,
                 },
                 _ => Resolution {
                     outcome: Outcome::Unresolved(UnresolvedReason::UnindexedSupertype),
-                    candidates: all,
+                    candidates,
                 },
             };
         }
         Resolution {
-            outcome: Outcome::Unresolved(UnresolvedReason::UnindexedSupertype),
+            outcome: Outcome::Unresolved(reason),
             candidates,
         }
     }
@@ -709,6 +817,20 @@ impl EcmaResolver {
         // one file, so no definition edit anywhere can change it.
         if r.locally_bound {
             return unresolved(UnresolvedReason::LocalBinding);
+        }
+        // C26/F11: a JSX element whose name is lowercase and undotted is an
+        // *intrinsic* — a host element checked against `JSX.IntrinsicElements`,
+        // never a binding in this repository. The extractor states it as the
+        // one thing the core `Reference` can carry that no other site
+        // produces: a `Call` in the **Type** space, which is where the
+        // language looks the name up. Exactly Node's builtin case one level
+        // over, and `External` rather than `Unresolved` for the same reason
+        // `node:fs` is: nothing here is missing.
+        if r.kind == RefKind::Call && r.space == DeclSpace::Type {
+            return Resolution {
+                outcome: Outcome::External("jsx:intrinsic".to_string()),
+                candidates: Vec::new(),
+            };
         }
         match r.kind {
             RefKind::Import => {
@@ -886,8 +1008,13 @@ macro_rules! ecma_resolver_impl {
                 // The header is rebuilt from the scope: `resolve` does not
                 // receive one, and the two facts a specifier needs — the
                 // module path and its kind — are both in the scope already.
+                // The kind is carried rather than re-derived: `EcmaHeader`'s
+                // default is `Undecided`, which would send every `.mjs` file
+                // back to its `package.json` and, absent a `"type"` field,
+                // resolve its specifiers as CommonJS.
                 let header = EcmaHeader {
                     rel_path: scope.module.clone(),
+                    module_kind: scope.kind,
                     ..EcmaHeader::default()
                 };
                 self.resolve_ref(cfg, scope, &header, r, probe)
@@ -1011,8 +1138,11 @@ mod tests {
 
     #[test]
     fn static_is_not_in_the_fqn_and_mergeable_says_so() {
-        // Invariant 4 has a cost, and it is paid openly rather than hidden:
-        // `class C { m(){} static m(){} }` is two members with one identity.
+        // Invariant 4 says the FQN may not read a facet. That is why the
+        // static/instance split rides in the *owner chain* instead — but two
+        // definitions that reach this function with the same owner and
+        // differing only in `STATIC` are still not one entity, and saying
+        // they are would hide a genuine collision.
         let instance = def(DefKind::Method, "m", &["C"], DeclSpace::Value);
         let mut stat = instance.clone();
         stat.facets = DefFacets::STATIC;
@@ -1022,6 +1152,9 @@ mod tests {
             &instance,
             &stat
         ));
+        // As the extractor writes them, they are two identities.
+        let written = def(DefKind::Method, "m", &["C", PROTOTYPE], DeclSpace::Value);
+        assert_ne!(fqn_of("m.ts", &written), fqn_of("m.ts", &stat));
 
         // Two declarations of one entity — an overload set, declaration
         // merging, a CommonJS redeclaration — are merged, not counted as a
@@ -1045,6 +1178,47 @@ mod tests {
 
         let nested = def(DefKind::Method, "c", &["a#b"], DeclSpace::Value);
         assert_ne!(fqn_of("m.ts", &nested), fqn);
+    }
+
+    #[test]
+    fn a_colon_in_a_file_name_cannot_forge_an_external_key() {
+        // `crate::pipeline` keys a dependency under `external:<pkg>` and
+        // rests that on no FQN containing a colon. A POSIX file name may hold
+        // one, so a repository with a file named `external:npm:foo.js` would
+        // otherwise hash its module node and the external package
+        // `npm:foo.js` to one identity — silently, as every hash collision is.
+        let module = def(
+            DefKind::Module,
+            "external:npm:foo.js",
+            &[],
+            DeclSpace::Namespace,
+        );
+        let fqn = fqn_of("external:npm:foo.js", &module);
+        assert_eq!(fqn, "external%3Anpm%3Afoo.js");
+        assert!(!fqn.contains(':'));
+        assert_ne!(fqn, "external:npm:foo.js");
+    }
+
+    #[test]
+    fn the_prototype_segment_separates_an_instance_member_from_a_static_one() {
+        let instance = def(DefKind::Method, "m", &["C", PROTOTYPE], DeclSpace::Value);
+        let stat = def(DefKind::Method, "m", &["C"], DeclSpace::Value);
+        assert_eq!(fqn_of("m.ts", &instance), "m.ts#value:C.prototype.m");
+        assert_eq!(fqn_of("m.ts", &stat), "m.ts#value:C.m");
+        assert_ne!(fqn_of("m.ts", &instance), fqn_of("m.ts", &stat));
+
+        // And it survives an encloser, so an edge out of an instance method
+        // starts at the node that method is.
+        let encloser = Encloser {
+            path: vec!["C".into(), PROTOTYPE.into(), "m".into()],
+            kind: DefKind::Method,
+        };
+        let as_def = encloser.as_definition().expect("nameable");
+        assert_eq!(fqn_of("m.ts", &as_def), fqn_of("m.ts", &instance));
+
+        let owner = vec!["C".to_string(), PROTOTYPE.to_string()];
+        assert_eq!(split_prototype(&owner), (&owner[..1], true));
+        assert_eq!(split_prototype(&owner[..1]), (&owner[..1], false));
     }
 
     #[test]

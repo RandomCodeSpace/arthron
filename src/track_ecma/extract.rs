@@ -24,9 +24,16 @@
 //!   calls with runtime meaning; no rule pretends otherwise.
 //! - **Transpiler output** (`__exportStar`, `_interopRequireDefault`) is not
 //!   pattern-matched. The directories that hold it are skipped instead.
-//! - **Triple-slash directives** and `export as namespace` are not emitted:
-//!   the core `Reference` has no way to carry a directive origin, and
-//!   inventing one in a shared file is not this track's to do.
+//! - **`export as namespace jQuery`** is not emitted. It is a *declaration*,
+//!   not a reference: it names nothing, it makes this module's exports
+//!   reachable as a global in script files, and the owner it would need —
+//!   the global scope — is not something a module-path-rooted FQN can spell.
+//!   Nothing is dropped by omitting it; what is lost is that a global
+//!   `jQuery.foo()` in a script file resolves to nothing, and that lands in
+//!   an honest reason. Recorded as a gap, not as a claim.
+//!   (A `/// <reference … />` directive *is* a reference and is emitted; only
+//!   `lib=` is skipped, because it names a compiler library no repository
+//!   holds.)
 //! - **Computed names** (`class C { [k](){} }`, `obj[name] = fn`) are not
 //!   definitions. They have no static name, and naming them from the
 //!   expression text would invent one.
@@ -39,11 +46,14 @@ use crate::model::{
     TargetRoot,
 };
 use crate::sg::{Rules, SgNode, SourceTree, span_of};
-use crate::track_ecma::bind::{is_function_like, is_locally_bound, pattern_names};
+use crate::track_ecma::bind::{
+    is_function_like, is_locally_bound, module_scope_binds, pattern_names,
+};
 use crate::track_ecma::lang::{
     Dialect, EcmaHeader, ExportEntry, ImportBinding, ImportSyntax, ImportedName, JsLang,
     ModuleImport, ModuleKind, ModuleKindSource, TsLang, space_tag,
 };
+use crate::track_ecma::resolve::PROTOTYPE;
 
 /// The embedded JavaScript extraction rules.
 const JS_RULES: &str = include_str!("../rules/javascript.yml");
@@ -227,6 +237,23 @@ fn ambient_module_name(node: &SgNode) -> Option<String> {
 /// function or a block — where declarations are locals and locals are not
 /// nodes.
 fn owner_of(node: &SgNode) -> Option<Owner> {
+    owner_chain(node, false)
+}
+
+/// The container chain a `var` declaration's names belong to.
+///
+/// D3: ES puts `var` and function declarations in `VarScopedDeclarations`,
+/// which are instantiated in the nearest **function or module** environment —
+/// never in the block they are written in. So `{ var f = () => {} }` at module
+/// level declares a module-level binding, and a module-level binding is a
+/// node; the identical `let` is a local. Blocks, loop heads, `switch` bodies
+/// and `catch` clauses are therefore transparent here and opaque in
+/// [`owner_of`]. A class static block is not: it is a function environment.
+fn var_owner_of(node: &SgNode) -> Option<Owner> {
+    owner_chain(node, true)
+}
+
+fn owner_chain(node: &SgNode, var_scoped: bool) -> Option<Owner> {
     let ancestors: Vec<SgNode> = node.ancestors().collect();
     let mut path: Vec<String> = Vec::new();
     let mut space: Option<DeclSpace> = None;
@@ -261,15 +288,24 @@ fn owner_of(node: &SgNode) -> Option<Owner> {
                         path.push(GLOBAL_OWNER.to_string());
                     }
                 }
-                // Any other block is a scope, not a container.
+                // Any other block is a scope, not a container — except to a
+                // `var`, which hoists straight through it.
+                _ if var_scoped => {}
                 _ => return None,
             },
             // An object literal is a container only where the node rule says
             // so, and the caller says it — never by ancestry, or every
             // options object in the corpus becomes one.
             "object" => return None,
+            // A static block is a function environment, so a `var` in one
+            // stays local to it.
+            "class_static_block" => return None,
             "for_statement" | "for_in_statement" | "catch_clause" | "switch_body"
-            | "switch_case" | "switch_default" | "class_static_block" => return None,
+            | "switch_case" | "switch_default"
+                if !var_scoped =>
+            {
+                return None;
+            }
             kind if is_function_like(kind) => return None,
             _ => {}
         }
@@ -455,7 +491,19 @@ fn enclosing_definition(node: &SgNode) -> Option<Encloser> {
         let Some((name, kind)) = found else {
             continue;
         };
-        let Some(owner) = owner_of(&ancestor) else {
+        // A `var` declarator is var-scoped, so an edge out of a module-level
+        // `var f = () => {}` written inside a block starts at the node that
+        // declaration made rather than at nothing.
+        let owner = if ancestor.kind() == "variable_declarator"
+            && ancestor
+                .parent()
+                .is_some_and(|p| p.kind() == "variable_declaration")
+        {
+            var_owner_of(&ancestor)
+        } else {
+            owner_of(&ancestor)
+        };
+        let Some(owner) = owner else {
             continue;
         };
         // The declaration's own space when the ancestor kind fixes one, else
@@ -468,10 +516,36 @@ fn enclosing_definition(node: &SgNode) -> Option<Encloser> {
         };
         let mut path: Vec<String> = space_tag(space).into_iter().map(str::to_string).collect();
         path.extend(owner.path);
+        // The same prototype segment `class_members` gives the definition, so
+        // the edge out of a method and the node it starts at agree — and so
+        // `this.m()` inside an instance method looks the member up on the
+        // prototype while `this.m()` inside a static one looks it up on the
+        // constructor, which is what the two mean.
+        if is_instance_class_member(&ancestor) {
+            path.push(PROTOTYPE.to_string());
+        }
         path.push(name);
         return Some(Encloser { path, kind });
     }
     None
+}
+
+/// Whether a node is a class element installed on the prototype rather than
+/// on the constructor.
+///
+/// Written directly under a `class_body`, and without `static`. An interface
+/// or object-type member is not one: it has no constructor to be static on,
+/// so its container needs no discriminator.
+fn is_instance_class_member(node: &SgNode) -> bool {
+    matches!(
+        &*node.kind(),
+        "method_definition"
+            | "abstract_method_signature"
+            | "method_signature"
+            | "field_definition"
+            | "public_field_definition"
+    ) && node.parent().is_some_and(|p| p.kind() == "class_body")
+        && !has_child(node, "static")
 }
 
 /// A class or interface member's declared name, or `None` when it is
@@ -651,6 +725,7 @@ pub fn extract(dialect: Dialect, rel_path: &str, source: &str) -> EcmaFacts {
             "ref-type" => type_use(&mut ctx, &node),
             "ref-type-query" => type_query(&mut ctx, &node),
             "ref-decorator" => decorator(&mut ctx, &node),
+            "ref-triple-slash" => triple_slash(&mut ctx, &node),
             _ => {}
         }
     }
@@ -1401,14 +1476,28 @@ fn class_members(ctx: &mut Ctx, body: &SgNode, owner: &[String]) {
             continue;
         };
         let mut extra = extra;
+        let mut member_owner = owner.to_vec();
         if has_child(&member, "static") {
             extra = extra.union(DefFacets::STATIC);
+        } else {
+            // E3/E4/E5: a non-static element is installed on `C.prototype`
+            // and a static one on `C` itself, and they are two distinct
+            // members that a reference names two different ways —
+            // `new C().m()` against `C.m()`. The FQN has to separate them and
+            // cannot read `DefFacets::STATIC` to do it: the FQN grammar's
+            // fourth invariant forbids reading a facet, because
+            // `Encloser::as_definition` zeroes them and an edge out of the
+            // method would then start at an identity no node has. So the
+            // distinction rides in the owner chain, which `as_definition`
+            // preserves, spelled as the property the language actually puts
+            // the member on.
+            member_owner.push(PROTOTYPE.to_string());
         }
         let exported = member_exported(&member, &name);
         ctx.push_def(
             kind,
             name,
-            owner.to_vec(),
+            member_owner,
             DeclSpace::Value,
             def_facets(DeclSpace::Value, exported, true, extra),
             span_of(&member),
@@ -1417,7 +1506,14 @@ fn class_members(ctx: &mut Ctx, body: &SgNode, owner: &[String]) {
 }
 
 fn binding_declaration(ctx: &mut Ctx, node: &SgNode) {
-    let Some(owner) = owner_of(node) else {
+    // A `var` is var-scoped and a `let`/`const` is block-scoped, so the two
+    // ask a different question about the same ancestry.
+    let owner = if node.kind() == "variable_declaration" {
+        var_owner_of(node)
+    } else {
+        owner_of(node)
+    };
+    let Some(owner) = owner else {
         return;
     };
     let is_const = has_child(node, "const");
@@ -1769,6 +1865,49 @@ fn namespace_declaration(ctx: &mut Ctx, node: &SgNode) {
     }
 }
 
+/// The specifier a `/// <reference … />` directive names.
+///
+/// `path=` names a file and `types=` names an `@types` package; both add
+/// something to the program, which is what an import does. `lib=` is
+/// deliberately not one: it names a compiler library that is in no
+/// repository, so there is nothing for a resolver to look for and reporting
+/// it unresolved would blame a repository for a file it never had.
+fn reference_directive(text: &str) -> Option<String> {
+    for attribute in ["path", "types"] {
+        for after in text.split(attribute).skip(1) {
+            let after = after.trim_start();
+            let Some(after) = after.strip_prefix('=') else {
+                continue;
+            };
+            let after = after.trim_start();
+            let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let value = after[1..].split(quote).next()?;
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A18: a triple-slash reference directive is an import, written as a comment.
+fn triple_slash(ctx: &mut Ctx, node: &SgNode) {
+    let text = node.text();
+    let Some(specifier) = reference_directive(&text) else {
+        return;
+    };
+    ctx.push_import(
+        node,
+        ImportSyntax::Esm,
+        Some(specifier.clone()),
+        specifier,
+        // It binds no local name: the directive brings a file or a package's
+        // globals into the program, never a name into this file's scope.
+        Vec::new(),
+        DeclSpace::Type,
+    );
+}
+
 fn ambient_declaration(ctx: &mut Ctx, node: &SgNode) {
     // A17: `declare module "foo" { … }` is a module node with no file behind
     // it. Everything else an `ambient_declaration` wraps is matched by its
@@ -1808,11 +1947,10 @@ fn call(ctx: &mut Ctx, node: &SgNode) {
         "import" => dynamic_import(ctx, node),
         // C1: `require` is a *parameter* of Node's module wrapper, so it is
         // shadowable. Treating a shadowed `require` as an import invents an
-        // edge the language would not make.
-        "identifier"
-            if callee.text() == "require"
-                && !is_locally_bound(&callee, "require", DeclSpace::Value) =>
-        {
+        // edge the language would not make — and, worse for the measurement,
+        // classifies it `External`, which sits outside *both* terms of the
+        // rate.
+        "identifier" if callee.text() == "require" && !require_is_shadowed(&callee) => {
             require_call(ctx, node)
         }
         _ => {
@@ -1827,6 +1965,47 @@ fn call(ctx: &mut Ctx, node: &SgNode) {
             );
         }
     }
+}
+
+/// Whether `require` at this call site is a name the file itself bound rather
+/// than Node's module-wrapper parameter.
+///
+/// Two questions, because the graph's notion of "local" and the language's
+/// do not coincide here. [`is_locally_bound`] answers for every enclosing
+/// *scope*, and deliberately answers `false` at module level — a top-level
+/// declaration is a node. But a module-level `const require = …` shadows the
+/// wrapper's parameter exactly as a function-local one does, and in an ES
+/// module there is no wrapper parameter to shadow in the first place.
+///
+/// C11 is the exception, and it is the reason this is not simply "bound at
+/// module level": `const require = createRequire(import.meta.url)` *is* a
+/// CommonJS `require`, constructed on purpose, and the specifiers it names
+/// are real module edges. Treating that one as a shadow would trade a false
+/// `External` for a lost edge.
+fn require_is_shadowed(callee: &SgNode) -> bool {
+    if is_locally_bound(callee, "require", DeclSpace::Value) {
+        return true;
+    }
+    let Some(program) = callee.ancestors().find(|a| a.kind() == "program") else {
+        return false;
+    };
+    module_scope_binds(&program, "require") && !binds_create_require(&program)
+}
+
+/// Whether a subtree declares `require` from `createRequire(…)` — C11.
+fn binds_create_require(node: &SgNode) -> bool {
+    if node.kind() == "variable_declarator"
+        && node.field("name").is_some_and(|n| n.text() == "require")
+    {
+        return node.field("value").is_some_and(|v| {
+            v.kind() == "call_expression"
+                && v.field("function").is_some_and(|f| {
+                    let text = f.text();
+                    text == "createRequire" || text.ends_with(".createRequire")
+                })
+        });
+    }
+    node.children().any(|c| binds_create_require(&c))
 }
 
 /// The single named argument of a call, when it has exactly one.
@@ -1854,23 +2033,41 @@ fn dynamic_import(ctx: &mut Ctx, node: &SgNode) {
     } else {
         (ImportSyntax::DynamicImport, DeclSpace::Value)
     };
-    let bindings = const_bindings(node, ImportedName::Namespace);
+    let mut bindings = const_bindings(node, ImportedName::Namespace);
+    // A23: `import('./m').Foo` is *both* a module import and a type use, and
+    // the two are different work items when either fails. The type use is not
+    // an expression: the module is a literal and the member is written down,
+    // so reporting `NeedsExpressionType` would claim a type had to be
+    // inferred when nothing did.
+    //
+    // What carries it is a binding, not a new `TargetRoot`: the import site
+    // introduces one under a local name spelled `import(<specifier>)`, which
+    // no `IdentifierName` can be, and the reference names that binding. The
+    // resolver then resolves it by the same path it resolves
+    // `import * as ns from './m'; ns.Foo` — one mechanism, and the extractor
+    // still states only what this file writes.
+    let member = node
+        .parent()
+        .filter(|p| p.kind() == "member_expression")
+        .and_then(|p| p.field("property").map(|prop| (p, prop)));
+    let local = format!("import({raw})");
+    if type_position && member.is_some() {
+        bindings.push(ImportBinding {
+            local: local.clone(),
+            imported: ImportedName::Namespace,
+            space: DeclSpace::Type,
+        });
+    }
     ctx.push_import(node, syntax, specifier, raw, bindings, space);
-    // `import('./m').Foo` is *both* a module import and a type use, and the
-    // two are different work items when either fails.
-    if type_position
-        && let Some(parent) = node.parent()
-        && parent.kind() == "member_expression"
-        && let Some(property) = parent.field("property")
-    {
+    if type_position && let Some((parent, property)) = member {
         ctx.push_ref(
             RefKind::TypeUse,
             DeclSpace::Type,
             &parent,
-            property.text().to_string(),
+            parent.text().to_string(),
             RefTarget {
-                root: TargetRoot::Expr,
-                segments: vec![property.text().to_string()],
+                root: TargetRoot::Name,
+                segments: vec![local, property.text().to_string()],
             },
             None,
         );
@@ -2032,14 +2229,32 @@ fn jsx_element(ctx: &mut Ctx, node: &SgNode) {
         return;
     };
     // F11: JSX *is* a call after transformation, so `Call` is the honest
-    // classification. The convention that a lowercase single-word name is an
-    // intrinsic is a React transform rule, not part of the JSX grammar, so
-    // the extractor emits every element and the resolver applies the
-    // convention where it can be stated as one.
+    // classification.
+    //
+    // C26: an element name that is lowercase **and** undotted is an
+    // *intrinsic* — a host element checked against `JSX.IntrinsicElements`,
+    // never a binding in scope. That is a lookup in the **Type** space, and
+    // saying so is the whole of the fact: `Call` in the Type space is a
+    // combination no other site in this extractor produces, so the resolver
+    // can act on it without the core growing a `RefKind` this track would
+    // have to add to a shared file. The convention itself is a React
+    // transform rule (`@babel/plugin-transform-react-jsx`) and not part of
+    // the JSX grammar, which is why it is written down here.
     let target = member_target(&name);
+    let intrinsic = target.root == TargetRoot::Name
+        && target.segments.len() == 1
+        && target.segments[0]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_lowercase());
+    let space = if intrinsic {
+        DeclSpace::Type
+    } else {
+        DeclSpace::Value
+    };
     ctx.push_ref(
         RefKind::Call,
-        DeclSpace::Value,
+        space,
         &name,
         name.text().to_string(),
         target,
@@ -2213,7 +2428,7 @@ fn assignment(ctx: &mut Ctx, node: &SgNode) {
             ctx.push_def(
                 kind,
                 *name,
-                vec![(*class).to_string()],
+                vec![(*class).to_string(), PROTOTYPE.to_string()],
                 DeclSpace::Value,
                 DefFacets::RUNTIME.union(DefFacets::EXPORTED),
                 span,
@@ -2637,6 +2852,120 @@ mod tests {
     }
 
     #[test]
+    fn a_module_level_require_declaration_shadows_the_wrapper_too() {
+        // The same case one scope out, and the one that matters more: a
+        // module-level shadow made the call `External("node:fs")`, which sits
+        // outside *both* terms of the rate, so a wrong classification here
+        // raised the rate by deleting a reference.
+        let facts = js("const require = () => {};\nrequire('fs');\n");
+        assert!(refs(&facts, RefKind::Import).is_empty());
+        let call = site(&facts, "require");
+        assert_eq!(call.kind, RefKind::Call);
+        assert!(
+            !call.locally_bound,
+            "a module-level declaration is a node, not a local",
+        );
+        // Every shape of module-level binding, including one a `var` hoists
+        // out of a block.
+        for src in [
+            "function require(){}\nrequire('fs');\n",
+            "var require = 1;\nrequire('fs');\n",
+            "{ var require = 1; }\nrequire('fs');\n",
+        ] {
+            assert!(
+                refs(&js(src), RefKind::Import).is_empty(),
+                "still an import in:\n{src}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_created_require_is_still_require() {
+        // C11: `const require = createRequire(import.meta.url)` *is* a
+        // CommonJS `require`, so the specifiers it names are real module
+        // edges. The module-level shadow check must not swallow it.
+        let facts = js(concat!(
+            "import { createRequire } from 'node:module';\n",
+            "const require = createRequire(import.meta.url);\n",
+            "require('./m.js');\n",
+        ));
+        assert!(
+            facts
+                .header
+                .imports
+                .iter()
+                .any(|i| i.specifier.as_deref() == Some("./m.js")),
+        );
+    }
+
+    #[test]
+    fn a_module_level_var_in_a_block_is_a_node() {
+        // D3: `var` is `VarScopedDeclarations`, so it belongs to the nearest
+        // function or module environment and not to the block it is written
+        // in. Treating the block as its scope emitted no definition at all,
+        // and the call inside it became `LocalBinding` while the call after
+        // it became `NoMatchingDefinition` — one binding, two wrong answers.
+        let facts = js("if (x) { var f = () => {}; }\nf();\n");
+        assert_eq!(one(&facts, "f").kind, DefKind::Function);
+        assert!(one(&facts, "f").owner.is_empty());
+        assert!(!site(&facts, "f").locally_bound);
+        // A `let` in the same place is still a local, and still not a node.
+        let lexical = js("if (x) { let g = () => {}; g(); }\n");
+        assert!(defs(&lexical, "g").is_empty());
+        assert!(site(&lexical, "g").locally_bound);
+        // And inside a function a `var` is a local wherever it is written.
+        let inner = js("function outer(){ if (x) { var h = () => {}; } h(); }\n");
+        assert!(defs(&inner, "h").is_empty());
+        assert!(site(&inner, "h").locally_bound);
+    }
+
+    #[test]
+    fn a_triple_slash_directive_is_an_import() {
+        // A18: an import that is not an import statement. Emitting nothing
+        // for it is not an honest reason — it is a reference that never
+        // reaches a bucket at all.
+        let facts = ts(concat!(
+            "/// <reference path=\"./types.d.ts\" />\n",
+            "/// <reference types=\"node\" />\n",
+            "/// <reference lib=\"dom\" />\n",
+            "let x: Foo;\n",
+        ));
+        let specifiers: Vec<Option<&str>> = facts
+            .header
+            .imports
+            .iter()
+            .map(|i| i.specifier.as_deref())
+            .collect();
+        assert_eq!(specifiers, [Some("./types.d.ts"), Some("node")]);
+        // `lib=` names a compiler library that is in no repository, so there
+        // is nothing to look for and nothing is claimed.
+        assert_eq!(refs(&facts, RefKind::Import).len(), 2);
+        assert!(facts.header.imports.iter().all(|i| i.bindings.is_empty()));
+        // A directive does not make the file a module.
+        assert!(facts.header.script);
+    }
+
+    #[test]
+    fn a_lowercase_jsx_element_is_an_intrinsic_and_a_capitalised_one_is_a_binding() {
+        // C26/F11: `<div/>` is a host element checked against
+        // `JSX.IntrinsicElements` — a Type-space lookup, and never a binding
+        // in this repository. `<Button/>` and `<Icons.Star/>` are value
+        // references. The convention is React's transform rule, not the JSX
+        // grammar's, which is why it is written down.
+        let facts = js("const a = <div />;\nconst b = <Button />;\nconst c = <Icons.Star />;\n");
+        let by = |raw: &str| {
+            refs(&facts, RefKind::Call)
+                .into_iter()
+                .find(|r| r.raw_target == raw)
+                .unwrap_or_else(|| panic!("no `{raw}` element"))
+                .clone()
+        };
+        assert_eq!(by("div").space, DeclSpace::Type);
+        assert_eq!(by("Button").space, DeclSpace::Value);
+        assert_eq!(by("Icons.Star").space, DeclSpace::Value);
+    }
+
+    #[test]
     fn only_a_const_require_alias_binds() {
         // C6/C7: `let`/`var` aliases are mutable, and
         // `try { impl = require('./native') } catch { impl = require('./js') }`
@@ -2705,7 +3034,22 @@ mod tests {
         assert_eq!(refs(&facts, RefKind::Import)[0].space, DeclSpace::Type);
         let type_use = refs(&facts, RefKind::TypeUse);
         assert_eq!(type_use.len(), 1);
-        assert_eq!(type_use[0].raw_target, "Foo");
+        assert_eq!(type_use[0].raw_target, "import('./m').Foo");
+        // The module is a literal and the member is written down, so this is
+        // a *named* target — not an expression whose type has to be inferred.
+        // The root names the binding the import site introduced, which no
+        // `IdentifierName` can spell, so nothing else can name it by accident.
+        assert_eq!(type_use[0].target.root, TargetRoot::Name);
+        assert_eq!(
+            type_use[0].target.segments,
+            ["import(./m)".to_string(), "Foo".to_string()]
+        );
+        assert!(
+            import
+                .bindings
+                .iter()
+                .any(|b| b.local == "import(./m)" && b.space == DeclSpace::Type),
+        );
     }
 
     // ---- §3 exports, re-exports, and the export map ---------------------
@@ -3062,9 +3406,11 @@ mod tests {
 
     #[test]
     fn class_members_are_nodes_owned_by_their_class() {
-        // E3/E4/E9/E10/E11. Static and instance members share one owner
-        // chain; the `STATIC` facet is what tells them apart, so no owner
-        // string has to encode `prototype`.
+        // E3/E4/E9/E10/E11. An instance member is installed on
+        // `C.prototype` and a static one on `C`, and the owner chain says
+        // which — the `STATIC` facet cannot, because the FQN may not read a
+        // facet (grammar invariant 4) and two members of one name would then
+        // share one identity.
         let facts = js(concat!(
             "class C {\n",
             "  m(){}\n",
@@ -3082,9 +3428,12 @@ mod tests {
         ));
         let member = |name: &str| one(&facts, name);
         assert_eq!(member("m").kind, DefKind::Method);
-        assert_eq!(member("m").owner, ["C"]);
+        assert_eq!(member("m").owner, ["C", PROTOTYPE]);
         assert!(!member("m").facets.contains(DefFacets::STATIC));
+        assert_eq!(member("s").owner, ["C"]);
         assert!(member("s").facets.contains(DefFacets::STATIC));
+        assert_eq!(member("count").owner, ["C", PROTOTYPE]);
+        assert_eq!(member("sf").owner, ["C"]);
         // E10: a private name is not a property and cannot be reached from
         // outside the class body.
         assert!(!member("#p").facets.contains(DefFacets::EXPORTED));
@@ -3120,8 +3469,34 @@ mod tests {
         // scheme covers both eras. Pervasive in older corpora.
         let facts = js("function C(){}\nC.prototype.m = function(){};\nC.prototype.k = 1;\n");
         assert_eq!(one(&facts, "m").kind, DefKind::Method);
-        assert_eq!(one(&facts, "m").owner, ["C"]);
+        assert_eq!(one(&facts, "m").owner, ["C", PROTOTYPE]);
         assert_eq!(one(&facts, "k").kind, DefKind::Field);
+        // Identical to the `class` form, which is the whole point of E6.
+        let modern = js("class C { m(){} }\n");
+        assert_eq!(one(&facts, "m").owner, one(&modern, "m").owner);
+    }
+
+    #[test]
+    fn a_static_and_an_instance_member_of_one_name_are_two_identities() {
+        // `class C { m(){} static m(){} }` is legal and is two members:
+        // `new C().m()` and `C.m()` cannot reach the same node. Before the
+        // prototype segment they shared one FQN and one silently won.
+        let facts = js("class C { m(){} static m(){} }\n");
+        let both = defs(&facts, "m");
+        assert_eq!(both.len(), 2);
+        let header = EcmaHeader {
+            rel_path: "m.js".into(),
+            ..EcmaHeader::default()
+        };
+        let fqns: Vec<String> = both
+            .iter()
+            .map(|d| {
+                crate::track_ecma::resolve::definition_fqn(&header, d)
+                    .expect("nameable")
+                    .into_string()
+            })
+            .collect();
+        assert_eq!(fqns, ["m.js#value:C.prototype.m", "m.js#value:C.m"]);
     }
 
     #[test]
@@ -3568,7 +3943,7 @@ mod tests {
             [
                 Some(vec!["top".into()]),
                 Some(vec!["arrow".into()]),
-                Some(vec!["C".into(), "m".into()]),
+                Some(vec!["C".into(), PROTOTYPE.into(), "m".into()]),
                 Some(vec!["x".into()]),
                 None,
             ]

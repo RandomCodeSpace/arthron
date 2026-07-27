@@ -119,3 +119,14 @@ rule:
     - kind: extends_clause
     - kind: implements_clause
     - kind: extends_type_clause
+---
+# A18: `/// <reference path="./types.d.ts" />` and `types="node"`. An import
+# that is not an import statement — it adds a file, or a whole `@types`
+# package's globals, to the program. Selected by kind *and* text, so the rule
+# reads only the handful of comments that are directives rather than every
+# comment in the corpus.
+id: ref-triple-slash
+language: typescript
+rule:
+  kind: comment
+  regex: '^///\s*<reference\s'

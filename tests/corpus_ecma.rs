@@ -285,3 +285,80 @@ fn every_reference_on_fastify_has_exactly_one_stored_outcome() {
 fn every_reference_on_vue_core_has_exactly_one_stored_outcome() {
     assert_every_reference_is_accounted_for(Path::new("corpus/typescript/vue-core"));
 }
+
+/// Every triple-slash reference directive in a file, found by reading the
+/// source text rather than by asking the extractor.
+///
+/// An **independent oracle**, and the point of it is what it does not share:
+/// `extracted_reference_count` above re-runs the production extractor, so a
+/// reference the front end never emits is missing from both sides of that
+/// comparison and the assertion passes anyway. That is exactly how
+/// `/// <reference … />` went unnoticed — a directive is a comment, no rule
+/// selected it, and no bucket ever received it. This function knows only that
+/// a directive is a line beginning `///` that names `path=` or `types=`.
+fn directives_in(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in source.lines() {
+        let line = line.trim_start();
+        if !line.starts_with("///") || !line.contains("<reference") {
+            continue;
+        }
+        for attribute in ["path=", "types="] {
+            let Some(rest) = line.split_once(attribute).map(|(_, r)| r) else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            if let Some(value) = rest[1..].split(quote).next()
+                && !value.is_empty()
+            {
+                found.push(value.to_string());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_reference_directive_in_the_corpus_is_extracted() {
+    // A18. The never-drop guarantee is a claim about phase two *and* about
+    // the front end: a reference nothing emits reaches no bucket at all, and
+    // no per-reason tally can show its absence.
+    let corpus = Path::new("corpus/typescript/vue-core");
+    if !corpus_present(corpus) {
+        return;
+    }
+    let mut checked = 0usize;
+    for path in source_files::<TsLang>(corpus).expect("walking the corpus") {
+        let rel = path
+            .strip_prefix(corpus)
+            .expect("a walked path is under the corpus")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let expected = directives_in(&source);
+        if expected.is_empty() {
+            continue;
+        }
+        let facts = extract(Dialect::TypeScript, &rel, &source);
+        for specifier in expected {
+            assert!(
+                facts
+                    .header
+                    .imports
+                    .iter()
+                    .any(|i| i.specifier.as_deref() == Some(specifier.as_str())),
+                "{rel}: `{specifier}` is written in the source and named by no reference",
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "the corpus carries no directive, so this proves nothing — say so \
+         rather than letting a vacuous pass stand in for a measurement",
+    );
+}

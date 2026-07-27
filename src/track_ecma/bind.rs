@@ -142,6 +142,16 @@ fn var_hoist_binds(node: &SgNode, name: &str) -> bool {
             | "class"
             | "class_body"
             | "internal_module" => false,
+            // `for (var k in o)` writes its declaration in the head rather
+            // than as a `variable_declaration` child, so the generic descent
+            // below cannot see it. The body still has to be descended into.
+            "for_in_statement" => {
+                (child.children().any(|c| c.kind() == "var")
+                    && child
+                        .field("left")
+                        .is_some_and(|left| pattern_binds(&left, name)))
+                    || var_hoist_binds(&child, name)
+            }
             _ => var_hoist_binds(&child, name),
         };
         if hit {
@@ -149,6 +159,19 @@ fn var_hoist_binds(node: &SgNode, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a module's own top level binds `name`.
+///
+/// Module level is not a binding environment *for the graph* — a top-level
+/// declaration is a node, and reporting one local would delete a real
+/// reference from both terms of the rate. It is very much one for the
+/// *language*, and one question needs that: whether `require` at a call site
+/// is Node's module-wrapper parameter or a name this file declared over it
+/// (C1). Deliberately separate from [`is_locally_bound`], which answers the
+/// graph's question and must keep answering `false` here.
+pub fn module_scope_binds(program: &SgNode, name: &str) -> bool {
+    block_binds(program, name, DeclSpace::Value) || var_hoist_binds(program, name)
 }
 
 /// Whether a function environment binds `name`.
@@ -177,13 +200,16 @@ fn function_scope_binds(func: &SgNode, name: &str, space: DeclSpace) -> bool {
 
 /// Whether the declarations directly inside a block bind `name`.
 ///
-/// `LexicallyScopedDeclarations` cover the whole block regardless of where in
-/// it they are written, so this is position-free too.
+/// `variable_declaration` — `var` — is deliberately absent: ES puts it in
+/// `VarScopedDeclarations`, so it belongs to the nearest *function* or module
+/// environment and not to the block it is written in. `var_hoist_binds` finds
+/// it from there. Treating it as block-scoped made `{ var f = () => {}; f() }`
+/// at module level report `LocalBinding` for the inner call and
+/// `NoMatchingDefinition` for a call after the block, when both name one
+/// module-level definition.
 fn block_binds(block: &SgNode, name: &str, space: DeclSpace) -> bool {
     block.children().any(|c| match &*c.kind() {
-        "lexical_declaration" | "variable_declaration" => {
-            space == DeclSpace::Value && declarators_bind(&c, name)
-        }
+        "lexical_declaration" => space == DeclSpace::Value && declarators_bind(&c, name),
         "function_declaration" | "generator_function_declaration" => {
             space == DeclSpace::Value && named(&c, name)
         }
@@ -205,23 +231,27 @@ fn switch_binds(body: &SgNode, name: &str, space: DeclSpace) -> bool {
 }
 
 /// Whether a `for (…;…;…)` head binds `name`.
+///
+/// `let`/`const` only, for the same reason `block_binds` takes only those:
+/// `for (var i = 0; …)` is var-scoped and belongs to the enclosing function or
+/// module, which `var_hoist_binds` reaches through the loop.
 fn for_head_binds(stmt: &SgNode, name: &str, space: DeclSpace) -> bool {
     space == DeclSpace::Value
-        && stmt.children().any(|c| {
-            matches!(&*c.kind(), "lexical_declaration" | "variable_declaration")
-                && declarators_bind(&c, name)
-        })
+        && stmt
+            .children()
+            .any(|c| c.kind() == "lexical_declaration" && declarators_bind(&c, name))
 }
 
-/// Whether a `for … in`/`for … of` head binds `name`.
+/// Whether a `for … in`/`for … of` head binds `name` *lexically*.
 ///
-/// Only when it *declares*: `for (k of xs)` assigns to a name bound
-/// elsewhere and introduces nothing.
+/// Only when it declares with `let`/`const`: `for (k of xs)` assigns to a
+/// name bound elsewhere and introduces nothing, and `for (var k of xs)`
+/// declares one that belongs to the enclosing function or module.
 fn for_in_head_binds(stmt: &SgNode, name: &str, space: DeclSpace) -> bool {
     space == DeclSpace::Value
         && stmt
             .children()
-            .any(|c| matches!(&*c.kind(), "let" | "const" | "var"))
+            .any(|c| matches!(&*c.kind(), "let" | "const"))
         && stmt
             .field("left")
             .is_some_and(|left| pattern_binds(&left, name))
@@ -495,13 +525,38 @@ mod tests {
 
     #[test]
     fn loop_heads_bind_their_bodies() {
-        // D7.
+        // D7. A `let`/`const` head is lexical and binds its loop.
         assert!(bound_js("for (let i = 0; i < 3; i++) { i(); }\n", "i"));
         assert!(bound_js("for (const it of list) { it(); }\n", "it"));
-        assert!(bound_js("for (var k in o) { k(); }\n", "k"));
         assert!(
             !bound_js("let k;\nfor (k of list) { k(); }\n", "k"),
             "assigning to an existing name declares nothing"
+        );
+    }
+
+    #[test]
+    fn var_belongs_to_the_function_or_module_and_never_to_a_block() {
+        // D3: `var` is `VarScopedDeclarations`. Inside a function it is a
+        // local wherever it is written; at module level it is a module-level
+        // binding — a node — however deeply the block nests.
+        assert!(bound_js("function f(){ { var v = 1; } v(); }\n", "v"));
+        assert!(bound_js("function f(){ for (var i = 0;;) {} i(); }\n", "i"));
+        assert!(bound_js("function f(){ for (var k in o) { k(); } }\n", "k"));
+        assert!(
+            !bound_js("{ var f = () => {}; f(); }\n", "f"),
+            "at module level a `var` in a block is not a local"
+        );
+        assert!(
+            !bound_js("if (x) { var g = () => {}; }\ng();\n", "g"),
+            "and the call after the block names the same binding"
+        );
+        assert!(
+            bound_js("{ let s = 1; s(); }\n", "s"),
+            "a `let` in the same place still is one"
+        );
+        assert!(
+            !bound_js("for (var k in o) { k(); }\n", "k"),
+            "a module-level `for … in` head declares module-wide"
         );
     }
 
