@@ -26,6 +26,7 @@ use crate::lang::{
     Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, SymbolProbe,
 };
 use crate::model::{DefKind, Definition, Fqn, NodeId, Reference, node_id, reason_code};
+use crate::registry::REGISTRY;
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
     DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
@@ -129,10 +130,16 @@ pub fn scan<L: Language>(
     // it. All three mean the same thing to the graph, and dropping its facts
     // before anything is written is what keeps a stale node from surviving
     // as a resolution target.
+    //
+    // Only files carrying an extension *this* language owns are candidates.
+    // The store is shared by every enabled track, and a file this walk never
+    // looked for is not a file this walk can say is gone. Extension ownership
+    // is a partition — see `Lang::for_extension` — so every stored file
+    // belongs to exactly one track, and no track can forget another's.
     let deleted: Vec<String> = store
         .known_files()?
         .into_iter()
-        .filter(|known| !owned.contains_key(known))
+        .filter(|known| !owned.contains_key(known) && claims::<L>(known))
         .collect();
 
     // The container names this event's own files decide, folded in before
@@ -383,9 +390,48 @@ fn phase_two<L: Language>(
     finish(acc, &file.rel_path, file.hash)
 }
 
-/// Scan a Go repository. What `main` and the integration tests call.
+/// Scan a Go repository. The Go track's registry entry, and what the Go
+/// integration tests call directly.
 pub fn scan_go(root: &Path, db_path: &Path) -> Result<Report, String> {
     scan::<GoLang>(root, db_path, &GoExtractor, &GoResolver)
+}
+
+/// Scan a repository with every enabled track in [`REGISTRY`], in registry
+/// order. What `main` calls.
+///
+/// This is the whole of the driver's knowledge of which languages exist: it
+/// names none of them. A disabled track is skipped, owns no extension, and so
+/// contributes neither a file read nor a row — which is why a build with only
+/// Go live measures exactly what `scan_go` alone measured.
+///
+/// The returned [`Report`] is the last enabled track's, and that is the whole
+/// report rather than that track's share of it: [`Store::report`] tallies
+/// every row in the store, and each track's rows are already there by the
+/// time it runs. Tallies are keyed by language code and stay separate — the
+/// report carries one line per language and no combined number exists to
+/// return.
+pub fn scan_repo(root: &Path, db_path: &Path) -> Result<Report, String> {
+    let mut report = None;
+    for track in REGISTRY {
+        let Some(scan) = track.scan else {
+            continue; // not live: owns no file, contributes nothing
+        };
+        report = Some(scan(root, db_path)?);
+    }
+    // Not a default-empty report: "no track is built into this binary" and
+    // "every track found nothing" are different facts, and returning zeros
+    // for the first would let a gate bless a build that measures nothing.
+    report.ok_or_else(|| "no language track is enabled in this build".to_string())
+}
+
+/// Whether a repo-relative path carries an extension this language owns.
+///
+/// Matches the test [`source_files`] applies, so the set a scan can forget is
+/// exactly the set it can find.
+fn claims<L: Language>(rel_path: &str) -> bool {
+    Path::new(rel_path)
+        .extension()
+        .is_some_and(|ext| L::extensions().iter().any(|want| ext == *want))
 }
 
 /// File one reference's resolution into this file's half: its row, its edge,
