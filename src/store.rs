@@ -32,7 +32,7 @@ use crate::model::{DefFacets, DefKind, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -40,9 +40,19 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
 const REFS: TableDefinition<(&str, &[u8]), &[u8]> = TableDefinition::new("refs");
-const EDGES: TableDefinition<(&[u8; 16], &[u8; 16], u8), ()> = TableDefinition::new("edges");
-const REV_EDGES: TableDefinition<(&[u8; 16], &[u8; 16], u8), ()> =
-    TableDefinition::new("rev_edges");
+/// One edge, as the tables key it: `(src, dst, `[`crate::model::RefKind`]` code)`.
+type EdgeKey<'a> = (&'a [u8; 16], &'a [u8; 16], u8);
+
+/// Edge → the files that produce it, sorted.
+///
+/// An edge is a *shared* fact, exactly as a node is: two files of one
+/// package whose package-level references reach the same target produce the
+/// same triple, and a third file may produce it again tomorrow. Storing the
+/// producers rather than a unit is what stops one file being re-scanned or
+/// deleted from taking another file's edge with it — the never-drop rule,
+/// applied where the key is not per-file.
+const EDGES: TableDefinition<EdgeKey<'static>, &[u8]> = TableDefinition::new("edges");
+const REV_EDGES: TableDefinition<EdgeKey<'static>, &[u8]> = TableDefinition::new("rev_edges");
 const CANDIDATES: MultimapTableDefinition<&[u8; 16], (&str, &[u8])> =
     MultimapTableDefinition::new("candidates");
 const FILES: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("files");
@@ -51,7 +61,7 @@ const REF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("ref_owned"
 
 type NodeTable<'txn> = redb::Table<'txn, &'static [u8; 16], &'static [u8]>;
 type RefTable<'txn> = redb::Table<'txn, (&'static str, &'static [u8]), &'static [u8]>;
-type EdgeTable<'txn> = redb::Table<'txn, (&'static [u8; 16], &'static [u8; 16], u8), ()>;
+type EdgeTable<'txn> = redb::Table<'txn, EdgeKey<'static>, &'static [u8]>;
 type CandidateTable<'txn> =
     redb::MultimapTable<'txn, &'static [u8; 16], (&'static str, &'static [u8])>;
 type BytesTable<'txn> = redb::Table<'txn, &'static str, &'static [u8]>;
@@ -497,11 +507,8 @@ impl Store {
                     record.rows.push(encoded);
                 }
                 for (src, dst, kind) in &file.edges {
-                    edges
-                        .insert((src, dst, *kind), ())
-                        .map_err(|e| e.to_string())?;
-                    rev.insert((dst, src, *kind), ())
-                        .map_err(|e| e.to_string())?;
+                    claim_edge(&mut edges, (src, dst, *kind), &file.path)?;
+                    claim_edge(&mut rev, (dst, src, *kind), &file.path)?;
                     record.edges.push((*src, *dst, *kind));
                 }
                 for (cand, key) in &file.candidates {
@@ -654,6 +661,27 @@ impl Store {
         Ok(out)
     }
 
+    /// The node ids phase 1 owns for these files.
+    ///
+    /// Read *before* an event writes anything: it is the only record of what
+    /// the event's own files declared beforehand, and comparing it with what
+    /// they declare afterwards is what selects the unchanged files an added
+    /// or removed definition has to wake. Read it after
+    /// [`Store::apply_defs`] and the comparison is against itself.
+    pub fn declared_nodes(&self, paths: &[String]) -> Result<BTreeSet<NodeId>, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
+        let mut out = BTreeSet::new();
+        for path in paths {
+            let Some(guard) = table.get(path.as_str()).map_err(|e| e.to_string())? else {
+                continue; // a file the store has no phase-1 half for
+            };
+            let owned: DefOwned = decode(guard.value())?;
+            out.extend(owned.nodes);
+        }
+        Ok(out)
+    }
+
     /// Every reference row that probed this identity, hit or miss.
     ///
     /// The misses are the point: a reference that probed an identity and
@@ -668,6 +696,31 @@ impl Store {
             let guard = value.map_err(|e| e.to_string())?;
             let (file, encoded) = guard.value();
             out.push(RefKey::join(file, encoded)?);
+        }
+        Ok(out)
+    }
+
+    /// Every reference row that probed any of these identities, deduplicated.
+    ///
+    /// [`Store::candidate_rows`] answers for one identity and opens one read
+    /// transaction to do it; an event asks for every identity it created or
+    /// destroyed at once, and a transaction per identity is the difference
+    /// between a bounded read and thousands of them on a cold store.
+    pub fn rows_for(&self, ids: &[NodeId]) -> Result<BTreeSet<RefKey>, String> {
+        if ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = txn
+            .open_multimap_table(CANDIDATES)
+            .map_err(|e| e.to_string())?;
+        let mut out = BTreeSet::new();
+        for id in ids {
+            for value in table.get(id).map_err(|e| e.to_string())? {
+                let guard = value.map_err(|e| e.to_string())?;
+                let (file, encoded) = guard.value();
+                out.insert(RefKey::join(file, encoded)?);
+            }
         }
         Ok(out)
     }
@@ -868,6 +921,53 @@ fn drop_site(table: &mut NodeTable<'_>, id: &NodeId, path: &str) -> Result<(), S
     Ok(())
 }
 
+/// The files that produce an edge, or an empty list when nothing does.
+fn edge_producers(table: &EdgeTable<'_>, key: EdgeKey<'_>) -> Result<Vec<String>, String> {
+    let Some(guard) = table.get(key).map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    decode(guard.value())
+}
+
+/// Record that `path` produces this edge.
+fn claim_edge(table: &mut EdgeTable<'_>, key: EdgeKey<'_>, path: &str) -> Result<(), String> {
+    let mut producers = edge_producers(table, key)?;
+    producers.push(path.to_string());
+    producers.sort();
+    producers.dedup();
+    let bytes = encode(&producers)?;
+    table
+        .insert(key, bytes.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Drop one file's claim on an edge, and the edge with it when nothing
+/// produces it any more.
+///
+/// The conditional is the whole point, and it is the same one
+/// [`drop_site`] makes for nodes: an edge two files both produce must
+/// survive either of them going. Deleting it unconditionally leaves a store
+/// that is *nearly* right — the tallies never move, because they are counted
+/// from per-file rows — and only a whole-store comparison against a cold
+/// scan can see it.
+fn release_edge(table: &mut EdgeTable<'_>, key: EdgeKey<'_>, path: &str) -> Result<(), String> {
+    let mut producers = edge_producers(table, key)?;
+    if producers.is_empty() {
+        return Ok(());
+    }
+    producers.retain(|producer| producer != path);
+    if producers.is_empty() {
+        table.remove(key).map_err(|e| e.to_string())?;
+    } else {
+        let bytes = encode(&producers)?;
+        table
+            .insert(key, bytes.as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Remove everything phase 2 owns for one file. The ownership record itself
 /// is left for the caller: a replace rewrites it, a forget removes it.
 #[allow(clippy::too_many_arguments)]
@@ -893,8 +993,8 @@ fn forget_ref_half(
             .map_err(|e| e.to_string())?;
     }
     for (src, dst, kind) in &previous.edges {
-        edges.remove((src, dst, *kind)).map_err(|e| e.to_string())?;
-        rev.remove((dst, src, *kind)).map_err(|e| e.to_string())?;
+        release_edge(edges, (src, dst, *kind), path)?;
+        release_edge(rev, (dst, src, *kind), path)?;
     }
     for id in &previous.nodes {
         drop_site(nodes, id, path)?;

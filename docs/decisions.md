@@ -4,6 +4,64 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Candidate invalidation: an edit reaches the files it changed the answer for
+
+An edit that adds or removes a definition now re-resolves the references in
+**unchanged** files that probed that identity. Every reference records the
+identities it probed, hits *and* misses, and the misses are the point: a
+reference that looked for `pkg.Missing` and found nothing is exactly the one
+that must be woken when a later commit declares it.
+
+**Whole affected files are re-resolved, not individual rows.** The index
+selects the file; re-resolving one is a parse plus its references through the
+per-file replace every changed file already uses.
+*Rejected:* patching single rows — it needs sub-file ownership of edges and
+candidate entries, which is more machinery, more ways to be subtly wrong, and
+no measured need. Its oracle is already built, so it stays available as a
+later optimisation.
+
+**One round terminates.** Re-reading a file whose bytes did not move cannot
+change what it declares, so the woken set cannot widen the event again.
+*Rejected:* a fixed-point loop with an iteration cap — nothing in Go needs one,
+and a cap is a silent-truncation risk bought for a language that does not
+exist yet.
+
+**The affected set is selected from ownership read before the event writes
+anything.** Read it after phase 1 and the comparison is against itself: the
+set comes out empty, and every test whose caller happens to sit in the changed
+file still passes. It is a deliberate over-approximation — an identity another,
+unchanged file also declares is woken though it never disappeared — because
+waking too many files is wasted work and waking too few is a wrong answer.
+
+**An edge is a shared fact and now records which files produce it** (store
+schema 2 → 3). Two files of one package whose package-level references reach
+the same target produce the identical `(src, dst, kind)` triple; deleting one
+file used to take the other's edge with it. Nothing in the report notices —
+tallies are summed from per-file rows, never from the edge table — so only a
+whole-store comparison against a cold scan can see it. Found by exactly that
+comparison, at corpus scale, on a file the four-file fixtures could not model:
+one `Import` edge between two packages vanished when a file that was not its
+only producer was deleted. This is the never-drop rule applied where the key
+is not per-file, and it is the same rule a node's declaration sites already
+followed.
+*Rejected:* re-deriving surviving edges by scanning every file's ownership
+record on each delete — correct, and O(repo) per event.
+
+**The oracle is the deliverable, and it runs against both corpora.** After
+touch, delete and restore events, the incremental store is compared to a cold
+scan of the same tree — snapshot and report, every node, row, edge and
+candidate entry — **after each event, not once at the end**, because a delete
+followed by a restore puts every identity back and makes a store that went
+stale in between look correct again. Both corpora land byte-identical,
+including the one holding 28 FQNs that two files each declare.
+
+Counts are unchanged from the binding-environment entry below, which is the
+requirement: this stage moves no reference between categories. Release build,
+cold store: first corpus `4467 / 6085 / 4276 / 799`, rate 84.8%; second corpus
+`3006 / 9571 / 9425 / 1815`, rate 62.4%, 28 FQN collisions.
+
+---
+
 ## 2026-07-27 — Go binding environments: the false-edge fix, measured
 
 The shadowing bug the road-to-27 entry described is closed. The extractor now

@@ -8,6 +8,13 @@
 //! replaces only itself. That is what makes a re-scan of one file an edit
 //! rather than an append, and it is the whole reason the store is addressed
 //! per file.
+//!
+//! An event is not only the files whose bytes moved. A definition that
+//! appears or disappears changes the answer for references in files nobody
+//! edited, and the candidate index — every identity every reference probed,
+//! hits and misses alike — is what names them. Those files are re-read and
+//! re-resolved in the same event, so the store an incremental scan leaves is
+//! the store a cold scan of the same tree would have built.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -25,8 +32,12 @@ use crate::store::{
     StoredOutcome,
 };
 
-/// One changed file, extracted.
-struct ChangedFile<L: Language> {
+/// One file this event re-reads, extracted.
+///
+/// Either its bytes moved, or an identity it referenced did — both mean the
+/// same thing to the store: replace this file's halves with what this event
+/// says they are.
+struct ScannedFile<L: Language> {
     rel_path: String,
     hash: [u8; 32],
     facts: FileFacts<L>,
@@ -55,6 +66,12 @@ struct RefAcc {
 /// Walk, extract, resolve, store, report. The changed set is exactly the
 /// files whose content hash differs from the store — an empty store makes
 /// that every file, which is the entire cold/warm distinction.
+///
+/// The event then widens once, and only once: the identities the changed and
+/// deleted files stopped or started declaring name the rows that probed
+/// them, those rows name their files, and those files are re-resolved too.
+/// Re-reading a file whose bytes did not move cannot change what it
+/// declares, so nothing it does can widen the set again.
 pub fn scan<L: Language>(
     root: &Path,
     db_path: &Path,
@@ -80,24 +97,21 @@ pub fn scan<L: Language>(
 
     // Collect the changed set, in walk order, and everything the walk
     // reached and this scan owns.
-    let mut walked: HashSet<String> = HashSet::with_capacity(paths.len());
-    let mut changed: Vec<ChangedFile<L>> = Vec::new();
+    let mut owned: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut changed: Vec<ScannedFile<L>> = Vec::new();
     for path in &paths {
         let rel = rel_path(root, path)?;
         if !rs.owns_file(&cfg, &rel) {
             continue; // governed by another project; not this scan's file
         }
-        let source = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => return Err(format!("reading {rel}: {e}")),
-        };
+        let source = read_source(path, &rel)?;
         let hash = *blake3::hash(source.as_bytes()).as_bytes();
-        walked.insert(rel.clone());
+        owned.insert(rel.clone(), path.clone());
         if store.file_hash(&rel)? == Some(hash) {
             continue; // unchanged: not in this event's changed set
         }
         let facts = ex.extract(&rel, &source);
-        changed.push(ChangedFile {
+        changed.push(ScannedFile {
             rel_path: rel,
             hash,
             facts,
@@ -112,106 +126,226 @@ pub fn scan<L: Language>(
     let deleted: Vec<String> = store
         .known_files()?
         .into_iter()
-        .filter(|known| !walked.contains(known))
+        .filter(|known| !owned.contains_key(known))
         .collect();
+
+    // What this event's own files declared before it ran, read before a
+    // single fact is written. After phase 1 has rewritten the ownership
+    // records this comparison is against itself, and the affected set comes
+    // out empty — which every test whose caller sits in the changed file
+    // would still pass.
+    let mut event_paths: Vec<String> = changed.iter().map(|f| f.rel_path.clone()).collect();
+    event_paths.extend(deleted.iter().cloned());
+    let declared_before = store.declared_nodes(&event_paths)?;
+
     store.forget_files(&deleted)?;
 
     // Phase 1: definition and container nodes for the changed set.
     let probe = store.symbol_entries()?;
-    let mut def_batch = DefBatch {
-        files: Vec::with_capacity(changed.len()),
-    };
     // The definitions this event declared, by identity. Two of them under
     // one identity is the only case the language can be asked about.
     let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
-    for file in &changed {
-        let mut nodes = Vec::with_capacity(file.facts.defs.len());
-        for def in &file.facts.defs {
-            let Some(fqn) = rs.def_fqn(&cfg, &file.facts.header, &def.owner, def, &probe) else {
-                continue; // not nameable, so not a node
-            };
-            let id = node_id(L::DOMAIN, fqn.as_str());
-            let declarations = vec![DeclSite {
-                file: file.rel_path.clone(),
-                line: def.span.line,
-            }];
-            let record = if def.kind == DefKind::Module {
-                // An empty name means "this file does not say", which is not
-                // the same as naming the empty string.
-                NodeRecord::Package {
-                    import_path: fqn.into_string(),
-                    name: (!def.name.is_empty()).then(|| def.name.clone()),
-                    declarations,
-                }
-            } else {
-                NodeRecord::Definition {
-                    fqn: fqn.into_string(),
-                    kind: def.kind.code(),
-                    declarations,
-                }
-            };
-            nodes.push((id, record));
-            event_defs.entry(id).or_default().push(def.clone());
-        }
-        def_batch.files.push(FileDefs {
-            path: file.rel_path.clone(),
-            nodes,
-        });
-    }
-    let colliding = store.apply_defs(&def_batch)?;
-    let merged = mergeable_count(rs, &colliding, &event_defs);
-
-    // Phase 2: resolve every reference in the changed set. The container
-    // names phase 1 just wrote are part of the scope every file is resolved
-    // against, so the config is refreshed before any scope is built.
-    let probe = store.symbol_entries()?;
-    rs.learn_containers(&mut cfg, &store.package_names()?);
-    let mut ref_batch = RefBatch {
+    let mut def_batch = DefBatch {
         files: Vec::with_capacity(changed.len()),
     };
     for file in &changed {
-        let scope = rs.scope(&cfg, &file.facts, &probe);
-        // The file's container stands in wherever a reference has no
-        // nameable encloser, which is where a package-level initialiser's
-        // calls belong.
-        let container = container_fqn::<L>(rs, &cfg, &file.facts, &probe);
-        let container_id = container
-            .as_ref()
-            .map(|fqn| node_id(L::DOMAIN, fqn.as_str()));
-        let container_name = container.as_ref().map_or("", Fqn::as_str);
-        let mut acc = RefAcc::default();
+        def_batch
+            .files
+            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+    }
+    let declared_now: BTreeSet<NodeId> = def_batch
+        .files
+        .iter()
+        .flat_map(|f| f.nodes.iter().map(|(id, _)| *id))
+        .collect();
 
-        for r in &file.facts.refs {
-            let res = rs.resolve(&cfg, &scope, r, &probe);
-            // The source of an edge is the reference's nearest nameable
-            // encloser, named by the same function that names definitions —
-            // so an edge and the node it starts at cannot disagree.
-            let enclosing = r
-                .enclosing
-                .as_ref()
-                .and_then(|e| e.as_definition())
-                .and_then(|d| rs.def_fqn(&cfg, &file.facts.header, &d.owner, &d, &probe));
-            let (src, enclosing_name) = match &enclosing {
-                Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
-                None => (container_id, container_name),
-            };
-            let key = RefKey {
-                file: file.rel_path.clone(),
-                kind: r.kind.code(),
-                space: r.space.code(),
-                enclosing: enclosing_name.to_string(),
-                raw_target: r.raw_target.clone(),
-                argc: r.argc,
-            };
-            record::<L>(key, r, src, res, &mut acc);
-        }
-        ref_batch.files.push(finish(acc, &file.rel_path, file.hash));
+    // The identities this event started or stopped declaring. An
+    // over-approximation on purpose: an id another, unchanged file also
+    // declares still exists, so waking its probers is wasted work rather
+    // than a wrong answer, and the narrower test is an existence check the
+    // candidate index does not need in order to be correct.
+    let touched: Vec<NodeId> = declared_before
+        .symmetric_difference(&declared_now)
+        .copied()
+        .collect();
+    let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &changed, &owned)?
+        .into_iter()
+        .map(|(rel, path)| scan_file(ex, &path, rel))
+        .collect::<Result<_, String>>()?;
+    // Their definitions cannot have changed — their bytes did not — so this
+    // re-asserts an ownership record identical to the one already stored,
+    // and keeps every file this event writes phase-2 facts for covered by a
+    // phase-1 half.
+    for file in &waking {
+        def_batch
+            .files
+            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+    }
+
+    let colliding = store.apply_defs(&def_batch)?;
+    let merged = mergeable_count(rs, &colliding, &event_defs);
+
+    // Phase 2: resolve every reference in the changed set and in every file
+    // the changed set woke. The container names phase 1 just wrote are part
+    // of the scope every file is resolved against, so the config is
+    // refreshed before any scope is built.
+    let probe = store.symbol_entries()?;
+    rs.learn_containers(&mut cfg, &store.package_names()?);
+    let mut ref_batch = RefBatch {
+        files: Vec::with_capacity(changed.len() + waking.len()),
+    };
+    for file in changed.iter().chain(waking.iter()) {
+        ref_batch.files.push(phase_two(rs, &cfg, file, &probe));
     }
     store.apply_refs(&ref_batch)?;
 
     let mut report = store.report()?;
     report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
     Ok(report)
+}
+
+/// The unchanged files holding a reference that probed one of `touched`.
+///
+/// Whole files, not individual rows: the index selects the file, and
+/// re-resolving one is a parse plus its references through the same per-file
+/// replace every changed file already uses. Patching single rows would need
+/// sub-file ownership of edges and candidate entries — more machinery, more
+/// ways to be subtly wrong, and no measured need.
+///
+/// A row whose file this event already re-read is dropped here rather than
+/// left for a later dedupe: the file is being resolved anyway, and letting it
+/// in a second time would make the event replace the same half twice, which
+/// is correct only for as long as every pass writes a file's half in full.
+/// That is a property to keep, not one to depend on.
+fn wake_files<L: Language>(
+    store: &Store,
+    touched: &[NodeId],
+    changed: &[ScannedFile<L>],
+    owned: &BTreeMap<String, PathBuf>,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let already: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+    let mut out = BTreeMap::new();
+    for key in store.rows_for(touched)? {
+        if already.contains(key.file.as_str()) {
+            continue;
+        }
+        // A row whose file the walk did not reach belongs to a deleted file,
+        // whose facts are already forgotten; nothing is left to re-resolve.
+        if let Some(path) = owned.get(&key.file) {
+            out.insert(key.file, path.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Read one file and extract it, as the walk does for a changed file.
+fn scan_file<L: Language>(
+    ex: &dyn Extractor<L>,
+    path: &Path,
+    rel_path: String,
+) -> Result<ScannedFile<L>, String> {
+    let source = read_source(path, &rel_path)?;
+    let hash = *blake3::hash(source.as_bytes()).as_bytes();
+    let facts = ex.extract(&rel_path, &source);
+    Ok(ScannedFile {
+        rel_path,
+        hash,
+        facts,
+    })
+}
+
+fn read_source(path: &Path, rel_path: &str) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("reading {rel_path}: {e}"))
+}
+
+/// One file's phase-1 half: a node per nameable definition, and the
+/// definitions themselves, kept for the one question only the language can
+/// answer about two of them sharing an identity.
+fn phase_one<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    file: &ScannedFile<L>,
+    probe: &dyn SymbolProbe,
+    event_defs: &mut HashMap<NodeId, Vec<Definition>>,
+) -> FileDefs {
+    let mut nodes = Vec::with_capacity(file.facts.defs.len());
+    for def in &file.facts.defs {
+        let Some(fqn) = rs.def_fqn(cfg, &file.facts.header, &def.owner, def, probe) else {
+            continue; // not nameable, so not a node
+        };
+        let id = node_id(L::DOMAIN, fqn.as_str());
+        let declarations = vec![DeclSite {
+            file: file.rel_path.clone(),
+            line: def.span.line,
+        }];
+        let record = if def.kind == DefKind::Module {
+            // An empty name means "this file does not say", which is not
+            // the same as naming the empty string.
+            NodeRecord::Package {
+                import_path: fqn.into_string(),
+                name: (!def.name.is_empty()).then(|| def.name.clone()),
+                declarations,
+            }
+        } else {
+            NodeRecord::Definition {
+                fqn: fqn.into_string(),
+                kind: def.kind.code(),
+                declarations,
+            }
+        };
+        nodes.push((id, record));
+        event_defs.entry(id).or_default().push(def.clone());
+    }
+    FileDefs {
+        path: file.rel_path.clone(),
+        nodes,
+    }
+}
+
+/// One file's phase-2 half: every reference resolved against the scope its
+/// own header builds, and the rows, edges, external nodes and candidate
+/// entries that fall out.
+fn phase_two<L: Language>(
+    rs: &dyn Resolver<L>,
+    cfg: &L::Config,
+    file: &ScannedFile<L>,
+    probe: &dyn SymbolProbe,
+) -> FileRefs {
+    let scope = rs.scope(cfg, &file.facts, probe);
+    // The file's container stands in wherever a reference has no nameable
+    // encloser, which is where a package-level initialiser's calls belong.
+    let container = container_fqn::<L>(rs, cfg, &file.facts, probe);
+    let container_id = container
+        .as_ref()
+        .map(|fqn| node_id(L::DOMAIN, fqn.as_str()));
+    let container_name = container.as_ref().map_or("", Fqn::as_str);
+    let mut acc = RefAcc::default();
+
+    for r in &file.facts.refs {
+        let res = rs.resolve(cfg, &scope, r, probe);
+        // The source of an edge is the reference's nearest nameable
+        // encloser, named by the same function that names definitions — so
+        // an edge and the node it starts at cannot disagree.
+        let enclosing = r
+            .enclosing
+            .as_ref()
+            .and_then(|e| e.as_definition())
+            .and_then(|d| rs.def_fqn(cfg, &file.facts.header, &d.owner, &d, probe));
+        let (src, enclosing_name) = match &enclosing {
+            Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
+            None => (container_id, container_name),
+        };
+        let key = RefKey {
+            file: file.rel_path.clone(),
+            kind: r.kind.code(),
+            space: r.space.code(),
+            enclosing: enclosing_name.to_string(),
+            raw_target: r.raw_target.clone(),
+            argc: r.argc,
+        };
+        record::<L>(key, r, src, res, &mut acc);
+    }
+    finish(acc, &file.rel_path, file.hash)
 }
 
 /// Scan a Go repository. What `main` and the integration tests call.

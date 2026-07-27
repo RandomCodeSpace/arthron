@@ -430,3 +430,56 @@ fn row_keys_round_trip_through_the_split_encoding() {
     assert!(RefKey::join("pkg/a.go", &encoded).is_err());
     assert!(RefKey::join("pkg/a.go", &[]).is_err());
 }
+
+#[test]
+fn an_edge_two_files_produce_survives_one_of_them_being_forgotten() {
+    // An edge is keyed by `(src, dst, kind)` and nothing else, so two files
+    // can produce the very same triple: two files of one package whose
+    // package-level references both reach the same target — every file in a
+    // package importing the same package, for instance. Removing one file's
+    // claim unconditionally used to delete the other's edge too.
+    //
+    // Nothing in the report notices: tallies are summed from per-file rows,
+    // never from the edge table. Only a whole-store comparison against a
+    // cold scan sees it, which is why the rule lives here, where it is one
+    // assertion instead of a corpus.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+    let shared = (go("m/pkg.Caller"), go("m/pkg.Foo"), 0);
+    store
+        .apply_refs(&RefBatch {
+            files: vec![
+                refs_of("pkg/b.go", "Foo", go("m/pkg.Foo")),
+                refs_of("pkg/c.go", "Foo", go("m/pkg.Foo")),
+            ],
+        })
+        .expect("apply refs");
+    assert!(store.snapshot().unwrap().edges.contains(&shared));
+
+    // Replacing one producer's half leaves the other's claim standing.
+    store
+        .apply_refs(&RefBatch {
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+        })
+        .expect("replace");
+    assert!(store.snapshot().unwrap().edges.contains(&shared));
+
+    // So does forgetting it outright.
+    store
+        .forget_files(&["pkg/b.go".to_string()])
+        .expect("forget");
+    assert!(
+        store.snapshot().unwrap().edges.contains(&shared),
+        "`pkg/c.go` still produces this edge",
+    );
+    assert!(store.has_edge(&shared.0, &shared.1, shared.2).unwrap());
+
+    // And the last producer going takes it, leaving nothing behind.
+    store
+        .forget_files(&["pkg/c.go".to_string()])
+        .expect("forget");
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.edges.contains(&shared), "nothing produces it now");
+    assert!(snapshot.edges.is_empty());
+    assert!(!store.has_edge(&shared.0, &shared.1, shared.2).unwrap());
+}

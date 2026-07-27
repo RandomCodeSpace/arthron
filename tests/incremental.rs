@@ -12,13 +12,51 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 
+use arthron::UnresolvedReason;
+use arthron::model::{Domain, NodeId, RefKind, node_id, reason_code};
 use arthron::pipeline::scan_go;
-use arthron::store::Store;
+use arthron::store::{Store, StoredOutcome};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
+}
+
+/// The identity a Go FQN hashes to.
+fn go(fqn: &str) -> NodeId {
+    node_id(Domain::Go, fqn)
+}
+
+/// The single stored outcome for one reference site.
+///
+/// Asserting on the row rather than on the tally is what makes these tests
+/// about *this* reference: a tally can stay put while two references swap
+/// outcomes.
+fn outcome(db: &Path, file: &str, raw_target: &str) -> StoredOutcome {
+    let rows = Store::open(db).expect("open").snapshot().unwrap().rows;
+    let mut found: Vec<StoredOutcome> = rows
+        .iter()
+        .filter(|(key, _)| key.file == file && key.raw_target == raw_target)
+        .map(|(_, row)| row.outcome.clone())
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one `{raw_target}` row in {file}, found {found:?}",
+    );
+    found.pop().expect("one row")
+}
+
+fn unresolved(reason: UnresolvedReason) -> StoredOutcome {
+    StoredOutcome::Unresolved(reason_code(&reason))
+}
+
+fn calls(db: &Path, src: &str, dst: &str) -> bool {
+    Store::open(db)
+        .expect("open")
+        .has_edge(&go(src), &go(dst), RefKind::Call.code())
+        .expect("edge lookup")
 }
 
 const SERVER: &str = concat!(
@@ -183,6 +221,352 @@ fn renaming_a_file_lands_the_same_state_as_a_cold_scan() {
     // move — and the importer, which was never edited, keeps its edge.
     fs::rename(root.join("util/util.go"), root.join("util/parse.go")).unwrap();
     scan_go(root, &db).expect("second scan");
+    assert_matches_cold(root, &db);
+}
+
+// ---------------------------------------------------------------------
+// Candidate invalidation: an edit that adds or removes a definition has to
+// reach the references in files nobody touched.
+//
+// Every test below edits one file and asserts about another. If the affected
+// set ever degenerates to "only the changed files", each of them fails —
+// which is the point, because the degenerate version passes any test whose
+// caller happens to sit in the file that changed.
+// ---------------------------------------------------------------------
+
+/// Calls a name its own package does not define — yet.
+const CALLER: &str = "package server\n\nfunc Call() {\n\tMissing()\n}\n";
+
+const MISSING: &str = "package server\n\nfunc Missing() {}\n";
+
+#[test]
+fn adding_a_definition_repoints_an_unresolved_caller_in_an_unchanged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(root, "server/caller.go", CALLER);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    assert_eq!(
+        outcome(&db, "server/caller.go", "Missing"),
+        unresolved(UnresolvedReason::NoMatchingDefinition),
+        "nothing declares it yet",
+    );
+
+    // A new file, in a package the caller already belongs to. The caller is
+    // not rewritten, so its hash still matches and the changed set holds one
+    // file it does not appear in.
+    write(root, "server/missing.go", MISSING);
+    scan_go(root, &db).expect("second scan");
+
+    assert_eq!(
+        outcome(&db, "server/caller.go", "Missing"),
+        StoredOutcome::Resolved(go("example.com/app/server.Missing")),
+    );
+    assert!(calls(
+        &db,
+        "example.com/app/server.Call",
+        "example.com/app/server.Missing",
+    ));
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn removing_it_again_returns_the_caller_to_unresolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(root, "server/caller.go", CALLER);
+    write(root, "server/missing.go", MISSING);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    assert!(calls(
+        &db,
+        "example.com/app/server.Call",
+        "example.com/app/server.Missing",
+    ));
+
+    fs::remove_file(root.join("server/missing.go")).unwrap();
+    scan_go(root, &db).expect("second scan");
+
+    assert_eq!(
+        outcome(&db, "server/caller.go", "Missing"),
+        unresolved(UnresolvedReason::NoMatchingDefinition),
+        "the definition is gone, so the edge must be too",
+    );
+    assert!(!calls(
+        &db,
+        "example.com/app/server.Call",
+        "example.com/app/server.Missing",
+    ));
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn a_higher_priority_definition_repoints_a_resolved_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    // `Parse` resolves through the dot-import — the *second* candidate. The
+    // miss on the first is indexed too, which is the only reason declaring
+    // it later can reach this file.
+    write(
+        root,
+        "server/dotter.go",
+        "package server\n\nimport . \"example.com/app/util\"\n\nfunc Dot() {\n\tParse(\"x\")\n}\n",
+    );
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    assert_eq!(
+        outcome(&db, "server/dotter.go", "Parse"),
+        StoredOutcome::Resolved(go("example.com/app/util.Parse")),
+    );
+
+    write(
+        root,
+        "server/parse.go",
+        "package server\n\nfunc Parse(s string) string { return s }\n",
+    );
+    scan_go(root, &db).expect("second scan");
+
+    assert_eq!(
+        outcome(&db, "server/dotter.go", "Parse"),
+        StoredOutcome::Resolved(go("example.com/app/server.Parse")),
+        "the same package outranks a dot-import",
+    );
+    assert!(calls(
+        &db,
+        "example.com/app/server.Dot",
+        "example.com/app/server.Parse",
+    ));
+    assert!(
+        !calls(
+            &db,
+            "example.com/app/server.Dot",
+            "example.com/app/util.Parse",
+        ),
+        "the edge re-points; it does not accumulate",
+    );
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn deleting_the_only_definition_of_a_package_removes_its_node_and_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    assert_eq!(
+        outcome(&db, "server/server.go", "util.Parse"),
+        StoredOutcome::Resolved(go("example.com/app/util.Parse")),
+    );
+
+    // The importer is never edited: both its import and its qualified call
+    // have to be woken by the deletion alone.
+    fs::remove_file(root.join("util/util.go")).unwrap();
+    scan_go(root, &db).expect("second scan");
+
+    assert_eq!(
+        outcome(&db, "server/server.go", "util.Parse"),
+        unresolved(UnresolvedReason::NoMatchingDefinition),
+    );
+    assert_eq!(
+        outcome(&db, "server/server.go", "example.com/app/util"),
+        unresolved(UnresolvedReason::NoMatchingDefinition),
+        "the package node went with its last file",
+    );
+    let snapshot = Store::open(&db).expect("reopen").snapshot().unwrap();
+    assert!(!snapshot.nodes.contains_key(&go("example.com/app/util")));
+    assert!(
+        !snapshot
+            .nodes
+            .contains_key(&go("example.com/app/util.Parse"))
+    );
+    assert!(
+        !snapshot
+            .edges
+            .iter()
+            .any(|(_, dst, _)| *dst == go("example.com/app/util")
+                || *dst == go("example.com/app/util.Parse")),
+        "no edge is left pointing at a node nothing declares",
+    );
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn an_unrelated_edit_wakes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(root, "server/caller.go", CALLER);
+    write(root, "server/missing.go", MISSING);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    let before = Store::open(&db).unwrap().snapshot().unwrap();
+
+    // A trailing comment: the file's hash moves, no line above it does, and
+    // it declares and removes nothing. Nothing outside it can be affected,
+    // so nothing outside it may be rewritten.
+    write(
+        root,
+        "server/server.go",
+        &format!("{SERVER}\n// unrelated\n"),
+    );
+    scan_go(root, &db).expect("second scan");
+    let after = Store::open(&db).unwrap().snapshot().unwrap();
+
+    assert_eq!(before.nodes, after.nodes);
+    assert_eq!(before.rows, after.rows);
+    assert_eq!(before.edges, after.edges);
+    assert_eq!(before.candidates, after.candidates);
+    assert_ne!(
+        before.files, after.files,
+        "the edited file's hash is the one thing that moved",
+    );
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn the_candidate_index_names_only_the_files_that_probed_an_identity() {
+    // The bound on the affected set, asserted where it is decided. Without
+    // this, "wake the files that probed it" and "wake every file" are
+    // indistinguishable on a fixture where they coincide.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(
+        root,
+        "server/a.go",
+        "package server\n\nfunc A() {\n\tMissing()\n}\n",
+    );
+    write(
+        root,
+        "server/b.go",
+        "package server\n\nfunc B() {\n\tMissing()\n}\n",
+    );
+    write(
+        root,
+        "server/c.go",
+        "package server\n\nfunc C() {\n\thelper()\n}\n",
+    );
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("scan");
+
+    let rows = Store::open(&db)
+        .unwrap()
+        .rows_for(&[go("example.com/app/server.Missing")])
+        .unwrap();
+    let files: BTreeSet<&str> = rows.iter().map(|key| key.file.as_str()).collect();
+    assert_eq!(
+        files,
+        BTreeSet::from(["server/a.go", "server/b.go"]),
+        "only the files that probed the identity, not every file in the package",
+    );
+}
+
+#[test]
+fn an_affected_file_that_also_changed_is_resolved_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(root, "server/caller.go", CALLER);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+
+    // One event that both declares the identity and edits the file that
+    // probed it. The caller is in the changed set *and* named by the index,
+    // so the two selections overlap and the event must resolve it once.
+    write(root, "server/missing.go", MISSING);
+    write(root, "server/caller.go", &format!("// edited\n{CALLER}"));
+    scan_go(root, &db).expect("second scan");
+
+    let rows = Store::open(&db).unwrap().snapshot().unwrap().rows;
+    let caller: Vec<_> = rows
+        .iter()
+        .filter(|(key, _)| key.file == "server/caller.go" && key.raw_target == "Missing")
+        .collect();
+    assert_eq!(caller.len(), 1, "one row, not one per pass: {caller:?}");
+    assert_eq!(caller[0].1.count, 1, "one occurrence, counted once");
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn cold_equals_warm_survives_every_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    write(root, "server/caller.go", CALLER);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("initial scan");
+
+    // Add the definition the caller wants.
+    write(root, "server/missing.go", MISSING);
+    scan_go(root, &db).expect("add");
+
+    // Rename it: one identity added and one removed in a single event, both
+    // of which the caller probed.
+    write(
+        root,
+        "server/missing.go",
+        "package server\n\nfunc Renamed() {}\n",
+    );
+    scan_go(root, &db).expect("edit");
+
+    // Take the whole file away.
+    fs::remove_file(root.join("server/missing.go")).unwrap();
+    scan_go(root, &db).expect("delete");
+
+    // And put it back.
+    write(root, "server/missing.go", MISSING);
+    scan_go(root, &db).expect("add back");
+
+    assert_eq!(
+        outcome(&db, "server/caller.go", "Missing"),
+        StoredOutcome::Resolved(go("example.com/app/server.Missing")),
+    );
+    assert_matches_cold(root, &db);
+}
+
+#[test]
+fn inserting_a_declaration_above_another_changes_no_unrelated_node_id() {
+    // The executable form of FQN grammar invariant 3: no identity may carry
+    // an occurrence-order component. If one did, everything below an insert
+    // would re-key, every stored edge would dangle, and an incremental scan
+    // would quietly rebuild half the graph.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("first scan");
+    let before: BTreeSet<NodeId> = Store::open(&db)
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .nodes
+        .into_keys()
+        .collect();
+
+    write(
+        root,
+        "util/util.go",
+        "package util\n\nfunc Added() {}\n\nfunc Parse(s string) string { return s }\n",
+    );
+    scan_go(root, &db).expect("second scan");
+    let after: BTreeSet<NodeId> = Store::open(&db)
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .nodes
+        .into_keys()
+        .collect();
+
+    let lost: Vec<&NodeId> = before.difference(&after).collect();
+    assert!(
+        lost.is_empty(),
+        "identities an unrelated insert moved: {lost:?}"
+    );
+    assert!(after.contains(&go("example.com/app/util.Added")));
     assert_matches_cold(root, &db);
 }
 
