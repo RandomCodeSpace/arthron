@@ -21,7 +21,11 @@
 //! corpus's 15 source-root names across 47 directories, which mill selects
 //! among per Scala version and per platform, do not enter one identity — and
 //! the cross-build hazard they create shows up where it belongs, as *several
-//! files declaring one FQN*, counted rather than silently merged.
+//! files declaring one FQN*, counted rather than silently merged. All 26 of
+//! them: [`crate::lang::Resolver::stores_as_package`] keeps an `object` —
+//! a container in the FQN grammar, a declaration in the graph — out of the
+//! package nodes, because a package declared by every file under it is not a
+//! collision and an `object` written once per build configuration is.
 //!
 //! # What tier 2 means here, stated so nobody has to infer it
 //!

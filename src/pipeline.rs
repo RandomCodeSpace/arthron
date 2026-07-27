@@ -466,7 +466,7 @@ fn phase_one<L: Language>(
             // hand the resolver a one-step cycle to detect at every probe.
             .filter(|t| *t != id)
             .collect();
-        let payload = if def.kind == DefKind::Module {
+        let payload = if rs.stores_as_package(def) {
             NodePayload::Package((!def.name.is_empty()).then(|| def.name.clone()))
         } else if targets.is_empty() {
             NodePayload::Definition(def.kind.code(), def.facets.bits())

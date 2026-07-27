@@ -94,8 +94,11 @@
 //!   quotes.reflect.*` start at a macro context or a `given` — a value whose
 //!   *type* names the container. The first segment binds nothing in any
 //!   package or object, so the path is `UnknownPackage`, which understates
-//!   what a reader can see. Distinguishing it needs the declared type of a
-//!   local, which is type-directed resolution, which is the tier.
+//!   what a reader can see: 45 of that reason's 305 rows in the measured
+//!   corpus name no package at all. Mislabelled in the conservative
+//!   direction — every one of them counts *against* the rate — and
+//!   distinguishing them needs the declared type of a local, which is
+//!   type-directed resolution, which is the tier.
 //! - **A class's own members, from an import written inside it.** `class C {
 //!   object H; import H.x }` is real Scala: the members of an enclosing
 //!   template are in scope. The chain a site carries stops at the first
@@ -113,18 +116,22 @@
 //!   [`UnresolvedReason::WildcardImport`], because at tier 2 no later
 //!   reference depends on that set and there is no site at which the reason
 //!   could be the answer. A tier-1 Scala track is what would earn it.
-//! - **The build configuration.** 13 fully-qualified names in the measured
+//! - **The build configuration.** 26 fully-qualified names in the measured
 //!   corpus are each written in two or three source roots, one per platform
-//!   or Scala version. The graph holds the union, `mergeable` says so, and a
-//!   path naming one of them resolves to an identity several files declare.
+//!   or Scala version — nine `object`s, six types and eleven members. The
+//!   graph holds the union, `mergeable` says so, and a path naming one of
+//!   them resolves to an identity several files declare. The nine `object`s
+//!   are countable only because [`ScalaResolver::stores_as_package`] files a
+//!   container that is a *term* as a definition; a package node several
+//!   files declare is not a collision and never could be.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::lang::{FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe};
 use crate::model::{
-    DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, RefTarget, Reference, TargetRoot,
-    node_id,
+    DeclSpace, DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, RefTarget, Reference,
+    TargetRoot, node_id,
 };
 use crate::track_scala::extract::{ImportBinding, ScalaExtractor, ScalaHeader};
 use crate::track_scala::lang::{
@@ -428,19 +435,38 @@ impl Resolver<ScalaLang> for ScalaResolver {
         Vec::new()
     }
 
+    fn stores_as_package(&self, def: &Definition) -> bool {
+        // Scala files two different things under `DefKind::Module`, and only
+        // one of them is a package. `package p` and `package object p` are
+        // namespaces: every file under `p` reopens it, and a node several
+        // files declare is what a package *is*. `object O` is a term — a
+        // single declaration that happens to be a container in the FQN
+        // grammar — and two files declaring one are two entities, exactly as
+        // two files declaring one `class` are.
+        //
+        // The extractor already separated them, in `space_of_container`; this
+        // is where that distinction reaches the graph. Without it an `object`
+        // written once per build configuration would be stored as one package
+        // node with several declaration sites, contribute nothing to
+        // `fqn_collisions`, and never reach `mergeable` below — the union
+        // over build configurations would hold, but nothing would count it.
+        def.kind == DefKind::Module && def.space == DeclSpace::Namespace
+    }
+
     fn mergeable(&self, _a: &Definition, _b: &Definition) -> bool {
         // Two *declarations* sharing an FQN are two entities, never one. The
         // measured corpus is built across five Scala versions and three
-        // platforms, and 13 fully-qualified names are each written in two or
+        // platforms, and 26 fully-qualified names are each written in two or
         // three source roots — `upickle.WebJson` in `src-js`, `src-jvm` and
         // `src-native`, `upickle.core.compat.SortInPlace` in `src-2.12` and
         // `src-2.13+`. Every one of them is real under its own build, the
         // graph holds the union over configurations, and merging them would
         // hide exactly that.
         //
-        // A *package* never reaches this question: it is stored as a package
-        // node rather than a definition, and being declared by every file in
-        // it is what a package is.
+        // A *package* never reaches this question, because
+        // `stores_as_package` above already answered `true` for it and being
+        // declared by every file in it is what a package is. An `object`
+        // does reach it, and the answer is the same `false` a `class` gets.
         false
     }
 
@@ -653,11 +679,50 @@ mod tests {
     }
 
     #[test]
-    fn a_companion_pair_never_shares_an_identity() {
+    fn a_companion_pair_under_a_package_never_shares_an_identity() {
         let class = fqn(&[".p"], &def_of(DefKind::Type, "Foo"));
         let object = fqn(&[".p"], &def_of(DefKind::Module, "Foo"));
         assert_eq!(class, "_root_.p#Foo");
         assert_eq!(object, "_root_.p.Foo");
+    }
+
+    #[test]
+    fn a_companion_pair_under_a_type_does_share_one() {
+        // The cost of the one-crossing grammar, recorded rather than left to
+        // be discovered: the `#` is spent on `C`, so every segment below it
+        // is dotted and the term/type distinction that separated the pair
+        // above has nowhere left to be written. The two merge into one node
+        // carrying both declaration sites. Both sites are in one file — a
+        // companion pair has to be — so this never reaches the cross-build
+        // count; the corpus test names all nine such pairs in upickle.
+        let class = fqn(&[".p", "C"], &def_of(DefKind::Type, "X"));
+        let object = fqn(&[".p", "C"], &def_of(DefKind::Module, "X"));
+        assert_eq!(class, "_root_.p#C.X");
+        assert_eq!(object, class);
+    }
+
+    #[test]
+    fn an_object_is_a_definition_and_a_package_is_a_package() {
+        // The two share `DefKind::Module`, and only the space tells them
+        // apart. Storing an `object` as a package node would give it a
+        // record that is exempt from the collision count by design, so a
+        // cross-built one would keep both its declaration sites and be
+        // counted nowhere.
+        let object = def_of(DefKind::Module, "Foo");
+        assert_eq!(object.space, DeclSpace::Value);
+        assert!(!ScalaResolver.stores_as_package(&object));
+
+        let package = Definition {
+            space: DeclSpace::Namespace,
+            ..def_of(DefKind::Module, "p")
+        };
+        assert!(ScalaResolver.stores_as_package(&package));
+
+        // Everything that is not a container answers `false` whatever its
+        // space, exactly as the default does.
+        for kind in [DefKind::Type, DefKind::Function, DefKind::Const] {
+            assert!(!ScalaResolver.stores_as_package(&def_of(kind, "x")));
+        }
     }
 
     #[test]

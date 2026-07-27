@@ -27,7 +27,11 @@
 //!    directories are selected among per build. arthron measures the *tree*,
 //!    so several files declare one FQN — and the count of those is asserted,
 //!    because a resolver that quietly merged them would report a cleaner
-//!    graph than the repository has.
+//!    graph than the repository has. Containers are in that count: an
+//!    `object` shares `DefKind::Module` with a package, and one filed as a
+//!    package node would keep both its declaration sites and still count
+//!    nothing, because a package several files declare is not a collision.
+//!    Both sides of that rule are asserted by name here.
 //! 4. **The ratchet.** The counts are compared against
 //!    `baselines/scala-upickle.toml` through the same
 //!    [`arthron::gate::evaluate`] the `arthron gate` command uses, so a rate
@@ -113,23 +117,42 @@ const DEFS: &[(DefKind, u64)] = &[
 /// censuses is the point: the extractor's says nothing was lost on the way
 /// in, the store's says nothing was lost or over-merged on the way through.
 ///
-/// `DefKind::Module` is absent because the driver files a module as a
-/// *package* node rather than a definition; those are counted by
-/// [`PACKAGES`] instead.
+/// `DefKind::Module` is present and counts **objects only**. Scala files an
+/// `object` and a package under one kind, and `Resolver::stores_as_package`
+/// is where they part: a package is a namespace every file under it reopens
+/// and becomes a package node ([`PACKAGES`]), an `object` is a term written
+/// once and becomes a definition — which is what puts a cross-built one into
+/// [`COLLISIONS`] instead of merging it into a package node that counts
+/// nothing.
+///
+/// `Type` is 447 rather than the 438 the previous split recorded, and the
+/// nine are named in the test body: a companion `class` and `object` nested
+/// *inside* a type share one FQN, because the grammar spends its single `#`
+/// crossing on the enclosing type and dots every segment below it. The pair
+/// merges into one node whose kind is its first declaring site's — a
+/// property of the one-crossing grammar, not of this census, and one both
+/// sites of the pair are recorded on.
 const STORED: &[(DefKind, u64)] = &[
     (DefKind::Function, 534),
     (DefKind::Method, 686),
-    (DefKind::Type, 438),
+    (DefKind::Type, 447),
     (DefKind::Const, 283),
     (DefKind::Var, 40),
     (DefKind::Constructor, 14),
+    (DefKind::Module, 348),
 ];
 
-/// Package nodes: every package this repository declares, every `object`, and
-/// the unnamed root package two files sit in — 592 module definitions in, 375
-/// identities out, which is what `package upickle.core` written in
-/// twenty-seven files looks like from the other side.
-const PACKAGES: u64 = 375;
+/// Package nodes: every package this repository declares, and nothing else.
+///
+/// Eighteen — the seventeen named packages plus the unnamed root package two
+/// files sit in. Small on purpose: a package node is the one record several
+/// files may declare without that being a collision, so anything filed here
+/// that is *not* a package is a cross-build duplicate the report can never
+/// count. `package upickle.core`, written in twenty-seven files, is one
+/// identity here; the 357 `object` identities that used to land beside it are
+/// definitions now — 348 of them under `Module` in [`STORED`], and nine
+/// merged into the nested companion types described there.
+const PACKAGES: u64 = 18;
 
 /// External nodes. **Zero, and asserted rather than observed.** Scala's
 /// platform roots and its build's Maven coordinates are both outside this
@@ -140,12 +163,18 @@ const EXTERNALS: u64 = 0;
 
 /// Distinct FQNs a definition in more than one file claims.
 ///
-/// The union over build configurations, counted. `upickle.WebJson` is written
-/// in `src-js`, `src-jvm` and `src-native`; `upickle.core.compat.Factory` in
-/// `src-2.12` and `src-2.13+`. Every one is real under its own build and none
-/// is merged, because merging would report a cleaner graph than the
-/// repository has.
-const COLLISIONS: u64 = 17;
+/// The union over build configurations, counted — **containers included**.
+/// `upickle.WebJson` is written in `src-js`, `src-jvm` and `src-native`;
+/// `upickle.core.compat.Factory` in `src-2.12` and `src-2.13+`; the `object
+/// upickle.core.compat.SortInPlace` that carries the second of those is in
+/// both roots too, and is counted on its own line rather than folded into
+/// the package node its kind would otherwise have put it in. Every one is
+/// real under its own build and none is merged, because merging would report
+/// a cleaner graph than the repository has.
+///
+/// A *package* is deliberately not here: `upickle.core` is declared by
+/// twenty-seven files and that is what a package is, not a collision.
+const COLLISIONS: u64 = 26;
 
 /// Named nodes, spelled out: `(fqn, kind, declaring file, line)`.
 ///
@@ -153,6 +182,11 @@ const COLLISIONS: u64 = 17;
 /// Visitor` and `object Visitor` cannot both be right unless the term and
 /// type namespaces stayed apart, and `ujson.read` cannot be right unless a
 /// `package object`'s members landed in the package.
+///
+/// The kind column is load-bearing twice over. An `object` is
+/// `Definition(Module)` and a package is `Package`, and the two records are
+/// not interchangeable: only the first can be a [`COLLISIONS`] entry, so an
+/// `object` filed as a package is a cross-build duplicate nothing counts.
 const PINNED: &[(&str, NodeKind, &str, u32)] = &[
     // The companion pair, thirteen lines apart in one file: the trait is a
     // member of the package and the object *is* a container, so they are two
@@ -165,7 +199,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
     ),
     (
         "_root_.upickle.core.Visitor",
-        NodeKind::Package,
+        NodeKind::Definition(DefKind::Module),
         "upickle/core/src/upickle/core/Visitor.scala",
         155,
     ),
@@ -210,16 +244,55 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
     // qualified clause.
     (
         "_root_.upickle.default",
-        NodeKind::Package,
+        NodeKind::Definition(DefKind::Module),
         "upickle/src/upickle/Api.scala",
         187,
     ),
     (
         "_root_.upickletest.Flatten",
-        NodeKind::Package,
+        NodeKind::Definition(DefKind::Module),
         "upickle/test/src/upickletest/MacroTests.scala",
         148,
     ),
+    // The package that holds them, at one of its twenty-seven sites: still a
+    // package node, and still not a collision however many files reopen it.
+    (
+        "_root_.upickle.core",
+        NodeKind::Package,
+        "upickle/core/src/upickle/core/Visitor.scala",
+        1,
+    ),
+    // A cross-built **object**, at its second source root. The corpus
+    // provenance names this one as the case the corpus exists to expose, and
+    // filing it as a package node is what used to make it uncountable.
+    (
+        "_root_.upickle.core.compat.SortInPlace",
+        NodeKind::Definition(DefKind::Module),
+        "upickle/core/src-2.13+/upickle/core/compat/SortInPlace.scala",
+        3,
+    ),
+];
+
+/// Companion pairs nested *inside* a type, which the FQN grammar merges.
+///
+/// The grammar spends its one `#` crossing on the enclosing type, so a
+/// `class X` and an `object X` written inside `trait T` are both
+/// `…#T.X` and become one node with two declaration sites in one file.
+/// Named here rather than left in a census delta: it is a known cost of the
+/// one-crossing grammar, it is what makes [`STORED`]'s `Type` count nine
+/// higher than the object/package split alone, and a change to the grammar
+/// must move this list deliberately. Same file both sites, so none of these
+/// is a [`COLLISIONS`] entry — and none should become one.
+const NESTED_COMPANIONS: &[&str] = &[
+    "_root_.upickle#LegacyApi.TaggedReaderState",
+    "_root_.upickle.core#Types.ReadWriter",
+    "_root_.upickle.core#Types.Reader",
+    "_root_.upickle.core#Types.TaggedReadWriter",
+    "_root_.upickle.core#Types.TaggedReader",
+    "_root_.upickle.core#Types.TaggedWriter",
+    "_root_.upickle.core#Types.Writer",
+    "_root_.upickletest#MixedIn.Trt1.ClsA",
+    "_root_.upickletest#MixedIn.Trt2.ClsB",
 ];
 
 #[test]
@@ -346,13 +419,19 @@ fn the_scala_track_drops_nothing_and_holds_its_baseline() {
     // bugs:
     //
     // `UnknownPackage` is every path whose first segment binds in no scope
-    // this repository declares. Three shapes, and 166 of its 305 rows are
-    // the first: the platform roots `scala.*` (105 rows) and `java.*` (61);
-    // the Maven artifacts `build.mill` names without stating the package
-    // prefixes they ship (`utest`, `io.circe`, `play.api`, `argonaut`,
-    // `acyclic`); and the path-dependent imports `import c.universe._` and
-    // `import quotes.reflect.*`, which start at a term whose *type* names
-    // the container.
+    // this repository declares. The count asserted below is 309
+    // *occurrences* over 305 deduplicated rows — a row is one edge source
+    // naming one target, and four of them are written twice in their own
+    // file. Three shapes, and 166 of the 305 rows are the first: the
+    // platform roots `scala.*` (105 rows) and `java.*` (61); the Maven
+    // artifacts `build.mill` names without stating the package prefixes they
+    // ship (`utest`, `io.circe`, `play.api`, `argonaut`, `acyclic`); and the
+    // 45 path-dependent rows `import c.universe._` and `import
+    // quotes.reflect.*`, which start at a term whose *type* names the
+    // container. The last shape names no package, so the reason is wrong
+    // about it — wrong in the direction that costs the rate, since every one
+    // of the 45 counts against it, and `track_scala::resolve` records why
+    // naming them properly is a tier-1 question.
     assert_eq!(reasons.get("UnknownPackage").copied(), Some(309));
     // `NoMatchingDefinition` is dominated by one shape, and it is a tier
     // boundary rather than a bug: `import upickle.default.read` names a
@@ -375,6 +454,7 @@ fn the_scala_track_drops_nothing_and_holds_its_baseline() {
     let mut packages = 0u64;
     let mut externals = 0u64;
     let mut multi_file: BTreeSet<String> = BTreeSet::new();
+    let mut multi_file_packages: BTreeSet<String> = BTreeSet::new();
     read.for_each_node(|_, record| {
         match record {
             NodeRecord::Definition {
@@ -389,7 +469,17 @@ fn the_scala_track_drops_nothing_and_holds_its_baseline() {
                     multi_file.insert(fqn);
                 }
             }
-            NodeRecord::Package { .. } => packages += 1,
+            NodeRecord::Package {
+                import_path,
+                declarations,
+                ..
+            } => {
+                packages += 1;
+                let files: BTreeSet<&str> = declarations.iter().map(|d| d.file.as_str()).collect();
+                if files.len() > 1 {
+                    multi_file_packages.insert(import_path);
+                }
+            }
             NodeRecord::External { .. } => externals += 1,
         }
         Ok(())
@@ -417,8 +507,72 @@ fn the_scala_track_drops_nothing_and_holds_its_baseline() {
         "_root_.upickle#WebJson",
         "_root_.upickle.core.compat#Factory",
         "_root_.upickle.implicits#MacroImplicits",
+        // Containers, and the reason this list is 26 and not 17: an `object`
+        // written once per build configuration is a *declaration* several
+        // files make, exactly as the type beside it is. Filed as a package
+        // node it would carry both sites and count nothing, and
+        // `upickle.core.compat.SortInPlace` — the name the corpus
+        // provenance calls out — would be the one it hid.
+        "_root_.upickle.core.compat.SortInPlace",
+        "_root_.upickle.core.compat.DistinctBy",
+        "_root_.upickle.core.compat.LinkedHashMapCompat",
+        "_root_.upickletest.Main",
+        "_root_.upickle.withTimeout",
+        "_root_.upickletest.withTimeout",
+        "_root_.ujson.DoubleToDecimalElem",
+        "_root_.ujson.FloatToDecimalElem",
+        "_root_.ujson.MathUtilsElem",
     ] {
         assert!(multi_file.contains(one), "{one} is not cross-built");
+    }
+
+    // The other side of the same rule: a package node really is declared by
+    // every file under it, and that is not a collision. Pinned by name, so
+    // that a container wrongly filed as a package shows up here as an
+    // *addition* rather than as a silent subtraction from `COLLISIONS`.
+    println!("             multi-file packages {multi_file_packages:?}");
+    let want: BTreeSet<String> = [
+        "_root_",
+        "_root_.ujson",
+        "_root_.upack",
+        "_root_.upickle",
+        "_root_.upickle.core",
+        "_root_.upickle.core.compat",
+        "_root_.upickle.implicits",
+        "_root_.upickle.implicits.internal",
+        "_root_.upickle.implicits.namedTuples",
+        "_root_.upickle.jsonschema",
+        "_root_.upickletest",
+        "_root_.upickletest.example",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        multi_file_packages, want,
+        "a node several files declare is filed as a package and counts as no \
+         collision; every one of them must be a package",
+    );
+
+    // The one merge the FQN grammar does make, named rather than left in a
+    // census delta. Both sites are in one file, so none of these is — or may
+    // become — a `COLLISIONS` entry.
+    for fqn in NESTED_COMPANIONS {
+        let id = node_id(Domain::Scala, fqn);
+        let def = definition(&read, &id)
+            .unwrap_or_else(|e| panic!("{fqn}: {e}"))
+            .unwrap_or_else(|| panic!("{fqn} is not in the store"));
+        let files: BTreeSet<&str> = def.declarations.iter().map(|d| d.file.as_str()).collect();
+        assert_eq!(
+            def.declarations.len(),
+            2,
+            "{fqn} is not the companion pair this list records",
+        );
+        assert_eq!(files.len(), 1, "{fqn} is cross-built, not a nested pair");
+        assert!(
+            !multi_file.contains(*fqn),
+            "{fqn} became a cross-build collision",
+        );
     }
 
     // -- the named nodes ---------------------------------------------------

@@ -87,12 +87,15 @@ pub struct ScalaLang;
 ///
 /// That is not a shortcut around the measured corpus's hardest property. The
 /// build there selects among 15 source-root names across 47 directories per
-/// (Scala version, platform) combination, and 13 fully-qualified names are
-/// each written in two or three of those roots. Reading the build would not
-/// help a bit: mill's `PlatformScalaModule` picks a root per *build*, and a
-/// scan measures the tree, so the honest graph holds the union over
-/// configurations and records the duplicate declarations. `Resolver::mergeable`
-/// is where that is said, and the corpus test is where it is counted.
+/// (Scala version, platform) combination, and 26 fully-qualified names are
+/// each written in two or three of those roots — nine `object`s, six types
+/// and eleven members. Reading the build would not help a bit: mill's
+/// `PlatformScalaModule` picks a root per *build*, and a scan measures the
+/// tree, so the honest graph holds the union over configurations and records
+/// the duplicate declarations. `Resolver::mergeable` is where that is said,
+/// `Resolver::stores_as_package` is what keeps the nine `object`s countable
+/// rather than folded into package nodes, and the corpus test is where the
+/// 26 are counted.
 ///
 /// So the digest is empty and a Scala scan is never invalidated by a manifest
 /// — which is the contract [`crate::lang::Resolver::config_digest`] already
