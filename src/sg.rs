@@ -99,6 +99,16 @@ impl SourceTree {
         Self::parse(SupportLang::Rust, source)
     }
 
+    /// Parse Scala source.
+    ///
+    /// One grammar for every dialect: Scala 2 and Scala 3 differ in surface
+    /// syntax the same tree-sitter grammar reads — `import a._` and `import
+    /// a.*` are both wildcards, `=>` and `as` are both renames — and a
+    /// repository that cross-builds writes both in one tree.
+    pub fn parse_scala(source: &str) -> Self {
+        Self::parse(SupportLang::Scala, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -246,6 +256,16 @@ rule:
             "id: t\nlanguage: rust\nrule:\n  kind: function_item\n",
             "function_item",
             "hi",
+        );
+    }
+
+    #[test]
+    fn parses_scala() {
+        one_match(
+            &SourceTree::parse_scala("package p\nclass Greeter { def hi(): Unit = () }\n"),
+            "id: t\nlanguage: scala\nrule:\n  kind: class_definition\n",
+            "class_definition",
+            "Greeter",
         );
     }
 }

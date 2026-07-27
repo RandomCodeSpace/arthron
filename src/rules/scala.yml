@@ -1,0 +1,52 @@
+id: package-clause
+language: scala
+rule:
+  kind: package_clause
+---
+id: package-object
+language: scala
+rule:
+  kind: package_object
+---
+id: import
+language: scala
+rule:
+  kind: import_declaration
+---
+id: def-object
+language: scala
+rule:
+  kind: object_definition
+---
+id: def-type
+language: scala
+rule:
+  any:
+    - kind: class_definition
+    - kind: trait_definition
+    - kind: enum_definition
+    - kind: type_definition
+---
+id: def-enum-case
+language: scala
+rule:
+  any:
+    - kind: simple_enum_case
+    - kind: full_enum_case
+---
+id: def-function
+language: scala
+rule:
+  any:
+    - kind: function_definition
+    - kind: function_declaration
+---
+id: def-value
+language: scala
+rule:
+  any:
+    - kind: val_definition
+    - kind: val_declaration
+    - kind: var_definition
+    - kind: var_declaration
+    - kind: given_definition
