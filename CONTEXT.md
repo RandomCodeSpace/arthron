@@ -79,6 +79,23 @@ An edge a framework rule adds, provenanced by its framework and counted per
 framework. Framework coverage never moves a language's resolution rate.
 _Avoid_: magic edge, implicit edge
 
+**Framework node**:
+A node a framework rule mints in its own namespace: a route, a property key,
+a settings key. Counted only in that framework's tally.
+_Avoid_: virtual node, synthetic node
+
+**Framework site**:
+One place a framework rule fired. The unit the framework coverage rate is
+computed over. A site emitting several edges is one site.
+_Avoid_: framework reference
+
+**Policy reason**:
+A framework outcome no rule improvement can change, because arthron does not
+execute code or touch the network. Reported beside the rate, excluded from
+both terms, and gated on drift — the same treatment `LocalBinding` gets one
+layer down.
+_Avoid_: skipped, ignored
+
 **Corpus**:
 A pinned, vendored snapshot of real source against which resolution rate is
 measured.
