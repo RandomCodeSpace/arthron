@@ -4,6 +4,68 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — The gate is a command with an exit code, and a baseline it cannot game
+
+`arthron gate <corpus> --baseline <file> [--db <path>] [--rebase]` scans a
+corpus and compares its per-language counts against a committed baseline.
+Exit `0` pass, `1` regression, `2` usage or I/O error. Resolution rate is the
+primary gate and it now has a mechanism instead of a paragraph.
+
+**The baselines are measured, and here they are.** Release build, cold store,
+at the candidate-invalidation commit:
+
+| Corpus | resolved | external | local-binding | unresolved | rate |
+|---|---|---|---|---|---|
+| `go/codeiq` | 4467 | 6085 | 4276 | 799 | 84.8% |
+| `go/caddy` | 3006 | 9571 | 9425 | 1815 | 62.4% |
+
+Both totals conserve: `4467 + 6085 + 4276 + 799 = 15627` extracted references
+on the first corpus, `3006 + 9571 + 9425 + 1815 = 23817` on the second — the
+same totals as before the binding-environment fix moved references between
+categories. `--rebase` refuses to write a baseline whose four counts sum to
+zero, because an all-zero file looks exactly as authoritative as a correct one
+and every later run would bless it.
+
+**The rate is not stored, only its two terms are.** Comparison is exact
+rational arithmetic in `u128` — `now.resolved × was_denom` against
+`was.resolved × now_denom` — never floats. At corpus scale a float comparison
+is accurate enough; the reason to refuse it is that a stored rate can disagree
+with the counts beside it, and then the file no longer says one thing.
+*Rejected:* storing the rate as a third number.
+
+**`local_binding` and `external` drift fail the gate unconditionally.** Both
+sit outside *both* terms, so moving references into either raises the rate
+while deleting real edges — the exact shape of an over-approximating binding
+environment passing for a fix. Demonstrated: a baseline claiming a *lower*
+rate than the run measured still fails when its `local_binding` differs, so an
+"improvement" bought by reclassification cannot land silently. A capability
+that legitimately moves `external` re-bases; it never quietly compares.
+*Rejected:* a tolerance band on either count — a threshold is a budget, and a
+budget gets spent.
+
+**A zero denominator is an error, not a pass.** A rate of zero and the absence
+of any reference are different facts, and a gate that called the second one
+green would bless a total collapse.
+
+**The baseline format is flat TOML — `key = value`, `#` comments, no tables —
+read by a strict reader in this tree.** A table header, an unknown key, a
+duplicate key, a missing key, a non-numeric or overflowing count, or a format
+version this build does not know is an error, loudly. A baseline that silently
+reads as zeros is worse than no baseline.
+*Rejected:* `toml` + `serde` for six scalars, in a tree that has neither.
+
+**The default store is a fresh temporary one, deleted after the run.** A warm
+store would gate on whatever the previous run happened to leave behind.
+`--db` exists to keep the graph for inspection and is documented as such.
+
+**`corpus` and `commit` are provenance: printed, never verified.** A vendored
+corpus snapshot carries no git metadata to check them against, so a check
+would be theatre. What guards against a baseline recorded from the wrong run
+is that the regeneration command is a comment inside the file and the numbers
+are quoted here, where a mismatch is visible in review.
+
+---
+
 ## 2026-07-27 — Candidate invalidation: an edit reaches the files it changed the answer for
 
 An edit that adds or removes a definition now re-resolves the references in
