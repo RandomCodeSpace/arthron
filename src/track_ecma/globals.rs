@@ -27,6 +27,7 @@ pub const ES_GLOBALS: &[&str] = &[
     "Boolean",
     "DataView",
     "Date",
+    "Error",
     "EvalError",
     "FinalizationRegistry",
     "Float32Array",
@@ -213,6 +214,28 @@ mod tests {
         assert_eq!(external_key("process"), Some("node:global"));
         assert_eq!(external_key("console"), Some("web:global"));
         assert_eq!(external_key("parse"), None);
+    }
+
+    #[test]
+    fn the_error_constructors_are_present_as_a_family() {
+        // `Error` was absent while all seven of its own subclasses were
+        // listed — an omission, not the deliberate conservatism the module
+        // header describes, which names host types real projects redeclare.
+        // A missing global is not a harmless miss: it reports
+        // `NoMatchingDefinition`, which says the lookup table was complete
+        // and the name absent, and for `new Error(...)` neither half is true.
+        for name in [
+            "Error",
+            "AggregateError",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+        ] {
+            assert_eq!(external_key(name), Some("js:global"), "{name}");
+        }
     }
 
     #[test]

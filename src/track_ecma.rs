@@ -1,4 +1,4 @@
-//! The EcmaScript track. **Not live.** Owns `.js`, `.mjs`, `.cjs` and `.ts`.
+//! The EcmaScript track. **Live.** Owns `.js`, `.mjs`, `.cjs` and `.ts`.
 //!
 //! One track, **two languages**. JavaScript and TypeScript share
 //! [`crate::model::Domain::EcmaScript`] because a `.ts` file naming a
@@ -10,14 +10,14 @@
 //! report line each, and no combined EcmaScript number is ever produced. One
 //! number would let a collapse in one of them be masked by the other.
 //!
-//! [`TRACK`] is registered with `scan: None`, so the driver runs nothing and
-//! [`crate::registry::Track::owns_extension`] answers `false` for all four
-//! extensions. `.d.ts` needs no rule: its extension is `ts`.
+//! [`TRACK`] is registered with `scan: Some(scan_ecma)`, so the driver runs
+//! both passes and [`crate::registry::Track::owns_extension`] answers `true`
+//! for all four extensions. `.d.ts` needs no rule: its extension is `ts`.
 //!
-//! # Going live
+//! # How it went live
 //!
-//! Every step happens inside this file or under `src/track_ecma/`. Nothing in
-//! `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track moves.
+//! Every step happened inside this file or under `src/track_ecma/`. Nothing in
+//! `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track moved.
 //!
 //! 1. **Submodules, nested.** *Landed.* [`extract`], [`lang`] and the
 //!    private `bind` resolve to `src/track_ecma/*.rs`; `lib.rs` already
@@ -40,7 +40,8 @@
 //!    [`crate::sg::SourceTree::parse_typescript`]. It emits
 //!    [`crate::model::Definition`] and [`crate::model::Reference`] records
 //!    and **never an edge**.
-//! 4. **One resolver** — *next* — implementing [`crate::lang::Resolver`] for both impls:
+//! 4. **One resolver.** *Landed* as [`resolve::EcmaResolver`], implementing
+//!    [`crate::lang::Resolver`] for both impls:
 //!    the same linking code, so a `.ts` file and a `.js` file resolve against
 //!    one symbol table in one identity space. It is the only place an
 //!    [`crate::Outcome`] is produced, and it never drops: every reference
@@ -63,13 +64,13 @@
 //!    wakes the files that probed an identity that later appeared, so the end
 //!    state is correct either way; the track still has to say which order it
 //!    runs and why, and prove it with a cold-versus-incremental comparison.
-//! 7. **An entry point** with the shape of [`crate::registry::TrackScan`]:
-//!    `fn scan_ecma(root, db)`, driving both impls through
+//! 7. **An entry point** with the shape of [`crate::registry::TrackScan`].
+//!    *Landed* as [`scan_ecma`], driving both impls through
 //!    [`crate::pipeline::scan`] and returning the later report.
-//! 8. **Flip the switch here**: `scan: None` becomes `scan: Some(scan_ecma)`.
-//! 9. **Two baselines, never one.** `arthron gate` compares per language; a
-//!    baseline file names the language it measures and refuses to be compared
-//!    against another's scan.
+//! 8. **The switch, here.** *Landed*: `scan: None` became `scan: Some(scan_ecma)`.
+//! 9. **Two baselines, never one.** *Landed.* `arthron gate --language`
+//!    compares per language; a baseline file names the language it measures
+//!    and refuses to be compared against another's scan.
 //!
 //! Sharing the store with a live Go track is safe: a scan forgets only files
 //! carrying an extension the running track owns, and extension ownership is a

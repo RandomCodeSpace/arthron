@@ -6,18 +6,35 @@
 //! JavaScript be masked by TypeScript. Each baseline names the language it
 //! measures and is compared only against that language's tally.
 //!
-//! This suite is where the gate runs for this track. `arthron gate` itself
-//! cannot be pointed at a JavaScript-only corpus today: `pipeline::scan_repo`
-//! propagates the first live track's error, and the Go track's phase 0 fails
-//! when there is no `go.mod`. That is a core seam this track may not touch, so
-//! the comparison is driven here through the same `gate::evaluate` the command
-//! uses — the arithmetic is identical, only the entry point differs.
+//! The two baselines here are written by the command, never by hand:
+//!
+//! ```text
+//! arthron gate corpus/javascript/fastify  --language javascript \
+//!     --baseline baselines/javascript-fastify.toml  --rebase --commit <pin>
+//! arthron gate corpus/typescript/vue-core --language typescript \
+//!     --baseline baselines/typescript-vue-core.toml --rebase --commit <pin>
+//! ```
+//!
+//! `--language` is load-bearing and the rendered header comment omits it: the
+//! flag defaults to `go`, so re-running the printed command against one of
+//! these files would overwrite a JavaScript or TypeScript baseline with the
+//! Go tally. The `language = "…"` field records which one is meant, and
+//! `a_baseline_is_refused_against_another_languages_scan` below is what makes
+//! the mistake fail rather than pass quietly.
+//!
+//! The comparison also runs here, through the same `gate::evaluate` the
+//! command uses, so CI gates this track without building the binary — the
+//! arithmetic is identical and only the entry point differs.
 
 use std::path::Path;
 
 use arthron::gate::{Baseline, GateVerdict, Measured, evaluate, parse_baseline};
+use arthron::lang::Language;
 use arthron::model::{Lang, reason_name};
+use arthron::pipeline::source_files;
 use arthron::store::Report;
+use arthron::track_ecma::extract::extract;
+use arthron::track_ecma::lang::{Dialect, JsLang, TsLang};
 use arthron::track_ecma::scan_ecma;
 
 /// Whether a corpus has been cloned in.
@@ -173,4 +190,98 @@ fn the_unresolved_floor_is_real_on_both_corpora() {
             lang.name(),
         );
     }
+}
+
+/// Count one language's references in the corpus by extracting it again,
+/// independently of the pipeline.
+///
+/// This deliberately does not ask the pipeline how many references it found:
+/// a bug that loses one between the extractor and the store would lose it
+/// from both sides of the comparison and the assertion would pass. It shares
+/// only the two things it must in order to be counting the same files at all
+/// — `extract`, and `source_files` for the file set.
+fn extracted_reference_count<L: Language>(corpus: &Path, dialect: Dialect) -> u64 {
+    let mut total = 0u64;
+    for path in source_files::<L>(corpus).expect("walking the corpus") {
+        let rel = path
+            .strip_prefix(corpus)
+            .expect("a walked path is under the corpus")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        total += extract(dialect, &rel, &source).refs.len() as u64;
+    }
+    total
+}
+
+/// Both languages' columns must partition both languages' references, on one
+/// scan of one corpus.
+fn assert_every_reference_is_accounted_for(corpus: &Path) {
+    if !corpus_present(corpus) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let report = scan_ecma(corpus, &dir.path().join("graph.redb")).expect("scan");
+    // Both halves, on every corpus. A corpus with no file of one language
+    // still asserts something: `0 == 0` fails the moment a row is tagged with
+    // a language whose files are not there, which is exactly how one rate
+    // could start borrowing from the other's.
+    for (lang, extracted) in [
+        (
+            Lang::JavaScript,
+            extracted_reference_count::<JsLang>(corpus, Dialect::JavaScript),
+        ),
+        (
+            Lang::TypeScript,
+            extracted_reference_count::<TsLang>(corpus, Dialect::TypeScript),
+        ),
+    ] {
+        let tally = report
+            .per_lang
+            .get(&lang.code())
+            .cloned()
+            .unwrap_or_default();
+        let stored =
+            tally.resolved + tally.external + tally.local_binding + tally.unresolved_total();
+        println!(
+            "{} on {}: stored outcomes {stored}, extracted references {extracted}",
+            lang.name(),
+            corpus.display(),
+        );
+        assert_eq!(
+            stored,
+            extracted,
+            "{} on {}: resolved {} + external {} + local-binding {} + unresolved {} \
+             must equal the {extracted} references the extractor found — every \
+             reference gets exactly one stored outcome",
+            lang.name(),
+            corpus.display(),
+            tally.resolved,
+            tally.external,
+            tally.local_binding,
+            tally.unresolved_total(),
+        );
+    }
+}
+
+#[test]
+fn every_reference_on_fastify_has_exactly_one_stored_outcome() {
+    // "The resolver never drops" is the project's central claim, and a rate is
+    // no evidence for it: silently discarding the references it cannot link
+    // would *raise* the rate. The four reported columns partition the
+    // extracted references, so their sum is the reference count — exactly.
+    // Under-counting is a dropped reference; over-counting is one reference
+    // reported as two outcomes. Both break the contract.
+    //
+    // `local_binding` is one of the columns even though it is outside both
+    // terms of the rate: it is excluded from the *measurement*, never from the
+    // *accounting*. Leaving it out here is precisely how moving references
+    // into it could look like an improvement.
+    assert_every_reference_is_accounted_for(Path::new("corpus/javascript/fastify"));
+}
+
+#[test]
+fn every_reference_on_vue_core_has_exactly_one_stored_outcome() {
+    assert_every_reference_is_accounted_for(Path::new("corpus/typescript/vue-core"));
 }

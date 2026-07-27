@@ -1,7 +1,5 @@
-# arthron gate baseline — regenerate by running
-#   cargo test --release --test ecma_corpus -- --nocapture
-# and copying the counts it prints. See baselines/javascript-fastify.toml for
-# why this does not go through `arthron gate` yet.
+# arthron gate baseline — regenerate with:
+#   arthron gate corpus/typescript/vue-core --baseline <this file> --rebase --commit <sha>
 # Release build, cold store. Counts are measured, never estimated.
 #
 # `corpus` and `commit` are provenance: printed, never verified.
@@ -10,22 +8,11 @@
 # arithmetic and cannot disagree with its own counts.
 # `external` and `local_binding` sit outside both rate terms; any
 # drift in either fails the gate and must be re-based deliberately.
-#
-# Two floors in `unresolved` are real and must not be argued away:
-#   NeedsExpressionType 11153 — `expect(x).toBe(y)` chains, whose receiver is
-#     an expression. Resolving them needs the type of a call result.
-#   WildcardImport 7807 — vue-core's barrels are `export * from`, whose name
-#     set is ES `GetExportedNames`, a fixed point over the module graph. The
-#     core declares `Resolver::link_kinds` for that phase and never drives it,
-#     so the honest report is "the export set could not be enumerated".
-#   NoMatchingDefinition 16155 is dominated by `expect`/`test`/`it`/`describe`
-#     — ambient globals a test framework's `.d.ts` declares under
-#     `node_modules`, which this build does not index.
 format = 1
 corpus = "corpus/typescript/vue-core"
 commit = "fa2885d"
 language = "typescript"
 resolved = 17897
-external = 3567
-local_binding = 9371
-unresolved = 36664
+external = 3691
+local_binding = 9564
+unresolved = 36347

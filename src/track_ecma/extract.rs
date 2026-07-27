@@ -1153,15 +1153,35 @@ fn export_statement(ctx: &mut Ctx, node: &SgNode) {
     // B5: `export * from './x'` — every name except `default`, and the set
     // is a fixed point over the module graph rather than a fact about this
     // file.
+    //
+    // The star is marked once per declaration space it forwards, because a
+    // module's export surface has two halves in TypeScript and `export *`
+    // forwards both. Marking only the value half made every type-space name
+    // arriving through a barrel report `NoMatchingDefinition`, which claims
+    // the export table was complete — and the table is exactly what could not
+    // be enumerated. `export type *` forwards the type half alone; the
+    // grammar in this build does not parse that form (the keyword lands in an
+    // `ERROR` node), so it is recognised from the token text rather than a
+    // kind, which is also correct if the grammar later learns it.
     if has_child(node, "*") {
-        ctx.push_export(indirect_entry(
-            None,
-            specifier.clone(),
-            ImportedName::All,
-            space,
-            span,
-        ));
-        export_reference(ctx, node, specifier, space);
+        let type_only = node.children().any(|c| c.text().trim() == "type");
+        let spaces: &[DeclSpace] = match (ctx.dialect, type_only) {
+            (Dialect::JavaScript, _) => &[DeclSpace::Value],
+            (Dialect::TypeScript, true) => &[DeclSpace::Type],
+            (Dialect::TypeScript, false) => &[DeclSpace::Value, DeclSpace::Type],
+        };
+        for forwarded in spaces {
+            ctx.push_export(indirect_entry(
+                None,
+                specifier.clone(),
+                ImportedName::All,
+                *forwarded,
+                span,
+            ));
+        }
+        // One statement names one module, so it is one reference however many
+        // spaces it forwards: a second would double-count the export layer.
+        export_reference(ctx, node, specifier, spaces[0]);
         return;
     }
 
@@ -2777,6 +2797,41 @@ mod tests {
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].raw_target, "./x.js");
         assert_eq!(segments(exports[0]), ["./x.js"]);
+    }
+
+    #[test]
+    fn a_bare_star_re_export_forwards_both_declaration_spaces() {
+        // B5: `export *` forwards a module's *whole* export surface, and in
+        // TypeScript that surface has a type half as well as a value half.
+        // Marking the star in the value space alone makes a type-space lookup
+        // through a barrel report `NoMatchingDefinition` — a claim that the
+        // export table was complete — when the table is precisely the thing
+        // that could not be enumerated.
+        let star_spaces = |facts: &EcmaFacts| -> Vec<DeclSpace> {
+            let mut spaces: Vec<DeclSpace> = facts
+                .defs
+                .iter()
+                .filter(|d| d.kind == DefKind::Alias && d.name == STAR_EXPORT)
+                .map(|d| d.space)
+                .collect();
+            spaces.sort_by_key(|s| format!("{s:?}"));
+            spaces
+        };
+        let ts_star = ts("export * from './x';\n");
+        assert_eq!(
+            star_spaces(&ts_star),
+            [DeclSpace::Type, DeclSpace::Value],
+            "a TypeScript barrel forwards types too",
+        );
+        // One statement is one reference to the module it names, whichever
+        // spaces it forwards: the export layer must not double-count.
+        assert_eq!(refs(&ts_star, RefKind::Export).len(), 1);
+        // JavaScript has no type space, so claiming one would mint a marker
+        // no reference can name.
+        assert_eq!(
+            star_spaces(&js("export * from './x.js';\n")),
+            [DeclSpace::Value],
+        );
     }
 
     #[test]

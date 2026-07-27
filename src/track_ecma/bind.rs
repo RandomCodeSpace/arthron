@@ -241,6 +241,47 @@ fn type_parameters_bind(node: &SgNode, name: &str) -> bool {
         })
 }
 
+/// Whether a subtree declares `infer <name>`.
+fn declares_infer(node: &SgNode, name: &str) -> bool {
+    if node.kind() == "infer_type" {
+        return node
+            .children()
+            .any(|c| c.kind() == "type_identifier" && c.text() == name);
+    }
+    node.children().any(|c| declares_infer(&c, name))
+}
+
+/// Whether a conditional type's `extends` clause declares `infer <name>` and
+/// this site sits in the branch that declaration scopes over.
+///
+/// The true branch only: the false branch is the one the `extends` clause did
+/// not match, so nothing was inferred there and the name is genuinely free.
+fn infer_binds(conditional: &SgNode, site: &SgNode, name: &str) -> bool {
+    let (Some(extends), Some(consequence)) =
+        (conditional.field("right"), conditional.field("consequence"))
+    else {
+        return false;
+    };
+    let (site, branch) = (site.range(), consequence.range());
+    site.start >= branch.start && site.end <= branch.end && declares_infer(&extends, name)
+}
+
+/// Whether a mapped type's key clause — the `K` of `[K in keyof T]` — binds
+/// `name`.
+///
+/// The whole index signature is its scope: the constraint, the `as` clause
+/// that renames the key, and the value type all see it.
+fn mapped_key_binds(signature: &SgNode, name: &str) -> bool {
+    signature
+        .children()
+        .filter(|c| c.kind() == "mapped_type_clause")
+        .any(|clause| {
+            clause
+                .children()
+                .any(|c| c.kind() == "type_identifier" && c.text() == name)
+        })
+}
+
 /// Whether some enclosing binding environment binds `name` at this site.
 ///
 /// A *file-local verdict*, and the whole of it: every ECMAScript binder for a
@@ -263,8 +304,15 @@ pub fn is_locally_bound(node: &SgNode, name: &str, space: DeclSpace) -> bool {
     }
     let ancestors: Vec<SgNode> = node.ancestors().collect();
     for (i, ancestor) in ancestors.iter().enumerate() {
-        if space == DeclSpace::Type && type_parameters_bind(ancestor, name) {
-            return true;
+        if space == DeclSpace::Type {
+            // The type space has three binders that carry no `type_parameters`
+            // list of their own, and all three are decidable from this file.
+            if type_parameters_bind(ancestor, name)
+                || (ancestor.kind() == "conditional_type" && infer_binds(ancestor, node, name))
+                || (ancestor.kind() == "index_signature" && mapped_key_binds(ancestor, name))
+            {
+                return true;
+            }
         }
         let hit = match &*ancestor.kind() {
             "program" => return false,
@@ -340,6 +388,20 @@ mod tests {
             }
         }
         panic!("no type use of `{name}` in:\n{src}");
+    }
+
+    /// Whether the type name `name`, written directly under a node of kind
+    /// `parent`, is bound where it is written.
+    fn bound_type_under(src: &str, name: &str, parent: &str) -> bool {
+        let tree = SourceTree::parse_typescript(src);
+        let yaml = "id: t\nlanguage: typescript\nrule:\n  kind: type_identifier\n";
+        let rules = Rules::compile(yaml).expect("rules compile");
+        for (_, node) in tree.matches(&rules) {
+            if node.text() == name && node.parent().is_some_and(|p| p.kind() == parent) {
+                return is_locally_bound(&node, name, DeclSpace::Type);
+            }
+        }
+        panic!("no `{name}` under a `{parent}` in:\n{src}");
     }
 
     #[test]
@@ -513,6 +575,38 @@ mod tests {
         assert!(bound_type(
             "type T = string;\nclass C<T> { m(x: T): void {} }\n",
             "T"
+        ));
+    }
+
+    #[test]
+    fn an_infer_name_and_a_mapped_key_bind_in_the_type_space() {
+        // Two binders the language introduces without a `type_parameters`
+        // list. Missing them does not merely lose a `LocalBinding`: the name
+        // reaches the resolver as an ordinary type, misses, and is reported
+        // `NoMatchingDefinition` — which claims a definition was looked for
+        // and is absent, when the name never denoted a definition at all.
+        assert!(bound_type_under(
+            "type G<T> = T extends Set<infer V> ? V : never;\n",
+            "V",
+            "conditional_type",
+        ));
+        assert!(bound_type_under(
+            "type M<T> = { [K in keyof T]: T[K] };\n",
+            "K",
+            "lookup_type",
+        ));
+        // Each binding belongs to its declaration, not to the file.
+        assert!(!bound_type_under(
+            "type G<T> = T extends Set<infer V> ? V : never;\ntype H = V;\n",
+            "V",
+            "type_alias_declaration",
+        ));
+        // `infer` scopes over the true branch only: the false branch is where
+        // the extends clause did *not* match, so nothing was inferred.
+        assert!(!bound_type_under(
+            "type G<T> = T extends Set<infer V> ? number : V;\n",
+            "V",
+            "conditional_type",
         ));
     }
 
