@@ -25,7 +25,7 @@ use redb::{
 
 use crate::UnresolvedReason;
 use crate::lang::Entry;
-use crate::model::{DefFacets, DefKind, NodeId, reason_code};
+use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 
 /// On-disk schema generation.
 ///
@@ -489,25 +489,59 @@ impl Store {
     /// graph is a cache of facts the source tree can always rebuild, and
     /// every identity in it is downstream of the fingerprint.
     ///
-    /// Returns whether the store was wiped.
-    pub fn fence_config(&self, digest: &[u8]) -> Result<bool, String> {
-        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+    /// The fence is **per language**: the fingerprint is stored under the
+    /// language's own key, and going stale forgets only the files that
+    /// language owns. Two live languages share one store, and one language's
+    /// manifest says nothing about the identities of another's graph — a
+    /// global fence made every second language's scan wipe the first's rows.
+    /// An **empty digest is no opinion**: a language with no project
+    /// manifest is never invalidated by this, exactly as
+    /// [`crate::lang::Resolver::config_digest`] promises, and stores nothing.
+    ///
+    /// Returns whether the language's slice of the store was wiped.
+    pub fn fence_config(&self, lang: Lang, digest: &[u8]) -> Result<bool, String> {
+        if digest.is_empty() {
+            return Ok(false);
+        }
+        let key = format!("{CONFIG_DIGEST_KEY}:{}", lang.name());
         let stale = {
-            let meta = txn.open_table(META).map_err(|e| e.to_string())?;
-            let stored = meta
-                .get(CONFIG_DIGEST_KEY)
-                .map_err(|e| e.to_string())?
-                .map(|guard| guard.value().to_vec());
-            stored.as_deref() != Some(digest)
+            let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+            match txn.open_table(META) {
+                Ok(meta) => {
+                    let stored = meta
+                        .get(key.as_str())
+                        .map_err(|e| e.to_string())?
+                        .map(|guard| guard.value().to_vec());
+                    stored.as_deref() != Some(digest)
+                }
+                // A store no scan has written yet has no META table — and
+                // nothing to wipe either way.
+                Err(_) => true,
+            }
         };
         if stale {
-            drop_graph(&txn)?;
-            create_graph(&txn)?;
-            let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
-            meta.insert(CONFIG_DIGEST_KEY, digest)
-                .map_err(|e| e.to_string())?;
+            let owned: Vec<String> = self
+                .known_files()?
+                .into_iter()
+                .filter(|file| {
+                    std::path::Path::new(file)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| lang.extensions().contains(&ext))
+                })
+                .collect();
+            self.forget_files(&owned)?;
+            // The digest is written last: a crash between the forget and
+            // this write re-fences as stale next scan and forgets again,
+            // which is idempotent.
+            let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
+                meta.insert(key.as_str(), digest)
+                    .map_err(|e| e.to_string())?;
+            }
+            txn.commit().map_err(|e| e.to_string())?;
         }
-        txn.commit().map_err(|e| e.to_string())?;
         Ok(stale)
     }
 
