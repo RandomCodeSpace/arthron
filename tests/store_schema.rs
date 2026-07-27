@@ -157,6 +157,48 @@ fn reopening_a_store_of_the_same_version_keeps_everything() {
 }
 
 #[test]
+fn a_manifest_fingerprint_fences_the_store() {
+    // The manifest decides every identity in the graph but is not one of
+    // the files the walk hashes, so the store fences on a fingerprint of it.
+    // Both directions matter: a changed fingerprint must wipe, and an
+    // unchanged one must not — a fence that wiped every time would make
+    // every scan cold, which no cold-versus-warm comparison can detect.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+
+    assert!(
+        store.fence_config(b"module-a").expect("fence"),
+        "the first fingerprint a store sees is a change",
+    );
+    store
+        .apply_refs(&RefBatch {
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg.Foo"))],
+        })
+        .expect("apply refs");
+    assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
+
+    assert!(
+        !store.fence_config(b"module-a").expect("fence"),
+        "the same fingerprint is not an event",
+    );
+    assert_eq!(
+        store.known_files().unwrap(),
+        ["pkg/b.go"],
+        "an unchanged manifest leaves the graph alone",
+    );
+
+    assert!(
+        store.fence_config(b"module-b").expect("fence"),
+        "a different manifest describes a different project",
+    );
+    assert!(store.known_files().unwrap().is_empty());
+    let snapshot = store.snapshot().expect("snapshot");
+    assert!(snapshot.rows.is_empty());
+    assert!(snapshot.edges.is_empty());
+    assert!(snapshot.candidates.is_empty());
+}
+
+#[test]
 fn replacing_a_file_removes_exactly_its_own_facts() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir.path().join("graph.redb"));

@@ -481,6 +481,32 @@ impl Resolver<GoLang> for GoResolver {
         Ok(module)
     }
 
+    fn config_digest(&self, cfg: &GoModule) -> Vec<u8> {
+        // Exactly the three go.mod-derived facts, each length-prefixed so no
+        // pair of field values can be concatenated into another: the module
+        // path roots every FQN in the graph, `requires` decides whether an
+        // import is a known dependency or an unknown package, and
+        // `nested_modules` decides which files this scan owns at all.
+        //
+        // `package_names` is deliberately absent. The driver teaches it from
+        // the store as the scan proceeds, so folding it in would make the
+        // fingerprint change on every scan and wipe the graph each time.
+        let mut hasher = blake3::Hasher::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(cfg.path.as_bytes());
+        field(&(cfg.requires.len() as u64).to_le_bytes());
+        for require in &cfg.requires {
+            field(require.as_bytes());
+        }
+        for nested in &cfg.nested_modules {
+            field(nested.as_bytes());
+        }
+        hasher.finalize().as_bytes().to_vec()
+    }
+
     fn learn_containers(&self, cfg: &mut GoModule, names: &HashMap<String, String>) {
         for (path, name) in names {
             cfg.package_names.insert(path.clone(), name.clone());

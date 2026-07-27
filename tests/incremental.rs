@@ -240,6 +240,31 @@ const CALLER: &str = "package server\n\nfunc Call() {\n\tMissing()\n}\n";
 const MISSING: &str = "package server\n\nfunc Missing() {}\n";
 
 #[test]
+fn renaming_the_module_lands_a_cold_scans_store() {
+    // `go.mod`'s module directive is the root of every FQN in the graph: a
+    // package's import path is `{module}/{dir}`, and every node id hashes
+    // that path. Rewriting the directive renames every node in the store
+    // while not one `.go` file's bytes move — so a scan that hashes only
+    // source files sees an empty changed set and leaves the whole graph
+    // under the old module path.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let db = root.join("graph.redb");
+    scan_go(root, &db).expect("cold scan");
+    assert!(calls(
+        &db,
+        "example.com/app/server.Serve",
+        "example.com/app/util.Parse",
+    ));
+
+    write(root, "go.mod", "module example.com/renamed\n\ngo 1.22\n");
+    scan_go(root, &db).expect("scan after the module rename");
+
+    assert_matches_cold(root, &db);
+}
+
+#[test]
 fn adding_a_definition_repoints_an_unresolved_caller_in_an_unchanged_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

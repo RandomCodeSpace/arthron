@@ -149,6 +149,24 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// resolver-internal; the core only moves the result.
     fn config(&self, root: &Path, files: &FileIndex) -> Result<L::Config, LayoutError>;
 
+    /// A fingerprint of everything the project's *manifest* decides.
+    ///
+    /// The manifest is a scan input the walk never hashes: it carries no
+    /// extension the language owns and contributes no facts of its own. It
+    /// still decides every identity in the graph — a module path is the root
+    /// of every FQN beneath it — so a store built under a different one
+    /// describes a different project and cannot be patched into this one
+    /// file by file.
+    ///
+    /// Covers only what phase 0 read. Anything the driver teaches the config
+    /// afterwards — see [`Resolver::learn_containers`] — changes as the scan
+    /// learns rather than as the project does, and folding it in here would
+    /// wipe the store on every scan.
+    ///
+    /// A language with no project manifest returns an empty fingerprint and
+    /// is never invalidated by this.
+    fn config_digest(&self, cfg: &L::Config) -> Vec<u8>;
+
     /// Fold container names the store already holds into the config.
     ///
     /// Binding an unaliased import needs a fact out of the *imported*

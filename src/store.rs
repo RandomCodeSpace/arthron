@@ -37,6 +37,9 @@ pub const SCHEMA_VERSION: u32 = 4;
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
+/// The [`META`] key the resolver's manifest fingerprint is stored under.
+const CONFIG_DIGEST_KEY: &str = "config_digest";
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
 const REFS: TableDefinition<(&str, &[u8]), &[u8]> = TableDefinition::new("refs");
@@ -423,32 +426,51 @@ impl Store {
                     .map(u32::from_le_bytes)
             };
             if stored != Some(SCHEMA_VERSION) {
-                txn.delete_table(NODES).map_err(|e| e.to_string())?;
-                txn.delete_table(REFS).map_err(|e| e.to_string())?;
-                txn.delete_table(EDGES).map_err(|e| e.to_string())?;
-                txn.delete_table(REV_EDGES).map_err(|e| e.to_string())?;
-                txn.delete_multimap_table(CANDIDATES)
-                    .map_err(|e| e.to_string())?;
-                txn.delete_table(FILES).map_err(|e| e.to_string())?;
-                txn.delete_table(DEF_OWNED).map_err(|e| e.to_string())?;
-                txn.delete_table(REF_OWNED).map_err(|e| e.to_string())?;
+                drop_graph(&txn)?;
                 let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
                 meta.insert(SCHEMA_VERSION_KEY, &SCHEMA_VERSION.to_le_bytes()[..])
                     .map_err(|e| e.to_string())?;
             }
-            // Create every table, so a later read transaction finds them.
-            txn.open_table(NODES).map_err(|e| e.to_string())?;
-            txn.open_table(REFS).map_err(|e| e.to_string())?;
-            txn.open_table(EDGES).map_err(|e| e.to_string())?;
-            txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
-            txn.open_multimap_table(CANDIDATES)
-                .map_err(|e| e.to_string())?;
-            txn.open_table(FILES).map_err(|e| e.to_string())?;
-            txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
-            txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+            create_graph(&txn)?;
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(Store { db })
+    }
+
+    /// Fence the store on the resolver's manifest fingerprint, wiping it
+    /// when the project it describes is no longer this one.
+    ///
+    /// A manifest is a scan input the walk never hashes: it carries no
+    /// extension a language owns and contributes no facts of its own. It
+    /// still decides every identity in the graph — a Go module path is the
+    /// root of every FQN beneath it — so rewriting one renames every node
+    /// while not a single source file's bytes move. The changed set comes
+    /// out empty and the store keeps a graph no cold scan would ever build.
+    ///
+    /// Wiped rather than patched, for the same reason a schema change is: a
+    /// graph is a cache of facts the source tree can always rebuild, and
+    /// every identity in it is downstream of the fingerprint.
+    ///
+    /// Returns whether the store was wiped.
+    pub fn fence_config(&self, digest: &[u8]) -> Result<bool, String> {
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let stale = {
+            let meta = txn.open_table(META).map_err(|e| e.to_string())?;
+            let stored = meta
+                .get(CONFIG_DIGEST_KEY)
+                .map_err(|e| e.to_string())?
+                .map(|guard| guard.value().to_vec());
+            stored.as_deref() != Some(digest)
+        };
+        if stale {
+            drop_graph(&txn)?;
+            create_graph(&txn)?;
+            let mut meta = txn.open_table(META).map_err(|e| e.to_string())?;
+            meta.insert(CONFIG_DIGEST_KEY, digest)
+                .map_err(|e| e.to_string())?;
+        }
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(stale)
     }
 
     /// Replace the phase-1 half of every file in the batch, in one
@@ -837,6 +859,35 @@ impl Store {
         }
         Ok(report)
     }
+}
+
+/// Drop every graph table. [`META`] is deliberately untouched: it carries
+/// the generation and fingerprint that decided the drop.
+fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
+    txn.delete_table(NODES).map_err(|e| e.to_string())?;
+    txn.delete_table(REFS).map_err(|e| e.to_string())?;
+    txn.delete_table(EDGES).map_err(|e| e.to_string())?;
+    txn.delete_table(REV_EDGES).map_err(|e| e.to_string())?;
+    txn.delete_multimap_table(CANDIDATES)
+        .map_err(|e| e.to_string())?;
+    txn.delete_table(FILES).map_err(|e| e.to_string())?;
+    txn.delete_table(DEF_OWNED).map_err(|e| e.to_string())?;
+    txn.delete_table(REF_OWNED).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Create every graph table, so a later read transaction finds it.
+fn create_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
+    txn.open_table(NODES).map_err(|e| e.to_string())?;
+    txn.open_table(REFS).map_err(|e| e.to_string())?;
+    txn.open_table(EDGES).map_err(|e| e.to_string())?;
+    txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
+    txn.open_multimap_table(CANDIDATES)
+        .map_err(|e| e.to_string())?;
+    txn.open_table(FILES).map_err(|e| e.to_string())?;
+    txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
+    txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn encode<T: Encode>(value: &T) -> Result<Vec<u8>, String> {
