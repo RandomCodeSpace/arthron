@@ -99,6 +99,16 @@ impl SourceTree {
         Self::parse(SupportLang::Rust, source)
     }
 
+    /// Parse Swift source.
+    ///
+    /// One grammar for every `.swift` file, a SwiftPM manifest included: a
+    /// `Package.swift` is an ordinary Swift program that the package manager
+    /// runs, not a configuration dialect, and reading it under a second
+    /// parser would be inventing a language the toolchain does not have.
+    pub fn parse_swift(source: &str) -> Self {
+        Self::parse(SupportLang::Swift, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -246,6 +256,16 @@ rule:
             "id: t\nlanguage: rust\nrule:\n  kind: function_item\n",
             "function_item",
             "hi",
+        );
+    }
+
+    #[test]
+    fn parses_swift() {
+        one_match(
+            &SourceTree::parse_swift("class Greeter { func hi() {} }\n"),
+            "id: t\nlanguage: swift\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
         );
     }
 }

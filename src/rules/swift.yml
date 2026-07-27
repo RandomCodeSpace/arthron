@@ -1,0 +1,55 @@
+id: import
+language: swift
+rule:
+  kind: import_declaration
+---
+id: def-type
+language: swift
+rule:
+  any:
+    - kind: class_declaration
+    - kind: protocol_declaration
+---
+id: def-function
+language: swift
+rule:
+  any:
+    - kind: function_declaration
+    - kind: protocol_function_declaration
+---
+id: def-init
+language: swift
+rule:
+  kind: init_declaration
+---
+id: def-deinit
+language: swift
+rule:
+  kind: deinit_declaration
+---
+id: def-subscript
+language: swift
+rule:
+  kind: subscript_declaration
+---
+id: def-property
+language: swift
+rule:
+  any:
+    - kind: property_declaration
+    - kind: protocol_property_declaration
+---
+id: def-typealias
+language: swift
+rule:
+  kind: typealias_declaration
+---
+id: def-associatedtype
+language: swift
+rule:
+  kind: associatedtype_declaration
+---
+id: def-enum-case
+language: swift
+rule:
+  kind: enum_entry
