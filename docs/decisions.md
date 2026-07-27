@@ -4,6 +4,76 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Resolver honesty fixes move the Go baseline
+
+Re-measured after the three fix commits, so the recorded baseline is what the
+engine actually does rather than what it did before them. Release build,
+`arthron scan corpus/go/codeiq` against a cold store, `codeiq` pinned at
+`6dd90b5`, 397 `.go` files.
+
+| | resolved | external | unresolved | `NeedsTypeInference` | `NoMatchingDefinition` | rate |
+|---|---|---|---|---|---|---|
+| before | 4467 | 6083 | 5077 | 4826 | 251 | 46.80% |
+| after | 4467 | **6085** | **5075** | **4824** | 251 | 46.81% |
+
+The rate still prints as 46.8%. That is the honest headline: three correctness
+fixes moved two references, and none of them moved the number the gate watches.
+
+**What each fix did, measured one commit at a time** — each commit built and
+run in isolation, because attributing a delta to a fix without measuring the
+commit that contains it is a guess:
+
+- **Extraction — raw-string imports, multi-name spec definitions:** zero
+  references moved. The corpus writes no `` import `fmt` `` and no
+  `const A, B = …` whose bogus `,` definition anything went on to name. The
+  fixes are real; this corpus does not exercise them.
+- **Resolution — version-aware import binding:** the entire delta. Two
+  references, both `yaml.Marshal(…)`, in the two files that import
+  `gopkg.in/yaml.v3` *without* an alias. Before, the unaliased import bound
+  `yaml.v3`, so the qualifier `yaml` was read as a variable and the call was
+  charged to `NeedsTypeInference`; now it binds `yaml` and the call is
+  correctly `External`. The third `yaml.*` call site was already correct — its
+  file writes the alias out (`yaml "gopkg.in/yaml.v3"`), which is precisely
+  what made the bug survive a reading of the corpus.
+- **Resolution — probe-before-builtin, probed-only candidates,
+  whitespace-robust `go.mod`:** zero references moved. The corpus declares no
+  package-level shadow of a builtin, and its `go.mod` is space-separated.
+- **Package identity — declared package names:** zero references moved. No
+  *importable* package in the corpus declares a name its directory does not
+  already carry; the only mismatches are two `package main` directories under
+  `cmd/`, which nothing may import. (Grepping for `^package` finds three more,
+  all inside raw-string Go fixtures in `_test.go` files — the extractor parses
+  the real AST and never saw them.)
+- **Package identity — `init` is not a node, `_test` is its own package:**
+  zero references moved, and node counts changed, which is the expected shape.
+  116 `func init()` declarations across 20 packages stopped producing
+  definition nodes — as one `{pkg}.init` identity per package, not 116, since
+  they collapsed onto each other. 26 external-test files across 6 packages
+  moved their definitions into `{pkg}_test`. The predicted risk that `_test`
+  namespacing would *lower* `resolved` by breaking a wrong resolution did not
+  materialise: no production file in this corpus was resolving to a
+  test-only definition.
+
+**Completeness is now asserted, not claimed.** A rate is no evidence that
+nothing was dropped — quietly discarding the references it cannot link would
+*raise* it. Both acceptance suites now re-extract independently and assert
+that `resolved + external + unresolved` equals the reference count exactly:
+**15,627** on the corpus, and it was 15,627 before the fixes too. The three
+commits reclassified references and neither gained nor lost one.
+
+**Rejected: ratcheting the gate to 46.8% now.** The baseline is honest but the
+fixes it reflects are almost untested by this corpus — four of the five moved
+nothing here. A ratchet against a single corpus that exercises so little would
+lock in a number, not a capability. The gate command comes with a second
+corpus.
+
+Cold scan 0.52 s, maximum RSS 17,536 KB, store 2.3 MB; warm re-scan 0.01 s,
+8,320 KB, identical tallies. AMD EPYC 9354P, 8 cores — not the 2 vCPU
+reference hardware, so these are an upper bound on this box and not a 2 vCPU
+claim.
+
+---
+
 ## 2026-07-27 — Package identity: declared names, no `init` node, `_test` is its own package
 
 Three corrections to what a Go node *is*, all of them cases where the graph

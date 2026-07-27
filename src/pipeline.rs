@@ -222,7 +222,12 @@ fn dir_package_name<'a>(names: &'a HashMap<String, String>, pkg_path: &'a str) -
 
 /// All `.go` files under root, skipping vendor/, testdata/, and any
 /// directory governed by a nested go.mod.
-fn go_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+///
+/// Public because the completeness assertion — every extracted reference has
+/// exactly one stored outcome — has to count references over *this* file set.
+/// A second copy of these rules in a test would drift, and the first thing it
+/// would hide is a file the scan silently never read.
+pub fn go_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root).build() {
         let entry = entry.map_err(|e| e.to_string())?;

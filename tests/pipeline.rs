@@ -82,6 +82,36 @@ fn scan_reports_honest_per_language_counts() {
 }
 
 #[test]
+fn every_extracted_reference_has_exactly_one_stored_outcome() {
+    // The non-negotiable, counted rather than asserted in prose: the three
+    // outcome columns are a partition of the references the extractor found,
+    // so they must sum to the reference count exactly. Over-counting is as
+    // much a failure as dropping — one reference, one outcome.
+    //
+    // Hand-counted for `fixture`:
+    //   util/util.go      0 imports, 0 calls
+    //   server/server.go  2 imports ("fmt", "example.com/app/util")
+    //                     5 calls   (fmt.Println, util.Parse, helper,
+    //                                missing, conn.Close)
+    const EXPECTED_REFERENCES: u64 = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let report = scan(dir.path(), &dir.path().join("graph.redb")).expect("scan succeeds");
+    let go = &report.per_lang[&Lang::Go.code()];
+
+    assert_eq!(
+        go.resolved + go.external + go.unresolved_total(),
+        EXPECTED_REFERENCES,
+        "resolved {} + external {} + unresolved {} must account for every \
+         reference in the fixture, once each",
+        go.resolved,
+        go.external,
+        go.unresolved_total(),
+    );
+}
+
+#[test]
 fn an_unaliased_internal_import_binds_the_declared_package_name() {
     // Go binds an unaliased import to the imported package's *declared*
     // name, which need not match its directory. Directory `utilx` declares
