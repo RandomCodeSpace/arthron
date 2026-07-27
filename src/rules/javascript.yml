@@ -1,0 +1,76 @@
+# Node kinds the JavaScript extractor interprets. Selection only: every field
+# read, every filter, and every classification lives in `track_ecma::extract`,
+# so a grammar rename touches this file and nothing else.
+#
+# Rule ids are shared with `typescript.yml` wherever the two grammars agree,
+# because one Rust `match` interprets both. TypeScript-only ids exist only
+# there.
+id: import-stmt
+language: javascript
+rule:
+  kind: import_statement
+---
+id: export-stmt
+language: javascript
+rule:
+  kind: export_statement
+---
+# E1: `function f(){}` and `function* g(){}`.
+id: def-function
+language: javascript
+rule:
+  any:
+    - kind: function_declaration
+    - kind: generator_function_declaration
+---
+# E1/E3/E4/E5/E9/E10: the class and everything in its body.
+id: def-class
+language: javascript
+rule:
+  kind: class_declaration
+---
+# E1: `const f = () => {}`, `let x`, `var y` — the dominant modern form. A
+# rule matching only `function_declaration` misses most of a modern corpus.
+id: def-binding
+language: javascript
+rule:
+  any:
+    - kind: lexical_declaration
+    - kind: variable_declaration
+---
+# C3/C4/C5/E6: `module.exports = …`, `exports.x = …`, `this.x = …`,
+# `C.prototype.m = …`. Definitions written as assignments.
+id: def-assign
+language: javascript
+rule:
+  kind: assignment_expression
+---
+# F1/F3/F5/F12, and C1/C8/F13/F14 — `require(…)` and `import(…)` are calls in
+# the grammar and imports in the language.
+id: ref-call
+language: javascript
+rule:
+  kind: call_expression
+---
+# F8: `new C()` is not a `call_expression`; a single call rule misses every
+# construction site.
+id: ref-new
+language: javascript
+rule:
+  kind: new_expression
+---
+# F11: `<Button/>`, `<Icons.Star/>`. Skipping JSX loses most references in any
+# React corpus.
+id: ref-jsx
+language: javascript
+rule:
+  any:
+    - kind: jsx_opening_element
+    - kind: jsx_self_closing_element
+---
+# F9: `class D extends C`. tree-sitter-javascript has no `extends_clause`; the
+# heritage is the node, and the extractor reads the expression inside it.
+id: ref-heritage
+language: javascript
+rule:
+  kind: class_heritage

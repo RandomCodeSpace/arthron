@@ -19,10 +19,10 @@
 //! Every step happens inside this file or under `src/track_ecma/`. Nothing in
 //! `pipeline.rs`, `lib.rs`, `model.rs`, `registry.rs` or another track moves.
 //!
-//! 1. **Submodules, nested.** *Landed.* [`lang`] resolves to
-//!    `src/track_ecma/lang.rs`; `lib.rs` already declares `track_ecma`, so
-//!    nothing shared moved. `mod extract;` and `mod resolve;` join it the
-//!    same way.
+//! 1. **Submodules, nested.** *Landed.* [`extract`], [`lang`] and the
+//!    private `bind` resolve to `src/track_ecma/*.rs`; `lib.rs` already
+//!    declares `track_ecma`, so nothing shared moved. `mod resolve;` joins
+//!    them the same way.
 //! 2. **Two [`crate::lang::Language`] impls, not one.** *Landed* as
 //!    [`lang::JsLang`] and [`lang::TsLang`]. The shared driver
 //!    tags every stored row with `L::LANG`, so a single impl can only report
@@ -34,12 +34,13 @@
 //!    language instead would work too, and would edit a shared file — which
 //!    is exactly the conflict this layout exists to avoid. Prefer the two
 //!    impls.
-//! 3. **An extractor** implementing [`crate::lang::Extractor`] for both,
+//! 3. **An extractor.** *Landed* as [`extract::JsExtractor`] and
+//!    [`extract::TsExtractor`], implementing [`crate::lang::Extractor`] for both,
 //!    parsing with [`crate::sg::SourceTree::parse_javascript`] and
 //!    [`crate::sg::SourceTree::parse_typescript`]. It emits
 //!    [`crate::model::Definition`] and [`crate::model::Reference`] records
 //!    and **never an edge**.
-//! 4. **One resolver** implementing [`crate::lang::Resolver`] for both impls:
+//! 4. **One resolver** — *next* — implementing [`crate::lang::Resolver`] for both impls:
 //!    the same linking code, so a `.ts` file and a `.js` file resolve against
 //!    one symbol table in one identity space. It is the only place an
 //!    [`crate::Outcome`] is produced, and it never drops: every reference
@@ -74,6 +75,8 @@
 //! carrying an extension the running track owns, and extension ownership is a
 //! partition (see [`Lang::for_extension`]).
 
+mod bind;
+pub mod extract;
 pub mod lang;
 
 use crate::model::Lang;
