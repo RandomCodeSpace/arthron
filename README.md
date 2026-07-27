@@ -87,6 +87,15 @@ re-analysing: the changed set is exactly the files whose content hash moved.
 Cold indexing is the same code path with a changed set of everything, so there
 is no separate incremental mode that can silently skip work.
 
+```
+arthron mcp [--db <FILE>]
+```
+
+Serves the graph to an agent over the Model Context Protocol on stdin/stdout —
+`scan_repo`, `query_def`, `query_refs` and `query_impact`, each returning the
+same JSON document the command line prints. Still no network: stdio only, no
+socket bound. See [`docs/mcp.md`](docs/mcp.md).
+
 ## What works today
 
 | | State |
@@ -97,7 +106,8 @@ is no separate incremental mode that can silently skip work.
 | Java · JavaScript · TypeScript · Python | Planned, in that order |
 | `arthron gate` (CI, fails on regression) | Planned |
 | `arthron impact <path>` (blast radius) | Planned |
-| `arthron watch` · daemon · MCP server | Planned |
+| `arthron mcp` (MCP server, stdio) | **Working** — [`docs/mcp.md`](docs/mcp.md) |
+| `arthron watch` · daemon | Planned |
 
 Language *coverage* spans the 27 languages ast-grep's built-in parsers handle.
 Language *capability* is tiered and declared rather than assumed:

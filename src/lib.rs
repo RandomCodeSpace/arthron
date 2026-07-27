@@ -1,9 +1,10 @@
 //! Local-first code intelligence: parse each file in isolation, then resolve
 //! the references between them into a verified graph.
 //!
-//! **Status: early.** Scanning works and produces a real graph for Go; the
-//! remaining tier-1 languages and the CI, watch and query surfaces are not
-//! built yet. The API is pre-1.0 and will change.
+//! **Status: early.** Scanning, the [`gate`] and the [`query`] surface all
+//! work, across every tier-1 language, in a report for a person, a [`json`]
+//! document for a script, or an [`mcp`] tool call for an agent; the watch
+//! surface is not built yet. The API is pre-1.0 and will change.
 //!
 //! # The contract
 //!
@@ -168,11 +169,15 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
     Some(resolved as f64 / total as f64)
 }
 
+pub mod config;
 pub mod extract_go;
 pub mod gate;
+pub mod json;
 pub mod lang;
+pub mod mcp;
 pub mod model;
 pub mod pipeline;
+pub mod query;
 pub mod registry;
 pub mod resolve_go;
 pub mod sg;

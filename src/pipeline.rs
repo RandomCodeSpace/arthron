@@ -28,6 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Outcome;
+use crate::config::{CONFIG_FILE, Config, FileFilter};
 use crate::extract_go::GoExtractor;
 use crate::lang::{
     Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, Supertypes, SymbolProbe,
@@ -120,8 +121,9 @@ pub fn scan<L: Language>(
     db_path: &Path,
     ex: &dyn Extractor<L>,
     rs: &dyn Resolver<L>,
+    filter: &FileFilter,
 ) -> Result<Report, String> {
-    let paths = source_files::<L>(root)?;
+    let paths = source_files_with::<L>(root, filter)?;
     let mut index = FileIndex {
         files: Vec::with_capacity(paths.len()),
     };
@@ -626,10 +628,18 @@ fn phase_two<L: Language>(
     finish(acc, &file.rel_path, file.hash)
 }
 
-/// Scan a Go repository. The Go track's registry entry, and what the Go
-/// integration tests call directly.
+/// Scan a Go repository, reading every Go file the walk finds.
+///
+/// What the Go integration tests call directly. [`scan_go_with`] is the same
+/// scan under a repository's include/exclude globs, and is what [`REGISTRY`]
+/// holds.
 pub fn scan_go(root: &Path, db_path: &Path) -> Result<Report, String> {
-    scan::<GoLang>(root, db_path, &GoExtractor, &GoResolver)
+    scan_go_with(root, db_path, &FileFilter::none())
+}
+
+/// Scan a Go repository under a filter. The Go track's registry entry.
+pub fn scan_go_with(root: &Path, db_path: &Path, filter: &FileFilter) -> Result<Report, String> {
+    scan::<GoLang>(root, db_path, &GoExtractor, &GoResolver, filter)
 }
 
 /// Scan a repository with every enabled track in [`REGISTRY`], in registry
@@ -647,17 +657,47 @@ pub fn scan_go(root: &Path, db_path: &Path) -> Result<Report, String> {
 /// report carries one line per language and no combined number exists to
 /// return.
 pub fn scan_repo(root: &Path, db_path: &Path) -> Result<Report, String> {
+    scan_repo_with(root, db_path, &Config::default())
+}
+
+/// [`scan_repo`] under a repository's own [`Config`].
+///
+/// Two things the config may do here and nowhere else: compile the walk's
+/// include/exclude globs once for every track, and take a live track out of
+/// the run.
+///
+/// A track the config switches off is skipped entirely — it is not handed an
+/// empty file set. The difference matters: a scan forgets the stored files of
+/// the extensions the running track owns, so running a track over nothing
+/// would delete that language's rows, while skipping it leaves them exactly
+/// as the last scan left them. Switching a track off means "do not measure
+/// this here", not "erase what was measured".
+pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Report, String> {
+    let filter = config.filter(root)?;
     let mut report = None;
+    let mut switched_off = false;
     for track in REGISTRY {
         let Some(scan) = track.scan else {
             continue; // not live: owns no file, contributes nothing
         };
-        report = Some(scan(root, db_path)?);
+        if !config.track_enabled(track.name) {
+            switched_off = true;
+            continue;
+        }
+        report = Some(scan(root, db_path, &filter)?);
     }
     // Not a default-empty report: "no track is built into this binary" and
     // "every track found nothing" are different facts, and returning zeros
     // for the first would let a gate bless a build that measures nothing.
-    report.ok_or_else(|| "no language track is enabled in this build".to_string())
+    // A config that switched every live track off is a third fact, and says
+    // so rather than blaming the build.
+    report.ok_or_else(|| {
+        if switched_off {
+            format!("every live language track is switched off by {CONFIG_FILE}")
+        } else {
+            "no language track is enabled in this build".to_string()
+        }
+    })
 }
 
 /// Whether a repo-relative path carries an extension this language owns.
@@ -804,8 +844,30 @@ fn rel_path(root: &Path, path: &Path) -> Result<String, String> {
 /// A second copy of these rules in a test would drift, and the first thing it
 /// would hide is a file the scan silently never read.
 pub fn source_files<L: Language>(root: &Path) -> Result<Vec<PathBuf>, String> {
+    source_files_with::<L>(root, &FileFilter::none())
+}
+
+/// [`source_files`] under a repository's include/exclude globs.
+///
+/// The globs go into the walk rather than filtering its output, so an
+/// excluded directory is pruned instead of descended into and thrown away.
+///
+/// `include` does not prune. A whitelist-only override in the `ignore` crate
+/// is applied to files alone — a directory that matches nothing is still
+/// descended — so `include = ["src/**"]` walks `node_modules` and rejects its
+/// files one at a time. It decides what is *read*, never what is *walked*.
+/// Pruning a subtree out of the walk is what `exclude` is for, and the two
+/// compose: naming a subtree with `include` and excluding the expensive
+/// directories is faster than `include` alone.
+pub fn source_files_with<L: Language>(
+    root: &Path,
+    filter: &FileFilter,
+) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).build() {
+    for entry in ignore::WalkBuilder::new(root)
+        .overrides(filter.overrides())
+        .build()
+    {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let owned = path
