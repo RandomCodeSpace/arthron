@@ -7,8 +7,8 @@ intelligence engine written in Rust. It parses each file in isolation, then
 resolves the references between them into a verified graph — and records the
 references it could not resolve rather than dropping them.
 
-It is in the design phase. The approved design is public:
-**https://github.com/RandomCodeSpace/arthron**
+The engine is early — scanning works for Go, built from source. See the
+repository: **https://github.com/RandomCodeSpace/arthron**
 
 ## Why this package exists
 
@@ -33,9 +33,9 @@ mapping and a GitHub token with `read:packages`:
 
 ## Meanwhile
 
-The Rust crate is published and equally not-yet-usable:
-[crates.io/crates/arthron](https://crates.io/crates/arthron). It exposes the
-resolution contract the design is built around — nothing more.
+The `0.0.0` crate on [crates.io](https://crates.io/crates/arthron) predates the
+engine and is equally a placeholder. Build from source until both move off
+`0.0.0`.
 
 ## License
 
