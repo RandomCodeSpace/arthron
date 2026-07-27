@@ -80,4 +80,9 @@ fn print_report(report: &arthron::store::Report) {
             println!("             {} {count}", reason_name(*code));
         }
     }
+    // Data, not a verdict: two files declaring one FQN is a fact about the
+    // repository, printed so it can be looked at, never gating anything.
+    if report.fqn_collisions > 0 {
+        println!("fqn collisions {}", report.fqn_collisions);
+    }
 }

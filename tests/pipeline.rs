@@ -7,6 +7,13 @@ use arthron::model::{Domain, Lang, NodeId, RefKind, node_id, reason_code};
 use arthron::pipeline::scan_go;
 use arthron::store::{NodeRecord, Store};
 
+/// Whether an edge of the given kind runs from one Go FQN to another.
+fn links(store: &Store, src: &str, dst: &str, kind: RefKind) -> bool {
+    store
+        .has_edge(&go(src), &go(dst), kind.code())
+        .expect("edge lookup")
+}
+
 fn write(root: &std::path::Path, rel: &str, content: &str) {
     let path = root.join(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -109,6 +116,61 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
         go.external,
         go.unresolved_total(),
     );
+}
+
+#[test]
+fn an_external_reference_gets_a_node_and_an_edge() {
+    // A dependency outside the repository is a node like any other, so a
+    // call into one is a real edge rather than a dead end — and giving it
+    // one must not move a single tally, because the reference's outcome is
+    // still `External` and the rate never counted it.
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let db = dir.path().join("graph.redb");
+
+    let report = scan_go(dir.path(), &db).expect("scan succeeds");
+    let tally = &report.per_lang[&Lang::Go.code()];
+    assert_eq!(tally.resolved, 3);
+    assert_eq!(tally.external, 2);
+    assert_eq!(tally.unresolved_total(), 2);
+
+    let store = Store::open(&db).expect("reopen");
+    // The import of `"fmt"` and the call `fmt.Println` reach the standard
+    // library under the two strings the resolver produces for them.
+    for (fqn, package) in [("external:std:fmt", "std:fmt"), ("external:fmt", "fmt")] {
+        match node(&store, fqn) {
+            Some(NodeRecord::External {
+                package: stored,
+                declarations,
+            }) => {
+                assert_eq!(stored, package);
+                assert_eq!(declarations.len(), 1, "one site per referencing file");
+                assert_eq!(declarations[0].file, "server/server.go");
+            }
+            other => panic!("{fqn} should be an external node, not {other:?}"),
+        }
+    }
+    // The import has no nameable encloser, so its edge starts at the file's
+    // package; the call's starts at the function it sits in.
+    assert!(links(
+        &store,
+        "example.com/app/server",
+        "external:std:fmt",
+        RefKind::Import,
+    ));
+    assert!(links(
+        &store,
+        "example.com/app/server.Serve",
+        "external:fmt",
+        RefKind::Call,
+    ));
+
+    // The prefix is what keeps the external keyspace unreachable: no Go
+    // import path or FQN may contain a `:`, so no candidate can be built
+    // that collides with one of these identities.
+    assert_ne!(go("external:std:fmt"), go("std:fmt"));
+    assert_eq!(node(&store, "std:fmt"), None);
+    assert_eq!(node(&store, "fmt"), None);
 }
 
 #[test]

@@ -3,17 +3,27 @@
 //! Generic over [`Language`]: every per-language type is an associated type
 //! this module moves and never inspects, so no language's manifest, scope,
 //! or naming convention is named here.
+//!
+//! Each phase writes its own half of every file's facts, and each half
+//! replaces only itself. That is what makes a re-scan of one file an edit
+//! rather than an append, and it is the whole reason the store is addressed
+//! per file.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Outcome;
 use crate::extract_go::GoExtractor;
-use crate::lang::{Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, SymbolProbe};
-use crate::model::{DefKind, NodeId, Reference, node_id, reason_code};
+use crate::lang::{
+    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, SymbolProbe,
+};
+use crate::model::{DefKind, Definition, Fqn, NodeId, Reference, node_id, reason_code};
 use crate::resolve_go::{GoLang, GoResolver};
-use crate::store::{Batch, NodeRecord, RefRecord, Report, Store, StoredOutcome};
+use crate::store::{
+    DeclSite, DefBatch, FileDefs, FileRefs, NodeRecord, RefBatch, RefKey, RefRecord, Report, Store,
+    StoredOutcome,
+};
 
 /// One changed file, extracted.
 struct ChangedFile<L: Language> {
@@ -22,8 +32,25 @@ struct ChangedFile<L: Language> {
     facts: FileFacts<L>,
 }
 
-/// The dedup row key: `(file, kind code, raw target)`.
-type RowKey = (String, u8, String);
+/// The store's symbol table, as a resolver probes it.
+///
+/// Lives here rather than beside the trait because the driver is the layer
+/// that loads it: a resolver receives a probe, never a table.
+impl SymbolProbe for HashMap<NodeId, Entry> {
+    fn probe(&self, id: &NodeId) -> Option<Entry> {
+        self.get(id).cloned()
+    }
+}
+
+/// One file's phase-2 facts, accumulated while its references resolve.
+#[derive(Default)]
+struct RefAcc {
+    rows: HashMap<RefKey, RefRecord>,
+    edges: BTreeSet<(NodeId, NodeId, u8)>,
+    candidates: BTreeSet<(NodeId, RefKey)>,
+    /// External identity → (package string, first line reaching it).
+    externals: BTreeMap<NodeId, (String, u32)>,
+}
 
 /// Walk, extract, resolve, store, report. The changed set is exactly the
 /// files whose content hash differs from the store — an empty store makes
@@ -51,7 +78,9 @@ pub fn scan<L: Language>(
     // it did not touch.
     rs.learn_containers(&mut cfg, &store.package_names()?);
 
-    // Collect the changed set, in walk order.
+    // Collect the changed set, in walk order, and everything the walk
+    // reached and this scan owns.
+    let mut walked: HashSet<String> = HashSet::with_capacity(paths.len());
     let mut changed: Vec<ChangedFile<L>> = Vec::new();
     for path in &paths {
         let rel = rel_path(root, path)?;
@@ -63,6 +92,7 @@ pub fn scan<L: Language>(
             Err(e) => return Err(format!("reading {rel}: {e}")),
         };
         let hash = *blake3::hash(source.as_bytes()).as_bytes();
+        walked.insert(rel.clone());
         if store.file_hash(&rel)? == Some(hash) {
             continue; // unchanged: not in this event's changed set
         }
@@ -74,92 +104,114 @@ pub fn scan<L: Language>(
         });
     }
 
+    // A file the store knows and this walk did not reach is gone: deleted,
+    // renamed, or no longer owned because a nested manifest appeared above
+    // it. All three mean the same thing to the graph, and dropping its facts
+    // before anything is written is what keeps a stale node from surviving
+    // as a resolution target.
+    let deleted: Vec<String> = store
+        .known_files()?
+        .into_iter()
+        .filter(|known| !walked.contains(known))
+        .collect();
+    store.forget_files(&deleted)?;
+
     // Phase 1: definition and container nodes for the changed set.
-    let probe = store.definition_ids()?;
-    let mut phase1 = Batch::default();
-    // Where each container node sits in `phase1.nodes`, so a second file
-    // declaring the same container can supply the name the first one did
-    // not carry, rather than pushing a duplicate.
-    let mut container_at: HashMap<NodeId, usize> = HashMap::new();
+    let probe = store.symbol_entries()?;
+    let mut def_batch = DefBatch {
+        files: Vec::with_capacity(changed.len()),
+    };
+    // The definitions this event declared, by identity. Two of them under
+    // one identity is the only case the language can be asked about.
+    let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
     for file in &changed {
+        let mut nodes = Vec::with_capacity(file.facts.defs.len());
         for def in &file.facts.defs {
             let Some(fqn) = rs.def_fqn(&cfg, &file.facts.header, &def.owner, def, &probe) else {
                 continue; // not nameable, so not a node
             };
             let id = node_id(L::DOMAIN, fqn.as_str());
-            if def.kind == DefKind::Module {
+            let declarations = vec![DeclSite {
+                file: file.rel_path.clone(),
+                line: def.span.line,
+            }];
+            let record = if def.kind == DefKind::Module {
                 // An empty name means "this file does not say", which is not
                 // the same as naming the empty string.
-                let name = (!def.name.is_empty()).then(|| def.name.clone());
-                match container_at.get(&id) {
-                    Some(&at) => {
-                        if let NodeRecord::Package { name: known, .. } = &mut phase1.nodes[at].1
-                            && known.is_none()
-                        {
-                            *known = name;
-                        }
-                    }
-                    None => {
-                        container_at.insert(id, phase1.nodes.len());
-                        phase1.nodes.push((
-                            id,
-                            NodeRecord::Package {
-                                import_path: fqn.into_string(),
-                                name,
-                            },
-                        ));
-                    }
+                NodeRecord::Package {
+                    import_path: fqn.into_string(),
+                    name: (!def.name.is_empty()).then(|| def.name.clone()),
+                    declarations,
                 }
-                continue;
-            }
-            phase1.nodes.push((
-                id,
+            } else {
                 NodeRecord::Definition {
                     fqn: fqn.into_string(),
                     kind: def.kind.code(),
-                    file: file.rel_path.clone(),
-                    line: def.span.line,
-                },
-            ));
+                    declarations,
+                }
+            };
+            nodes.push((id, record));
+            event_defs.entry(id).or_default().push(def.clone());
         }
+        def_batch.files.push(FileDefs {
+            path: file.rel_path.clone(),
+            nodes,
+        });
     }
-    store.apply(&phase1)?;
+    let colliding = store.apply_defs(&def_batch)?;
+    let merged = mergeable_count(rs, &colliding, &event_defs);
 
     // Phase 2: resolve every reference in the changed set. The container
     // names phase 1 just wrote are part of the scope every file is resolved
     // against, so the config is refreshed before any scope is built.
-    let probe = store.definition_ids()?;
+    let probe = store.symbol_entries()?;
     rs.learn_containers(&mut cfg, &store.package_names()?);
-    let mut phase2 = Batch::default();
+    let mut ref_batch = RefBatch {
+        files: Vec::with_capacity(changed.len()),
+    };
     for file in &changed {
-        phase2.files.push((file.rel_path.clone(), file.hash));
         let scope = rs.scope(&cfg, &file.facts, &probe);
-        let container = container_node::<L>(rs, &cfg, &file.facts, &probe);
-        let mut rows: HashMap<RowKey, RefRecord> = HashMap::new();
+        // The file's container stands in wherever a reference has no
+        // nameable encloser, which is where a package-level initialiser's
+        // calls belong.
+        let container = container_fqn::<L>(rs, &cfg, &file.facts, &probe);
+        let container_id = container
+            .as_ref()
+            .map(|fqn| node_id(L::DOMAIN, fqn.as_str()));
+        let container_name = container.as_ref().map_or("", Fqn::as_str);
+        let mut acc = RefAcc::default();
 
         for r in &file.facts.refs {
             let res = rs.resolve(&cfg, &scope, r, &probe);
             // The source of an edge is the reference's nearest nameable
             // encloser, named by the same function that names definitions —
-            // so an edge and the node it starts at cannot disagree. With no
-            // nameable encloser the file's container stands in, which is
-            // where a package-level initialiser's calls belong.
-            let src = r
+            // so an edge and the node it starts at cannot disagree.
+            let enclosing = r
                 .enclosing
                 .as_ref()
                 .and_then(|e| e.as_definition())
-                .and_then(|d| rs.def_fqn(&cfg, &file.facts.header, &d.owner, &d, &probe))
-                .map(|fqn| node_id(L::DOMAIN, fqn.as_str()))
-                .or(container);
-            record::<L>(&file.rel_path, r, src, res, &mut rows, &mut phase2);
+                .and_then(|d| rs.def_fqn(&cfg, &file.facts.header, &d.owner, &d, &probe));
+            let (src, enclosing_name) = match &enclosing {
+                Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
+                None => (container_id, container_name),
+            };
+            let key = RefKey {
+                file: file.rel_path.clone(),
+                kind: r.kind.code(),
+                space: r.space.code(),
+                enclosing: enclosing_name.to_string(),
+                raw_target: r.raw_target.clone(),
+                argc: r.argc,
+            };
+            record::<L>(key, r, src, res, &mut acc);
         }
-        for ((f, kind, raw), rec) in rows {
-            phase2.refs.push((f, kind, raw, rec));
-        }
+        ref_batch.files.push(finish(acc, &file.rel_path, file.hash));
     }
-    store.apply(&phase2)?;
+    store.apply_refs(&ref_batch)?;
 
-    store.report()
+    let mut report = store.report()?;
+    report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
+    Ok(report)
 }
 
 /// Scan a Go repository. What `main` and the integration tests call.
@@ -167,31 +219,45 @@ pub fn scan_go(root: &Path, db_path: &Path) -> Result<Report, String> {
     scan::<GoLang>(root, db_path, &GoExtractor, &GoResolver)
 }
 
-/// File one reference's resolution into the batch: its row, its edge if it
-/// resolved, and every candidate it probed.
+/// File one reference's resolution into this file's half: its row, its edge,
+/// the external node it reached, and every candidate it probed.
 fn record<L: Language>(
-    file: &str,
+    key: RefKey,
     r: &Reference,
     src: Option<NodeId>,
     res: Resolution,
-    rows: &mut HashMap<RowKey, RefRecord>,
-    batch: &mut Batch,
+    acc: &mut RefAcc,
 ) {
-    let key = (file.to_string(), r.kind.code(), r.raw_target.clone());
     for cand in &res.candidates {
-        batch.candidates.push((*cand, key.clone()));
+        acc.candidates.insert((*cand, key.clone()));
     }
     let stored = match &res.outcome {
         Outcome::Resolved(id) => {
             if let Some(src) = src {
-                batch.edges.push((src, *id, r.kind.code()));
+                acc.edges.insert((src, *id, r.kind.code()));
             }
             StoredOutcome::Resolved(*id)
         }
-        Outcome::External(pkg) => StoredOutcome::External(pkg.clone()),
+        Outcome::External(pkg) => {
+            // A dependency outside this repository is a node like any other,
+            // so a call into one is a real edge rather than a dead end. The
+            // `external:` prefix is unreachable by any candidate a resolver
+            // generates — no import path or FQN may contain a `:` — so
+            // growing the probe set this way cannot change one outcome.
+            let id = node_id(L::DOMAIN, &format!("external:{pkg}"));
+            if let Some(src) = src {
+                acc.edges.insert((src, id, r.kind.code()));
+            }
+            acc.externals
+                .entry(id)
+                .and_modify(|(_, line)| *line = (*line).min(r.span.line))
+                .or_insert_with(|| (pkg.clone(), r.span.line));
+            StoredOutcome::External(pkg.clone())
+        }
         Outcome::Unresolved(reason) => StoredOutcome::Unresolved(reason_code(reason)),
     };
-    rows.entry(key)
+    acc.rows
+        .entry(key)
         .and_modify(|row| row.count += 1)
         .or_insert(RefRecord {
             outcome: stored,
@@ -201,16 +267,72 @@ fn record<L: Language>(
         });
 }
 
-/// The node for the container a file's definitions live in, when it has one.
-fn container_node<L: Language>(
+/// Close one file's accumulator into the half the store replaces.
+fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
+    let mut rows: Vec<(RefKey, RefRecord)> = acc.rows.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let nodes = acc
+        .externals
+        .into_iter()
+        .map(|(id, (package, line))| {
+            (
+                id,
+                NodeRecord::External {
+                    package,
+                    declarations: vec![DeclSite {
+                        file: path.to_string(),
+                        line,
+                    }],
+                },
+            )
+        })
+        .collect();
+    FileRefs {
+        path: path.to_string(),
+        hash,
+        nodes,
+        rows,
+        edges: acc.edges.into_iter().collect(),
+        candidates: acc.candidates.into_iter().collect(),
+    }
+}
+
+/// How many of the identities the store flagged the language itself calls
+/// one entity rather than two.
+///
+/// Only a pair this event holds in full can be asked: a declaration stored
+/// by an earlier event kept its FQN, kind and sites, not its [`Definition`],
+/// so there is nothing to hand [`Resolver::mergeable`]. Those count as
+/// collisions, which is right for every language that answers `false`
+/// unconditionally and wrong for the first that does not — and the fix at
+/// that point is to store enough of the definition to ask, not to soften the
+/// count.
+fn mergeable_count<L: Language>(
+    rs: &dyn Resolver<L>,
+    colliding: &[NodeId],
+    event_defs: &HashMap<NodeId, Vec<Definition>>,
+) -> u64 {
+    let mut merged = 0;
+    for id in colliding {
+        let Some(defs) = event_defs.get(id) else {
+            continue;
+        };
+        if defs.len() >= 2 && defs.windows(2).all(|pair| rs.mergeable(&pair[0], &pair[1])) {
+            merged += 1;
+        }
+    }
+    merged
+}
+
+/// The container a file's definitions live in, when it names one.
+fn container_fqn<L: Language>(
     rs: &dyn Resolver<L>,
     cfg: &L::Config,
     facts: &FileFacts<L>,
     probe: &dyn SymbolProbe,
-) -> Option<NodeId> {
+) -> Option<Fqn> {
     let def = facts.defs.iter().find(|d| d.kind == DefKind::Module)?;
-    let fqn = rs.def_fqn(cfg, &facts.header, &def.owner, def, probe)?;
-    Some(node_id(L::DOMAIN, fqn.as_str()))
+    rs.def_fqn(cfg, &facts.header, &def.owner, def, probe)
 }
 
 /// A path under `root`, as a repo-relative `/`-separated string.
