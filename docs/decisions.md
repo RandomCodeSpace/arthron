@@ -4,6 +4,85 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — The road to 27 languages: core refactor first, ratified interface, staged corpora, frozen-core fanout
+
+Five language case studies (Java, JavaScript, TypeScript, Python, and a Go
+retrospective — design artifacts, kept local) were distilled into a
+language-neutral core interface. A grilling session ratified that interface
+and fixed the phase order. Four decisions, each with what it displaced.
+
+**Phase 2 is one core-refactor milestone.** The full core interface is
+implemented with Go as the only `Language` impl, inside a single window that
+takes the one permitted store-schema break and the one permitted contract
+break together. It includes the false-edge fix: today a local, parameter, or
+receiver that shadows an imported package name produces a **wrong resolved
+edge** — verified by executing probe programs, and worse than any miss,
+because a miss is counted and a wrong edge is not. The corpus is re-measured
+after the refactor with per-commit attribution.
+*Rejected:* evolving the trait piecemeal under the later language tracks
+(churns the boundary three tracks depend on and multiplies break windows);
+hot-fixing the shadowing bug on the old `Reference` type first (builds
+local-binding tracking twice).
+
+**Four amendments to earlier decisions, ratified.**
+
+1. *`LocalBinding` leaves the rate.* A reference to a local names a thing
+   that is not a node by decision, so the outcome is policy-caused, not a
+   language-support failure. It is reported on its own line beside
+   `External` and excluded from both terms of the resolution rate. Guard,
+   because the exclusion is gameable: the baseline file tracks the
+   `LocalBinding` count beside the rate, so reclassification drift is as
+   visible as a rate drop.
+   *Rejected:* counting it `Unresolved` (punishes the locals-are-not-nodes
+   policy and invites "fixing" the number by making locals nodes).
+2. *Baselines re-base on capability landings.* A capability that turns
+   `Unresolved` into `External` — receiver typing will, at scale — shrinks
+   both terms of the rate, which then jumps without one new in-repository
+   edge existing. When such a capability lands, the baseline is re-based,
+   not compared, and the external count is tracked as a time series. This
+   amends the ratchet decision, which assumed the denominator was stable.
+   *Rejected:* comparing across a capability landing (rewards
+   reclassification as if it were resolution).
+3. *The dedup row key gains a discriminator.* `(file, kind, raw_target)`
+   merges Java's `f.m(a)` with `f.m(a, b)` and Python's `self.run` across
+   two classes in one file — one row, one outcome, two correct answers. The
+   key gains an argument count and an enclosing discriminator where the
+   language needs one. Schema change; rides Phase 2's break window.
+4. *The unresolved-reason taxonomy grows to 18; `MacroGenerated` becomes
+   `Generated`.* The rename keeps its wire code; the taxonomy gains the
+   reasons the case studies demanded (`LocalBinding`, `NeedsReceiverType`,
+   `InterfaceDispatch`, `AmbiguousOverload`, `AmbiguousExport`,
+   `DynamicModuleSpecifier`, `ModuleNotFound`, `WildcardImport`, and
+   friends). Twelve proposed reasons were rejected in the design artifact.
+   Pre-0.1 with no crate consumers is exactly when a rename is cheap.
+   *Rejected:* keeping `MacroGenerated` and adding `Generated` beside it
+   (carries a dead variant forever).
+
+**Corpora are staged; the second Go corpus arrives now.** `caddy` is
+vendored into the corpus repository immediately, so Phase 2's re-measure
+gates on two independent Go repositories — the ratchet was already rejected
+on one corpus that four of five fixes couldn't move. Tier-1 corpora (one
+each for Java, JavaScript, TypeScript, Python) are vendored in Phase 3 when
+their `Language` impls start; tier-2 corpora are chosen per-language inside
+the Phase 5 fanout.
+*Rejected:* vendoring all 27 up front (snapshots go stale before their
+language exists, and provenance nobody exercises is decoration).
+
+**Phase 4 runs three concurrent tracks over a frozen core.** Java, JS/TS,
+and Python start together when Phase 2 lands. JS and TS are **one track**:
+they share module resolution, and identity hashes the *domain*, so a `.ts`
+import naming a `.js` definition is one reference space, not a cross-language
+edge. Per-language gates are never aggregated, so no track can move another's
+number. The core is frozen by default for the duration: a track that finds a
+core gap files a spec amendment and a dedicated core PR, which must keep
+every already-landed language's baseline green (re-based only under the
+capability rule above); no core change ever rides inside a language PR.
+*Rejected:* staggering the tracks (serializes without adding safety the
+independent gates don't already provide); per-track core edits (reintroduces
+exactly the cross-language regression smear that motivated gates-first).
+
+---
+
 ## 2026-07-27 — Resolver honesty fixes move the Go baseline
 
 Re-measured after the three fix commits, so the recorded baseline is what the
