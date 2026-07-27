@@ -32,7 +32,7 @@ enum Command {
     /// Build (or refresh) the graph for a repository and print per-language
     /// resolution rates.
     Scan {
-        /// Repository root (must contain go.mod).
+        /// Repository root.
         path: PathBuf,
         /// Database file (default: <path>/.arthron/graph.redb).
         #[arg(long)]
@@ -45,8 +45,13 @@ enum Command {
     /// provenance: printed, never verified — a vendored corpus snapshot
     /// carries no git metadata to check them against.
     Gate {
-        /// Corpus root (must contain go.mod).
+        /// Corpus root.
         path: PathBuf,
+        /// The language this gate measures. Rates are per language and never
+        /// aggregated, so the baseline and the tally are both this one
+        /// language's.
+        #[arg(long, default_value = "go")]
+        language: String,
         /// Baseline file to compare against, or to write with --rebase.
         #[arg(long)]
         baseline: PathBuf,
@@ -91,11 +96,19 @@ fn main() -> ExitCode {
         }
         Command::Gate {
             path,
+            language,
             baseline,
             db,
             rebase,
             commit,
-        } => run_gate(&path, &baseline, db.as_deref(), rebase, commit.as_deref()),
+        } => run_gate(
+            &path,
+            &language,
+            &baseline,
+            db.as_deref(),
+            rebase,
+            commit.as_deref(),
+        ),
     }
 }
 
@@ -126,11 +139,20 @@ fn scratch_dir() -> Result<ScratchDir, String> {
 
 fn run_gate(
     path: &Path,
+    language: &str,
     baseline_path: &Path,
     db: Option<&Path>,
     rebase: bool,
     commit: Option<&str>,
 ) -> ExitCode {
+    let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
+        let known: Vec<&str> = Lang::ALL.iter().map(|l| l.name()).collect();
+        eprintln!(
+            "arthron: unknown language `{language}`; one of: {}",
+            known.join(", ")
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
     // Read the baseline before scanning. A malformed file is a usage error,
     // and finding that out after a multi-minute scan helps nobody.
     let existing = match std::fs::read_to_string(baseline_path) {
@@ -149,7 +171,7 @@ fn run_gate(
     };
 
     if let Some(b) = &existing
-        && b.language != Lang::Go.name()
+        && b.language != lang.name()
     {
         // Rates are per language and never aggregated, so a baseline for one
         // language must never be compared against another's scan.
@@ -157,7 +179,7 @@ fn run_gate(
             "arthron: {}: baseline is for language `{}`, this scan measures `{}`",
             baseline_path.display(),
             b.language,
-            Lang::Go.name(),
+            lang.name(),
         );
         return ExitCode::from(EXIT_USAGE);
     }
@@ -195,7 +217,7 @@ fn run_gate(
 
     let tally = report
         .per_lang
-        .get(&Lang::Go.code())
+        .get(&lang.code())
         .cloned()
         .unwrap_or_default();
     let measured = Counts {
@@ -206,7 +228,14 @@ fn run_gate(
     };
 
     if rebase {
-        write_baseline(baseline_path, path, &measured, existing.as_ref(), commit)
+        write_baseline(
+            baseline_path,
+            path,
+            lang,
+            &measured,
+            existing.as_ref(),
+            commit,
+        )
     } else {
         let Some(baseline) = existing else {
             eprintln!(
@@ -222,6 +251,7 @@ fn run_gate(
 fn write_baseline(
     baseline_path: &Path,
     corpus: &Path,
+    lang: Lang,
     measured: &Counts,
     existing: Option<&Baseline>,
     commit: Option<&str>,
@@ -253,7 +283,7 @@ fn write_baseline(
         format: FORMAT,
         corpus,
         commit,
-        language: Lang::Go.name().to_string(),
+        language: lang.name().to_string(),
         counts: *measured,
     };
     if let Some(parent) = baseline_path.parent()

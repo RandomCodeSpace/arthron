@@ -87,6 +87,24 @@ pub fn scan<L: Language>(
         index.files.push(rel_path(root, path)?);
     }
     index.files.sort();
+
+    // A language none of whose files exist here has nothing to scan, and its
+    // resolver's config — its manifest — has no reason to exist in this tree
+    // either: a Go-less repository owes nobody a `go.mod`. Whatever the store
+    // still holds for this language belongs to files that are all gone now,
+    // so forget them, and report what the store knows: a track that read
+    // nothing has nothing of its own to report.
+    if index.files.is_empty() {
+        let store = Store::open(db_path)?;
+        let orphaned: Vec<String> = store
+            .known_files()?
+            .into_iter()
+            .filter(|file| claims::<L>(file))
+            .collect();
+        store.forget_files(&orphaned)?;
+        return store.report();
+    }
+
     let mut cfg = rs.config(root, &index).map_err(|e| e.message)?;
     let store = Store::open(db_path)?;
 
