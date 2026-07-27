@@ -227,6 +227,36 @@ impl Lang {
         }
     }
 
+    /// The capability tier this language's track reports at.
+    ///
+    /// Tier 1 resolves the call graph, so its rate is taken over calls, type
+    /// uses and imports together. Tier 2 extracts definitions, structure and
+    /// imports and emits no call reference at all, so its rate is an
+    /// *import*-resolution rate over a strictly smaller denominator — the
+    /// shape ratified in `docs/decisions.md`, 2026-07-27.
+    ///
+    /// Both are per-language and neither is ever aggregated, but two rates
+    /// printed in one column are read as one measurement unless something
+    /// says otherwise. This is that something: it is what the report line and
+    /// the `scan --json` tally state, so a tier-2 85% is never mistaken for a
+    /// tier-1 85%.
+    pub fn tier(self) -> u8 {
+        match self {
+            Lang::Go | Lang::Java | Lang::JavaScript | Lang::TypeScript | Lang::Python => 1,
+            _ => 2,
+        }
+    }
+
+    /// What this language's resolution rate is a rate *of*, in words, for the
+    /// human-readable report. Derived from [`Lang::tier`] so the number and
+    /// the phrase cannot disagree.
+    pub fn rate_scope(self) -> &'static str {
+        match self.tier() {
+            1 => "call-graph resolution",
+            _ => "import resolution",
+        }
+    }
+
     /// Inverse of [`Lang::code`]. `None` for codes no variant carries.
     pub fn from_code(c: u8) -> Option<Lang> {
         match c {
@@ -912,6 +942,29 @@ mod tests {
         // distinct, which is what says no two languages share a domain.
         let codes: Vec<u8> = pairs.iter().map(|(_, d)| d.code()).collect();
         assert_eq!(codes, (4u8..=17).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn the_tier_one_set_is_the_ratified_five_and_every_other_language_is_tier_two() {
+        // The tier decides what a rate is a rate *of*, so this list is a
+        // capability claim and not a convenience: adding a name here says
+        // that language's track resolves a call graph, and a report reader
+        // will read its number against Go's.
+        let tier_one = [
+            Lang::Go,
+            Lang::Java,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Python,
+        ];
+        for lang in Lang::ALL {
+            let want = if tier_one.contains(lang) { 1 } else { 2 };
+            assert_eq!(lang.tier(), want, "{} is not tier {want}", lang.name());
+        }
+        // The phrase a report prints is derived from the number, so a
+        // language cannot be labelled one tier and described as the other.
+        assert_eq!(Lang::Go.rate_scope(), "call-graph resolution");
+        assert_eq!(Lang::Ruby.rate_scope(), "import resolution");
     }
 
     #[test]
