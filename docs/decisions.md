@@ -4,6 +4,91 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — A framework rule may mint nodes, in a framework-owned namespace that no language tally counts
+
+**Decision:** `fw:<framework>/<kind>#<key>` — `fw:django/route#myapp:detail`,
+`fw:spring/property#app.order.timeout`, `fw:next/route#/blog/[slug]`. A route,
+a property key and a settings key are each a thing a reference can name whose
+identity is stable under unrelated edits, which is the node rule's test; none
+of them is a definition, a module or an external package, which is the closed
+list `CONTEXT.md` gives. They are stored in a framework table, hashed with a
+framework discriminator, and never entered in `NODES`.
+
+**Rejected:** synthesizing a direct target→consumer edge — making
+`reverse("admin:login")` point straight at the view — which loses the route as
+an object, cannot answer *"what routes exist"*, and produces a many-to-many
+edge explosion when several sites name one route. **Also rejected:** quietly
+adding a `NodeRecord` variant, which is the same change made invisible.
+
+---
+
+## 2026-07-27 — FrameworkFact spec self-ratified against the framework-edge decision
+
+Three framework case studies — Django (29 numbered cases plus four findings),
+Spring (30), React/Next (30) — were written against the vendored corpora and
+the shipped graph, then synthesized into one language-neutral contract. Per
+the production-readiness ratification, the spec self-ratifies by quoting the
+framework-edge decision verbatim and verifying every clause of its own design
+against it; the check found and fixed **four spec bugs** before finishing,
+each of which would have violated "never moves a language's rate" (framework
+probes in the shared candidates index; a framework `External` materialising
+into the language node table; a snapshot format without a framework half; an
+inherited fence rule that would leave stale framework edges behind).
+
+**What the contract fixes across the studies' three conflicts:**
+
+- Every framework edge declares, machine-readably, what it adds —
+  re-provenancing an already-resolved language edge with dispatch semantics,
+  or recovering a target from a string literal that was never in any
+  language denominator. Reported as a column, never merged.
+- The framework layer carries the same never-drop contract one layer up:
+  every site a rule matches is `Resolved`, `External`, or `Unresolved` with a
+  reason — including policy reasons no rule improvement can change, because
+  arthron does not execute code or touch the network. Policy counts are
+  drift-gated the way `LocalBinding` is.
+- Per-framework coverage is a rate over sites, per rule family, beside — never
+  inside — the language rates. The mechanical enforcement is a byte-identical
+  per-language-tally test with the framework layer off versus on.
+
+**Honest limit, recorded rather than hidden:** the framework rate cannot
+detect a missing rule, because its denominator is sites the rules matched.
+
+**Rejected:** framework rules as language-extractor extensions (the extractor
+is forbidden from linking, and a framework spans languages); a fourth
+language-level `Outcome` variant for framework results (the three-variant
+contract is not widened — the framework layer has its own).
+
+---
+
+## 2026-07-27 — Reference-hardware benchmark: the RSS ceiling fails at 1.8M lines
+
+First full benchmark on the reference envelope (2 vCPU via `taskset`, hard
+ceiling < 512 MB RSS, timing as targets), per the perf ratification:
+
+| corpus | lines | cold wall | cold s/1M | warm no-change | peak RSS cold | peak RSS warm |
+|---|---|---|---|---|---|---|
+| kubernetes v1.36.3 (Go) | 1,789,247 | 30.15 s | 16.85 s | 2.75 s | **729.1 MiB** | 133.4 MiB |
+| commons-lang (Java) | 189,376 | 4.04 s | 21.33 s | 0.27 s | 339.1 MiB | 33.8 MiB |
+
+**Verdicts:** cold RSS on kubernetes **fails the hard gate at 1.42× the
+ceiling** — the first hard-gate failure in the project. Cold throughput passes
+with 2.8–3.6× margin against the 60 s/1M-line target. Warm no-change misses
+its 1 s target on kubernetes (2.75 s) — a finding to explain, not a failure,
+exactly as the ratification anticipated for hash-walking a 1.8M-line tree.
+Warm RSS passes everywhere. Measured cause: scan memory grows linearly with
+corpus size because the cold scan holds every node id and payload in memory;
+Java's per-line slope is ~3.5× Go's. Timing numbers were taken on a loaded
+box and are upper bounds; RSS is load-independent and the failure is real.
+
+**Decision:** the robustness wave leads with bounding cold-scan memory, and
+re-running this benchmark until the RSS gate passes is that wave's acceptance
+test. **Rejected:** raising the ceiling — reference hardware is the promise,
+not the developer's box. **Also rejected:** promoting the warm-timing miss to
+a failure — timing was ratified as a target precisely because runners are
+noisy; the RSS ceiling is the hard line.
+
+---
+
 ## 2026-07-27 — The Java review round: an erased type frame is still a frame
 
 An adversarial review of the Java track produced eleven findings. Every one
