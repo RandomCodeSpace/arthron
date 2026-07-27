@@ -1,0 +1,63 @@
+# C# extraction rules.
+#
+# One rule, not one per construct, for the reason `java.yml` and `php.yml`
+# give: a rule per node kind walks every file once per rule, while a single
+# `any:` of kinds is one pre-order traversal whose order is document order.
+# The extractor needs that order — a declaration's namespace is the block it
+# sits in, and the blocks are matched by the same traversal.
+#
+# The list is an inventory of the grammar surface this extractor reads.
+# Nothing here decides what a node *means*: which of C#'s tables a `using`
+# consults, and whether a `field_declaration` is a constant or a field, are
+# decided in Rust where the modifiers and the ancestor chain are available.
+#
+# Kinds deliberately absent, and each one is the tier-2 contract rather than
+# an omission — a tier-2 language that emitted them un-gated would claim
+# tier-1 coverage:
+#   invocation_expression, member_access_expression
+#                             - call sites. Tier 2 links no call.
+#   object_creation_expression, generic_name, qualified_name in type position
+#                             - type uses. Tier 2 resolves no type.
+#   base_list                 - supertypes. Tier 2 emits no inheritance edge.
+#   attribute, global_attribute
+#                             - an attribute application is a type use, and
+#                               `[assembly: InternalsVisibleTo("Serilog.Tests")]`
+#                               carries its target in a string literal, which
+#                               is a framework-rule shape and never the core
+#                               extractor's.
+#   using_statement, local_declaration_statement
+#                             - the second meaning of `using`: disposing a
+#                               resource. It names a local, not a namespace.
+#   extern_alias_directive    - the third: an assembly alias the `.csproj`
+#                               declares. No source file declares its target,
+#                               so there is no node for it to name.
+#   local_function_statement  - a function local to a method body. Not a
+#                               member, and nothing outside can name it.
+id: csharp-node
+language: csharp
+rule:
+  any:
+    # Containers. A file may declare one, several, or none.
+    - kind: file_scoped_namespace_declaration
+    - kind: namespace_declaration
+    # Imports — the only reference kind this track emits.
+    - kind: using_directive
+    # Type declarations.
+    - kind: class_declaration
+    - kind: struct_declaration
+    - kind: interface_declaration
+    - kind: record_declaration
+    - kind: enum_declaration
+    - kind: delegate_declaration
+    # Members.
+    - kind: method_declaration
+    - kind: constructor_declaration
+    - kind: destructor_declaration
+    - kind: operator_declaration
+    - kind: conversion_operator_declaration
+    - kind: property_declaration
+    - kind: indexer_declaration
+    - kind: event_declaration
+    - kind: event_field_declaration
+    - kind: field_declaration
+    - kind: enum_member_declaration

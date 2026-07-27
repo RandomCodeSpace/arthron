@@ -94,6 +94,17 @@ impl SourceTree {
         Self::parse(SupportLang::Php, source)
     }
 
+    /// Parse C# source, exactly as written.
+    ///
+    /// No preprocessing: `#if` is a directive in the tree rather than a
+    /// filter over it, so **both arms of a conditional are parsed** and both
+    /// contribute declarations. Choosing an arm would mean choosing a target
+    /// framework, and a scan that read one build of a multi-targeted project
+    /// would report a graph that no single reader of the source could see.
+    pub fn parse_csharp(source: &str) -> Self {
+        Self::parse(SupportLang::CSharp, source)
+    }
+
     /// Parse Rust source.
     pub fn parse_rust(source: &str) -> Self {
         Self::parse(SupportLang::Rust, source)
@@ -236,6 +247,16 @@ rule:
             "id: t\nlanguage: ruby\nrule:\n  kind: module\n",
             "module",
             "Rack",
+        );
+    }
+
+    #[test]
+    fn parses_csharp() {
+        one_match(
+            &SourceTree::parse_csharp("namespace N;\nclass Greeter { void Hi() {} }\n"),
+            "id: t\nlanguage: csharp\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
         );
     }
 
