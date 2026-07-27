@@ -2,7 +2,7 @@
 name = "arthron"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Local-first code intelligence. Resolves cross-file references into a verified graph and records what it cannot resolve instead of dropping it. Design phase - see the repository."
 repository = "https://github.com/RandomCodeSpace/arthron"
 homepage = "https://github.com/RandomCodeSpace/arthron"
@@ -10,8 +10,20 @@ readme = "README.md"
 license = "MIT"
 keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
 categories = ["development-tools"]
+exclude = ["corpus/", "docs/superpowers/"]
 
 [dependencies]
+ast-grep-config = "=0.44.1"
+ast-grep-core = "=0.44.1"
+ast-grep-language = "=0.44.1"
+bincode = "2"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+redb = "=4.1.0"
 
 [lints.rust]
 missing_docs = "deny"
+
+[dev-dependencies]
+tempfile = "3"

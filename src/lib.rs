@@ -5,8 +5,8 @@
 //! between two files resolves to exactly one outcome, and that failing to
 //! resolve is recorded rather than discarded.
 //!
-//! The approved design lives in the repository under
-//! `docs/superpowers/specs/`. Read that before depending on anything here.
+//! The design decisions and their rationale are recorded in the repository's
+//! `docs/decisions.md`. Read that before depending on anything here.
 //!
 //! # Why this contract exists
 //!
@@ -37,6 +37,10 @@ pub enum UnresolvedReason {
     DynamicDispatch,
     /// The definition is produced by a macro or code generator not expanded here.
     MacroGenerated,
+    /// The target can only be found by inferring the type of an expression
+    /// (for example a method call on a variable), and this tool does not yet
+    /// perform type inference for the language.
+    NeedsTypeInference,
     /// The target names a package outside the repository that was not indexed.
     UnknownPackage,
     /// The language is supported structurally, but not for call-graph resolution.
@@ -102,6 +106,13 @@ pub fn resolution_rate(resolved: u64, unresolved: u64) -> Option<f64> {
     Some(resolved as f64 / total as f64)
 }
 
+pub mod extract_go;
+pub mod model;
+pub mod pipeline;
+pub mod resolve_go;
+pub mod sg;
+pub mod store;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +162,14 @@ mod tests {
     #[test]
     fn saturating_input_does_not_panic() {
         assert_eq!(resolution_rate(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn needs_type_inference_is_a_reason() {
+        let outcome: TestOutcome = Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
+        assert_eq!(
+            outcome.unresolved_reason(),
+            Some(&UnresolvedReason::NeedsTypeInference)
+        );
     }
 }

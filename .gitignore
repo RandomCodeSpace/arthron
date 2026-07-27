@@ -3,9 +3,22 @@
 **/*.rs.bk
 *.pdb
 
-# arthron's own store, when it exists
-/.arthron/
+# arthron's own store — created next to whatever tree gets scanned,
+# including the vendored corpus, so ignore it at any depth
+.arthron/
 *.redb
+
+# Claude Code worktrees
+/.claude/worktrees/
+
+# Local working artifacts: session discussion docs (specs, plans) and the
+# raw measurement write-ups. The public record is docs/decisions.md, which
+# carries the conclusions without the private predecessor's internals.
+/docs/superpowers/
+/docs/evidence/
+
+# Test corpora — RandomCodeSpace/arthron-corpus, cloned in, never vendored
+/corpus/
 
 # Local scratch
 /tmp/

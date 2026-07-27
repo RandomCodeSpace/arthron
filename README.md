@@ -8,8 +8,8 @@ A local-first code intelligence engine. It parses each file in isolation, then
 **resolves** the references between them into a verified graph — and tells you
 honestly which references it could not resolve.
 
-> **Status: design phase.** The engine is not implemented. The approved design
-> lives in [`docs/superpowers/specs/2026-07-26-arthron-design.md`](docs/superpowers/specs/2026-07-26-arthron-design.md).
+> **Status: design phase.** The engine is not implemented. The design decisions
+> and their rationale are recorded in [`docs/decisions.md`](docs/decisions.md).
 > Start there.
 >
 > The published `0.0.0` crate is not usable software. It ships the resolution
@@ -44,8 +44,8 @@ of three buckets:
 **Resolution rate is the primary quality gate** — ranked above performance. A
 change that lowers it fails the build. The honest baseline today is 0%.
 
-See [`docs/evidence/2026-07-26-baseline-measurements.md`](docs/evidence/2026-07-26-baseline-measurements.md)
-for the measurements behind every claim above.
+Every number above was measured, not estimated. The measurements are recorded
+in [`docs/decisions.md`](docs/decisions.md) alongside the decisions they drove.
 
 ## Shape
 
@@ -73,11 +73,11 @@ must be predictable there, not just fast on a developer's laptop.
 
 ## Language coverage
 
-All 32 languages ast-grep supports get structural analysis. Full call-graph
-resolution ships for five to start:
+All 27 languages ast-grep's built-in parsers support get structural analysis.
+Full call-graph resolution ships for five to start:
 
 - **Tier 1** (definitions, references, call graph): Java, TypeScript, Python, Go, JavaScript
-- **Tier 2** (definitions and structure): the remaining 27
+- **Tier 2** (definitions and structure): the remaining 22
 
 Tier 2 is a real product surface, not a stub — you get symbols, imports and file
 structure. You do not get verified call edges, and the tool says so rather than
