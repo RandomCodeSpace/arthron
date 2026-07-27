@@ -15,6 +15,9 @@
 # The public record is docs/decisions.md and docs/evidence/.
 /docs/superpowers/
 
+# Test corpora — RandomCodeSpace/arthron-corpus, cloned in, never vendored
+/corpus/
+
 # Local scratch
 /tmp/
 /bench/corpora/

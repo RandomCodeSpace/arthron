@@ -12,8 +12,12 @@ Read these before doing anything in this repo:
    its `_Avoid_` lists.
 
 **Status:** walking skeleton implemented — `arthron scan` prints a real Go
-resolution rate against `corpus/go/codeiq`. Next: gate command and baseline
+resolution rate against the `codeiq` Go corpus. Next: gate command and baseline
 ratchet, then Java.
+
+Corpora are **not** vendored here. They live in the private repository
+`RandomCodeSpace/arthron-corpus`; clone it into `corpus/` (gitignored) to run
+the acceptance test, which skips when it is absent.
 
 ## Non-negotiables
 
