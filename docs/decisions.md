@@ -143,6 +143,44 @@ that wrote the file would not be the one the gate compares against.
 
 ---
 
+## 2026-07-27 — Wave 1 capabilities land: alias chains, supertype closure, persisted facets
+
+Three capabilities, one branch, every movement attributed per commit and
+every touched baseline re-based under the capability rule. Go held
+byte-identical on both corpora throughout, as the rule demands.
+
+| Language | before | after | mechanism |
+|---|---|---|---|
+| TypeScript | 33.0% | **48.5%** | alias entries: re-export chains resolve; +8400 resolved, `WildcardImport` 9004 → 0, external and local-binding unchanged |
+| Java | 66.4% | **67.5%** | supertype closure: `UnindexedSupertype` 710 → 94; facets decide the anonymous-class case (one reference moved *into* the denominator — External was false) |
+| Python | 57.4% | **58.1%** | closure + C3: `UnindexedSupertype` 1468 → 1184 |
+| Go ×2, JavaScript | — | held exactly | no capability touches them; proven, not assumed |
+
+The alias landing is the single largest improvement in the project's
+history — bigger than every other commit's effect on every other corpus
+combined — and it moved nothing out of the rate's terms.
+
+**The review round found two highs; both were real and both are pinned by
+tests.** A barrel mixing a local star-export with an external one silently
+dropped the external contribution and resolved the overlap to the local
+name — a wrong `Resolved` edge; every star entry now contributes an
+identity and a departing star keeps the name set un-enumerable
+(`WildcardImport`). And the Python member walk was preorder DFS where
+CPython computes C3: `D(B, C)` resolved `self.m()` to `A.m` where Python
+calls `C.m` — replaced with real C3 linearization, `super()` following the
+MRO minus its head, verified against the interpreter's own answer.
+
+**First resource data point:** peak RSS under a cold scan — commons-lang
+339 MB (66% of the 512 MB hard ceiling), everything else ≤ 126 MB.
+
+*Rejected:* treating Python's unchanged django tally after the alias
+landing as "nothing happened" — its façade imports already resolved at the
+alias definition, so following chains moved edges onto the definitions
+without moving a count; the correctness gain is real and the tally was
+never the evidence for it.
+
+---
+
 ## 2026-07-27 — Production-readiness ratifications: framework edges, dependency-bounded coverage, 0.0.x releases, perf gates
 
 Four decisions taken up front so the remaining waves run without stopping.
