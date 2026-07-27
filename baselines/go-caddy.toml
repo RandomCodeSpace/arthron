@@ -1,0 +1,18 @@
+# arthron gate baseline — regenerate with:
+#   arthron gate corpus/go/caddy --baseline <this file> --rebase --commit <sha>
+# Release build, cold store. Counts are measured, never estimated.
+#
+# `corpus` and `commit` are provenance: printed, never verified.
+# The rate is not stored — it is derived from `resolved` and
+# `unresolved` on both sides, so the comparison is exact integer
+# arithmetic and cannot disagree with its own counts.
+# `external` and `local_binding` sit outside both rate terms; any
+# drift in either fails the gate and must be re-based deliberately.
+format = 1
+corpus = "corpus/go/caddy"
+commit = "853efde"
+language = "go"
+resolved = 3006
+external = 9571
+local_binding = 9425
+unresolved = 1815
