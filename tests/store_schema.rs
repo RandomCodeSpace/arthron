@@ -16,6 +16,12 @@ use redb::{Database, TableDefinition};
 /// `store.rs` makes this test fail loudly rather than quietly stop testing.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
+/// The file table as generation 8 declared it: a fixed 32-byte value, before
+/// a file's hash became a claim the store could take back. Restated here so
+/// the drop path is exercised against a table whose *types* differ, which is
+/// what an upgrade actually meets.
+const OLD_FILES: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("files");
+
 fn site(file: &str, line: u32) -> DeclSite {
     site_of(file, line, NodePayload::Definition(0, 0))
 }
@@ -171,6 +177,70 @@ fn a_version_mismatch_forces_a_cold_rescan() {
     assert!(snapshot.edges.is_empty());
     assert!(snapshot.candidates.is_empty());
     assert!(store.report().unwrap().per_lang.is_empty());
+}
+
+#[test]
+fn forgetting_a_hash_keeps_the_file_and_its_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("graph.redb"));
+    store
+        .apply_refs(&RefBatch {
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
+        })
+        .expect("apply refs");
+    let before = store.snapshot().expect("snapshot");
+
+    store
+        .forget_hashes(&["pkg/b.go".to_string(), "never/seen.go".to_string()])
+        .expect("forget hashes");
+
+    // The claim is gone, so the next scan re-reads the file...
+    assert_eq!(store.file_hash("pkg/b.go").unwrap(), None);
+    // ...and everything else it produced is still there, including the row
+    // in the file table that makes a walk which stops reaching it a deletion.
+    assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
+    let after = store.snapshot().expect("snapshot");
+    assert_eq!(after.rows, before.rows);
+    assert_eq!(after.edges, before.edges);
+    assert_eq!(after.candidates, before.candidates);
+    assert_eq!(after.nodes, before.nodes);
+    // A file the store never held facts for gains nothing: minting a row here
+    // would make a later walk that does not reach it a deletion of nothing.
+    assert!(!after.files.contains_key("never/seen.go"), "{after:?}");
+}
+
+#[test]
+fn a_store_whose_tables_are_typed_the_old_way_is_dropped_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.redb");
+
+    // What an older build left behind: the generation it wrote, and a `files`
+    // table whose value type this build no longer uses. Opening such a table
+    // is an error in redb, so a drop that went through `open_table` would
+    // turn every upgrade into a refusal instead of a cold re-scan.
+    {
+        let db = Database::create(&path).expect("raw open");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut meta = txn.open_table(META).expect("meta");
+            meta.insert("schema_version", &(SCHEMA_VERSION - 1).to_le_bytes()[..])
+                .expect("stamp");
+            let mut files = txn.open_table(OLD_FILES).expect("the old files table");
+            files.insert("pkg/a.go", &[7u8; 32]).expect("an old hash");
+        }
+        txn.commit().expect("commit");
+    }
+
+    let store = open(&path);
+    assert!(store.known_files().unwrap().is_empty());
+    assert!(store.snapshot().expect("snapshot").files.is_empty());
+    // And the rebuilt table is this build's: a hash goes in and comes back.
+    store
+        .apply_refs(&RefBatch {
+            files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
+        })
+        .expect("apply refs");
+    assert_eq!(store.file_hash("pkg/b.go").unwrap(), Some([1u8; 32]));
 }
 
 #[test]

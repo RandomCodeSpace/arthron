@@ -11,8 +11,15 @@
 //! make phase 2's replace delete what phase 1 just wrote for the same file,
 //! and the symptom would look like "some definitions randomly missing".
 //!
-//! One write transaction per batch (batch per event: 500 files in one
-//! transaction measured 60ms against 216ms as 500 separate transactions).
+//! One write transaction per batch, and a batch is a fixed number of files
+//! rather than the whole event (500 files in one transaction measured 60ms
+//! against 216ms as 500 separate transactions). What the bound buys is this
+//! layer's term and only this layer's: redb holds a transaction's dirty pages
+//! until it commits, so an event-sized transaction is an event-sized
+//! allocation, and a batch boundary hands both the batch and those pages
+//! back. It does not bound the scan — the driver holds the whole changed set
+//! while these run, and that term is the corpus's. See
+//! [`crate::pipeline::scan`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -32,13 +39,56 @@ use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
+/// Bytes redb may hold in its page cache, read and dirty pages together.
+///
+/// redb's own default is 1 GiB, which is not a cache at all for a store this
+/// size: a 257 MB graph fits inside it whole, nothing is ever evicted, and
+/// the process's peak becomes the database's size. Naming a smaller budget
+/// makes redb flush dirty pages as a transaction runs and evict clean ones as
+/// it reads.
+///
+/// This caps redb's term, and the pipeline's batch bound holds the same term
+/// down from the other side — a transaction over 500 files never has
+/// much dirty at once — so the two overlap rather than add. Peak RSS on the
+/// 1.79M-line reference corpus, 2 vCPU: 343 MB as shipped, 345 MB with
+/// redb's 1 GiB default cache, 349 MB with one transaction per phase, 440 MB
+/// with neither. The cap is kept because it is what holds the term when a
+/// phase's transaction is large, and neither knob makes the scan's own
+/// memory anything but linear in the tree — see [`crate::pipeline::scan`].
+///
+/// Chosen against the 512 MB ceiling on the 2 vCPU reference hardware, with
+/// room left for the batch and the symbol table beside it. Correctness does
+/// not depend on the number — a cache is a cache — only the ceiling does.
+const CACHE_BYTES: usize = 96 * 1024 * 1024;
+
 /// The [`META`] key the resolver's manifest fingerprint is stored under.
 const CONFIG_DIGEST_KEY: &str = "config_digest";
+
+/// What both open paths say when redb's exclusive lock is already taken.
+///
+/// redb's own words for it are `Database already open. Cannot acquire lock.`
+/// — true, and it names neither the file nor the thing that is holding it, so
+/// a person who ran two scans at once reads it as corruption. One sentence,
+/// shared by [`Store::open`] and [`ReadStore::open`], because the situation
+/// is the same one from either side: somebody else has the writer's lock.
+///
+/// The lock is `flock(2)`, which redb takes with `try_lock` — non-blocking.
+/// A second open therefore *fails*; it does not queue behind the first and it
+/// does not wait for a transaction to finish. That is the property worth
+/// keeping, and `tests/store_held.rs` bounds it in wall-clock time so that a
+/// future change to a blocking lock fails the build instead of hanging a
+/// scan. `flock` conflicts are per open file description, so a second open
+/// inside one process is refused exactly as a second process is — which is
+/// why the sentence says *handle* rather than *process*: it is true of both,
+/// and naming the process would send a reader who opened the store twice
+/// hunting for a second one that does not exist.
+pub const HELD_FOR_WRITING: &str =
+    "the store is held open for writing by another handle — a scan is already running against it";
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
@@ -58,7 +108,16 @@ const EDGES: TableDefinition<EdgeKey<'static>, &[u8]> = TableDefinition::new("ed
 const REV_EDGES: TableDefinition<EdgeKey<'static>, &[u8]> = TableDefinition::new("rev_edges");
 const CANDIDATES: MultimapTableDefinition<&[u8; 16], (&str, &[u8])> =
     MultimapTableDefinition::new("candidates");
-const FILES: TableDefinition<&str, &[u8; 32]> = TableDefinition::new("files");
+/// File → the content hash its stored facts were computed from, or an empty
+/// value when the store makes no such claim.
+///
+/// The key set is the file set: a file the store holds facts for has a row
+/// here, which is how a walk that no longer reaches it is read as a deletion.
+/// The *value* is a separate statement — "these facts are current for these
+/// bytes" — and a scan that could not read an owned file has to take that
+/// statement back without taking the facts, so the row stays and the hash
+/// goes. See [`Store::forget_hashes`].
+const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const DEF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("def_owned");
 const REF_OWNED: TableDefinition<&str, &[u8]> = TableDefinition::new("ref_owned");
 /// File → the supertypes each type it declares was placed at.
@@ -509,6 +568,22 @@ impl LangTally {
     }
 }
 
+/// One file a scan reached and could not turn into facts.
+///
+/// The never-drop rule, applied one level below a reference: a file that
+/// cannot be read produces no reference at all, so no [`crate::Outcome`] can
+/// carry the failure and a rate computed over the rest is silently taken over
+/// a smaller file set than the one the walk found. Recording the file, with
+/// what the filesystem or the decoder said, is what keeps that visible.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileError {
+    /// The path, repo-relative when the walk got far enough to have one and
+    /// as the walk saw it otherwise.
+    pub path: String,
+    /// One line: what failed.
+    pub message: String,
+}
+
 /// Tallies for every language present in the store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -522,6 +597,20 @@ pub struct Report {
     /// common cause, and before this counter existed one of them silently
     /// overwrote the other.
     pub fqn_collisions: u64,
+    /// The files this scan could not read, sorted by path and deduplicated.
+    ///
+    /// Data like [`Report::fqn_collisions`], and filled by the same hand: the
+    /// store tallies what it holds, and the walk that found these tells the
+    /// report about them afterwards — [`Store::report`] leaves the list
+    /// empty because a store cannot know what a walk failed to reach. A read
+    /// failure is not a scan failure: the walk keeps going, every other file
+    /// is measured, and the ones that were not are named here rather than
+    /// vanishing between the file count and the reference count.
+    ///
+    /// Bounded by the walk's own file list, which a scan already holds in
+    /// full, so carrying every failure costs nothing a scan was not already
+    /// paying.
+    pub file_errors: Vec<FileError>,
 }
 
 /// The whole store as one comparable value: the incremental oracle.
@@ -531,8 +620,9 @@ pub struct Report {
 /// This is what an incremental scan is compared against a cold one with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Content hash per known file.
-    pub files: BTreeMap<String, [u8; 32]>,
+    /// Content hash per known file, or `None` for one whose facts the store
+    /// no longer claims are current — see [`Store::forget_hashes`].
+    pub files: BTreeMap<String, Option<[u8; 32]>>,
     /// Every node, by identity.
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     /// Every reference row, by key.
@@ -556,8 +646,23 @@ impl Store {
     /// A store carrying any other [`SCHEMA_VERSION`] is wiped: its tables are
     /// dropped and recreated empty, so the next scan sees no known files and
     /// rebuilds everything.
+    ///
+    /// A store some other handle already holds is refused, immediately and by
+    /// name — see [`HELD_FOR_WRITING`]. There is one writer, and a second one
+    /// is told so rather than left waiting for the first to finish.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let db = Database::create(path).map_err(|e| e.to_string())?;
+        let db = redb::Builder::new()
+            .set_cache_size(CACHE_BYTES)
+            .create(path)
+            .map_err(|e| match e {
+                // Named rather than passed through: redb says only
+                // `Database already open. Cannot acquire lock.`, which names
+                // no file and no holder — see [`HELD_FOR_WRITING`].
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                }
+                other => format!("{}: {other}", path.display()),
+            })?;
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let stored = {
@@ -652,11 +757,18 @@ impl Store {
     /// Replace the phase-1 half of every file in the batch, in one
     /// transaction.
     ///
-    /// Returns the identities that ended this call with a *definition*
+    /// Returns the identities that ended *this call* with a *definition*
     /// declared in more than one file — the mechanical half of the FQN
     /// grammar's injectivity obligation. The store never judges what that
     /// means: two declarations sharing an FQN are a collision in one
     /// language and one entity in another, and only the language knows.
+    ///
+    /// "This call" is the whole of the promise. An event applies several
+    /// batches, and a batch sees only the graph as it stands when it commits
+    /// — an identity two files claim is flagged by whichever batch brings the
+    /// second one in, and an identity a later batch takes back is flagged all
+    /// the same. A caller spanning batches therefore collects these and asks
+    /// [`Store::definition_collisions`] which of them survived the event.
     pub fn apply_defs(&self, batch: &DefBatch) -> Result<Vec<NodeId>, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
         let mut colliding = Vec::new();
@@ -691,6 +803,32 @@ impl Store {
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(colliding)
+    }
+
+    /// Which of these identities a *definition* is declared for in more than
+    /// one file, as the graph stands right now.
+    ///
+    /// The settled answer to the question [`Store::apply_defs`] can only
+    /// answer per batch. Every identity any batch flagged goes in; what comes
+    /// out is the subset the finished event still holds two declarations for,
+    /// which is exactly what a single event-sized transaction would have
+    /// reported. One read transaction, because an event asks about every
+    /// identity it flagged at once.
+    pub fn definition_collisions(&self, ids: &BTreeSet<NodeId>) -> Result<Vec<NodeId>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(record) = read_node(&nodes, id)?
+                && record.is_definition_collision()
+            {
+                out.push(*id);
+            }
+        }
+        Ok(out)
     }
 
     /// Replace the supertype half of every file in the batch, in one
@@ -839,7 +977,7 @@ impl Store {
                 }
                 write_owned(&mut owned, &file.path, &record)?;
                 files
-                    .insert(file.path.as_str(), &file.hash)
+                    .insert(file.path.as_str(), file.hash.as_slice())
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -886,6 +1024,48 @@ impl Store {
         txn.commit().map_err(|e| e.to_string())
     }
 
+    /// Take back the store's claim that these files' facts are current,
+    /// keeping the facts themselves.
+    ///
+    /// What a scan does with an owned file it could not read. Stepping over
+    /// one and keeping its halves is right — a permission bit is not a
+    /// deletion — but the halves were resolved against a graph this event has
+    /// since moved, and the stored hash still matches the file's untouched
+    /// bytes. Left alone, the file is never in a later scan's changed set and
+    /// never woken by one either, because waking is driven by the identities
+    /// *this* event moved: its rows keep outcomes computed against a graph
+    /// state that no longer exists, and no report ever says so again.
+    ///
+    /// Clearing the hash puts the file in the next successful scan's changed
+    /// set, which re-reads and re-resolves it in full. The row survives, so
+    /// the file is still one [`Store::known_files`] names and a walk that
+    /// stops reaching it is still read as a deletion.
+    pub fn forget_hashes(&self, paths: &[String]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
+            for path in paths {
+                // Only a file the store already knows. A file that failed on
+                // its very first scan has no facts to go stale, and minting a
+                // row for it here would make the next walk that does not
+                // reach it look like a deletion of nothing.
+                if files
+                    .get(path.as_str())
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                {
+                    files
+                        .insert(path.as_str(), [].as_slice())
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
     /// Every file the store holds facts for.
     pub fn known_files(&self) -> Result<Vec<String>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
@@ -898,14 +1078,20 @@ impl Store {
         Ok(out)
     }
 
-    /// The stored content hash for a file, if any.
+    /// The bytes this file's stored facts were computed from, when the store
+    /// still claims they are current.
+    ///
+    /// `None` covers two situations a scan treats identically: the store has
+    /// never seen the file, and the store has taken its claim back because a
+    /// scan could not read it. Both mean "re-read this file", which is what
+    /// the caller does with an answer that does not match.
     pub fn file_hash(&self, path: &str) -> Result<Option<[u8; 32]>, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(FILES).map_err(|e| e.to_string())?;
         Ok(table
             .get(path)
             .map_err(|e| e.to_string())?
-            .map(|guard| *guard.value()))
+            .and_then(|guard| <[u8; 32]>::try_from(guard.value()).ok()))
     }
 
     /// The record stored under a node id, if the node exists.
@@ -1095,9 +1281,10 @@ impl Store {
         let files = txn.open_table(FILES).map_err(|e| e.to_string())?;
         for entry in files.iter().map_err(|e| e.to_string())? {
             let (key, value) = entry.map_err(|e| e.to_string())?;
-            snapshot
-                .files
-                .insert(key.value().to_string(), *value.value());
+            snapshot.files.insert(
+                key.value().to_string(),
+                <[u8; 32]>::try_from(value.value()).ok(),
+            );
         }
         let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
         for entry in nodes.iter().map_err(|e| e.to_string())? {
@@ -1220,13 +1407,15 @@ impl ReadStore {
     /// not a wipe: a reader that rebuilt the store to satisfy itself would
     /// destroy a graph whose owner never asked for one.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let db = ReadOnlyDatabase::open(path).map_err(|e| match e {
-            redb::DatabaseError::DatabaseAlreadyOpen => format!(
-                "{}: the store is open for writing — a scan is running against it",
-                path.display(),
-            ),
-            other => format!("{}: {other}", path.display()),
-        })?;
+        let db = redb::Builder::new()
+            .set_cache_size(CACHE_BYTES)
+            .open_read_only(path)
+            .map_err(|e| match e {
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                }
+                other => format!("{}: {other}", path.display()),
+            })?;
         let store = ReadStore { db };
         match store.schema_version()? {
             Some(SCHEMA_VERSION) => Ok(store),
