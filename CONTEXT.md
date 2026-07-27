@@ -71,7 +71,13 @@ languages. The primary quality gate.
 
 **Tier**:
 A language's declared capability level. Tier 1: definitions, references, call
-graph. Tier 2: definitions and structure; no verified call edges.
+graph. Tier 2: definitions, structure, and imports; no verified call edges —
+its gate is an import-resolution rate.
+
+**Framework edge**:
+An edge a framework rule adds, provenanced by its framework and counted per
+framework. Framework coverage never moves a language's resolution rate.
+_Avoid_: magic edge, implicit edge
 
 **Corpus**:
 A pinned, vendored snapshot of real source against which resolution rate is

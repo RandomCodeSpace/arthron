@@ -143,6 +143,54 @@ that wrote the file would not be the one the gate compares against.
 
 ---
 
+## 2026-07-27 — Production-readiness ratifications: framework edges, dependency-bounded coverage, 0.0.x releases, perf gates
+
+Four decisions taken up front so the remaining waves run without stopping.
+
+**A framework edge is separately provenanced and never moves a language's
+rate.** Frameworks add edges the language honestly cannot see (Django URL
+dispatch, Spring injection, component references). Each framework's rules
+produce edges tagged with their framework and counted per framework, with
+their own baselines when measured. Framework facts may consume the language
+graph; they never write into language tallies. *Rejected:* folding framework
+resolution into the language rate — a Django plugin would "improve Python",
+which is the reclassification-inflation class every prior decision refuses,
+and it destroys per-corpus comparability.
+
+**Tier-2 gates on an import-resolution rate, and coverage is bounded by the
+parser dependency.** Tier 2 extracts definitions, containers, and imports —
+no call references — and its per-language rate is resolved imports over
+resolved-plus-unresolved imports, same outcome contract, same ratchet
+mechanism. Coverage claim corrected from "27 languages" to **every language
+the pinned ast-grep ships a grammar for**: full tier-2 for C++ (C rides its
+grammar), C#, Kotlin, Swift, Ruby, PHP, Rust, Scala; best-effort (stock
+grammar, generic rules, explicitly non-blocking) for Dart, Elixir, Haskell,
+Lua, Bash, and HCL. Erlang, OCaml, Julia, R, Zig, Groovy, Perl and SQL are
+out until ast-grep ships them — a pinned-version bump is a deliberate
+decision, not drift. *Rejected:* custom tree-sitter grammars for the missing
+eight (spend on communities too small to block production readiness);
+tier-2 with no rate at all (unfalsifiable "support").
+
+**Releases start at 0.0.1 and publishing is pre-authorized.** First publish
+is 0.0.1 to crates.io (the 0.0.0 contract crate already reserves the name);
+each completed wave bumps 0.0.x. Publication happens autonomously when all
+corpus gates pass, CI is green on Linux, macOS and Windows, docs are
+complete, the performance evidence is recorded, and `cargo publish
+--dry-run` is clean. GitHub-Packages npm stays a reservation; public npmjs
+is skipped. *Rejected:* holding each publish for a manual word (pre-1.0,
+yankable, name already public).
+
+**RSS is a gate; time is a target — with numbers.** Measured under a 2 vCPU
+`taskset` with `/usr/bin/time -v` on a repository of at least one million
+lines: maximum RSS under 512 MB is a hard gate, cold and warm both. Cold
+scan at or under 60 seconds per million lines and a warm no-change scan at
+or under one second regardless of repository size are targets — missing one
+is a finding to explain in evidence, not a failure. *Rejected:* timing as a
+hard gate (shared runners flake, and a flaky red gate teaches people to
+ignore red).
+
+---
+
 ## 2026-07-27 — Tier 1 complete: five languages, six corpus gates, one frozen core
 
 The three language tracks ratified in the road-to-27 plan ran concurrently
