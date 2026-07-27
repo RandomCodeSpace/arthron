@@ -2,14 +2,20 @@
 //! and the measured counts are the ones the committed baseline was recorded
 //! from.
 //!
-//! Two questions, the same two every tier-1 corpus test asks:
+//! Three questions; the first and the last are the two every tier-1 corpus
+//! test asks, and the middle one is the half of tier 2 no rate reaches:
 //!
 //! 1. **Completeness.** Every reference the extractor emits ends in exactly
 //!    one of `Resolved`, `External` or `Unresolved(reason)`. The check
 //!    re-extracts the same files independently and compares totals, because a
 //!    resolver that silently dropped its hardest references would otherwise
 //!    report a *better* rate for doing less work.
-//! 2. **The ratchet.** The counts are compared against
+//! 2. **The definitions.** Tier 2's deliverable is definitions, structure
+//!    and imports, and the rate can only see the imports. The definition
+//!    census is therefore asserted exactly on both sides of the store — an
+//!    owner-frame bug that lost most of the corpus's methods moves no rate,
+//!    no bucket and no baseline, so nothing else here would notice it.
+//! 3. **The ratchet.** The counts are compared against
 //!    `baselines/ruby-rack.toml` through the same [`arthron::gate::evaluate`]
 //!    the `arthron gate` command uses, so a rate regression — or drift in
 //!    either of the two buckets that sit outside the rate — fails the build.
@@ -36,8 +42,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use arthron::gate::{Counts, GateVerdict, evaluate, parse_baseline};
-use arthron::model::{DefKind, Lang, RefKind, reason_name};
-use arthron::store::Store;
+use arthron::model::{DefKind, Domain, Lang, RefKind, node_id, reason_name};
+use arthron::query::{NodeKind, definition};
+use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_ruby::extract::{ImportForm, extract};
 use arthron::track_ruby::resolve::scan_ruby;
 
@@ -51,6 +58,117 @@ const REFERENCES: u64 = 342;
 const REQUIRE_RELATIVE: u64 = 247;
 const LOAD_PATH: u64 = 94;
 const DYNAMIC: u64 = 1;
+
+/// Every definition the extractor emits over those 93 files, by kind.
+///
+/// Asserted exactly, for the same reason the reference tally is. Definitions
+/// are the half of tier 2 the import-rate gate cannot see: an owner-frame bug
+/// that lost most of the methods in the corpus would leave every rate, every
+/// bucket and the whole ratchet untouched. `Module` counts the 93 synthetic
+/// feature nodes as well as the modules the source writes.
+const DEFS: &[(DefKind, u64)] = &[
+    (DefKind::Function, 2),
+    (DefKind::Method, 633),
+    (DefKind::Type, 88),
+    (DefKind::Const, 156),
+    (DefKind::Property, 44),
+    (DefKind::Module, 161),
+];
+
+/// Definition nodes the store holds after merging, by kind.
+///
+/// Lower than [`DEFS`] where reopening merges: `def call` written at the top
+/// level of two files is one `Object#call`. The pair of censuses is the
+/// point — the extractor's says nothing was lost on the way in, the store's
+/// says nothing was lost or over-merged on the way through.
+///
+/// `DefKind::Module` is absent because the driver files a module as a
+/// *package* node rather than a definition; those are counted by
+/// [`PACKAGES`] instead.
+const STORED: &[(DefKind, u64)] = &[
+    (DefKind::Function, 1),
+    (DefKind::Method, 630),
+    (DefKind::Type, 88),
+    (DefKind::Const, 156),
+    (DefKind::Property, 44),
+];
+
+/// Package nodes: the 93 feature nodes a `require` names, plus the modules
+/// the source declares once reopening has merged them — 161 module
+/// definitions in, 106 identities out, which is what `module Rack` written in
+/// most of a gem's files looks like from the other side.
+const PACKAGES: u64 = 106;
+
+/// External nodes: the one gem `rack.gemspec` declares and `test/helper.rb`
+/// requires. Named in [`PINNED`], because which gem ships a require path is
+/// a claim about the outside world and not a count.
+const EXTERNALS: u64 = 1;
+
+/// Named nodes, spelled out: `(fqn, kind, declaring file, line)`.
+///
+/// A census pins the scale; these pin the *shape*. Two `params` under
+/// different owners cannot both be right unless the owner frames were walked
+/// to the bottom, and `Rack::Builder.parse_file` cannot be right unless a
+/// singleton method is separated from an instance one of the same name.
+const PINNED: &[(&str, NodeKind, &str, u32)] = &[
+    // The feature `require 'rack/version'` names, and the module the same
+    // file declares: one file, two identities, and the path-derived one is
+    // what an import resolves to.
+    (
+        "$lib/rack/version",
+        NodeKind::Package,
+        "lib/rack/version.rb",
+        1,
+    ),
+    ("Rack", NodeKind::Package, "lib/rack.rb", 17),
+    (
+        "Rack::VERSION",
+        NodeKind::Definition(DefKind::Const),
+        "lib/rack/version.rb",
+        9,
+    ),
+    (
+        "Rack.release",
+        NodeKind::Definition(DefKind::Method),
+        "lib/rack/version.rb",
+        14,
+    ),
+    (
+        "Rack::Request",
+        NodeKind::Definition(DefKind::Type),
+        "lib/rack/request.rb",
+        16,
+    ),
+    (
+        "Rack::Request#params",
+        NodeKind::Definition(DefKind::Method),
+        "lib/rack/request.rb",
+        72,
+    ),
+    (
+        "Rack::Request::Helpers#params",
+        NodeKind::Definition(DefKind::Method),
+        "lib/rack/request.rb",
+        556,
+    ),
+    (
+        "Rack::Builder.parse_file",
+        NodeKind::Definition(DefKind::Method),
+        "lib/rack/builder.rb",
+        65,
+    ),
+    // `require 'minitest/global_expectations/autorun'`. That path is shipped
+    // by `minitest-global_expectations`, and `minitest` — also declared, also
+    // a prefix — does not ship it. Both answers classify the reference the
+    // same way and sit outside both rate terms; only one names the right
+    // package on the node the reference points at.
+    (
+        "minitest-global_expectations",
+        NodeKind::External,
+        "test/helper.rb",
+        26,
+    ),
+];
 
 #[test]
 fn the_ruby_track_drops_nothing_and_holds_its_baseline() {
@@ -141,6 +259,15 @@ fn the_ruby_track_drops_nothing_and_holds_its_baseline() {
     println!("             forms {forms:?}");
     println!("             defs  {kinds:?}");
 
+    // -- the definitions, exactly ------------------------------------------
+
+    let want: BTreeMap<u8, u64> = DEFS.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(
+        kinds, want,
+        "the definition census moved; tier 2's own deliverable is half \
+         definitions and no rate can see them",
+    );
+
     let accounted =
         measured.resolved + measured.external + measured.local_binding + measured.unresolved;
     assert_eq!(
@@ -182,6 +309,56 @@ fn the_ruby_track_drops_nothing_and_holds_its_baseline() {
         2,
         "an unexpected reason appeared: {reasons:?}"
     );
+
+    // -- the definitions the store kept, by kind and by name ---------------
+
+    let read = ReadStore::open(&db).expect("the store opens for reading");
+    let mut stored: BTreeMap<u8, u64> = BTreeMap::new();
+    let mut packages = 0u64;
+    let mut externals = 0u64;
+    read.for_each_node(|_, record| {
+        match record {
+            NodeRecord::Definition { kind, .. } => *stored.entry(kind).or_default() += 1,
+            NodeRecord::Package { .. } => packages += 1,
+            NodeRecord::External { .. } => externals += 1,
+        }
+        Ok(())
+    })
+    .expect("walking the node table");
+    println!("             nodes {stored:?} packages {packages} externals {externals}");
+    let want: BTreeMap<u8, u64> = STORED.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(stored, want, "the stored definition census moved");
+    assert_eq!(packages, PACKAGES, "the stored package census moved");
+    assert_eq!(externals, EXTERNALS, "the stored external census moved");
+
+    for (fqn, kind, file, line) in PINNED {
+        // An external node's identity carries the `external:` prefix the
+        // driver mints it under; a definition's is its FQN as written here.
+        let spelled = match kind {
+            NodeKind::External => format!("external:{fqn}"),
+            _ => (*fqn).to_string(),
+        };
+        let id = node_id(Domain::Ruby, &spelled);
+        let def = definition(&read, &id)
+            .unwrap_or_else(|e| panic!("{fqn}: {e}"))
+            .unwrap_or_else(|| panic!("{fqn} is not in the store"));
+        assert_eq!(def.node.name, *fqn);
+        assert_eq!(def.node.kind, *kind, "{fqn}");
+        // `module Rack` is reopened in most of the gem, so only the sites in
+        // the file this pin names are worth printing when it misses.
+        let here: Vec<u32> = def
+            .declarations
+            .iter()
+            .filter(|d| d.file == *file)
+            .map(|d| d.line)
+            .collect();
+        assert!(
+            here.contains(line),
+            "{fqn} is not declared at {file}:{line} — {} site(s) in that file, at {here:?}",
+            here.len(),
+        );
+    }
+    drop(read);
 
     // -- the ratchet ------------------------------------------------------
 
