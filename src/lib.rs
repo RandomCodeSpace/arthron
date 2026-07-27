@@ -166,9 +166,20 @@ pub mod gate;
 pub mod lang;
 pub mod model;
 pub mod pipeline;
+pub mod registry;
 pub mod resolve_go;
 pub mod sg;
 pub mod store;
+
+// One module per language track. All four are declared here, live or not, so
+// that bringing a language up edits only that track's own file — see
+// `registry.rs` for the rule and each track's module docs for the steps. A
+// track added from now on nests its extractor and resolver under
+// `src/track_<name>/`, which is why this list does not grow either.
+pub mod track_ecma;
+pub mod track_go;
+pub mod track_java;
+pub mod track_python;
 
 #[cfg(test)]
 mod tests {

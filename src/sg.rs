@@ -34,12 +34,45 @@ impl Rules {
 }
 
 impl SourceTree {
-    /// Parse Go source. tree-sitter is error-tolerant: broken files still
-    /// yield a tree, with error nodes where parsing failed.
-    pub fn parse_go(source: &str) -> Self {
+    /// Parse source in one grammar. tree-sitter is error-tolerant: broken
+    /// files still yield a tree, with error nodes where parsing failed, so
+    /// every `parse_*` below is total.
+    ///
+    /// Private because [`SupportLang`] is an ast-grep type and this module is
+    /// the only place that may name one. A track picks its grammar by calling
+    /// its own `parse_*`.
+    fn parse(lang: SupportLang, source: &str) -> Self {
         SourceTree {
-            inner: SupportLang::Go.ast_grep(source),
+            inner: lang.ast_grep(source),
         }
+    }
+
+    /// Parse Go source.
+    pub fn parse_go(source: &str) -> Self {
+        Self::parse(SupportLang::Go, source)
+    }
+
+    /// Parse Java source.
+    pub fn parse_java(source: &str) -> Self {
+        Self::parse(SupportLang::Java, source)
+    }
+
+    /// Parse JavaScript source — `.js`, `.mjs` and `.cjs` alike, since the
+    /// dialects differ in module semantics rather than in grammar.
+    pub fn parse_javascript(source: &str) -> Self {
+        Self::parse(SupportLang::JavaScript, source)
+    }
+
+    /// Parse TypeScript source, including `.d.ts` declaration files: a
+    /// declaration file is a `.ts` file whose bodies happen to be absent, not
+    /// a dialect of its own.
+    pub fn parse_typescript(source: &str) -> Self {
+        Self::parse(SupportLang::TypeScript, source)
+    }
+
+    /// Parse Python source.
+    pub fn parse_python(source: &str) -> Self {
+        Self::parse(SupportLang::Python, source)
     }
 
     /// Every `(rule id, node)` pair any rule matches, in rule order.
@@ -87,5 +120,78 @@ rule:
         let name = node.field("name").expect("has name field");
         assert_eq!(name.text(), "main");
         assert_eq!(span_of(&name).line, 3);
+    }
+
+    /// One rule and one source per grammar the tracks will need.
+    ///
+    /// The assertion that matters is not the count: it is that the grammar is
+    /// compiled into this build at all. `ast-grep-language` ships every
+    /// grammar by default, and this is what notices if that ever stops being
+    /// true — a missing grammar parses to a tree of error nodes and matches
+    /// nothing, which is silent everywhere else.
+    fn one_match(tree: &SourceTree, yaml: &str, want_kind: &str, want_name: &str) {
+        let rules = Rules::compile(yaml).expect("rules compile");
+        let found = tree.matches(&rules);
+        assert_eq!(found.len(), 1, "expected one {want_kind}");
+        let (_, node) = &found[0];
+        assert_eq!(node.kind(), want_kind);
+        let name = node.field("name").expect("has name field");
+        assert_eq!(name.text(), want_name);
+    }
+
+    #[test]
+    fn parses_java() {
+        one_match(
+            &SourceTree::parse_java("class Greeter { void hi() {} }\n"),
+            "id: t\nlanguage: java\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_javascript() {
+        let yaml = "id: t\nlanguage: javascript\nrule:\n  kind: function_declaration\n";
+        one_match(
+            &SourceTree::parse_javascript("export function hi() {}\n"),
+            yaml,
+            "function_declaration",
+            "hi",
+        );
+        // `.mjs` and `.cjs` are the same grammar: only module semantics differ.
+        one_match(
+            &SourceTree::parse_javascript("function hi() {}\nmodule.exports = { hi };\n"),
+            yaml,
+            "function_declaration",
+            "hi",
+        );
+    }
+
+    #[test]
+    fn parses_typescript_including_declaration_files() {
+        let yaml = "id: t\nlanguage: typescript\nrule:\n  kind: interface_declaration\n";
+        one_match(
+            &SourceTree::parse_typescript("interface Greeter { hi(): void }\n"),
+            yaml,
+            "interface_declaration",
+            "Greeter",
+        );
+        // A `.d.ts` file is a `.ts` file; the same parser reads it.
+        one_match(
+            &SourceTree::parse_typescript("declare interface Greeter { hi(): void }\n"),
+            yaml,
+            "interface_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_python() {
+        one_match(
+            &SourceTree::parse_python("def hi():\n    pass\n"),
+            "id: t\nlanguage: python\nrule:\n  kind: function_definition\n",
+            "function_definition",
+            "hi",
+        );
     }
 }
