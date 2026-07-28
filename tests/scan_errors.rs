@@ -19,6 +19,21 @@
 //! root reads a `chmod 000` file happily, so each of those tests checks that
 //! the mode actually took and says so instead of asserting something the
 //! kernel was never going to do.
+//!
+//! # Why this whole file is Unix-only
+//!
+//! Every refusal here is expressed in Unix terms: `chmod 000` for the two
+//! permission cases, and a filename that is bytes rather than UTF-16 for the
+//! unkeyable-path case. `std::os::unix` is `#[cfg(unix)]` in std, so the
+//! imports below do not merely fail their assertions off Unix — they fail to
+//! *compile*, which takes the whole test binary with them and stops
+//! `cargo test` before it runs anything. The gate is on the file rather than
+//! on the imports so that a Windows runner builds an empty binary and moves
+//! on to the rest of the suite. What is guarded here is not skipped on
+//! Windows so much as inexpressible on it; a Windows equivalent would be a
+//! different test with different mechanics, not a `cfg` arm of this one.
+
+#![cfg(unix)]
 
 use std::ffi::OsStr;
 use std::fs;

@@ -17,8 +17,11 @@
 /docs/superpowers/
 /docs/evidence/
 
-# Test corpora — RandomCodeSpace/arthron-corpus, cloned in, never vendored
-/corpus/
+# Test corpora — RandomCodeSpace/arthron-corpus, cloned in or symlinked,
+# never vendored. No trailing slash: with one, the pattern matches only a
+# real directory, and a `corpus -> ...` symlink (what a worktree gets) shows
+# up as untracked.
+/corpus
 
 # Local scratch
 /tmp/

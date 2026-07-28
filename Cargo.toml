@@ -1,16 +1,35 @@
 [package]
 name = "arthron"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.89"
-description = "Local-first code intelligence. Resolves cross-file references into a verified graph and records what it cannot resolve instead of dropping it. Design phase - see the repository."
+description = "Local-first code intelligence. One resolver links cross-file references into a verified graph and records every reference it cannot link, with a reason, instead of dropping it."
 repository = "https://github.com/RandomCodeSpace/arthron"
 homepage = "https://github.com/RandomCodeSpace/arthron"
 readme = "README.md"
 license = "MIT"
-keywords = ["code-analysis", "call-graph", "static-analysis", "ast", "codebase"]
-categories = ["development-tools"]
-exclude = ["corpus/", "docs/superpowers/"]
+keywords = ["code-intelligence", "call-graph", "static-analysis", "ast", "cross-reference"]
+categories = ["development-tools", "command-line-utilities"]
+# An allowlist, not a denylist: what a published crate carries is everything
+# that compiles it and nothing else. `src/**/*` is deliberately broad because
+# the extractors `include_str!` their rule files out of `src/rules/`, so a
+# `*.rs`-only list would break the build after packaging rather than before.
+# corpus/ (a symlink to a private repository), baselines/, tests/, docs/,
+# npm/ and .github/ are all outside it — none of them is needed to build the
+# crate, and the corpus is not ours to redistribute.
+#
+# Every pattern is anchored with a leading `/`. These are .gitignore patterns,
+# so an unanchored `LICENSE` matches a file of that name at *any* depth: it
+# pulled every `corpus/<lang>/<project>/LICENSE` into the tarball through the
+# corpus symlink, and `README.md` pulled in `npm/README.md`. Anchoring is what
+# makes this list mean the four files at the root that it reads as meaning.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 [dependencies]
 ast-grep-config = "=0.44.1"

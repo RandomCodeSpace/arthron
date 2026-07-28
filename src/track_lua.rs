@@ -1,4 +1,4 @@
-//! The Lua track. **Live.** Owns `.lua`, at **tier 2**.
+//! The Lua track. **Live.** Owns `.lua`, at **tier 2, best effort**.
 //!
 //! [`TRACK`] carries `scan: Some(`[`resolve::scan_lua_with`]`)`, so
 //! [`crate::registry::Track::owns_extension`] answers `true` for `lua` and
@@ -14,7 +14,7 @@
 //! - [`lang`] — the [`crate::lang::Language`] impl and the FQN grammar the
 //!   other three agree on.
 //!
-//! # What tier 2 means here, precisely
+//! # What tier 2, best effort means here, precisely
 //!
 //! Definitions, structure, and imports. **No call edges and no type-use
 //! resolution**, and the honest consequence is that the extractor emits no
@@ -32,6 +32,14 @@
 //!
 //! Lua's gate is therefore an **import-resolution rate**, and it is not
 //! comparable with Go's or Java's, nor with Ruby's or Scala's.
+//!
+//! *Best effort* lowers the ambition, never the honesty. The stock grammar
+//! and two call shapes are the whole of what this track reads, so the
+//! denominator is small by design — and every reference it does emit is
+//! still `Resolved`, `External` or `Unresolved` with a ratified reason, the
+//! resolver still never drops, and the number still blocks a merge in
+//! `.github/workflows/gate.yml` like every other. Non-blocking describes how
+//! much of the language is read, never whether the measurement counts.
 //!
 //! # The two numbers a reader of the baseline should expect
 //!

@@ -14,19 +14,19 @@
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
 //! it, which looks exactly like a passing gate and is the absence of one.
 //!
-//! This file closes half of it, and is worth reading for which half. It reads
-//! no corpus and runs everywhere, including the CI job where `corpus/` is
-//! absent and every ratchet skips — so it does catch a baseline that no test
-//! file names at all.
+//! This file closes it, and is worth reading for how. It reads no corpus and
+//! runs everywhere, including the CI job where `corpus/` is absent and every
+//! ratchet skips — so it catches a baseline that no test file names at all.
 //!
-//! What it does **not** catch is a baseline whose ratchet exists and never
-//! runs. Every file in the right-hand column below skips without a corpus,
-//! and the corpus is private, so `cargo test` in CI proves nothing about any
-//! of these numbers. The job that does is
-//! `.github/workflows/gate.yml`, which is the one place the corpus is
-//! fetched, and a `GATED` row here says nothing about whether a step there
-//! names the same baseline. Adding a baseline therefore takes **two** entries,
-//! not one, and only the first of them is checked below.
+//! It also catches the other half, which is worse: a baseline whose ratchet
+//! exists and never runs. Every file in the right-hand column below skips
+//! without a corpus, and the corpus is private, so `cargo test` in CI proves
+//! nothing about any of these numbers. The job that does is
+//! `.github/workflows/gate.yml`, the one place the corpus is fetched and the
+//! one place a rate blocks a merge. Adding a baseline therefore takes **two**
+//! entries, not one — a `GATED` row here and a step there — and
+//! [`every_gated_baseline_has_a_step_in_the_corpus_gate_workflow`] is what
+//! makes forgetting the second fail, in a test that itself needs no corpus.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,7 +41,7 @@ use arthron::model::Lang;
 /// A row here is *not* enforcement. The driver it names skips whenever
 /// `corpus/` is absent, which is every CI run; the step in
 /// `.github/workflows/gate.yml` is what makes the number block a merge. Both
-/// are required, and nothing here checks the second.
+/// are required, and both are checked below.
 const GATED: &[(&str, &str)] = &[
     ("baselines/go-codeiq.toml", "tests/corpus.rs"),
     ("baselines/go-caddy.toml", "tests/corpus.rs"),
@@ -140,4 +140,113 @@ fn no_two_baselines_measure_the_same_corpus() {
         );
     }
     assert_eq!(corpora.len(), GATED.len());
+}
+
+/// The corpus-gate workflow, read as text.
+///
+/// A test that compiled the file with a YAML parser would need a YAML parser,
+/// and the crate has no reason to carry one. The steps it checks are a fixed
+/// shape — one `run:` line per gate, with the three arguments below — so the
+/// tokens are read directly and the shape itself is asserted: a step header
+/// this parser does not turn into a triple fails the test rather than
+/// silently shrinking the set it compares.
+const GATE_WORKFLOW: &str = ".github/workflows/gate.yml";
+
+/// One parsed `arthron gate` invocation: corpus path, `--language`, `--baseline`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GateStep {
+    corpus: String,
+    language: String,
+    baseline: String,
+}
+
+/// Every `arthron gate` invocation in [`GATE_WORKFLOW`], and the number of
+/// step headers they were parsed out of.
+fn gate_steps() -> (Vec<GateStep>, usize) {
+    let text = std::fs::read_to_string(GATE_WORKFLOW)
+        .unwrap_or_else(|e| panic!("reading {GATE_WORKFLOW}: {e}"));
+    let headers = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("- name: Gate "))
+        .count();
+    let mut steps = Vec::new();
+    for line in text.lines() {
+        let Some((_, invocation)) = line.split_once("arthron gate ") else {
+            continue;
+        };
+        let words: Vec<&str> = invocation.split_whitespace().collect();
+        let flag = |name: &str| {
+            words
+                .iter()
+                .position(|w| *w == name)
+                .and_then(|i| words.get(i + 1))
+                .map(|w| (*w).to_string())
+        };
+        let (Some(corpus), Some(language), Some(baseline)) = (
+            words.first().map(|w| (*w).to_string()),
+            flag("--language"),
+            flag("--baseline"),
+        ) else {
+            panic!("{GATE_WORKFLOW}: cannot read a gate invocation from `{line}`");
+        };
+        steps.push(GateStep {
+            corpus,
+            language,
+            baseline,
+        });
+    }
+    (steps, headers)
+}
+
+#[test]
+fn every_gated_baseline_has_a_step_in_the_corpus_gate_workflow() {
+    // The gap this closes: `cargo test` skips every corpus ratchet when
+    // `corpus/` is absent, and it is absent in `.github/workflows/ci.yml`
+    // because the corpus is private. A baseline with a ratchet but no step in
+    // the gate workflow is therefore gated by nothing at all, and looks
+    // exactly like a passing gate. This test reads no corpus, so it is one of
+    // the things that does run in CI.
+    let (steps, headers) = gate_steps();
+    assert_eq!(
+        steps.len(),
+        headers,
+        "{GATE_WORKFLOW} has {headers} gate steps and {} readable invocations;          a step this test cannot read is a step it cannot check",
+        steps.len(),
+    );
+
+    let in_workflow: BTreeSet<String> = steps.iter().map(|s| s.baseline.clone()).collect();
+    assert_eq!(
+        in_workflow.len(),
+        steps.len(),
+        "{GATE_WORKFLOW} gates one baseline twice: {steps:?}",
+    );
+    let listed: BTreeSet<String> = GATED.iter().map(|(path, _)| (*path).to_string()).collect();
+    assert_eq!(
+        listed, in_workflow,
+        "a baseline with no step in {GATE_WORKFLOW} is gated by nothing: `cargo test` skips          its ratchet wherever corpus/ is absent, which is every run of ci.yml",
+    );
+}
+
+#[test]
+fn every_gate_step_names_the_corpus_and_language_its_baseline_records() {
+    // A step that points at the wrong tree, or passes the wrong `--language`,
+    // is a step that measures something the baseline does not describe — and
+    // it would pass or fail for reasons that have nothing to do with the
+    // number being gated.
+    let (steps, _) = gate_steps();
+    for step in &steps {
+        let text = std::fs::read_to_string(&step.baseline)
+            .unwrap_or_else(|e| panic!("{GATE_WORKFLOW} names {}: {e}", step.baseline));
+        let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{}: {e}", step.baseline));
+        assert_eq!(
+            step.language, baseline.language,
+            "{GATE_WORKFLOW} gates {} as `{}`, which the baseline does not record",
+            step.baseline, step.language,
+        );
+        assert_eq!(
+            step.corpus, baseline.corpus,
+            "{GATE_WORKFLOW} scans {} for {}, whose provenance is {}",
+            step.corpus, step.baseline, baseline.corpus,
+        );
+    }
 }

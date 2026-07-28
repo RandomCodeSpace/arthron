@@ -1,0 +1,82 @@
+# cargo-deny configuration. Run by the `audit` job in .github/workflows/ci.yml.
+#
+# Two questions are asked of the dependency tree on every push and pull request:
+# does anything in it carry a known advisory, and is every license in it one we
+# may actually ship under? Both are the kind of thing that is cheap to answer
+# continuously and expensive to discover at publish time.
+
+[graph]
+# Every feature on, and no `targets` filter, so the graph checked here is the
+# widest one the lockfile can produce — including the platform-specific crates
+# the macOS and Windows legs of the CI matrix pull in. Narrowing it would hide
+# a dependency from the audit on the platform where it is actually built.
+all-features = true
+
+[advisories]
+# RustSec advisories. Left at the v2 defaults, which deny vulnerabilities and
+# unmaintained crates alike, so either is a red check rather than a line in a
+# log nobody reads.
+version = 2
+yanked = "deny"
+
+# Every entry here is a known advisory that has been read and accepted, with
+# the reason it was accepted and what would end it. An empty `ignore` list is
+# the goal state; a long one is a smell. Nothing may be added here to make a
+# *vulnerability* go away — only an advisory whose category is a fact about
+# the crate's upkeep rather than about its behaviour.
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0141"
+# bincode 2.0.1 is unmaintained: the team stopped development in December 2025
+# and states that the released version is complete rather than abandoned
+# mid-flight. It is the encoder for redb's stored values, so replacing it
+# (postcard, bitcode, rkyv) changes the on-disk graph format and every stored
+# value's bytes — a store-format decision with its own migration, not something
+# to slip into a release commit. There is no vulnerability here and no
+# advisory for one; this ignore covers the unmaintained status only, and ends
+# the day the format changes or an actual vulnerability lands against it.
+reason = "unmaintained-only advisory; bincode is the stored graph's value encoder and replacing it is a store-format migration"
+
+[licenses]
+version = 2
+# An allowlist, and deliberately a short one: every entry is a license this
+# tree actually resolves to today. A permissive license that no dependency
+# uses is not listed — adding one is a decision to be made when a dependency
+# arrives needing it, in the commit that adds the dependency, not pre-emptively
+# here where nobody will ever revisit it.
+#
+#   MIT, Apache-2.0   the overwhelming majority of the tree
+#   Unicode-3.0       unicode-ident, which is
+#                     `(MIT OR Apache-2.0) AND Unicode-3.0` — the AND makes
+#                     this one mandatory rather than an alternative
+#   BSD-2-Clause      arrayref, the only crate in the tree with a single
+#                     non-MIT/Apache license and no alternative
+#
+# Everything else in the tree offers MIT or Apache-2.0 as one arm of an OR
+# (blake3's CC0, ryu's BSL-1.0, r-efi's LGPL-2.1-or-later,
+# constant_time_eq's MIT-0, the Unlicense/MIT pairs), so the permissive arm is
+# what gets selected and none of them needs an entry.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+]
+# How sure the text scanner must be when a crate declares no SPDX expression
+# and its license has to be inferred from a LICENSE file. Left at cargo-deny's
+# default: no crate in this tree relies on it today, and lowering it to make a
+# future one pass would be guessing at someone's license terms.
+confidence-threshold = 0.93
+
+[bans]
+# Duplicate versions of the same crate are a warning, not a failure: this tree
+# does not control its transitive dependencies' version ranges, and failing on
+# a duplicate would make an unrelated upstream bump break the build.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io. A git or alternate-registry dependency would be a supply-chain
+# decision, and it should arrive as a deliberate edit here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

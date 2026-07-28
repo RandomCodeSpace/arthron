@@ -1,6 +1,5 @@
 //! `arthron` CLI. Printing only — analysis logic lives in the library.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -20,7 +19,7 @@ use arthron::query::{
 };
 use arthron::registry::REGISTRY;
 use arthron::resolution_rate;
-use arthron::store::{LangTally, ReadStore, StoredOutcome};
+use arthron::store::{ReadStore, StoredOutcome};
 
 /// Exit code for a gate regression: the run worked, the numbers are worse.
 const EXIT_GATE_FAILED: u8 = 1;
@@ -715,15 +714,19 @@ fn show_rate(c: &Counts) -> String {
 
 fn report_text(report: &arthron::store::Report) -> String {
     let mut text = String::new();
-    // A scanned language with no reference rows still gets a line. The report
-    // is keyed off references, so printing only what it contains would make
-    // "nothing to measure" indistinguishable from a clean run, and those are
-    // different facts.
-    let empty = LangTally::default();
-    let mut lang_codes: BTreeSet<u8> = report.per_lang.keys().copied().collect();
-    lang_codes.insert(Lang::Go.code());
-    for lang_code in lang_codes {
-        let tally = report.per_lang.get(&lang_code).unwrap_or(&empty);
+    // One line per language the store holds rows for, and no line for one it
+    // does not — the same rule `--json` documents as stable public API: "a
+    // language with no rows has no entry, which is not a rate of zero." The
+    // two outputs describe the same run, so they list the same languages.
+    //
+    // This used to force a `go` line in unconditionally, which printed a
+    // language on repositories that contain no Go at all, gave it a rate of
+    // "nothing to measure", and disagreed with `--json` about the very same
+    // scan. The report is keyed off references and carries no record of which
+    // languages were walked, so it cannot tell "scanned, found nothing" from
+    // "not present" for *any* language; naming one of the nineteen was not a
+    // way of saying so.
+    for (&lang_code, tally) in &report.per_lang {
         let known = Lang::from_code(lang_code);
         let lang = known.map_or("unknown", Lang::name);
         let unresolved = tally.unresolved_total();
@@ -756,6 +759,16 @@ fn report_text(report: &arthron::store::Report) -> String {
         for (code, count) in &tally.unresolved {
             outln!(text, "             {} {count}", reason_name(*code));
         }
+    }
+    // The one thing an empty language list must not be is a blank report.
+    // Naming no language is correct — nothing in the tree produced a row to
+    // name — but saying nothing at all is the silence this report exists to
+    // avoid, and it reads identically to a scan that never ran.
+    if report.per_lang.is_empty() {
+        outln!(
+            text,
+            "no references — no live track produced a reference row for this tree"
+        );
     }
     // Data, not a verdict: two files declaring one FQN is a fact about the
     // repository, printed so it can be looked at, never gating anything.
