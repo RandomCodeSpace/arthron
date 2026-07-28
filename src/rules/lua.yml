@@ -1,0 +1,19 @@
+id: def-function
+language: lua
+rule:
+  kind: function_declaration
+---
+id: assign
+language: lua
+rule:
+  kind: assignment_statement
+---
+id: field
+language: lua
+rule:
+  kind: field
+---
+id: call
+language: lua
+rule:
+  kind: function_call
