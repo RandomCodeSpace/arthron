@@ -1,8 +1,8 @@
-//! The C++ track. **Live.** Owns `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh` and
-//! `.hxx`, at **tier 2**.
+//! The C++ track. **Live.** Owns `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`,
+//! `.hh` and `.hxx`, at **tier 2**.
 //!
 //! [`TRACK`] carries `scan: Some(`[`resolve::scan_cpp`]`)`, so
-//! [`crate::registry::Track::owns_extension`] answers `true` for those six
+//! [`crate::registry::Track::owns_extension`] answers `true` for those seven
 //! and the driver runs C++ over every file the walk reaches under one. Four
 //! layers, and the boundary between them is the project's first
 //! non-negotiable:
@@ -30,29 +30,23 @@
 //! enumerations and their constants, functions and member functions, type
 //! aliases, the module a file exports, and the *unit* every file is.
 //!
-//! # The one number a reader of the baseline must not misread
+//! # `.h` is claimed, and the claim is the amendment the registration reserved
 //!
-//! **fmt's headers are all `.h`, and `.h` is an extension this build does not
-//! claim.** The tier-2 registration left `.c` and `.h` unclaimed — a C
-//! translation unit read under the C++ grammar is the wrong language — and
-//! going live widened nothing. The corpus is a header-dominated library: 21
-//! of its 55 source files are `.h`, and 99 of the 116 quoted `#include`
-//! directives in the 33 files this track *does* read name one of them.
+//! The tier-2 registration left `.c` and `.h` unclaimed — a C translation
+//! unit read under the C++ grammar is the wrong language — and this track
+//! went live owning six extensions, which on the measured corpus cost the
+//! measurement itself. fmt is a header-dominated library whose headers are
+//! all `.h`: 21 of its 55 source files were invisible, 100 in-repository
+//! header references were `Unresolved` as an extension-policy floor, and
+//! the rate came out at 3.4% — a number that measured the policy, not the
+//! resolver. The registration reserved the widening for "the commit that
+//! parses it", and this is that commit: `.h` rides the C++ track, the scan
+//! reads the headers, and the re-based rate measures resolution.
 //!
-//! So those 99 references, and one angled `<fmt/base.h>` beside them, are
-//! `Unresolved` with a reason: a literal specifier that resolved to no module
-//! under this build's configured resolution, whose translation units are the
-//! six extensions above. They are **not** `External` — laundering an
-//! in-repository header into the bucket that sits outside the rate is exactly
-//! the failure the Rust review caught one language earlier — so they count
-//! *against* the rate, and the rate is correspondingly small.
-//!
-//! That is a floor of the extension policy, not a resolver gap, and it is
-//! stated here so nobody reads the number as a broken track. The rate is
-//! still a ratchet: it can only be re-based upward, and the single change
-//! that would move it most is a *separate, ratified* decision to claim `.h`,
-//! which is a claim about parsing C headers under a C++ grammar and not
-//! something a go-live commit may make on its own.
+//! The accepted risk, stated rather than hidden: a pure-C repository's
+//! `.h` files now parse under the C++ grammar. That stands until a C track
+//! exists and arbitrates ownership — `.c` stays unclaimed, because no
+//! commit yet parses a C translation unit as C.
 //!
 //! # Known limits, recorded rather than left to be rediscovered
 //!
@@ -108,7 +102,7 @@ mod tests {
     fn cpp_is_registered_and_live() {
         assert!(TRACK.is_enabled());
         assert_eq!(TRACK.langs, [Lang::Cpp]);
-        for ext in ["cpp", "cc", "cxx", "hpp", "hh", "hxx"] {
+        for ext in ["cpp", "cc", "cxx", "h", "hpp", "hh", "hxx"] {
             assert!(Lang::Cpp.owns_extension(ext));
             // Extension ownership is a property of the language whether or
             // not anything is built for it; whether a scan reads such a file
@@ -122,18 +116,18 @@ mod tests {
     }
 
     #[test]
-    fn going_live_claimed_no_extension_the_registration_had_not() {
-        // The tier-2 registration committed six extensions and deliberately
-        // left `.c` and `.h` unclaimed. Claiming either is a claim about
-        // reading a C translation unit under the C++ grammar, and it is a
-        // decision of its own — not something this commit makes on the way
-        // past, however much it would move the measured rate.
+    fn the_h_claim_is_the_one_ratified_widening_and_c_stays_unclaimed() {
+        // The tier-2 registration committed six extensions and reserved
+        // `.h` for a decision of its own — the first honest moment to
+        // claim an extension is the commit that parses it. This build
+        // parses `.h`, so the list is exactly one wider. `.c` is still a
+        // claim about reading a C translation unit under the C++ grammar,
+        // and nobody has ratified it.
         assert_eq!(
             Lang::Cpp.extensions(),
-            ["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            ["cpp", "cc", "cxx", "h", "hpp", "hh", "hxx"],
         );
-        for unclaimed in ["c", "h"] {
-            assert!(!TRACK.owns_extension(unclaimed));
-        }
+        assert!(TRACK.owns_extension("h"));
+        assert!(!TRACK.owns_extension("c"));
     }
 }

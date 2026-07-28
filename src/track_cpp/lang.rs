@@ -41,12 +41,12 @@ impl Language for CppLang {
     /// Read off [`Lang::extensions`] rather than restated, so the registry's
     /// view of what C++ owns and this one cannot drift apart.
     ///
-    /// `.c` and `.h` are **not** claimed, and going live does not widen the
-    /// list the tier-2 registration committed. A `.c` file read under the C++
-    /// grammar is the wrong language, and a `.h` file is a C header as often
-    /// as a C++ one. The consequence is measured rather than hidden — see
-    /// [`crate::track_cpp`] for what it costs on a header-only corpus whose
-    /// headers are all `.h`.
+    /// `.h` **is** claimed — the amendment the tier-2 registration reserved,
+    /// made because a header-dominated C++ library is unmeasurable without
+    /// it; see [`crate::model::Lang::extensions`] for the measurement and
+    /// the accepted risk. `.c` is **not**: a C translation unit read under
+    /// the C++ grammar is the wrong language, and that claim waits for a C
+    /// track.
     fn extensions() -> &'static [&'static str] {
         Lang::Cpp.extensions()
     }
@@ -109,18 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn the_extension_list_is_the_registrys_own_and_going_live_widened_nothing() {
+    fn the_extension_list_is_the_registrys_own_and_h_is_its_ratified_widening() {
         assert_eq!(CppLang::extensions(), Lang::Cpp.extensions());
         assert_eq!(
             CppLang::extensions(),
-            ["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            ["cpp", "cc", "cxx", "h", "hpp", "hh", "hxx"],
         );
-        // The two the tier-2 registration deliberately left unclaimed. The
-        // first honest moment to claim an extension is the commit that
-        // parses it, and this one does not parse either.
-        for unclaimed in ["c", "h"] {
-            assert!(!CppLang::extensions().contains(&unclaimed));
-        }
+        // `.c` stays unclaimed. The first honest moment to claim an
+        // extension is the commit that parses it: the `.h` claim was made
+        // by exactly such a commit, and no commit parses C as C.
+        assert!(!CppLang::extensions().contains(&"c"));
     }
 
     #[test]
