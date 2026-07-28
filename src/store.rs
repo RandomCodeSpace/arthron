@@ -36,7 +36,9 @@
 //! [`crate::pipeline::scan`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use bincode::{Decode, Encode, config};
 use redb::{
@@ -103,6 +105,61 @@ const CONFIG_DIGEST_KEY: &str = "config_digest";
 /// hunting for a second one that does not exist.
 pub const HELD_FOR_WRITING: &str =
     "the store is held open for writing by another handle — a scan is already running against it";
+
+/// What both open paths say about bytes that are not a graph.
+///
+/// redb makes a database in two steps: it sizes the file and syncs it, and
+/// only then writes the magic number that says the bytes are a database —
+/// deliberately, so that a half-made file can never be mistaken for a whole
+/// one. The cost of that safety is that the window has no exit: a process
+/// killed inside it leaves a file every later open refuses, with no repair
+/// path and nothing in redb's own words (`I/O error: invalid data`) to say
+/// which file or what to do about it.
+///
+/// [`Store::open`] does not leave one any more — a store that does not exist
+/// yet is built beside its path and published whole, so the path holds either
+/// nothing or a database. This sentence is for the two cases that remain: a
+/// file an older build wedged, and a `--db` aimed at something that was never
+/// a store. Both read the same from here, and both end the same way — and not
+/// by arthron's hand. A graph is a cache the tree can always rebuild, but the
+/// bytes at a path the caller named are the caller's to delete.
+pub const NOT_A_STORE: &str = "not an arthron store — an interrupted first scan left it \
+     half-made, or the path is not a graph at all; delete the file and re-run `arthron scan`";
+
+/// What a read-only open says about a store an interrupted scan left behind.
+///
+/// redb marks a store as needing recovery while a write transaction is in
+/// flight and clears the mark when it lands, so a scan killed between the two
+/// leaves the mark set. Recovery is a *write*, which a reader cannot do and
+/// must not: repairing a store in order to answer a question is the one thing
+/// [`ReadStore`] exists not to do. redb's own words — `Database repair
+/// aborted.` — name neither the store nor the way out.
+///
+/// The refusal is wider than the damage, on purpose. The mark says a scan
+/// died; it does not say the graph is wrong, and a store can carry it while
+/// being byte-for-byte what the finished scan would have written. Nothing in
+/// the file distinguishes those two, so answering out of one would mean
+/// answering out of the ones that *are* torn — and the way out is one command
+/// that fixes both, because a scan re-reads every file whose claim the killed
+/// one withdrew.
+pub const NEEDS_RECOVERY: &str =
+    "an interrupted scan left this store needing recovery — re-run `arthron scan`";
+
+/// What a query says about a store that is readable but not wholly current.
+///
+/// A [`FILES`] row with an empty value is the store saying it holds facts for
+/// a file it no longer claims are current — see [`Store::forget_hashes`] and
+/// the currency rule in this module's header. Two things leave one: a scan
+/// that could not read an owned file, and a scan that was killed between a
+/// file's two halves. A query cannot tell them apart and does not need to,
+/// because the consequence is the same either way — some of these answers
+/// were computed against a graph the store has since moved past.
+///
+/// Said on stderr and never on stdout: the answer is still the best one the
+/// store has, `--json` stays one document, and the exit code stays what the
+/// question deserved. What is not acceptable is saying it silently.
+pub const NOT_ALL_CURRENT: &str = "this store no longer claims to be current for some of its files; \
+     answers touching them may be stale — re-run `arthron scan`";
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
@@ -685,19 +742,35 @@ impl Store {
     /// A store some other handle already holds is refused, immediately and by
     /// name — see [`HELD_FOR_WRITING`]. There is one writer, and a second one
     /// is told so rather than left waiting for the first to finish.
+    ///
+    /// # Creation is all-or-nothing
+    ///
+    /// A store that does not exist yet — or a path holding no bytes at all,
+    /// which is the same thing to redb — is **not** made at its own path. It
+    /// is made beside it, at [`staging_path`], and published only once it is a
+    /// database — because the window in which it is not one has no exit. redb
+    /// sizes the file and syncs it before writing the magic number, so a
+    /// process killed between those two leaves bytes that every later open
+    /// refuses, forever, with no repair path: the first scan of a repository
+    /// wedges its own store and only `rm` gets past it. Building beside the
+    /// path and publishing whole means the path holds either nothing — which
+    /// the next scan reads as "cold scan" and heals by definition — or a
+    /// database. See [`NOT_A_STORE`].
+    ///
+    /// Publication is a [`fs::hard_link`], which refuses to replace a path
+    /// that exists, and *that* refusal is the point: two scans that both found
+    /// no store both build one, and the loser must not unlink the winner's
+    /// store out from under a handle already writing into it. The loser drops
+    /// its own and opens the winner's, where redb's lock refuses it by name
+    /// exactly as it would have before.
     pub fn open(path: &Path) -> Result<Self, String> {
+        if !holds_bytes(path) {
+            create_beside(path)?;
+        }
         let db = redb::Builder::new()
             .set_cache_size(CACHE_BYTES)
             .create(path)
-            .map_err(|e| match e {
-                // Named rather than passed through: redb says only
-                // `Database already open. Cannot acquire lock.`, which names
-                // no file and no holder — see [`HELD_FOR_WRITING`].
-                redb::DatabaseError::DatabaseAlreadyOpen => {
-                    format!("{}: {HELD_FOR_WRITING}", path.display())
-                }
-                other => format!("{}: {other}", path.display()),
-            })?;
+            .map_err(|e| open_failure(path, e))?;
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let stored = {
@@ -1523,6 +1596,160 @@ impl Store {
     }
 }
 
+/// Where a store that does not exist yet is built before it is published.
+///
+/// A sibling of the store's own path, so the publication below is a link
+/// within one directory and therefore within one filesystem — a store staged
+/// under `/tmp` and published onto another mount could not be linked at all.
+/// The name is derived rather than unique on purpose: it is the *lock*. Two
+/// scans that both find no store both open this one path, and redb's
+/// `flock(2)` refuses the second exactly as it refuses a second writer on a
+/// store that already exists. A unique name per process would let both build
+/// one and both publish.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".new");
+    PathBuf::from(name)
+}
+
+/// Turn redb's word for a failed open into one that names the store and the
+/// way out.
+///
+/// Shared by both open paths for the two failures that read the same from
+/// either side. redb says `Database already open. Cannot acquire lock.` and
+/// `I/O error: invalid data`, and neither names a file, a holder, or a
+/// remedy — see [`HELD_FOR_WRITING`] and [`NOT_A_STORE`].
+fn open_failure(path: &Path, e: redb::DatabaseError) -> String {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => {
+            format!("{}: {HELD_FOR_WRITING}", path.display())
+        }
+        e if is_not_a_database(&e) => format!("{}: {NOT_A_STORE}", path.display()),
+        other => format!("{}: {other}", path.display()),
+    }
+}
+
+/// Whether redb refused these bytes because they are not a database.
+///
+/// The magic number is absent: the file was never finished being created, or
+/// it was never a store. redb reports both as an `InvalidData` I/O error,
+/// which is the one redb failure that no retry and no repair gets past.
+fn is_not_a_database(e: &redb::DatabaseError) -> bool {
+    matches!(
+        e,
+        redb::DatabaseError::Storage(redb::StorageError::Io(io))
+            if io.kind() == std::io::ErrorKind::InvalidData
+    )
+}
+
+/// Build an empty database beside `path` and publish it there whole.
+///
+/// Called only when nothing at `path` holds bytes. What it leaves is a *bare*
+/// redb
+/// database — no schema stamp and no tables — because that is the state
+/// [`Store::open`] already knows how to finish, and giving the same work two
+/// implementations is how they drift apart. A process killed after the
+/// publication and before the stamp lands opens a store whose generation is
+/// absent, which is the wipe-and-rebuild path, unchanged.
+fn create_beside(path: &Path) -> Result<(), String> {
+    let staging = staging_path(path);
+    {
+        let build = || {
+            redb::Builder::new()
+                .set_cache_size(CACHE_BYTES)
+                .create(&staging)
+        };
+        let _db = match build() {
+            Ok(db) => db,
+            // Another scan is building the same store right now. Its path is
+            // the one worth naming: the staging file is an implementation
+            // detail of the store the caller asked for.
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(format!("{}: {HELD_FOR_WRITING}", path.display()));
+            }
+            // A staging file an earlier scan was killed while making. Nobody
+            // holds it — the lock above would have said so — and the name is
+            // arthron's own, derived from the store the caller named, so this
+            // is the one file it may take back. Truncated in place rather
+            // than unlinked, so that a scan racing this one locks the same
+            // inode and is refused instead of building a second store.
+            Err(e) if is_not_a_database(&e) => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&staging)
+                    .map_err(|e| format!("{}: {e}", staging.display()))?;
+                build().map_err(|e| open_failure(&staging, e))?
+            }
+            Err(other) => return Err(open_failure(&staging, other)),
+        };
+        // Dropped here: the file is closed and its lock released before the
+        // link, so the store the caller ends up with is the one `Store::open`
+        // opens by name below, holding the only handle anybody has to it.
+    }
+    publish(&staging, path)
+}
+
+/// Move a finished staging database onto the store's own path.
+///
+/// [`fs::hard_link`] and not [`fs::rename`], because rename replaces. Two
+/// scans that both found no store race here, and a rename by the loser would
+/// unlink the winner's store while the winner is writing into it — leaving a
+/// scan that reports a rate for a graph nothing can ever read. A link refuses
+/// an occupied path, so the loser simply drops what it built and opens what
+/// it found.
+///
+/// The rename is the fallback for a filesystem with no links at all (FAT),
+/// where the choice is between a small race and no store whatsoever.
+fn publish(staging: &Path, path: &Path) -> Result<(), String> {
+    let mut linked = fs::hard_link(staging, path).is_ok();
+    // A path holding no bytes is not a store and is not data — a `touch` is
+    // the usual way one gets there. redb would initialise it where it lies,
+    // which is the window all of this exists to close, so it is taken out of
+    // the way. The link is *retried* rather than assumed: a scan that
+    // published a real store into the gap still wins it.
+    if !linked && !holds_bytes(path) {
+        let _ = fs::remove_file(path);
+        linked = fs::hard_link(staging, path).is_ok();
+    }
+    if linked || path.exists() {
+        let _ = fs::remove_file(staging);
+    } else {
+        fs::rename(staging, path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    sync_dir(path);
+    Ok(())
+}
+
+/// Whether a path holds anything a store could be read out of.
+///
+/// A missing file and an empty one are the same answer, because they are the
+/// same answer to redb: both are a database it is willing to make from
+/// nothing. Everything else — a real store, a wedged one, a tarball someone
+/// aimed `--db` at — holds bytes, and bytes at a path the caller named are
+/// never taken away by a scan.
+fn holds_bytes(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
+}
+
+/// Make the new directory entry durable, best effort.
+///
+/// The link is what publishes the store, and a link is a directory write. The
+/// file's own bytes are already synced — redb did that before it wrote the
+/// magic number — so the worst a lost entry costs is a store that is not
+/// there, which the next scan reads as "nothing here yet" and rebuilds. That
+/// is why this is best effort: platforms that will not open a directory as a
+/// file lose nothing that is not already recoverable.
+fn sync_dir(path: &Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
 /// A read-only handle on a graph some earlier scan wrote.
 ///
 /// A separate type rather than a mode of [`Store`], because the two differ in
@@ -1556,20 +1783,25 @@ impl std::fmt::Debug for ReadStore {
 impl ReadStore {
     /// Open an existing store for reading only.
     ///
-    /// Three failures, each named rather than collapsed into "cannot open":
-    /// the file is not there, a scan is holding it for writing, or it was
-    /// written under a different schema generation. The last is a refusal and
-    /// not a wipe: a reader that rebuilt the store to satisfy itself would
-    /// destroy a graph whose owner never asked for one.
+    /// Five failures, each named rather than collapsed into "cannot open":
+    /// the file is not there, a scan is holding it for writing, an
+    /// interrupted scan left it needing recovery, it is not a store at all,
+    /// or it was written under a different schema generation. The last two
+    /// are refusals and not repairs: a reader that rebuilt the store to
+    /// satisfy itself would destroy a graph whose owner never asked for one —
+    /// see [`NEEDS_RECOVERY`] and [`NOT_A_STORE`].
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = redb::Builder::new()
             .set_cache_size(CACHE_BYTES)
             .open_read_only(path)
             .map_err(|e| match e {
-                redb::DatabaseError::DatabaseAlreadyOpen => {
-                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                // Recovery is a write. redb aborts it under a read-only open
+                // rather than doing it, which is the right answer and an
+                // unreadable way of giving it — see [`NEEDS_RECOVERY`].
+                redb::DatabaseError::RepairAborted => {
+                    format!("{}: {NEEDS_RECOVERY}", path.display())
                 }
-                other => format!("{}: {other}", path.display()),
+                other => open_failure(path, other),
             })?;
         let store = ReadStore { db };
         match store.schema_version()? {
@@ -1583,6 +1815,37 @@ impl ReadStore {
                 found.map_or_else(|| "absent".to_string(), |v| v.to_string()),
             )),
         }
+    }
+
+    /// The files the store holds facts for and no longer claims are current.
+    ///
+    /// The one predicate that says a store is not wholly answerable: a
+    /// [`FILES`] row whose value is not a hash. Both things that leave one —
+    /// a scan that could not read an owned file, and a scan killed between a
+    /// file's two halves — mean the same to a reader, and the reader is the
+    /// only surface that can say so, because the scan that would have said it
+    /// is the one that did not finish. See [`NOT_ALL_CURRENT`].
+    ///
+    /// A count and not the paths: every caller of this asks one question —
+    /// may I answer without a caveat — and materialising a path per file
+    /// would make the caveat cost a whole-table string allocation on a store
+    /// where the answer is almost always zero.
+    pub fn not_current(&self) -> Result<usize, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        // A store no scan ever wrote to has no `files` table, which is no
+        // files rather than a failure — the same reading `schema_version`
+        // gives an absent `meta`.
+        let Ok(table) = txn.open_table(FILES) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            if <[u8; 32]>::try_from(value.value()).is_err() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// The generation stamped in [`META`], if the store carries one.

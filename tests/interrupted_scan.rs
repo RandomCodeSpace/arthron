@@ -22,6 +22,15 @@
 //! second kills a real `arthron scan` child at several points across a real
 //! event, which is the thing that actually happened.
 //!
+//! Then the two places a kill leaves something a *later* scan cannot simply
+//! finish. The store's own creation is one of them: redb sizes the file and
+//! syncs it before writing the magic number that makes the bytes a database,
+//! so a process killed inside that window used to leave a file every later
+//! open refused — a first cold scan wedging its own store, with `rm` the only
+//! way past and nothing saying so. And a store a kill left behind is one the
+//! read paths have to speak about rather than either serve or refuse in
+//! redb's words.
+//!
 //! `#![cfg(unix)]` because the second test needs to kill a child process and
 //! read the store it left: `Child::kill` is portable, but a Windows process
 //! killed mid-write leaves the file mapped until the handle is released, and
@@ -34,7 +43,10 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use arthron::pipeline::scan_repo;
-use arthron::store::{DeclSite, DefBatch, FileDefs, NodeRecord, Snapshot, Store, StoredOutcome};
+use arthron::store::{
+    DeclSite, DefBatch, FileDefs, NEEDS_RECOVERY, NOT_A_STORE, NOT_ALL_CURRENT, NodeRecord,
+    ReadStore, Snapshot, Store, StoredOutcome,
+};
 
 /// Callers in the deterministic test. Enough that a wrong answer is loud in
 /// the counts and small enough that the scan is instant.
@@ -259,7 +271,14 @@ fn a_real_scan_killed_across_the_event_is_healed_by_the_next_scan() {
          below can be read as a statement about interruptions",
     );
 
-    let mut interrupted = 0;
+    // How many kills landed where this test is about: after phase 1 took
+    // `Beta` away and before phase 2 put the callers right. `torn != truth`
+    // is not that question — the pristine store differs from the truth too
+    // (1001 edges against 501), so a kill that landed before the event's
+    // first commit satisfies it while proving nothing. A dangling edge or row
+    // cannot be left by a kill that wrote nothing and cannot survive one that
+    // wrote everything, so it is the sentinel: it is exactly the hazard.
+    let mut tore = 0;
     for step in 1..=5 {
         let delay = event.mul_f64(f64::from(step) / 6.0);
         fs::copy(&pristine, &db).expect("copy");
@@ -283,8 +302,8 @@ fn a_real_scan_killed_across_the_event_is_healed_by_the_next_scan() {
         // `flock` with the process, but the file is only ours once it is
         // reaped, which the wait above guarantees.
         let torn = snapshot_of(&db);
-        if torn != truth {
-            interrupted += 1;
+        if dangling(&torn) > 0 {
+            tore += 1;
         }
 
         scan_repo(&root, &db).expect("the next scan");
@@ -309,9 +328,10 @@ fn a_real_scan_killed_across_the_event_is_healed_by_the_next_scan() {
         );
     }
     assert!(
-        interrupted > 0,
-        "no kill in the sweep landed inside the event, so the sweep asserts \
-         nothing: every store was already the finished one",
+        tore > 0,
+        "no kill in the sweep landed between the two phases, so the sweep \
+         asserts nothing: every store it read was whole — either the one the \
+         event started from or the one it would have finished with",
     );
 }
 
@@ -378,4 +398,282 @@ fn an_interrupted_addition_is_healed_the_same_way() {
         healed.edges.len(),
         truth.edges.len(),
     );
+}
+
+/// A repository with a store beside it, the shape most of the tests below
+/// want: `dir/repo` holding `callers` callers of both functions, and the
+/// path a store would go at.
+fn repo_and_db(dir: &Path, callers: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = dir.join("repo");
+    fixture(&root, callers, true);
+    (root, dir.join("graph.redb"))
+}
+
+/// Where a store is built before it is published — the name `Store::open`
+/// stages under, restated here so the tests pin it rather than assume it.
+fn staging_of(db: &Path) -> std::path::PathBuf {
+    let mut name = std::ffi::OsString::from(db.as_os_str());
+    name.push(".new");
+    std::path::PathBuf::from(name)
+}
+
+#[test]
+fn a_store_that_does_not_exist_is_published_whole_and_leaves_nothing_beside_it() {
+    // The invariant the creation path exists for, stated where a reader will
+    // look for it: after a scan there is a store at the path and nothing at
+    // the staging name. A staging file that outlived its scan would be the
+    // wedge back again, one directory entry over.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, db) = repo_and_db(dir.path(), FEW);
+    scan_repo(&root, &db).expect("the first scan of a repository");
+
+    assert!(db.exists(), "the scan published no store");
+    assert!(
+        !staging_of(&db).exists(),
+        "the staging file outlived the scan that made it",
+    );
+    ReadStore::open(&db).expect("the published store opens for reading");
+}
+
+#[test]
+fn a_staging_file_a_killed_creation_left_is_taken_back() {
+    // What a process killed inside redb's creation window leaves: bytes at
+    // the staging name that are not a database. Nobody holds them and the
+    // name is arthron's own, derived from the store the caller asked for, so
+    // the next scan takes them back rather than dying on them — which is the
+    // whole point of building there instead of at the store's own path.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, db) = repo_and_db(dir.path(), FEW);
+    let staging = staging_of(&db);
+    // Sized like the real thing — redb resizes the file before it syncs — but
+    // any non-empty file with no magic number is the same refusal.
+    fs::write(&staging, vec![0u8; 1 << 20]).expect("a half-made staging file");
+
+    scan_repo(&root, &db).expect("the scan after a killed creation");
+    assert!(db.exists(), "the scan published no store");
+    assert!(!staging.exists(), "the half-made staging file survived");
+    ReadStore::open(&db).expect("the store opens for reading");
+}
+
+#[test]
+fn bytes_that_are_not_a_store_are_named_rather_than_passed_through_and_left_alone() {
+    // The other half of the same failure, and the one arthron must *not*
+    // recover from: a store an older build wedged, or a `--db` aimed at a
+    // file that was never a graph. Both say so in a sentence with a way out,
+    // and neither is deleted — a graph is a cache, but the bytes at a path
+    // the caller named are the caller's.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("graph.redb");
+    let bytes = b"this is not a graph".to_vec();
+    fs::write(&db, &bytes).expect("something that is not a store");
+
+    let Err(write_err) = Store::open(&db) else {
+        panic!("bytes that are not a database must not open as a store")
+    };
+    assert!(write_err.contains(NOT_A_STORE), "{write_err}");
+    assert!(write_err.contains(&db.display().to_string()), "{write_err}");
+
+    let read_err = ReadStore::open(&db).expect_err("nor for reading");
+    assert!(read_err.contains(NOT_A_STORE), "{read_err}");
+
+    assert_eq!(
+        fs::read(&db).expect("the file is still there"),
+        bytes,
+        "a refused open rewrote the caller's file",
+    );
+}
+
+#[test]
+fn a_path_holding_no_bytes_is_no_store_at_all() {
+    // `touch graph.redb` and then scan. An empty file is what redb is willing
+    // to make a database out of *in place*, which is the one window this
+    // whole path exists to close, so it is treated as the absence it is.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, db) = repo_and_db(dir.path(), FEW);
+    fs::write(&db, b"").expect("touch");
+
+    scan_repo(&root, &db).expect("a scan onto an empty path");
+    assert!(!staging_of(&db).exists(), "the staging file survived");
+    ReadStore::open(&db).expect("the store opens for reading");
+}
+
+#[test]
+fn a_query_against_a_store_that_is_not_wholly_current_says_so() {
+    // The store knows when it has stopped vouching for a file — that is what
+    // an empty `files` row is, and both a scan that could not read a file and
+    // a scan killed between a file's two halves leave one. A reader that
+    // served those answers without a word would be the silence this whole
+    // file is about, one surface over.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, db) = repo_and_db(dir.path(), FEW);
+    scan_repo(&root, &db).expect("first scan");
+
+    let quiet = query_refs(&db, "Alpha");
+    assert_eq!(quiet.2, Some(0), "{}", quiet.1);
+    assert!(
+        !quiet.1.contains(NOT_ALL_CURRENT),
+        "a store that is wholly current must say nothing: {}",
+        quiet.1,
+    );
+
+    {
+        let store = Store::open(&db).expect("the store opens");
+        store
+            .forget_hashes(&["a/a.go".to_string()])
+            .expect("withdraw one claim");
+    }
+
+    let (stdout, stderr, code) = query_refs(&db, "Alpha");
+    assert_eq!(code, Some(0), "the answer is still an answer: {stderr}");
+    assert!(
+        stdout.contains("references"),
+        "stdout is still the answer: {stdout}",
+    );
+    assert!(
+        stderr.contains(NOT_ALL_CURRENT),
+        "a store that stopped vouching for a file must say so: {stderr}",
+    );
+    assert!(
+        stderr.contains(&db.display().to_string()),
+        "and which store: {stderr}",
+    );
+}
+
+/// Run `arthron query refs <name>` against a store and hand back what it said.
+fn query_refs(db: &Path, name: &str) -> (String, String, Option<i32>) {
+    let out = Command::new(env!("CARGO_BIN_EXE_arthron"))
+        .args(["query", "refs", name, "--db"])
+        .arg(db)
+        .output()
+        .expect("running the arthron binary");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// Whether this machine can put a signal at a chosen syscall.
+///
+/// `strace --inject` is the only way to kill a scan *exactly* at a commit
+/// boundary rather than approximately, by a sleep — and the creation window
+/// this file cares about is a millisecond wide, so approximately is no use.
+/// It needs `ptrace`, which a container can be built without, so the test
+/// that wants it says why it did not run rather than failing a machine that
+/// is fine.
+fn can_inject() -> bool {
+    Command::new("strace")
+        .args([
+            "-o",
+            "/dev/null",
+            "-e",
+            "inject=fdatasync:signal=SIGKILL:when=4096",
+            "/bin/true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Kill `arthron scan` at the `when`th `fdatasync` it reaches, and say
+/// whether the kill landed.
+fn scan_killed_at_sync(root: &Path, db: &Path, when: u32) -> bool {
+    let status = Command::new("strace")
+        .args(["-f", "-o", "/dev/null", "-e"])
+        .arg(format!("inject=fdatasync:signal=SIGKILL:when={when}"))
+        .arg(env!("CARGO_BIN_EXE_arthron"))
+        .arg("scan")
+        .arg(root)
+        .arg("--db")
+        .arg(db)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("running arthron under strace");
+    !status.success()
+}
+
+#[test]
+fn a_first_cold_scan_killed_at_any_sync_leaves_a_store_the_next_scan_finishes() {
+    // The failure this creation path exists for, end to end and at the exact
+    // syscall: the *first* scan of a repository, killed at each sync it
+    // reaches. Every one of those used to leave a file no later scan could
+    // open — `I/O error: invalid data`, forever, for every kill point across
+    // the whole of redb's creation. There is nothing to heal *from* here: a
+    // store that was never published is a repository nobody has scanned, and
+    // a cold scan is what that asks for.
+    if !can_inject() {
+        eprintln!("skipped: `strace --inject` does not run here, so a kill cannot be placed");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let truth = cold(dir.path(), FEW, true);
+    let root = dir.path().join("repo");
+    fixture(&root, FEW, true);
+
+    let mut killed = 0;
+    // Past the last sync redb's own creation makes, so the sweep covers the
+    // window before publication, the publication, and the schema stamp after
+    // it.
+    for when in 1..=14 {
+        let db = dir.path().join(format!("cold-{when}.redb"));
+        if scan_killed_at_sync(&root, &db, when) {
+            killed += 1;
+        }
+        scan_repo(&root, &db).expect("the scan after a killed first scan");
+        let healed = snapshot_of(&db);
+        assert_eq!(
+            dangling(&healed),
+            0,
+            "killed at sync {when} of a first scan: the next scan left edges              pointing at nodes that are gone",
+        );
+        assert!(
+            healed == truth,
+            "killed at sync {when} of a first scan: the next scan is not the              store a cold scan builds — {} nodes / {} edges against {} / {}",
+            healed.nodes.len(),
+            healed.edges.len(),
+            truth.nodes.len(),
+            truth.edges.len(),
+        );
+        assert!(
+            !staging_of(&db).exists(),
+            "killed at sync {when}: the staging file outlived the scan that healed it",
+        );
+    }
+    assert!(
+        killed > 0,
+        "no injected kill landed, so this sweep asserts nothing about          interruptions: every scan ran to completion",
+    );
+}
+
+#[test]
+fn a_store_a_kill_left_mid_flight_is_refused_for_reading_by_name() {
+    // redb marks a store as needing recovery while a write transaction is in
+    // flight, and recovery is a write — so a reader cannot do it and must
+    // not. What it *can* do is say which store and what fixes it, rather than
+    // hand back `Database repair aborted.` and leave a person guessing at
+    // corruption. And the fix has to be true: one scan, after which the
+    // reader opens.
+    if !can_inject() {
+        eprintln!("skipped: `strace --inject` does not run here, so a kill cannot be placed");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (root, db) = repo_and_db(dir.path(), FEW);
+    scan_repo(&root, &db).expect("the store the kill starts from");
+    ReadStore::open(&db).expect("a finished scan leaves a store a reader opens");
+
+    declare(&root, false);
+    assert!(
+        scan_killed_at_sync(&root, &db, 1),
+        "the injected kill did not land, so nothing below is about a kill",
+    );
+
+    let err = ReadStore::open(&db).expect_err("a store left mid-flight must not be read");
+    assert!(err.contains(NEEDS_RECOVERY), "{err}");
+    assert!(err.contains(&db.display().to_string()), "{err}");
+
+    scan_repo(&root, &db).expect("the scan the refusal names");
+    ReadStore::open(&db).expect("and after it the reader opens");
 }
