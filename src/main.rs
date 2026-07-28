@@ -1,4 +1,20 @@
 //! `arthron` CLI. Printing only — analysis logic lives in the library.
+//!
+//! # Exit codes
+//!
+//! Three, meaning the same three things on every command, because the number
+//! is what a script reads:
+//!
+//! - **0** — the command ran and this is the answer.
+//! - **1** — the command ran and the answer is *no*: a gate regression, a
+//!   query that matched nothing or matched several. Never an error.
+//! - **2** — nothing was measured: usage, I/O, or the environment.
+//!
+//! `scan` has no verdict to fail, so `scan` never returns 1. Everything that
+//! can go wrong for it — a store another scan is holding, a root that is not
+//! there, a directory it cannot create, a config file that will not parse — is
+//! a 2. That distinction is the point: a build may retry a 2 and must never
+//! retry a 1, and a lock collision answering 1 made the two indistinguishable.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -30,8 +46,13 @@ const EXIT_GATE_FAILED: u8 = 1;
 /// neither means the run failed. A store that would not open is
 /// [`EXIT_USAGE`] instead, because then there is no answer at all.
 const EXIT_NO_ANSWER: u8 = 1;
-/// Exit code for usage and I/O problems: nothing was measured, so neither a
-/// pass nor a failure may be reported.
+/// Exit code for usage, I/O and environment problems: nothing was measured, so
+/// neither a pass nor a failure may be reported.
+///
+/// The environment half is what keeps 1 meaning one thing. A store another
+/// scan is holding is not a worse measurement, it is no measurement, and a
+/// build that cannot tell the two apart either retries a real regression or
+/// fails a run that only needed to wait.
 const EXIT_USAGE: u8 = 2;
 
 /// Where a query looks for the graph when `--db` is not given: the path
@@ -120,7 +141,14 @@ enum Command {
     /// resolution rates.
     ///
     /// Settings may also come from `arthron.toml` at the repository root; a
-    /// flag given here wins over the file.
+    /// flag given here wins over the file. The file's `db` must name a store
+    /// inside the scanned repository; `--db` here may name any path, because
+    /// the person typing it is the one saying so.
+    ///
+    /// Exit codes: 0 the scan answered, 2 usage, I/O or the environment — a
+    /// config that will not parse, a root that is not there, a store another
+    /// scan is holding. Never 1: a scan has no verdict to fail, and 1 is
+    /// reserved for one that does.
     #[command(after_long_help = json::CONFIG_HELP)]
     Scan {
         /// Repository root.
@@ -135,8 +163,10 @@ enum Command {
     },
     /// Scan a corpus and compare its counts against a committed baseline.
     ///
-    /// Exit codes: 0 pass (or a successful --rebase), 1 gate failure, 2 usage
-    /// or I/O error. The baseline's `corpus` and `commit` fields are
+    /// Exit codes: 0 pass (or a successful --rebase), 1 gate failure — the run
+    /// worked and the numbers are worse — and 2 for usage, I/O or the
+    /// environment, where nothing was measured at all. The baseline's
+    /// `corpus` and `commit` fields are
     /// provenance: printed, never verified — a vendored corpus snapshot
     /// carries no git metadata to check them against.
     ///
@@ -186,7 +216,9 @@ enum Command {
     /// exit code 1, and the list to choose from — because picking one would
     /// be a guess.
     ///
-    /// Exit codes: 0 answered, 1 no match or ambiguous, 2 usage or I/O error.
+    /// Exit codes: 0 answered, 1 no match or ambiguous — both are answers —
+    /// and 2 for usage, I/O or the environment, including a store a scan is
+    /// holding open for writing.
     Query {
         #[command(subcommand)]
         verb: QueryVerb,
@@ -349,7 +381,7 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         noteln!("arthron: creating {}: {e}", parent.display());
-        return ExitCode::FAILURE;
+        return ExitCode::from(EXIT_USAGE);
     }
     match scan_repo_with(path, &db_path, &config) {
         Ok(report) => {
@@ -360,9 +392,14 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
                 emit(&report_text(&report), ExitCode::SUCCESS)
             }
         }
+        // Nothing was measured, so this is [`EXIT_USAGE`] and never
+        // [`EXIT_GATE_FAILED`]: every way a scan can fail is environmental —
+        // a store another scan holds, a root that is not there, a store that
+        // will not open — and a scan has no verdict that could make 1 mean
+        // anything here.
         Err(e) => {
             noteln!("arthron: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(EXIT_USAGE)
         }
     }
 }

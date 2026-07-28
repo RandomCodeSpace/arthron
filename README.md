@@ -90,11 +90,26 @@ it that starts at a separator. `crypto.Verify` is not, and matches nothing.
 arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
 ```
 
-Scans a corpus and compares its counts against a committed baseline. Exit 0
-pass, 1 regression, 2 usage or I/O error — this is what makes a resolution-rate
-regression fail a build. `--rebase` overwrites the baseline with what the run
-measured, which is how the ratchet moves up: by a deliberate commit, never by a
-number quietly drifting.
+Scans a corpus and compares its counts against a committed baseline — this is
+what makes a resolution-rate regression fail a build. `--rebase` overwrites the
+baseline with what the run measured, which is how the ratchet moves up: by a
+deliberate commit, never by a number quietly drifting.
+
+### Exit codes
+
+Three, meaning the same three things on every command, because the number is
+what a build script reads.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command ran and this is the answer. |
+| `1` | The command ran and the answer is **no**: a gate regression, a query that matched nothing or matched several. Never an error — never retry it. |
+| `2` | Nothing was measured: usage, I/O or the environment. A config that will not parse, a root that is not there, a store another scan is holding open for writing. Safe to retry. |
+
+`scan` has no verdict to fail, so `scan` never returns `1`; every failure it can
+have is a `2`. A store somebody else is scanning against is the case that
+matters in CI: it is a `2`, not the `1` a regression uses, so a build can wait
+and try again without ever masking a real one.
 
 `scan`, `gate` and `query` each take `--json` and print one document instead
 of the report.
