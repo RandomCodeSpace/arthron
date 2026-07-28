@@ -4,46 +4,24 @@
 and move as one. In Greek grammar, the *article*: the small word whose only job
 is binding a reference to its referent.
 
-A local-first code intelligence engine. It parses each file in isolation, then
-**resolves** the references between them into a verified graph — and tells you
-precisely which references it could not resolve, and why.
-
-> **Status: early.** `arthron scan` works and produces a real graph for Go.
-> Everything else in this README that is not marked as working is a target, not
-> a promise. The `0.0.0` crate on crates.io predates this code and is a name
-> placeholder — build from source.
-
-## What it looks like
-
-```console
-$ arthron scan ./my-go-service
-go           resolved 2        external 7        unresolved 1        rate 66.7%
-             NeedsTypeInference 1
-```
-
-Every number there is checkable. In the module that produced it: **2 resolved**
-— one in-repo import and the `store.Lookup` call that crosses between packages.
-**7 external** — two dependency imports, `fmt.Errorf`, `uuid.New`, and the
-`make`/`append`/`len` builtins. **1 unresolved** — a `log.Warn(err)` call on an
-interface-typed parameter, which needs type inference the engine does not yet
-do. That last one is the point: it is *reported*, not quietly omitted.
+Local-first code intelligence. Each file is parsed in isolation; a single
+**resolver** links the references between files into a verified graph — and
+records what it could not link, and why, instead of dropping it.
 
 ## Why it is built this way
 
 The usual way to build a code graph is to let a per-file analyzer emit edges. A
 file-local analyzer cannot know whether the symbol it just saw is defined
-somewhere else in the repository. So it either guesses — and the guess gets
-discarded by whatever validates edges downstream — or it gives up and emits
-nothing.
-
-Both paths produce the same result: a graph with plenty of nodes, almost no
-edges between files, and a tool that reports success throughout. You cannot ask
-it what a change breaks, because it never linked anything to begin with.
+somewhere else in the repository, so it either guesses — and something
+downstream discards the guess — or it gives up and emits nothing. Both paths
+produce the same artefact: plenty of nodes, almost no edges between files, and a
+tool that reports success throughout. You cannot ask it what a change breaks,
+because it never linked anything.
 
 arthron inverts the responsibility. **Extractors are forbidden from emitting
 edges.** They emit *references* — "this call site names `parseConfig`, in this
-scope, at this byte range." A single resolver, which sees every file, owns all
-linking, and every reference lands in exactly one of three outcomes:
+scope, at this byte range." One resolver, which sees every file, owns all
+linking, and every reference lands in exactly one outcome:
 
 | Outcome | Meaning |
 |---|---|
@@ -51,111 +29,231 @@ linking, and every reference lands in exactly one of three outcomes:
 | `External` | Linked to a dependency outside it. |
 | `Unresolved` | Could not be linked — **recorded with a reason, never dropped.** |
 
-There is no fourth outcome and no way to express "dropped." An unresolved
-reference is data: aggregated, the reasons tell you exactly where language
-support is thin.
-
-That makes **resolution rate** — `resolved / (resolved + unresolved)`, per
-language, never averaged across them — the number that matters, ranked above
-performance. Optimising a tool that resolves nothing is optimising the wrong
-thing.
+There is no fourth outcome and no way to express "dropped".
 
 ## Install
 
 ```bash
-git clone https://github.com/RandomCodeSpace/arthron
-cd arthron
-cargo build --release      # requires Rust 1.89+
-./target/release/arthron scan /path/to/repo
+cargo install arthron
 ```
 
-`cargo install arthron` does **not** work yet — the published crate is a
-placeholder from before the engine existed.
+Requires Rust 1.89 or newer. One binary, no runtime dependencies. (The `0.0.0`
+crate was a name reservation and contains no engine; `0.0.1` is the first real
+release.)
 
 ## Usage
 
-```
-arthron scan <PATH> [--db <FILE>]
-```
-
-Builds or refreshes the graph for a repository and prints per-language
-resolution rates with a breakdown of every unresolved reason. The graph is
-stored at `<PATH>/.arthron/graph.redb` unless `--db` says otherwise.
-
-Re-running against an unchanged tree re-reads the stored graph instead of
-re-analysing: the changed set is exactly the files whose content hash moved.
-Cold indexing is the same code path with a changed set of everything, so there
-is no separate incremental mode that can silently skip work.
-
-```
-arthron mcp [--db <FILE>]
+```bash
+arthron scan ./my-repo
 ```
 
-Serves the graph to an agent over the Model Context Protocol on stdin/stdout —
-`scan_repo`, `query_def`, `query_refs` and `query_impact`, each returning the
-same JSON document the command line prints. Still no network: stdio only, no
-socket bound. See [`docs/mcp.md`](docs/mcp.md).
+Builds or refreshes the graph and prints per-language resolution rates with a
+breakdown of every unresolved reason:
 
-## What works today
-
-| | State |
-|---|---|
-| `arthron scan` | **Working** — Go, Java, JavaScript, TypeScript, Python, PHP |
-| Tier-1 resolution | **Working** — definitions, imports, calls, per-reason unresolved reporting |
-| Tier-2 resolution | **Working** — PHP: definitions, structure and imports, no call edges |
-| Incremental re-scan | **Working** — content-hash changed set |
-| `arthron gate` (CI, fails on regression) | **Working** — one committed baseline per corpus, in [`baselines/`](baselines) |
-| `arthron query` (definitions, references, blast radius) | **Working** |
-| `arthron mcp` (MCP server, stdio) | **Working** — [`docs/mcp.md`](docs/mcp.md) |
-| `arthron watch` · daemon | Planned |
-
-Language *coverage* spans the 27 languages ast-grep's built-in parsers handle.
-Language *capability* is tiered and declared rather than assumed:
-
-- **Tier 1** — definitions, references, and call-graph resolution. Go, Java,
-  JavaScript, TypeScript and Python today.
-- **Tier 2** — definitions and file structure, no verified call edges. PHP
-  today; the rest of the ratified tier-2 set is registered and not yet live.
-
-Tier 2 is honest rather than degraded: you get symbols and imports, you do not
-get call edges, and the tool says which is which instead of inventing the
-difference.
-
-## Design targets
-
-Not yet met, and stated so they can be measured against:
-
-| Budget | Target |
-|---|---|
-| Cold index, 5M LOC | < 30 s |
-| Warm re-index, unchanged tree | < 3 s |
-| Peak RSS | < 512 MB |
-| Reference hardware | **2 vCPU** — a CI runner, not a workstation |
-
-The 2 vCPU floor is deliberate. This runs in CI and inside agent loops, where
-being predictable matters more than being fast on a developer's laptop. Resource
-ceilings are hard limits; timings are targets.
-
-## Shape
-
-```
-ast-grep ──▶ Extractor ──▶ Resolver ──▶ Store
- parse +      YAML rules:   refs →       redb
- match        defs, refs    outcomes
+```console
+$ arthron scan corpus/go/codeiq
+go           resolved 4467     external 6085     local-binding 4276     unresolved 799      rate 84.8% (tier 1: call-graph resolution)
+             NoMatchingDefinition 123
+             NeedsTypeInference 676
 ```
 
-One Rust binary. No network calls, ever — nothing about your code leaves the
-machine.
+The graph is stored at `<PATH>/.arthron/graph.redb` unless `--db` says
+otherwise. Re-running against an unchanged tree re-reads the stored graph: the
+changed set is exactly the files whose content hash moved. Cold indexing is the
+same code path with a changed set of everything, so there is no separate
+incremental mode that can silently skip work.
+
+```bash
+arthron query def   crypto.Verify
+arthron query refs  crypto.Verify
+arthron query impact crypto.Verify --depth 3
+```
+
+The definition and its declaring sites; every stored reference row that resolved
+to it; and what transitively reaches it, layer by layer — the blast radius of a
+change. A name may be a full FQN or any suffix of one that starts at a
+separator; a suffix several nodes end is answered with *all* of them and exit
+code 1, because picking one would be a guess. The store is opened read-only: a
+query never creates or rebuilds it.
+
+```bash
+arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
+```
+
+Scans a corpus and compares its counts against a committed baseline. Exit 0
+pass, 1 regression, 2 usage or I/O error — this is what makes a resolution-rate
+regression fail a build. `--rebase` overwrites the baseline with what the run
+measured, which is how the ratchet moves up: by a deliberate commit, never by a
+number quietly drifting.
+
+`scan`, `gate` and `query` each take `--json` and print one document instead
+of the report.
+
+```bash
+arthron mcp
+```
+
+Serves the graph to an agent over the Model Context Protocol on stdio — JSON-RPC
+2.0, one message per line, `scan_repo` / `query_def` / `query_refs` /
+`query_impact`. Each returns the same document `--json` prints, from the same
+library calls the CLI makes: there is no second answer for agents. No socket is
+opened and no address is bound. See [`docs/mcp.md`](docs/mcp.md).
+
+### `arthron.toml`
+
+Optional, at the repository root. Every key is optional too, so a repository
+with no config behaves exactly as it would without one.
+
+```toml
+include = ["src/**"]        # a whitelist: with any include, an unmatched file is not read
+exclude = ["**/vendor/**"]  # wins over include, last-match-wins like .gitignore
+db = ".arthron/graph.redb"
+
+[tracks]
+java = false                # switch a live track off for this repository
+```
+
+An unrecognised key is refused **by name** rather than ignored — at the top
+level and under `[tracks]` — because a silent typo means scanning a different
+tree than you believe you are scanning while reporting a number you then trust.
+`[tracks]` switches off, never on: a track this build does not implement cannot
+be conjured by config.
+
+## Languages
+
+Nineteen live languages. Coverage is *tiered and declared* rather than assumed,
+and every rate below is derived from a committed baseline in
+[`baselines/`](baselines) — `resolved / (resolved + unresolved)`, measured on a
+release build against a pinned corpus snapshot.
+
+### Tier 1 — definitions, references, and call-graph resolution
+
+Five languages: Go, Java, JavaScript, TypeScript, Python. The rate is over call
+sites, imports and type uses.
+
+| language | corpus | resolved | unresolved | rate |
+|---|---|---:|---:|---:|
+| Go | `codeiq` `853efde` | 4,467 | 799 | **84.8%** |
+| Go | `caddy` `853efde` | 3,006 | 1,815 | **62.4%** |
+| Go | `probes` `synthetic` | 17 | 0 | **100.0%** † |
+| Java | `commons-lang` `598dfc1` | 39,591 | 19,093 | **67.5%** |
+| Java | `gson` `3ff35d6` | 16,074 | 7,215 | **69.0%** |
+| JavaScript | `fastify` `94bcbcc` | 2,795 | 1,640 | **63.0%** |
+| JavaScript | `express` `dbac741` | 2,267 | 5,553 | **29.0%** |
+| TypeScript | `vue-core` `fa2885d` | 26,297 | 27,945 | **48.5%** |
+| TypeScript | `zod` `1fb56a5` | 10,043 | 26,821 | **27.2%** |
+| Python | `django` `af67523` | 19,103 | 13,764 | **58.1%** |
+| Python | `flask` `22d9247` | 1,192 | 2,847 | **29.5%** |
+
+### Tier 2 — definitions, structure and imports; no verified call edges
+
+Fourteen languages. A tier-2 rate is an **import-resolution rate**, and it is
+not comparable to a tier-1 rate — different denominators measuring different
+things.
+
+| language | corpus | resolved | unresolved | rate |
+|---|---|---:|---:|---:|
+| Rust | `ripgrep` `e89fff8` | 649 | 13 | **98.0%** |
+| Elixir | `plug` `9fa11c8` | 116 | 1 | **99.1%** |
+| Kotlin | `okio` `6604edb` | 683 | 80 | **89.5%** |
+| C++ | `fmt` `1be298e` | 127 | 18 | **87.6%** |
+| Ruby | `rack` `e1f22fd` | 291 | 50 | **85.3%** |
+| PHP | `guzzle` `3aeea04` | 360 | 170 | **67.9%** |
+| C# | `serilog` `6d9fc0b` | 53 | 0 | **100.0%** |
+| Dart | `collection` `dec28c1` | 75 | 0 | **100.0%** |
+| Haskell | `aeson` `e00ef15` | 278 | 0 | **100.0%** |
+| HCL | `terraform-aws-vpc` `3ffbd46` | 23 | 0 | **100.0%** |
+| Swift | `alamofire` `7595cbc` | 40 | 0 | **100.0%** |
+| Scala | `upickle` `87e0b24` | 267 | 364 | **42.3%** |
+| Lua | `busted` `56e6d68` | 99 | 153 | **39.3%** |
+| Bash | `bats-core` `eb7f42f` | 0 | 6 | **0.0%** |
+
+Tier 2 is honest rather than degraded: you get symbols, structure and imports,
+you do not get call edges, and the tool says which is which instead of inventing
+the difference. Five tier-2 tracks declare themselves **best effort** in their
+own module docs — Bash, Dart, Elixir, Haskell and HCL — meaning the track reads
+a deliberately narrow slice of that language's reference surface, so the
+denominator is small by design and the definition census beside it carries most
+of the weight.
+
+† `probes` is a synthetic corpus, written to pin resolver behaviour rather than
+sampled from a real project. It is listed because it is gated like the others,
+not as evidence about real Go.
+
+## How to read these numbers
+
+**A rate is never aggregated.** There is no "arthron resolves N% of code"
+figure, and there will not be one. Rates are reported per language, per corpus,
+because averaging Go's call-graph rate with Bash's import rate produces a number
+that means nothing and hides every regression underneath it. Nineteen languages,
+twenty-five committed baselines, twenty-five separate numbers.
+
+**`Unresolved` is data, not failure.** Every unresolved reference is stored with
+a reason — `NeedsTypeInference`, `NoMatchingDefinition`, `ModuleNotFound`,
+`AliasCycle`, `DynamicDispatch` and the rest. Aggregated, those reasons say
+exactly where language support is thin, which is what makes the next
+improvement a decision instead of a guess. A resolver that dropped its hardest
+references would report a *better* rate for doing less work; that is the failure
+mode the three-outcome contract exists to make impossible.
+
+**`External` and `LocalBinding` sit outside both terms of the rate.** A
+dependency import is not a resolver failure, and a reference to a parameter or
+local variable is excluded by policy — locals are not nodes. Neither may be used
+to inflate a rate, so the gate checks both for drift and fails on any movement
+in either.
+
+**The gate refuses a shrinking denominator.** At a 100% baseline a *dropped*
+`Resolved` row would otherwise be invisible, and at any baseline a dropped
+`Unresolved` row reads as an improvement. A run whose `resolved + unresolved`
+falls below the baseline's fails with `denominator_shrank`; growth stays legal.
+
+**Bash sits at 0.0% over a denominator of 6, and that is a working gate.**
+bats-core was vendored *because* not one of its `source` targets is a literal
+path — they are composed at run time out of shell variables. Matching on the
+tail of a composed path would take the number from 0% to 50% in one commit and
+would be a guess about values the running program computes. A small honest
+denominator with the right reason on every miss is the deliverable; the drift
+checks on `external` and `local_binding` — both zero — are what keep it
+un-gameable, and the 91-function definition census beside it is what the track
+is actually for.
+
+## Reference hardware
+
+**2 vCPU** — a CI runner, not a workstation. arthron runs inside CI jobs and
+agent loops, where being predictable matters more than being fast on a
+developer's laptop. Resource ceilings are hard limits; timings are targets.
+
+| Budget | Target | Measured |
+|---|---|---|
+| Peak RSS | **< 512 MB (hard)** | 337.1 MiB cold-scanning kubernetes v1.36.3, 1,789,247 lines — 66% of the ceiling, six runs spanning 0.2% |
+| Cold index throughput | < 60 s / 1M lines | ~17 s / 1M lines on the same scan |
+| Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes — a miss, recorded as a finding rather than hidden |
+
+The RSS number is the interesting one: it was **729.0 MiB** and failed the hard
+gate. Bounding it — per-500-file commits on every phase, a capped redb page
+cache, phase 2 consuming facts per file — brought it to 337.1 MiB, and
+byte-identity of the resulting graph was proven at the level of full blake3
+snapshot digests across five corpora, not at the level of matching tallies.
+
+## No network calls, ever
+
+Not for dependency metadata, not for telemetry, not for updates. `arthron mcp`
+speaks stdio and binds no socket. Nothing about your code leaves the machine.
 
 ## Contributing
 
-Decisions and the reasoning behind them are recorded in
+Decisions and the reasoning behind them are in
 [`docs/decisions.md`](docs/decisions.md), newest first, including what was
 rejected. Read the relevant entry before changing something it covers; if you
-change it anyway, add an entry saying why.
+change it anyway, add an entry saying why. [`CONTEXT.md`](CONTEXT.md) is the
+glossary — use its terms, respect its `_Avoid_` lists.
 
-Measurements must be executed, never estimated. A benchmark that turns out to
-be invalid stays in the record with the reason it was wrong.
+Measurements must be executed, never estimated. A benchmark that turns out to be
+invalid stays in the record with the reason it was wrong.
+
+The corpora are not vendored here. They live in the private
+`RandomCodeSpace/arthron-corpus`; clone it into `corpus/` (gitignored) to run
+the acceptance tests, which skip when it is absent.
 
 ## License
 
