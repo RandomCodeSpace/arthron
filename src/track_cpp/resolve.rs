@@ -35,7 +35,7 @@
 //!   implementation looks"; the resolver has enumerated every include root
 //!   this repository declares and probed the tree at every candidate path,
 //!   and found nothing. The header is supplied by the toolchain or by a
-//!   dependency. 156 of the 157 angled directives in the files this track
+//!   dependency. 254 of the 255 angled directives in the files this track
 //!   reads are this, and calling them unresolved would fill the gate with the
 //!   standard library.
 //!
@@ -49,19 +49,22 @@
 //! Everything else that misses is a floor and counts *against* the rate:
 //!
 //! - **An angled include that names a file that *is* under an include root**,
-//!   but carries an extension this build does not parse. `<fmt/base.h>` is a
-//!   file in this repository. It is not `External` — laundering an
-//!   in-repository header into the bucket that sits outside the rate is
-//!   exactly the failure the Rust review caught one language earlier — so it
-//!   is [`UnresolvedReason::ModuleNotFound`]: a literal specifier that
-//!   resolved to no *module* under this build's configured resolution, whose
-//!   translation units are the extensions [`crate::model::Lang::Cpp`] claims.
+//!   but that this scan holds no node for — one the walk pruned, under a
+//!   `third_party/` or a path an `arthron.toml` excludes. It is not
+//!   `External` — laundering an in-repository header into the bucket that
+//!   sits outside the rate is exactly the failure the Rust review caught one
+//!   language earlier — so it is [`UnresolvedReason::ModuleNotFound`]: a
+//!   literal specifier that resolved to no *module* under this build's
+//!   configured resolution. Before the `.h` claim this shape carried
+//!   `<fmt/base.h>`, a real file this repository publishes; that directive
+//!   resolves now, and on the measured corpus the shape is empty — the
+//!   fixture tests hold it.
 //! - **A quoted include that hits nothing.** The quoted syntax says "this
 //!   project's own header", so a miss is this project failing to supply what
-//!   it said it supplies, not a link to somebody else. That covers both the
-//!   `.h` headers this build does not parse (99 sites) and the 14
+//!   it said it supplies, not a link to somebody else. With `.h` claimed
+//!   that is the 17
 //!   `"gtest/gtest.h"` / `"gmock/gmock.h"` directives whose bundle the corpus
-//!   deliberately does not vendor. The second case is the PHP track's
+//!   deliberately does not vendor. The case is the PHP track's
 //!   decision applied
 //!   unchanged: guzzle's 170 `use` statements naming sibling packages outside
 //!   the snapshot are `ModuleNotFound` and count against the rate, because a
@@ -70,13 +73,13 @@
 //!   **The consequence, stated rather than left to be found:** one bundle can
 //!   draw two verdicts, decided by bracket style alone. googletest is not
 //!   vendored — `test/CMakeLists.txt` adds it as a subdirectory the corpus
-//!   snapshot does not carry — and fmt's tests reach it 16 times: 14 quoted,
+//!   snapshot does not carry — and fmt's tests reach it 19 times: 17 quoted,
 //!   which count against the rate, and 2 angled, which are `External` and
 //!   sit outside it. Both follow their own syntax's rule, and the split runs
-//!   in the conservative direction, the 14-site majority being the counted
+//!   in the conservative direction, the 17-site majority being the counted
 //!   one. It is not a third rule and there is no fix that is not a guess
 //!   about which bundle a header belongs to; reclassifying the 2 would move
-//!   the rate by a tenth of a point.
+//!   the rate by 1.2 points.
 //! - **A module name no `export module` in this repository declares.**
 //!   `import std;` names the standard library's module.
 //!   [`UnresolvedReason::UnknownPackage`] — a package outside the repository

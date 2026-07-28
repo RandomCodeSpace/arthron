@@ -38,8 +38,9 @@
 //!
 //! # The second fact: what sits on the include path unparsed
 //!
-//! `.h` is not an extension this build claims, so a header named by an
-//! `#include` may be a real file in this repository that no scan reads. That
+//! A header named by an `#include` may be a real file in this repository
+//! that no scan reads — not for its extension, now that `.h` is claimed,
+//! but because the walk was told to leave it alone. That
 //! is not the same fact as "the target is outside this repository", and
 //! collapsing the two would launder an in-repository header into `External`,
 //! where it would sit outside both terms of the resolution rate. So phase 0
@@ -83,8 +84,8 @@ pub struct CppProject {
     /// Repository-relative include roots, in search order.
     pub include_roots: Vec<String>,
     /// Repository-relative paths under an include root that this scan did
-    /// not index — `.h` headers, most of all, and every file the walk was
-    /// told to prune besides.
+    /// not index — every file the walk was told to prune, however it is
+    /// spelled.
     ///
     /// Sorted, because it is fingerprinted: a set whose order depended on the
     /// filesystem would wipe the store on every scan.
@@ -205,8 +206,9 @@ mod tests {
         let index = indexed(&["include/fmt/base.hpp", "src/format.cc"]);
         let project = layout(dir.path(), &index).expect("layout");
         assert_eq!(project.include_roots, ["include"]);
-        // `.h` is not indexed, so it is listed; the `.hpp` is, so it is not —
-        // the walk already minted a node for it and the resolver probes that.
+        // The `.h` is absent from this scan's index, so it is listed; the
+        // `.hpp` is present, so it is not — the walk already minted a node
+        // for it and the resolver probes that.
         assert_eq!(
             project.unparsed.iter().cloned().collect::<Vec<_>>(),
             ["include/fmt/format.h"],

@@ -636,8 +636,8 @@ fn declaration(facts: &mut FileFacts<CppLang>, node: &SgNode) {
 ///
 /// **A macro invocation followed by a braced block is a `function_definition`
 /// to this grammar.** `TEST(format_test, escape) { … }` comes back as a
-/// function named `TEST` with no return type, and the 33 files this track
-/// reads write 600 of them. C++ gives every function a declared return type
+/// function named `TEST` with no return type, and the 33 files the
+/// six-extension world read wrote 600 of them. C++ gives every function a declared return type
 /// except a constructor, a destructor and a conversion function ([dcl.fct]),
 /// so a function-shaped node that states no type and is none of those three
 /// is a macro invocation, and no node is invented for it. Merging 600 of them

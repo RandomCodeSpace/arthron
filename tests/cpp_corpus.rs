@@ -27,31 +27,33 @@
 //!    review found an owner-frame bug that lost 566 of 633 methods while every
 //!    rate, bucket and baseline stayed green, and nothing but a census
 //!    notices that.
-//! 3. **Where the misses are.** 114 of the 115 unresolved references are one
-//!    reason, and reading that number without its shape is how a floor gets
-//!    mistaken for a bug. The split by include syntax is asserted, because
-//!    the one angled miss is the anti-laundering case: `<fmt/base.h>` names a
-//!    file that is really in this repository, and putting it in `External`
-//!    would move it outside both terms of the rate. The FQN-collision count
-//!    is asserted beside them: C++ is the only live track that reports a
-//!    non-zero one, and an unpinned number this track alone emits is a number
-//!    that drifts.
+//! 3. **Where the misses are.** 17 of the 18 unresolved references are one
+//!    reason — quoted includes naming the googletest bundle the corpus
+//!    deliberately does not vendor — and reading that number without its
+//!    shape is how a floor gets mistaken for a bug. The split by include
+//!    syntax is asserted, and so is the one angled *hit*: `<fmt/base.h>`
+//!    names a file that is really in this repository, and now that `.h` is
+//!    read it must be `Resolved` — before the claim it was the one angled
+//!    miss, held out of `External` so it could not vanish from both terms
+//!    of the rate. The FQN-collision count is asserted beside them: C++ is
+//!    the only live track that reports a non-zero one, and an unpinned
+//!    number this track alone emits is a number that drifts.
 //! 4. **The ratchet.** The counts are compared against
 //!    `baselines/cpp-fmt.toml` through the same [`arthron::gate::evaluate`]
 //!    the `arthron gate` command uses, so a rate regression — or drift in
 //!    either of the two buckets that sit outside the rate — fails the build.
 //!
-//! # Why this rate is small, stated where it is measured
+//! # What the rate measures now, stated where it is measured
 //!
-//! fmt is header-dominated and **its headers are all `.h`**, which is an
-//! extension the tier-2 registration deliberately left unclaimed and which
-//! going live did not widen. 21 of the corpus's 55 source files are `.h`; the
-//! 33 this track reads name one of them in 99 of their 116 quoted `#include`
-//! directives, and in one angled directive besides. Those 100 references are
-//! `Unresolved` with an honest reason and count *against* the rate. The floor
-//! is the extension policy's, not the resolver's, and the one change that
-//! would move it is a separate, ratified decision to parse C headers under a
-//! C++ grammar.
+//! fmt is header-dominated and **its headers are all `.h`** — 21 of the
+//! corpus's 55 source files. Under the six-extension registration no scan
+//! read one, 100 in-repository header references were an extension-policy
+//! floor, and this rate was 3.4%. The `.h` claim — the amendment the
+//! registration reserved for the commit that parses the extension — makes
+//! the corpus measurable: 54 files read, and the floor that remains is the
+//! googletest bundle the corpus deliberately does not vendor (17 quoted
+//! includes) plus the one `import std;` no repository can supply. The rate
+//! now measures the resolver, not the policy.
 //!
 //! Re-base with the product's own command:
 //!
@@ -82,40 +84,41 @@ const BASELINE: &str = "baselines/cpp-fmt.toml";
 /// The measurement this baseline was recorded from, restated. See the module
 /// header for why these are exact and not bounds.
 ///
-/// 33 files and not 55: the 21 `.h` headers and the one `.c` translation unit
-/// carry extensions this build does not claim, so no scan reads them.
-const FILES: usize = 33;
-const REFERENCES: u64 = 275;
-const QUOTED: u64 = 116;
-const ANGLED: u64 = 157;
+/// 54 files and not 55: the 21 `.h` headers are read now that `.h` is
+/// claimed, and the one `.c` translation unit still carries an extension
+/// this build does not.
+const FILES: usize = 54;
+const REFERENCES: u64 = 399;
+const QUOTED: u64 = 142;
+const ANGLED: u64 = 255;
 const MODULE: u64 = 2;
 
-/// Every definition the extractor emits over those 33 files, by kind.
+/// Every definition the extractor emits over those 54 files, by kind.
 ///
 /// Asserted exactly, for the same reason the reference tally is. `Module`
-/// counts the 33 synthetic unit nodes and the one `export module fmt;`
+/// counts the 54 synthetic unit nodes and the one `export module fmt;`
 /// alongside the namespaces the source writes.
 ///
-/// `Function` is 177 rather than the 774 an earlier draft of this extractor
-/// produced: a macro invocation followed by a braced block is a
-/// `function_definition` to this grammar, and 600 of them were googletest's
-/// `TEST(suite, case) { … }`. C++ gives every function a declared return type
-/// except a constructor, a destructor and a conversion function, which is the
-/// rule that tells the two apart — see
-/// [`arthron::track_cpp::extract`]. 24 survive it, where a
-/// `FMT_END_NAMESPACE` that expands to nothing stands where a return type
-/// would be; without running a preprocessor there is nothing left to tell
-/// those from a function returning `FMT_END_NAMESPACE`, and this build runs
-/// none.
+/// `Function` excludes googletest's `TEST(suite, case) { … }` blocks: a
+/// macro invocation followed by a braced block is a `function_definition`
+/// to this grammar, and the first census — taken when the six-extension
+/// world read 33 files — found 600 of them. C++ gives every function a
+/// declared return type except a constructor, a destructor and a
+/// conversion function, which is the rule that tells the two apart — see
+/// [`arthron::track_cpp::extract`]. What survives it is the handful where
+/// a macro such as `FMT_END_NAMESPACE` that expands to nothing stands
+/// where a return type would be; without running a preprocessor there is
+/// nothing left to tell those from a function returning
+/// `FMT_END_NAMESPACE`, and this build runs none.
 const DEFS: &[(DefKind, u64)] = &[
-    (DefKind::Function, 177),
-    (DefKind::Method, 148),
-    (DefKind::Type, 181),
-    (DefKind::Const, 17),
-    (DefKind::Var, 18),
-    (DefKind::Constructor, 27),
-    (DefKind::Module, 61),
-    (DefKind::Alias, 37),
+    (DefKind::Function, 669),
+    (DefKind::Method, 795),
+    (DefKind::Type, 457),
+    (DefKind::Const, 101),
+    (DefKind::Var, 44),
+    (DefKind::Constructor, 121),
+    (DefKind::Module, 110),
+    (DefKind::Alias, 206),
 ];
 
 /// Definition nodes the store holds after merging, by kind.
@@ -129,43 +132,48 @@ const DEFS: &[(DefKind, u64)] = &[
 /// `DefKind::Module` is absent because the driver files a module as a
 /// *package* node rather than a definition; those are counted by [`PACKAGES`].
 const STORED: &[(DefKind, u64)] = &[
-    (DefKind::Function, 113),
-    (DefKind::Method, 134),
-    (DefKind::Type, 171),
-    (DefKind::Const, 15),
-    (DefKind::Var, 17),
-    (DefKind::Constructor, 18),
-    (DefKind::Alias, 35),
+    (DefKind::Function, 388),
+    (DefKind::Method, 694),
+    (DefKind::Type, 427),
+    (DefKind::Const, 99),
+    (DefKind::Var, 34),
+    (DefKind::Constructor, 70),
+    (DefKind::Alias, 194),
 ];
 
-/// Package nodes: the 33 unit nodes an `#include` names, the one named module
+/// Package nodes: the 54 unit nodes an `#include` names, the one named module
 /// an `import` names, and the namespaces the source declares once reopening
 /// has merged them.
-const PACKAGES: u64 = 47;
+const PACKAGES: u64 = 75;
 
 /// External nodes: one per distinct system or platform header the corpus
 /// includes with angle brackets and no include root supplies. Named rather
 /// than only counted in [`PINNED`], because which header is outside this
 /// repository is a claim and not a tally.
-const EXTERNALS: u64 = 72;
+const EXTERNALS: u64 = 83;
 
 /// Definition nodes more than one file declares — what `arthron scan` prints
 /// as `fqn collisions`.
 ///
 /// Every live track prints it; C++ is the only one whose count is not zero,
-/// which makes it the only one where leaving it unasserted lets it drift. All
-/// 20 are ordinary C++ across translation units — `main` in three test
-/// binaries, `operator<<` and `format_as` written per test file, googletest's
-/// `TEST` across 24 sites — rather than an identity bug: `CppResolver::
-/// mergeable` already merges a repeated *entity*, and what is left is
-/// different entities sharing a name in different units, which is exactly
-/// what the counter is for.
+/// which makes it the only one where leaving it unasserted lets it drift.
+/// All 90 are ordinary C++ across translation units rather than an identity
+/// bug, and the inventory splits 44/29/17: an entity declared in a header
+/// and written again in a source file (the posix-mock `test::` family,
+/// `output_redirect`'s members, `buffered_file`'s — the one-definition
+/// rule, working exactly as `CppResolver::mergeable` intends), fmt's
+/// public API written per header (`format`, `vformat`, `print`, `join`
+/// across `base.h`, `format.h`, `xchar.h`, `color.h`), and the source-only
+/// set the six-extension world already counted — `main` in three test
+/// binaries, `operator<<` and `format_as` written per test file,
+/// googletest's `TEST`. What is not a repeated entity is names shared
+/// across units, which is exactly what the counter is for.
 ///
 /// Counted here off the stored nodes rather than read from the scan's own
-/// `Report`, which subtracts this event's merges and so answers 2 for a cold
-/// scan of the same tree. The graph-derived number is the one a reader of
-/// `arthron scan` sees, and it is the one that must not drift.
-const COLLISIONS: u64 = 20;
+/// `Report`, which subtracts this event's merges and so answers 16 for a
+/// cold scan of the same tree. The graph-derived number is the one a reader
+/// of `arthron scan` sees, and it is the one that must not drift.
+const COLLISIONS: u64 = 90;
 
 /// Named nodes, spelled out: `(fqn, kind, declaring file, line)`.
 ///
@@ -175,9 +183,9 @@ const COLLISIONS: u64 = 20;
 /// reaching `../src/` from `test/` lands on the same node the sibling include
 /// in `src/fmt.cc` lands on.
 const PINNED: &[(&str, NodeKind, &str, u32)] = &[
-    // The three units a quoted `#include` actually resolves to in this
-    // corpus: `src/fmt.cc:149` includes `"format.cc"`, `:152` includes
-    // `"os.cc"`, and `test/posix-mock-test.cc:20` includes `"../src/os.cc"`.
+    // Units a quoted `#include` resolves to: `src/fmt.cc:149` includes
+    // `"format.cc"`, `:152` includes `"os.cc"`, and
+    // `test/posix-mock-test.cc:20` includes `"../src/os.cc"`.
     ("#src/format.cc", NodeKind::Package, "src/format.cc", 1),
     ("#src/os.cc", NodeKind::Package, "src/os.cc", 1),
     // The C++20 module `test/module-test.cc` imports, declared by a grammar
@@ -196,13 +204,14 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
         "src/os.cc",
         175,
     ),
-    // An out-of-line member definition. Filed under the right owner with the
-    // weaker kind, because one file cannot say whether `buffered_file` is a
-    // class or a namespace — the limit `track_cpp::extract` records, pinned
-    // so that closing it is a deliberate change and not a silent one.
+    // An out-of-line member definition. In the six-extension world one file
+    // could not say whether `buffered_file` was a class or a namespace, and
+    // this node carried the weaker `Function` — the limit `track_cpp::
+    // extract` records. With `include/fmt/os.h` read, the class body at
+    // `os.h:165` says *member*, and the node carries the header's kind.
     (
         "buffered_file::close",
-        NodeKind::Definition(DefKind::Function),
+        NodeKind::Definition(DefKind::Method),
         "src/os.cc",
         183,
     ),
@@ -211,6 +220,35 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
         NodeKind::Definition(DefKind::Type),
         "test/format-test.cc",
         2399,
+    ),
+    // Structure from the headers the `.h` claim made readable.
+    //
+    // `uint128` is spelled inside `namespace detail` (`format.h:190`), and
+    // is stored at the top level: under the pinned grammar the enclosing
+    // frame does not survive the preprocessor-conditional region above the
+    // class, where `base.h`'s `detail::` names keep theirs. The
+    // no-preprocessor limit, pinned so that closing it is a deliberate
+    // change and not a silent one.
+    (
+        "uint128",
+        NodeKind::Definition(DefKind::Type),
+        "include/fmt/format.h",
+        293,
+    ),
+    // An in-class member carries the kind the class body states.
+    (
+        "uint128::high",
+        NodeKind::Definition(DefKind::Method),
+        "include/fmt/format.h",
+        301,
+    ),
+    // A test header, because the claim covers `test/` as much as
+    // `include/`.
+    (
+        "output_redirect",
+        NodeKind::Definition(DefKind::Type),
+        "test/gtest-extra.h",
+        74,
     ),
     // A system header, outside this repository and reached only through the
     // angled syntax.
@@ -231,8 +269,8 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 /// *preprocessing* line — a `#`, the directive name, and a specifier — and
 /// reading it needs no grammar, which is exactly why this can disagree with
 /// an extractor that has one. Deliberately naive about comments: the corpus
-/// holds no commented-out directive (a comment-aware count over the same 33
-/// files returns the same 275), and if one ever appears the honest response
+/// holds no commented-out directive (a comment-aware count over the same 54
+/// files returns the same 399), and if one ever appears the honest response
 /// is to teach *this* function about it rather than to loosen the assertion
 /// it feeds.
 fn directives(source: &str) -> (u64, u64, u64, u64) {
@@ -318,10 +356,14 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
     assert_eq!(owned.len(), FILES, "the scan owned a different file set");
     for rel in &owned {
         assert!(
-            !rel.ends_with(".h") && !rel.ends_with(".c"),
-            "{rel}: this build claims neither extension, and going live widened nothing",
+            !rel.ends_with(".c"),
+            "{rel}: `.c` is unclaimed, and the `.h` amendment widened nothing else",
         );
     }
+    assert!(
+        owned.iter().any(|rel| rel.ends_with(".h")),
+        "`.h` is claimed, and a scan of a header-dominated corpus read none",
+    );
 
     let mut re_extracted = 0u64;
     let mut forms: BTreeMap<&str, u64> = BTreeMap::new();
@@ -427,23 +469,24 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
     // exercise is recorded as absent rather than assumed.
     assert_eq!(forms.get("computed").copied(), None);
 
-    // Three quoted includes name a `.cc` file — the only in-repository
-    // translation units this build parses — and `import fmt;` names the one
-    // module `src/fmt.cc` exports.
-    assert_eq!(measured.resolved, 4);
-    // Every angled include but one names a header no include root supplies.
-    assert_eq!(measured.external, 156);
+    // 125 quoted includes and one angled `<fmt/base.h>` land on units this
+    // scan read — most of them the `.h` headers the claim made visible —
+    // and `import fmt;` names the one module `src/fmt.cc` exports.
+    assert_eq!(measured.resolved, 127);
+    // Every angled include but `<fmt/base.h>` names a header no include
+    // root supplies.
+    assert_eq!(measured.external, 254);
     // Tier 2 emits no expression-level reference, so nothing can name a
     // local. The bucket that sits outside both rate terms is empty, which is
     // what makes this rate un-gameable by reclassification.
     assert_eq!(measured.local_binding, 0);
-    assert_eq!(measured.unresolved, 115);
+    assert_eq!(measured.unresolved, 18);
 
-    // The floor, named. 113 quoted includes name a `.h` header or the
-    // unvendored googletest bundle; one angled include names `fmt/base.h`,
-    // which is a real file in this repository under an extension this build
-    // does not parse.
-    assert_eq!(reasons.get("ModuleNotFound").copied(), Some(114));
+    // The floor, named. All 17 are quoted includes naming the
+    // `"gtest/gtest.h"` / `"gmock/gmock.h"` bundle the corpus deliberately
+    // does not vendor; the `.h` headers that used to dominate this bucket
+    // resolve now.
+    assert_eq!(reasons.get("ModuleNotFound").copied(), Some(17));
     // `import std;` names the standard library's module. No `export module`
     // here declares it and this build indexes no standard-library set.
     assert_eq!(reasons.get("UnknownPackage").copied(), Some(1));
@@ -455,9 +498,9 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
 
     // -- where the misses are, by include syntax ---------------------------
 
-    // The load-bearing split: the single angled miss must be the
-    // in-repository header, not an `External` that vanished from both terms
-    // of the rate.
+    // The load-bearing split: the one angled include naming a file this
+    // repository supplies must be the resolved one, and no quoted miss may
+    // be laundered into `External`.
     let store = Store::open(&db).expect("store opens");
     let snapshot = store.snapshot().expect("snapshot");
     let mut by_syntax: BTreeMap<(&str, &str), u64> = BTreeMap::new();
@@ -475,21 +518,26 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
         *by_syntax.entry((syntax, outcome)).or_default() += u64::from(record.count);
     }
     println!("             by syntax {by_syntax:?}");
-    assert_eq!(by_syntax.get(&("quoted", "resolved")).copied(), Some(3));
-    assert_eq!(by_syntax.get(&("quoted", "unresolved")).copied(), Some(113));
+    assert_eq!(by_syntax.get(&("quoted", "resolved")).copied(), Some(125));
+    assert_eq!(by_syntax.get(&("quoted", "unresolved")).copied(), Some(17));
     assert_eq!(
         by_syntax.get(&("quoted", "external")).copied(),
         None,
         "a quoted include says this project supplies the header; a miss is \
          this project's floor and is never laundered into `External`",
     );
-    assert_eq!(by_syntax.get(&("angled", "external")).copied(), Some(156));
+    assert_eq!(by_syntax.get(&("angled", "external")).copied(), Some(254));
+    assert_eq!(
+        by_syntax.get(&("angled", "resolved")).copied(),
+        Some(1),
+        "`<fmt/base.h>` is a file in this repository, and now that `.h` is \
+         read it must be an edge",
+    );
     assert_eq!(
         by_syntax.get(&("angled", "unresolved")).copied(),
-        Some(1),
-        "`<fmt/base.h>` is a file in this repository under an extension this \
-         build does not parse; `External` would move it outside both terms of \
-         the rate",
+        None,
+        "every angled include either lands on a unit this scan read or is \
+         supplied outside this repository",
     );
     assert_eq!(by_syntax.get(&("module", "resolved")).copied(), Some(1));
     assert_eq!(by_syntax.get(&("module", "unresolved")).copied(), Some(1));
@@ -575,10 +623,10 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
         "the namespace `fmt` is not in the store",
     );
 
-    // The extension policy, asserted where it costs the most. Every header
-    // fmt publishes is a `.h` file, and no scan read one, so no unit node
-    // exists for any of them — which is precisely why 100 references are a
-    // floor rather than an edge.
+    // The `.h` claim, asserted where it pays the most. Every header fmt
+    // publishes is a `.h` file, and the scan reads each one now, so the
+    // unit node an `#include` probes for exists — which is precisely why
+    // the 100 header references that used to be a floor are edges.
     for header in [
         "include/fmt/format.h",
         "include/fmt/base.h",
@@ -586,8 +634,8 @@ fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
     ] {
         let id = node_id(Domain::Cxx, &unit_fqn(header));
         assert!(
-            definition(&read, &id).expect("header read").is_none(),
-            "{header} has a unit node; this build does not parse `.h`",
+            definition(&read, &id).expect("header read").is_some(),
+            "{header} has no unit node; the `.h` claim is not being read",
         );
     }
     drop(read);
