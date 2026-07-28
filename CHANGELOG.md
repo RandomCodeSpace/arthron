@@ -34,13 +34,17 @@ and `arthron mcp` answer questions about the result.
   resolution rate and are gated on drift so neither can inflate it.
 - **`arthron gate` and twenty-five committed baselines** in `baselines/`, one
   per corpus, measured on a release build against a pinned snapshot. Every
-  baseline is bound to a test driver, and `tests/baselines.rs` fails the build
-  if one lands with nothing comparing against it. Exit 0 pass, 1 regression, 2
+  baseline is bound to a test driver *and* to a step in the corpus-gate
+  workflow, and `tests/baselines.rs` fails the build if either is missing — it
+  reads no corpus, so it is enforcement that runs on every platform. Exit 0
+  pass, 1 regression, 2
   usage or I/O error; `--rebase` is the only way the ratchet moves. The gate
   fails with `denominator_shrank` when `resolved + unresolved` falls below the
   baseline's, so a dropped row cannot read as an improvement.
 - **Corpus gates in CI** (`.github/workflows/gate.yml`), the one job that
-  fetches the private corpus and the place a red check blocks a merge.
+  fetches the private corpus and the place a red check blocks a merge —
+  twenty-five steps, one per committed baseline, each naming its corpus in the
+  step list so a regression is identified without reading a log.
 - **`arthron query def | refs | impact`** — a definition and its declaring
   sites, every stored reference row that resolved to a name, and the reverse
   transitive closure (`--depth`) that gives a change's blast radius. Names
@@ -80,6 +84,12 @@ and `arthron mcp` answer questions about the result.
 - **Unreadable and undecodable files are reported per file** — never dropped,
   never fatal — and a stepped-over file loses its currency claim so the next
   scan re-reads it. An absent scan root fails cleanly.
+- **The text report and `--json` list the same languages.** `arthron scan`
+  printed a `go` line on every repository, including ones containing no Go,
+  which contradicted the documented `--json` contract that a language with no
+  rows has no entry and is not a rate of zero. A scan that produced no
+  reference row at all now says so in one line instead of naming a language to
+  fill the space.
 
 ### Packaging
 
