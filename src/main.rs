@@ -377,6 +377,20 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
             }
         },
     };
+    // Asked before anything is created, because creating the store's
+    // directory would otherwise be what brings the scanned root into
+    // existence. The default store is `<root>/.arthron/graph.redb`, so
+    // `create_dir_all` on its parent makes every missing component of the
+    // root along the way; the walk then succeeds over the empty tree it just
+    // made and the run answers 0 with a report of zeros — the shape
+    // `scan_repo_with` refuses to return, arrived at by materialising the
+    // thing whose absence was the failure. With `--db` elsewhere the same
+    // invocation already answered 2, so the code depended on where the store
+    // happened to sit.
+    if let Err(e) = std::fs::metadata(path) {
+        noteln!("arthron: {}: {e}", path.display());
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {

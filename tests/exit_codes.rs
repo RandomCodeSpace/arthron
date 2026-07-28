@@ -116,6 +116,29 @@ fn a_root_that_is_not_there_exits_two() {
     );
 }
 
+/// The same question with no `--db`, which is the invocation the exit-code
+/// table is read against. The default store is `<root>/.arthron/graph.redb`,
+/// so creating its parent used to create the missing root along with it: the
+/// walk then found an empty tree, the run answered 0 with a report of zeros,
+/// and the tree that was not there was silently on disk afterwards. Whether a
+/// missing root is an error must not depend on where the store sits.
+#[test]
+fn a_root_that_is_not_there_exits_two_with_the_default_store_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-tree");
+    let out = arthron(&["scan", missing.to_str().expect("a utf-8 temp path")]);
+    assert_eq!(
+        code(&out),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !missing.exists(),
+        "the run created the root whose absence was the failure",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_store_directory_that_cannot_be_created_exits_two() {

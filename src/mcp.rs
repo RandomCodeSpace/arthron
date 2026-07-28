@@ -512,6 +512,11 @@ fn scan(root: &Path, db: Option<&Path>) -> Result<Value, String> {
             .db_path(root)?
             .unwrap_or_else(|| root.join(".arthron/graph.redb")),
     };
+    // Before anything is created: the default store sits inside the root, so
+    // `create_dir_all` on its parent would make a missing root and turn "that
+    // tree is not here" into a clean scan of the empty one it just made. The
+    // command line asks the same question in the same place.
+    std::fs::metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
     if let Some(parent) = db_path.parent()
         && !parent.as_os_str().is_empty()
     {
