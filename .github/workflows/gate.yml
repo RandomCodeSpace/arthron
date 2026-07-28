@@ -18,7 +18,7 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Seventeen cold scans of real repositories. Generous, but bounded: a hung
+    # Twenty-five cold scans of real repositories. Generous, but bounded: a hung
     # scan must not sit on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
@@ -121,3 +121,27 @@ jobs:
 
       - name: Gate scala / upickle
         run: ./target/release/arthron gate corpus/scala/upickle --language scala --baseline baselines/scala-upickle.toml
+
+      - name: Gate swift / alamofire
+        run: ./target/release/arthron gate corpus/swift/alamofire --language swift --baseline baselines/swift-alamofire.toml
+
+      - name: Gate cpp / fmt
+        run: ./target/release/arthron gate corpus/cpp/fmt --language cpp --baseline baselines/cpp-fmt.toml
+
+      - name: Gate dart / collection
+        run: ./target/release/arthron gate corpus/dart/collection --language dart --baseline baselines/dart-collection.toml
+
+      - name: Gate elixir / plug
+        run: ./target/release/arthron gate corpus/elixir/plug --language elixir --baseline baselines/elixir-plug.toml
+
+      - name: Gate haskell / aeson
+        run: ./target/release/arthron gate corpus/haskell/aeson --language haskell --baseline baselines/haskell-aeson.toml
+
+      - name: Gate lua / busted
+        run: ./target/release/arthron gate corpus/lua/busted --language lua --baseline baselines/lua-busted.toml
+
+      - name: Gate bash / bats-core
+        run: ./target/release/arthron gate corpus/bash/bats-core --language bash --baseline baselines/bash-bats-core.toml
+
+      - name: Gate hcl / terraform-aws-vpc
+        run: ./target/release/arthron gate corpus/hcl/terraform-aws-vpc --language hcl --baseline baselines/hcl-terraform-aws-vpc.toml
