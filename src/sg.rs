@@ -129,6 +129,18 @@ impl SourceTree {
         Self::parse(SupportLang::Scala, source)
     }
 
+    /// Parse Lua source.
+    ///
+    /// One grammar for every dialect: LuaJIT and PUC Lua 5.1 through 5.4
+    /// differ in library surface and in `goto`/integer-division spellings the
+    /// same tree-sitter grammar reads, and a repository that supports several
+    /// runtimes writes them in one tree. A rockspec is Lua too — it is a
+    /// chunk of assignments — and phase 0 parses it with this same function
+    /// rather than pattern-matching its bytes.
+    pub fn parse_lua(source: &str) -> Self {
+        Self::parse(SupportLang::Lua, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -315,6 +327,21 @@ rule:
                 .expect("the declaration names a type");
             assert_eq!(name.text(), "Greeter");
         }
+    }
+
+    /// Lua, which [`one_match`] cannot check the same way for every shape:
+    /// tree-sitter-lua names a `name` field on a function declaration, but
+    /// the name of `function M.foo()` is a `dot_index_expression` rather than
+    /// an identifier. The point of the test is the same one every grammar
+    /// check here makes — the grammar is compiled into this build at all.
+    #[test]
+    fn parses_lua() {
+        one_match(
+            &SourceTree::parse_lua("local function hi() end\n"),
+            "id: t\nlanguage: lua\nrule:\n  kind: function_declaration\n",
+            "function_declaration",
+            "hi",
+        );
     }
 
     #[test]
