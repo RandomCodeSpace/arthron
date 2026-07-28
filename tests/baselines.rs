@@ -160,18 +160,172 @@ struct GateStep {
     baseline: String,
 }
 
-/// Every `arthron gate` invocation in [`GATE_WORKFLOW`], and the number of
-/// step headers they were parsed out of.
-fn gate_steps() -> (Vec<GateStep>, usize) {
+/// A YAML line that carries something: blank lines and whole-line comments
+/// are dropped, so a comment can neither hide a key nor invent one, and what
+/// is left is `(indentation, content)`.
+fn significant(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .map(|l| (l.len() - l.trim_start().len(), l.trim().to_string()))
+        .collect()
+}
+
+/// `key: value` from a mapping line, with a leading `- ` list marker removed.
+///
+/// `None` for anything that is not a key — a block-scalar continuation line,
+/// a bare sequence item — so a `run:` body cannot be mistaken for a step key.
+fn split_key(line: &str) -> Option<(String, String)> {
+    let line = line.strip_prefix("- ").unwrap_or(line);
+    let (key, rest) = line.split_once(':')?;
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((key.to_string(), rest.trim().to_string()))
+}
+
+/// One step of the gate job.
+struct WorkflowStep {
+    /// Its `name:`, or the empty string for a step that declares none.
+    name: String,
+    /// Its own keys — the header's, plus every mapping line one level in.
+    /// Nested values (`with:`, a `run: |` body) are not keys and are not here.
+    keys: Vec<(String, String)>,
+    /// The whole step, comments and blank lines removed, as one string. What
+    /// the soft-failure scan reads, because a `|| true` can sit in a block
+    /// scalar where no key parser would find it.
+    block: String,
+}
+
+/// The corpus-gate workflow, read as text: its triggers, the gate job's own
+/// keys, and the job's steps.
+struct GateJob {
+    /// Everything under the workflow's `on:` key.
+    triggers: Vec<String>,
+    /// The job's own keys — `name`, `runs-on`, `timeout-minutes`, `steps`.
+    keys: Vec<(String, String)>,
+    steps: Vec<WorkflowStep>,
+}
+
+/// Read [`GATE_WORKFLOW`] into a [`GateJob`].
+///
+/// Indentation-driven rather than YAML-parsed, for the reason the header
+/// gives: the crate has no cause to carry a YAML parser. The shape is
+/// asserted rather than assumed at every step — a file this reader cannot
+/// split into a job with steps panics here, instead of yielding an empty set
+/// that every test below would pass against.
+fn gate_job() -> GateJob {
     let text = std::fs::read_to_string(GATE_WORKFLOW)
         .unwrap_or_else(|e| panic!("reading {GATE_WORKFLOW}: {e}"));
-    let headers = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("- name: Gate "))
+    let lines = significant(&text);
+
+    let on = lines
+        .iter()
+        .position(|(indent, content)| *indent == 0 && content == "on:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no `on:` block, so nothing triggers it"));
+    let triggers: Vec<String> = lines[on + 1..]
+        .iter()
+        .take_while(|(indent, _)| *indent > 0)
+        .map(|(_, content)| content.clone())
+        .collect();
+
+    let jobs = lines
+        .iter()
+        .position(|(indent, content)| *indent == 0 && content == "jobs:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no `jobs:` block"));
+    let (job_indent, header) = lines
+        .get(jobs + 1)
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: `jobs:` declares nothing"));
+    assert_eq!(
+        header, "gates:",
+        "{GATE_WORKFLOW}: the first job is not `gates:`; this reader checks that one",
+    );
+    let job_indent = *job_indent;
+    let body: Vec<&(usize, String)> = lines[jobs + 2..]
+        .iter()
+        .take_while(|(indent, _)| *indent > job_indent)
+        .collect();
+    assert!(!body.is_empty(), "{GATE_WORKFLOW}: the gates job is empty");
+
+    let key_indent = body[0].0;
+    let keys: Vec<(String, String)> = body
+        .iter()
+        .filter(|(indent, _)| *indent == key_indent)
+        .filter_map(|(_, content)| split_key(content))
+        .collect();
+
+    let steps_at = body
+        .iter()
+        .position(|(indent, content)| *indent == key_indent && content == "steps:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: the gates job declares no `steps:`"));
+    let step_lines: Vec<&(usize, String)> = body[steps_at + 1..]
+        .iter()
+        .take_while(|(indent, _)| *indent > key_indent)
+        .copied()
+        .collect();
+    assert!(!step_lines.is_empty(), "{GATE_WORKFLOW}: `steps:` is empty");
+    let step_indent = step_lines[0].0;
+    assert!(
+        step_lines[0].1.starts_with("- "),
+        "{GATE_WORKFLOW}: `steps:` does not begin with a list item",
+    );
+
+    let mut steps: Vec<WorkflowStep> = Vec::new();
+    let mut current: Vec<&(usize, String)> = Vec::new();
+    let finish = |block: &mut Vec<&(usize, String)>, out: &mut Vec<WorkflowStep>| {
+        if block.is_empty() {
+            return;
+        }
+        let keys: Vec<(String, String)> = block
+            .iter()
+            .filter(|(indent, _)| *indent <= step_indent + 2)
+            .filter_map(|(_, content)| split_key(content))
+            .collect();
+        let name = keys
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map_or(String::new(), |(_, v)| v.clone());
+        let text: Vec<&str> = block.iter().map(|(_, c)| c.as_str()).collect();
+        out.push(WorkflowStep {
+            name,
+            keys,
+            block: text.join("\n"),
+        });
+        block.clear();
+    };
+    for line in step_lines {
+        if line.0 == step_indent && line.1.starts_with("- ") {
+            finish(&mut current, &mut steps);
+        }
+        current.push(line);
+    }
+    finish(&mut current, &mut steps);
+    assert!(!steps.is_empty(), "{GATE_WORKFLOW}: no step was read");
+
+    GateJob {
+        triggers,
+        keys,
+        steps,
+    }
+}
+
+/// Every `arthron gate` invocation in [`GATE_WORKFLOW`], and the number of
+/// gate steps they were parsed out of.
+fn gate_steps() -> (Vec<GateStep>, usize) {
+    let job = gate_job();
+    let headers = job
+        .steps
+        .iter()
+        .filter(|s| s.name.starts_with("Gate "))
         .count();
     let mut steps = Vec::new();
-    for line in text.lines() {
-        let Some((_, invocation)) = line.split_once("arthron gate ") else {
+    for step in &job.steps {
+        let Some((_, run)) = step.keys.iter().find(|(k, _)| k == "run") else {
+            continue;
+        };
+        let Some((_, invocation)) = run.split_once("arthron gate ") else {
             continue;
         };
         let words: Vec<&str> = invocation.split_whitespace().collect();
@@ -187,7 +341,7 @@ fn gate_steps() -> (Vec<GateStep>, usize) {
             flag("--language"),
             flag("--baseline"),
         ) else {
-            panic!("{GATE_WORKFLOW}: cannot read a gate invocation from `{line}`");
+            panic!("{GATE_WORKFLOW}: cannot read a gate invocation from `{run}`");
         };
         steps.push(GateStep {
             corpus,
@@ -249,4 +403,138 @@ fn every_gate_step_names_the_corpus_and_language_its_baseline_records() {
             step.corpus, step.baseline, baseline.corpus,
         );
     }
+}
+
+/// The tokens that make a step, or a job, unable to fail.
+///
+/// Read as substrings of the step's text rather than as YAML keys on purpose:
+/// `continue-on-error` is a key, `|| true` is not, and both end the same way
+/// — a red command and a green check. Whole-line comments are already gone by
+/// the time this is applied, so prose about `|| true` costs nothing.
+const SOFT_FAILURE: &[&str] = &[
+    "continue-on-error",
+    "|| true",
+    "|| :",
+    "|| exit 0",
+    "; true",
+    "&& true",
+    "set +e",
+    "exit 0",
+];
+
+/// The one shape a gate step's command may have.
+///
+/// Anything else is a wrapper, and a wrapper is where an exit status goes to
+/// be discarded — `bash -c '… || true'`, a `set +e` above it, a `for` loop
+/// whose status is the last iteration's.
+const GATE_COMMAND: &str = "./target/release/arthron gate ";
+
+#[test]
+fn no_gate_step_can_pass_without_measuring() {
+    // The hole this closes, found by defeating the gate rather than by
+    // reading it: `every_gated_baseline_has_a_step_in_the_corpus_gate_workflow`
+    // counts steps, and a step carrying `continue-on-error: true` is still a
+    // step. Four baselines went on "passing" with their step's effect
+    // removed. A gate that cannot fail is not a gate, and counting is no way
+    // to tell the difference — so every gate step is checked for the three
+    // ways it could be neutralised: the key, the shell, and an `if:` that
+    // decides it does not apply today.
+    let job = gate_job();
+    let gates: Vec<&WorkflowStep> = job
+        .steps
+        .iter()
+        .filter(|s| s.name.starts_with("Gate "))
+        .collect();
+    assert_eq!(
+        gates.len(),
+        GATED.len(),
+        "{GATE_WORKFLOW} has {} gate steps for {} gated baselines",
+        gates.len(),
+        GATED.len(),
+    );
+
+    for step in &gates {
+        for token in SOFT_FAILURE {
+            assert!(
+                !step.block.contains(token),
+                "{GATE_WORKFLOW}: step `{}` carries `{token}`, so a regression it \
+                 measures cannot fail the job — which is indistinguishable from a pass",
+                step.name,
+            );
+        }
+        // `if:` is the quiet one: the step stays in the list, the job stays
+        // green, and the step is skipped. A gate that can decide it does not
+        // apply is a gate that can decide it never applies.
+        assert!(
+            !step.keys.iter().any(|(k, _)| k == "if"),
+            "{GATE_WORKFLOW}: step `{}` is conditional, so it can be skipped without \
+             anything going red",
+            step.name,
+        );
+        let (_, run) = step
+            .keys
+            .iter()
+            .find(|(k, _)| k == "run")
+            .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: step `{}` runs nothing", step.name));
+        assert!(
+            run.starts_with(GATE_COMMAND),
+            "{GATE_WORKFLOW}: step `{}` runs `{run}`, not `{GATE_COMMAND}…`; the job's \
+             verdict is the command's exit status and a wrapper is where that gets lost",
+            step.name,
+        );
+    }
+}
+
+#[test]
+fn the_corpus_gate_job_itself_has_no_soft_failure_path() {
+    // The other half. Every step can be strict and the job still not block a
+    // merge: `continue-on-error` on the job, an `if:` on the job, a step
+    // earlier in the list that swallows the corpus checkout's failure, or a
+    // workflow that never runs on a pull request at all.
+    let job = gate_job();
+
+    for (key, value) in &job.keys {
+        assert_ne!(
+            key, "continue-on-error",
+            "{GATE_WORKFLOW}: the gates job is `continue-on-error: {value}`, so no step \
+             in it can fail the run",
+        );
+        assert_ne!(
+            key, "if",
+            "{GATE_WORKFLOW}: the gates job is conditional on `{value}`, so it can be \
+             skipped without anything going red",
+        );
+    }
+
+    // Not only the gate steps: a `continue-on-error` on the corpus checkout
+    // would hand every gate an empty tree, and `arthron gate` exits 2 for
+    // "nothing measured" precisely so that cannot be read as a pass — but the
+    // key has no legitimate use anywhere in this job, so none is allowed.
+    for step in &job.steps {
+        assert!(
+            !step.block.contains("continue-on-error"),
+            "{GATE_WORKFLOW}: step `{}` carries continue-on-error",
+            step.name,
+        );
+    }
+
+    // The job's name is the branch-protection context. Renaming it does not
+    // fail anything — it silently drops the required check on main, which is
+    // the same failure mode as a step that cannot fail, one level up.
+    assert_eq!(
+        job.keys
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_str()),
+        Some("corpus gates"),
+        "{GATE_WORKFLOW}: the job name is the branch-protection context",
+    );
+
+    // And it has to run where a merge is decided. A workflow that triggers
+    // only on `push` reports the regression after it has landed.
+    assert!(
+        job.triggers.iter().any(|t| t.starts_with("pull_request")),
+        "{GATE_WORKFLOW}: no `pull_request` trigger, so a red gate blocks nothing: {:?}",
+        job.triggers,
+    );
 }

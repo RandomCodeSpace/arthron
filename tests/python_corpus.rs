@@ -14,6 +14,30 @@ use arthron::pipeline::source_files;
 use arthron::track_python::extract::extract;
 use arthron::track_python::lang::PyLang;
 
+/// The `.py` files under `corpus/python`: django's 899 and flask's 65.
+const FILES: u64 = 964;
+
+/// Every reference the extractor emits over them.
+const REFERENCES: u64 = 53_544;
+
+/// Every definition it emits, by kind — django and flask together, because
+/// the extractor is one piece of code reading both.
+///
+/// Exact, not a floor. The per-corpus censuses in `tests/corpus_python.rs`
+/// pin each tree on its own and pin the store beside it; this pins the
+/// extractor's own answer over the union, which is the number that moves
+/// first when a rule stops matching. `Module` is one per file.
+const DEFS: &[(DefKind, u64)] = &[
+    (DefKind::Function, 1699),
+    (DefKind::Method, 7498),
+    (DefKind::Type, 2020),
+    (DefKind::Var, 2281),
+    (DefKind::Field, 6186),
+    (DefKind::Property, 800),
+    (DefKind::Module, 964),
+    (DefKind::Alias, 6520),
+];
+
 #[test]
 fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
     let corpus = Path::new("corpus/python");
@@ -28,6 +52,7 @@ fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
     let mut defs = 0u64;
     let mut refs = 0u64;
     let mut by_ref_kind: BTreeMap<u8, u64> = BTreeMap::new();
+    let mut by_def_kind: BTreeMap<u8, u64> = BTreeMap::new();
     let mut locally_bound = 0u64;
 
     for path in &files {
@@ -51,6 +76,9 @@ fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
         );
         defs += facts.defs.len() as u64;
         refs += facts.refs.len() as u64;
+        for d in &facts.defs {
+            *by_def_kind.entry(d.kind.code()).or_default() += 1;
+        }
         for r in &facts.refs {
             *by_ref_kind.entry(r.kind.code()).or_default() += 1;
             if r.locally_bound {
@@ -78,5 +106,25 @@ fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
     for (code, n) in &by_ref_kind {
         println!("  ref kind {code}: {n}");
     }
-    assert!(defs > 0 && refs > 0);
+    println!("  defs by kind {by_def_kind:?}");
+
+    // `defs > 0 && refs > 0` was what stood here, and it is not a
+    // measurement: deleting the rule that emits `DefKind::Method` takes 7498
+    // definitions out of this walk and leaves both of those true. The census
+    // is asserted exactly instead — over both corpora at once, because this
+    // file's subject is the extractor and the extractor does not know which
+    // tree it is reading.
+    assert_eq!(files_read, FILES, "the walk found a different file set");
+    assert_eq!(refs, REFERENCES, "the reference tally moved");
+    let want: BTreeMap<u8, u64> = DEFS.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(
+        by_def_kind, want,
+        "the definition census moved; the extractor's half of the deliverable \
+         is definitions and no resolution rate can see one go missing",
+    );
+    assert_eq!(
+        defs,
+        DEFS.iter().map(|(_, n)| n).sum::<u64>(),
+        "the per-kind census and the total disagree",
+    );
 }

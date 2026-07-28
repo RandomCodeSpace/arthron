@@ -177,6 +177,52 @@ fn node<'a>(snapshot: &'a Snapshot, fqn: &str) -> &'a NodeRecord {
         .unwrap_or_else(|| panic!("no node is stored for `{fqn}`"))
 }
 
+/// Assert a definition is stored under `fqn`, with this kind, declared at
+/// exactly these `(file, line)` sites.
+///
+/// `matches!(node(…), NodeRecord::Definition { .. })` is what stood at four
+/// of these call sites, and it is the weakest true thing that can be said
+/// about a node: it passes for a definition of the wrong kind, under the
+/// wrong name, sourced from the wrong file and the wrong line. A probe
+/// exists to pin an *outcome*; this pins the whole record.
+fn expect_definition(snapshot: &Snapshot, fqn: &str, kind: DefKind, sites: &[(&str, u32)]) {
+    let NodeRecord::Definition {
+        fqn: stored,
+        kind: stored_kind,
+        declarations,
+        ..
+    } = node(snapshot, fqn)
+    else {
+        panic!("{fqn} is not a definition");
+    };
+    assert_eq!(
+        stored, fqn,
+        "the node stored under {fqn} answers to another name"
+    );
+    assert_eq!(
+        *stored_kind,
+        kind.code(),
+        "{fqn} is stored as {}, not {}",
+        DefKind::from_code(*stored_kind).map_or("?", DefKind::name),
+        kind.name(),
+    );
+    let got: Vec<(&str, u32)> = declarations
+        .iter()
+        .map(|d| (d.file.as_str(), d.line))
+        .collect();
+    assert_eq!(got, sites.to_vec(), "{fqn} declaration sites");
+}
+
+/// Assert a file owns no reference row at all.
+///
+/// Not a formality: `expect_sites` pins the rows of the five files that carry
+/// references, and the pin in `the_probe_pin_holds` pins the totals — but a
+/// regression that invented a row in one of these twelve files and lost one
+/// elsewhere would satisfy both. Saying "none" out loud is what closes that.
+fn expect_no_sites(snapshot: &Snapshot, file: &str) {
+    expect_sites(snapshot, file, vec![]);
+}
+
 /// Copy a tree so an event has something to edit. `corpus/` is pinned test
 /// data and is never written to.
 fn copy_tree(from: &Path, to: &Path) {
@@ -232,6 +278,15 @@ fn a_clause_header_resolves_its_right_hand_side_to_the_outer_binding() {
         return;
     }
     let (_, snapshot) = scan_fresh(Path::new(CORPUS));
+    // The identity the three headers must reach, pinned before they are
+    // asked to reach it: `Resolved(…#Producer)` says which node, and only
+    // this says which declaration that node is.
+    expect_definition(
+        &snapshot,
+        &q("/clauseheader#Producer"),
+        DefKind::Function,
+        &[("clauseheader/clauseheader.go", 14)],
+    );
     let producer = format!("Resolved({})", q("/clauseheader#Producer"));
     expect_sites(
         &snapshot,
@@ -272,6 +327,16 @@ fn a_shadowed_call_and_its_package_level_twin_are_two_rows() {
         return;
     }
     let (_, snapshot) = scan_fresh(Path::new(CORPUS));
+    // The package-level `Emit`, and the only one: the block-local `Emit` is
+    // a func literal bound to a local and is not a node, so a second
+    // declaration site here would be the shadowed binding leaking into the
+    // graph — the other half of the bug this probe pins.
+    expect_definition(
+        &snapshot,
+        &q("/shadowpair#Emit"),
+        DefKind::Function,
+        &[("shadowpair/shadowpair.go", 13)],
+    );
     expect_sites(
         &snapshot,
         "shadowpair/shadowpair.go",
@@ -349,6 +414,10 @@ fn build_exclusive_twins_keep_both_declaration_sites() {
     );
     // Two files declaring one FQN is data, printed and never a gate.
     assert_eq!(report.fqn_collisions, 1);
+    // Neither twin references anything, so neither owns a row. A twin that
+    // grew one would be a build-constraint bug wearing a reference's clothes.
+    expect_no_sites(&snapshot, "buildtwin/twin_linux.go");
+    expect_no_sites(&snapshot, "buildtwin/twin_other.go");
 }
 
 #[test]
@@ -410,6 +479,23 @@ fn two_variants_of_one_package_name_resolve_to_their_own_directories() {
         assert_eq!(*import_path, fqn);
         assert_eq!(name.as_deref(), Some(expected));
     }
+    // The two definitions the consumer's calls must land on, by kind and by
+    // site: `Resolved(…/alpha#Name)` below is a statement about an identity,
+    // and an identity sourced from the wrong file would still spell the same.
+    expect_definition(
+        &snapshot,
+        &q("/pkgrename/alpha#Name"),
+        DefKind::Function,
+        &[("pkgrename/alpha/alpha.go", 6)],
+    );
+    expect_definition(
+        &snapshot,
+        &q("/pkgrename/beta#Name"),
+        DefKind::Function,
+        &[("pkgrename/beta/beta.go", 12)],
+    );
+    expect_no_sites(&snapshot, "pkgrename/alpha/alpha.go");
+    expect_no_sites(&snapshot, "pkgrename/beta/beta.go");
     expect_sites(
         &snapshot,
         "pkgrename/consumer.go",
@@ -517,10 +603,22 @@ fn a_nested_module_is_excluded_and_its_definitions_never_appear() {
     assert!(names.is_empty(), "the nested module contributed {names:?}");
     // And the package this module *does* own is rooted in the module
     // directive, which owns no `.go` bytes of its own.
-    assert!(matches!(
-        node(&snapshot, &q("/modfence#Rooted")),
-        NodeRecord::Definition { .. }
-    ));
+    //
+    // Pinned whole, not by `matches!(…, Definition { .. })`: the fact this
+    // probe exists for is *which module roots the FQN*, and a record that
+    // answered to the right name from the wrong file, at the wrong line, or
+    // as the wrong kind would satisfy a match on the variant alone.
+    expect_definition(
+        &snapshot,
+        &q("/modfence#Rooted"),
+        DefKind::Function,
+        &[("modfence/modfence.go", 14)],
+    );
+    // Neither file references anything, so the fence is visible in the rows
+    // as well as in the nodes: the excluded file owns none because it was
+    // never read, and the owned one owns none because it names nothing.
+    expect_no_sites(&snapshot, "modfence/modfence.go");
+    expect_no_sites(&snapshot, "modfence/nested/nested.go");
 }
 
 #[test]
@@ -552,12 +650,15 @@ fn rewriting_the_module_directive_renames_every_fqn() {
 
     let store = Store::open(&warm_db).expect("open warm");
     let snapshot = store.snapshot().expect("warm snapshot");
-    assert!(
-        matches!(
-            node(&snapshot, &format!("{renamed}/modfence#Rooted")),
-            NodeRecord::Definition { .. }
-        ),
-        "the renamed module roots the FQN",
+    // The renamed module roots the FQN — and roots it at the same source
+    // line, because no `.go` byte moved. A record that survived the rename
+    // by being rebuilt from nothing would answer to the new name with no
+    // declaration site at all.
+    expect_definition(
+        &snapshot,
+        &format!("{renamed}/modfence#Rooted"),
+        DefKind::Function,
+        &[("modfence/modfence.go", 14)],
     );
     let stale = arthron::model::node_id(Lang::Go.domain(), &q("/modfence#Rooted"));
     assert!(
@@ -590,10 +691,15 @@ fn deleting_a_nested_manifest_hands_its_files_to_the_outer_module() {
         snapshot.files.contains_key("modfence/nested/nested.go"),
         "the file the nested module owned is now the probe module's",
     );
-    assert!(matches!(
-        node(&snapshot, &q("/modfence/nested#NotOurs")),
-        NodeRecord::Definition { .. }
-    ));
+    // And the definition it carries is rooted in the *outer* module now, at
+    // the line it was always written on: the file's bytes never changed, so
+    // anything else here is the fence and not the file.
+    expect_definition(
+        &snapshot,
+        &q("/modfence/nested#NotOurs"),
+        DefKind::Function,
+        &[("modfence/nested/nested.go", 12)],
+    );
 }
 
 // -- probe 6: `#` separates a container from its members -------------------
@@ -631,6 +737,23 @@ fn a_dotted_directory_and_a_dotted_fqn_are_two_nodes() {
         Some("pfoo"),
         "an unaliased import binds the declared name, which cannot contain a dot",
     );
+    // Both halves of the old collision, pinned whole. Under the `{pkg}.{name}`
+    // grammar these were one identity carrying both files' declaration sites,
+    // so "one site each, from its own file" is the outcome that regressed.
+    expect_definition(
+        &snapshot,
+        &q("/dotted/p#Foo"),
+        DefKind::Function,
+        &[("dotted/p/p.go", 13)],
+    );
+    expect_definition(
+        &snapshot,
+        &q("/dotted/p.Foo#Bar"),
+        DefKind::Function,
+        &[("dotted/p.Foo/pfoo.go", 11)],
+    );
+    expect_no_sites(&snapshot, "dotted/p/p.go");
+    expect_no_sites(&snapshot, "dotted/p.Foo/pfoo.go");
     expect_sites(
         &snapshot,
         "dotted/consumer.go",
@@ -718,10 +841,45 @@ fn only_the_directory_decides_which_clause_is_an_external_test_package() {
 
     // The in-package test's own definition is filed in the production
     // container, and calls Serve there with no import.
-    assert!(matches!(
-        node(&snapshot, &q("/testpkg/api_test#CallServe")),
-        NodeRecord::Definition { .. }
-    ));
+    //
+    // Whole, not `matches!(…, Definition { .. })`: this probe exists because
+    // the bug filed `CallServe` under one namespace and sourced its edge at
+    // another, and a match on the variant alone is true of both answers.
+    expect_definition(
+        &snapshot,
+        &q("/testpkg/api_test#CallServe"),
+        DefKind::Function,
+        &[("testpkg/api_test/api_test.go", 18)],
+    );
+    // The three `Serve` declarations the containers keep apart. Two are
+    // spelled identically in the source and differ only by the directory
+    // they sit in, which is the whole of what this probe asserts.
+    expect_definition(
+        &snapshot,
+        &q("/testpkg/api#Serve"),
+        DefKind::Function,
+        &[("testpkg/api/api.go", 6)],
+    );
+    expect_definition(
+        &snapshot,
+        &q("/testpkg/api_test#Serve"),
+        DefKind::Function,
+        &[("testpkg/api_test/api.go", 11)],
+    );
+    expect_definition(
+        &snapshot,
+        &q("/testpkg/api!test#ExerciseServe"),
+        DefKind::Function,
+        &[("testpkg/api/api_ext_test.go", 16)],
+    );
+    expect_definition(
+        &snapshot,
+        &q("/testpkg/api_test!test#ExerciseServe"),
+        DefKind::Function,
+        &[("testpkg/api_test/api_ext_test.go", 13)],
+    );
+    expect_no_sites(&snapshot, "testpkg/api/api.go");
+    expect_no_sites(&snapshot, "testpkg/api_test/api.go");
     expect_sites(
         &snapshot,
         "testpkg/api_test/api_test.go",

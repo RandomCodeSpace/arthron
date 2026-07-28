@@ -40,15 +40,128 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use arthron::gate::{Counts, GateVerdict, evaluate, parse_baseline};
-use arthron::model::{DefKind, Lang, RefKind, reason_name};
+use arthron::model::{DefKind, Lang, RefKind, node_id, reason_name};
 use arthron::pipeline::source_files;
-use arthron::store::Store;
+use arthron::query::{NodeKind, definition};
+use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_rust::extract::extract;
 use arthron::track_rust::lang::RsLang;
 use arthron::track_rust::resolve::scan_rust;
 
 const CORPUS: &str = "corpus/rust/ripgrep";
 const BASELINE: &str = "baselines/rust-ripgrep.toml";
+
+/// The files the scan owns. Exact, because everything below is a count over
+/// this set and a census over a different file set is a different census.
+const FILES: usize = 99;
+
+/// Every definition the extractor emits over those 99 files, by kind.
+///
+/// Asserted **exactly**, and this is the assertion this file was missing.
+/// Definitions are tier 2's other deliverable and the import rate cannot see
+/// one of them: deleting the rule that emits `DefKind::Method` removes 2066
+/// nodes — 54.6% of everything ripgrep declares — and moves no reference, no
+/// bucket, no rate and no baseline. `defs > 0` and "at least as many modules
+/// as files" both still held. A number that can only be wrong deliberately
+/// is the only kind worth writing down.
+///
+/// `Module` is 137 rather than 99 because a file declares its own module and
+/// the tree writes 38 inline `mod x { … }` blocks besides.
+const DEFS: &[(DefKind, u64)] = &[
+    (DefKind::Function, 742),
+    (DefKind::Method, 2066),
+    (DefKind::Type, 419),
+    (DefKind::Const, 48),
+    (DefKind::Var, 7),
+    (DefKind::Constructor, 253),
+    (DefKind::Module, 137),
+    (DefKind::Alias, 109),
+];
+
+/// Definition nodes the store holds after merging, by kind.
+///
+/// Lower than [`DEFS`] wherever two files declare one path — `impl` blocks
+/// for one type split across files, a `#[cfg]` pair. The two censuses are the
+/// point: the extractor's says nothing was lost on the way in, the store's
+/// says nothing was lost or over-merged on the way through, and a bug that
+/// moved definitions between the two would have to move both.
+///
+/// `DefKind::Module` is absent because a module is filed as a *package* node
+/// rather than a definition; those are [`PACKAGES`].
+const STORED: &[(DefKind, u64)] = &[
+    (DefKind::Function, 732),
+    (DefKind::Method, 2053),
+    (DefKind::Type, 418),
+    (DefKind::Const, 48),
+    (DefKind::Var, 7),
+    (DefKind::Constructor, 253),
+    (DefKind::Alias, 109),
+];
+
+/// Package nodes: one per module the tree declares, the 99 file-level ones
+/// and the inline blocks together.
+const PACKAGES: u64 = 137;
+
+/// External nodes: the crates.io dependencies ripgrep's members name and this
+/// scan does not index.
+const EXTERNALS: u64 = 21;
+
+/// Named definitions, spelled out: `(fqn, kind, declaring file, line)`.
+///
+/// A census pins the scale; these pin the shape. `DecompressionMatcher.new`
+/// cannot be right unless an inherent `impl` block was attributed to the type
+/// it implements, `ParseSizeErrorKind.InvalidInt` unless an enum variant is a
+/// constructor rather than a field, and `flags#Flag` unless the crate root a
+/// module hangs off is `crates/core/main.rs` — a binary target, not the
+/// workspace root, which is the fact ripgrep's ten members exist here to
+/// test.
+const PINNED: &[(&str, NodeKind, &str, u32)] = &[
+    (
+        "crates/cli/src/lib.rs::decompress#DecompressionMatcher",
+        NodeKind::Definition(DefKind::Type),
+        "crates/cli/src/decompress.rs",
+        147,
+    ),
+    (
+        "crates/cli/src/lib.rs::decompress#DecompressionMatcher.new",
+        NodeKind::Definition(DefKind::Method),
+        "crates/cli/src/decompress.rs",
+        167,
+    ),
+    (
+        "crates/cli/src/lib.rs::human#parse_human_readable_size",
+        NodeKind::Definition(DefKind::Function),
+        "crates/cli/src/human.rs",
+        79,
+    ),
+    (
+        "crates/cli/src/lib.rs::human#ParseSizeErrorKind.InvalidInt",
+        NodeKind::Definition(DefKind::Constructor),
+        "crates/cli/src/human.rs",
+        14,
+    ),
+    (
+        "crates/core/main.rs::flags#Flag",
+        NodeKind::Definition(DefKind::Type),
+        "crates/core/flags/mod.rs",
+        71,
+    ),
+    // A `pub use` re-export: an alias key, which is why its site carries no
+    // line of its own.
+    (
+        "crates/core/main.rs::flags#GenerateMode",
+        NodeKind::Definition(DefKind::Alias),
+        "crates/core/flags/mod.rs",
+        0,
+    ),
+    // The module a file declares, filed as a package and not a definition.
+    (
+        "crates/regex/src/lib.rs::literal",
+        NodeKind::Package,
+        "crates/regex/src/literal.rs",
+        1,
+    ),
+];
 
 #[test]
 fn the_extractor_reads_the_rust_corpus_without_losing_its_invariants() {
@@ -115,18 +228,107 @@ fn the_extractor_reads_the_rust_corpus_without_losing_its_invariants() {
             DefKind::from_code(*code).map_or("?", DefKind::name)
         );
     }
-    assert!(defs > 0 && refs > 0);
-    // Every file declares one module of its own, and the corpus's 38 inline
-    // `mod x { … }` blocks declare more — so the module count is the file
-    // count plus whatever is written, never fewer.
-    assert!(
-        by_def_kind
-            .get(&DefKind::Module.code())
-            .copied()
-            .unwrap_or(0)
-            >= files_read,
-        "fewer modules than files",
+
+    // What stood here was `defs > 0 && refs > 0` and "at least as many
+    // modules as files", and neither could fail: the loop above already
+    // asserts that *every* file declares a module first, so 99 files force
+    // both. An assertion implied by one already made is not a second check,
+    // it is a second place to read a pass. The totals are pinned instead —
+    // ripgrep is fixed test data, so each of these is a fact about this
+    // extractor reading a fixed 99 files.
+    assert_eq!(
+        files_read, FILES as u64,
+        "the walk found a different file set"
     );
+    assert_eq!(defs, DEFS.iter().map(|(_, n)| n).sum::<u64>());
+    assert_eq!(defs, 3781, "the definition total moved");
+    assert_eq!(refs, 1073, "the reference total moved");
+    assert_eq!(use_decls, 377, "the `use` declaration tally moved");
+    // 137 and not 99: every file declares one module of its own, and the
+    // corpus's 38 inline `mod x { … }` blocks declare the rest.
+    assert_eq!(
+        by_def_kind.get(&DefKind::Module.code()).copied(),
+        Some(137),
+        "the module census moved",
+    );
+}
+
+#[test]
+fn the_rust_definition_census_is_exact() {
+    // The hole this closes, found by deleting rather than by reading: with
+    // Rust's method extraction removed — 2066 of the 3763 definitions the
+    // tree declares — `cargo test corpus_rust` still passed, every count in
+    // it being either a reference count or a floor. Definitions are half of
+    // what a tier-2 track delivers and the import rate is blind to all of
+    // them, so they are asserted exactly here or nowhere.
+    let corpus = Path::new(CORPUS);
+    if !corpus.is_dir() {
+        println!("SKIP: no corpus at {CORPUS} — see README");
+        return;
+    }
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let db = scratch.path().join("graph.redb");
+    scan_rust(corpus, &db).expect("the corpus scans");
+
+    let store = Store::open(&db).expect("store opens");
+    let owned = store.known_files().expect("known files");
+    drop(store);
+    assert_eq!(owned.len(), FILES, "the scan owned a different file set");
+
+    // Re-extracted from disk with no resolver in sight, over exactly the
+    // files the scan owned.
+    let mut kinds: BTreeMap<u8, u64> = BTreeMap::new();
+    for rel in &owned {
+        let source = std::fs::read_to_string(corpus.join(rel))
+            .unwrap_or_else(|e| panic!("re-reading {rel}: {e}"));
+        for def in &extract(rel, &source).defs {
+            *kinds.entry(def.kind.code()).or_default() += 1;
+        }
+    }
+    println!("extracted defs {kinds:?}");
+    let want: BTreeMap<u8, u64> = DEFS.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(
+        kinds, want,
+        "the definition census moved; no rate, no bucket and no baseline can see it",
+    );
+
+    let read = ReadStore::open(&db).expect("the store opens for reading");
+    let mut stored: BTreeMap<u8, u64> = BTreeMap::new();
+    let (mut packages, mut externals) = (0u64, 0u64);
+    read.for_each_node(|_, record| {
+        match record {
+            NodeRecord::Definition { kind, .. } => *stored.entry(kind).or_default() += 1,
+            NodeRecord::Package { .. } => packages += 1,
+            NodeRecord::External { .. } => externals += 1,
+        }
+        Ok(())
+    })
+    .expect("walking the node table");
+    println!("stored defs {stored:?} packages {packages} externals {externals}");
+    let want: BTreeMap<u8, u64> = STORED.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(stored, want, "the stored definition census moved");
+    assert_eq!(packages, PACKAGES, "the stored package census moved");
+    assert_eq!(externals, EXTERNALS, "the stored external census moved");
+
+    for (fqn, kind, file, line) in PINNED {
+        let id = node_id(Lang::Rust.domain(), fqn);
+        let def = definition(&read, &id)
+            .unwrap_or_else(|e| panic!("{fqn}: {e}"))
+            .unwrap_or_else(|| panic!("{fqn} is not in the store"));
+        assert_eq!(def.node.name, *fqn);
+        assert_eq!(def.node.kind, *kind, "{fqn}");
+        let here: Vec<u32> = def
+            .declarations
+            .iter()
+            .filter(|d| d.file == *file)
+            .map(|d| d.line)
+            .collect();
+        assert!(
+            here.contains(line),
+            "{fqn} is not declared at {file}:{line} — {} site(s) in that file, at {here:?}",
+            here.len(),
+        );
+    }
 }
 
 #[test]
