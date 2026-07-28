@@ -10,13 +10,30 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's failure must not hide another's. A cross-platform bug
+      # usually shows up on exactly one runner, and cancelling the rest is
+      # cancelling the evidence.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # fmt and clippy are platform-independent — the same source, the same
+          # toolchain, the same lints — so they run once rather than three
+          # times. `cargo test` does not: the store, the file walk and every
+          # path this engine builds are exactly where a platform difference
+          # would show up.
+          - os: ubuntu-latest
+            lint: true
     steps:
       - uses: actions/checkout@v5
 
-      # Runners ship rustup, so no third-party toolchain action is needed.
+      # Runners ship rustup on all three platforms, so no third-party toolchain
+      # action is needed.
       - name: Pin toolchain
+        shell: bash
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
@@ -36,15 +53,21 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Formatting
+        if: matrix.lint
         run: cargo fmt --all --check
 
       # -D on the clippy invocation, not RUSTFLAGS: a global RUSTFLAGS would
       # also deny warnings inside dependencies, which we do not control.
       - name: Clippy
+        if: matrix.lint
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       # The corpus lives in the private RandomCodeSpace/arthron-corpus and is
-      # not fetched here, so tests/corpus.rs skips. Everything else runs.
+      # not fetched here, so every corpus ratchet skips — by design, and on all
+      # three platforms, which is why no deploy key is needed off Linux. What
+      # runs here is everything else: the fixtures, the store, the resolver
+      # units, the CLI and the JSON shapes. `.github/workflows/gate.yml` is the
+      # job that fetches the corpus and makes the rates block a merge.
       - name: Tests
         run: cargo test --all-features
 
@@ -77,3 +100,33 @@ jobs:
 
       - name: Build
         run: cargo check --all-targets --all-features
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The one third-party action in this repository, and it earns its place:
+      # both tools ship prebuilt binaries, and `cargo install`ing them from
+      # source costs several minutes of runner time on every push to answer a
+      # question that takes seconds.
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # Vulnerabilities, unsound APIs and yanked releases, against the live
+      # RustSec database — a `cargo audit` failure here means a fresh advisory
+      # landed against a dependency, not that this commit changed anything.
+      # `unmaintained` is deliberately not denied on this step: it is a fact
+      # about a crate's upkeep rather than its behaviour, and the reviewed
+      # decision about each one lives in deny.toml where it can carry a reason.
+      - name: cargo audit
+        run: cargo audit --deny unsound --deny yanked
+
+      # The policy check: licenses we may ship under, crates.io as the only
+      # source, no wildcard version requirements, and the advisory list with
+      # its documented exceptions. See deny.toml.
+      - name: cargo deny
+        run: cargo deny check
