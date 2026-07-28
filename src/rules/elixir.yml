@@ -1,0 +1,11 @@
+# Elixir has no declaration node. `defmodule`, `def`, `alias` and every other
+# construct that declares or imports is an ordinary function call whose
+# `target` is the identifier that spells it — `defmodule Plug.Conn do ... end`
+# is a call to `defmodule` with one argument and a `do` block. So one rule
+# selects every call in the file and `track_elixir::extract` reads the target
+# to decide what it is; a rule per construct would be eleven copies of one
+# `kind: call`.
+id: call
+language: elixir
+rule:
+  kind: call

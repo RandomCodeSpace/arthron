@@ -1,0 +1,18 @@
+# arthron gate baseline — regenerate with:
+#   arthron gate corpus/elixir/plug --baseline <this file> --rebase --commit <sha>
+# Release build, cold store. Counts are measured, never estimated.
+#
+# `corpus` and `commit` are provenance: printed, never verified.
+# The rate is not stored — it is derived from `resolved` and
+# `unresolved` on both sides, so the comparison is exact integer
+# arithmetic and cannot disagree with its own counts.
+# `external` and `local_binding` sit outside both rate terms; any
+# drift in either fails the gate and must be re-based deliberately.
+format = 1
+corpus = "corpus/elixir/plug"
+commit = "9fa11c8"
+language = "elixir"
+resolved = 116
+external = 55
+local_binding = 0
+unresolved = 1

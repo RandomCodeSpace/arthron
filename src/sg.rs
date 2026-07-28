@@ -129,6 +129,15 @@ impl SourceTree {
         Self::parse(SupportLang::Scala, source)
     }
 
+    /// Parse Elixir source — `.ex` and `.exs` alike.
+    ///
+    /// One grammar for both: a script, a test file and a library module are
+    /// the same language, and only the walk decides which of them a scan
+    /// reads. There is no separate script dialect to pick between.
+    pub fn parse_elixir(source: &str) -> Self {
+        Self::parse(SupportLang::Elixir, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -314,6 +323,55 @@ rule:
                 .find(|c| c.kind() == "type_identifier")
                 .expect("the declaration names a type");
             assert_eq!(name.text(), "Greeter");
+        }
+    }
+
+    /// Elixir, which [`one_match`] cannot check: tree-sitter-elixir names no
+    /// declaration node at all. `defmodule`, `def` and every other `def*`
+    /// form is an ordinary `call` whose `target` is the identifier that
+    /// spells it, which is why the extractor reads one node kind and
+    /// interprets it. The point of the test is the same — the grammar is
+    /// compiled into this build, and a missing one would match nothing.
+    #[test]
+    fn parses_elixir() {
+        let rules = Rules::compile("id: t\nlanguage: elixir\nrule:\n  kind: call\n")
+            .expect("rules compile");
+        // `.exs` is the same grammar: a script is Elixir whose top level
+        // happens not to be a module.
+        // `.exs` is the same grammar: a script is Elixir whose top level
+        // happens not to be a module.
+        for (source, want) in [
+            (
+                "defmodule Plug.Conn do\n  def get(conn), do: conn\nend\n",
+                "Plug.Conn",
+            ),
+            (
+                "defmodule Mix.Tasks.Run do\n  def run(_), do: :ok\nend\n",
+                "Mix.Tasks.Run",
+            ),
+        ] {
+            let tree = SourceTree::parse_elixir(source);
+            let found = tree.matches(&rules);
+            // Three: the `defmodule`, the `def`, and the `get(conn)` inside
+            // the `def`'s own arguments. Every construct is a call, which is
+            // the whole shape of this grammar.
+            assert_eq!(found.len(), 3, "expected three calls in {source:?}");
+            let (_, node) = &found[0];
+            assert_eq!(node.kind(), "call");
+            let target = node.field("target").expect("a call names its target");
+            assert_eq!(target.text(), "defmodule");
+            // `arguments` is a child kind and not a field: the grammar gives
+            // a call one field, `target`, and everything else is a child.
+            let args = node
+                .children()
+                .find(|c| c.kind() == "arguments")
+                .expect("defmodule takes a name");
+            assert_eq!(args.text(), want);
+            // The module name is one `alias` node, dots included: an Elixir
+            // module name is an atom and not a path through containers.
+            let name = args.children().next().expect("the name is a child");
+            assert_eq!(name.kind(), "alias");
+            assert_eq!(name.text(), want);
         }
     }
 
