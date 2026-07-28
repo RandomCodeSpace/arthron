@@ -405,6 +405,75 @@ fn a_config_db_under_a_symlinked_directory_is_refused() {
     );
 }
 
+/// A link with nothing on the other end passes `lstat` and fails
+/// `canonicalize`, and the containment walk used to read that failure as
+/// "not there yet" and step over it to the parent — which is inside the root,
+/// so the whole path was called contained and the store was created *through*
+/// the link. One planted link, one file written anywhere this process can
+/// write, exit 0, nothing said. The second run was refused, because by then
+/// the target existed; the first had already done it.
+#[cfg(unix)]
+#[test]
+fn a_config_db_that_is_a_link_to_nothing_is_refused_before_it_creates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let victim_parent = dir.path().join("victim_parent");
+    fs::create_dir_all(&victim_parent).unwrap();
+    fixture(&repo);
+    let planted = victim_parent.join("planted.redb");
+    // The target does not exist: that is the whole point of the case.
+    std::os::unix::fs::symlink(&planted, repo.join("graph.redb")).unwrap();
+    write(&repo, "arthron.toml", "db = \"graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("inside the repository"),
+        "the refusal has to say what the rule is: {stderr}",
+    );
+    assert!(
+        !planted.exists(),
+        "the scan created a file outside the repository it was asked to scan",
+    );
+    // And again, because the hole was self-limiting rather than closed: a
+    // second run must be refused for the same reason and not because the
+    // first one made the target exist.
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!planted.exists(), "the second run created it instead");
+}
+
+/// The same hole one level down: `sub/graph.redb` where `sub` exists and
+/// `sub/graph.redb` is the dangling link. Lexically inside, and the deepest
+/// existing component is inside too.
+#[cfg(unix)]
+#[test]
+fn a_nested_config_db_that_is_a_link_to_nothing_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fixture(&repo);
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    let planted = outside.join("planted.redb");
+    std::os::unix::fs::symlink(&planted, repo.join("sub/graph.redb")).unwrap();
+    write(&repo, "arthron.toml", "db = \"sub/graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        !planted.exists(),
+        "the scan wrote through the link: {stderr}"
+    );
+}
+
 /// The flag is the person, the file is the repository. Only one of them is an
 /// authority about where this machine's files may be written.
 #[test]

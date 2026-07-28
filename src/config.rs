@@ -167,7 +167,9 @@ impl Config {
 /// still under the canonical root, which is what catches a directory inside
 /// the repository that is a symbolic link out of it. The deepest *existing*
 /// part is what there is to ask about: the store itself usually does not exist
-/// until the scan creates it.
+/// until the scan creates it — and "does not exist" means `symlink_metadata`
+/// finds nothing, not merely that `canonicalize` failed, because a link with
+/// nothing on the other end fails the second while passing the first.
 fn contained(root: &Path, db: &Path) -> Result<PathBuf, String> {
     let refuse = |why: &str| {
         Err(format!(
@@ -206,6 +208,28 @@ fn contained(root: &Path, db: &Path) -> Result<PathBuf, String> {
         match probe.canonicalize() {
             Ok(real) if real.starts_with(&real_root) => return Ok(path),
             Ok(_) => return refuse("resolves outside it"),
+            // `canonicalize` fails for two different reasons, and only one of
+            // them means "not there yet". A component `symlink_metadata`
+            // answers for is a component that *exists* — a symbolic link
+            // whose target does not is the ordinary case — and walking past
+            // one to its parent would find the parent inside the root and
+            // call the whole path contained. `Store::open` then creates the
+            // file *through* the link, at whatever path the scanned
+            // repository put on the other end of it, which is the one thing
+            // this function exists to prevent. Once is enough: the target
+            // exists after the first scan, so only the second is refused.
+            //
+            // Refusing is the safe direction here whatever the cause. A
+            // component that will not resolve cannot be shown to stay inside
+            // the root, and the reader's fix is the same either way — name
+            // the store on the command line, or point the link at a file.
+            Err(_) if probe.symlink_metadata().is_ok() => {
+                return refuse(
+                    "has a component that exists but does not resolve, usually a \
+                     symbolic link with nothing on the other end, so nothing shows \
+                     where it would be written",
+                );
+            }
             // Not there yet: ask the same question of its parent, down to the
             // root, which does exist.
             Err(_) => match probe.parent() {
@@ -492,6 +516,44 @@ mod tests {
         // …and a real directory of the same shape is fine, so the check is
         // about where the path resolves and not about having subdirectories.
         std::fs::create_dir_all(root.join("build")).expect("mkdir build");
+        let config = Config::parse("db = \"build/graph.redb\"\n").expect("parses");
+        assert_eq!(
+            config.db_path(&root).expect("inside the root"),
+            Some(root.join("build/graph.redb")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_db_that_is_a_link_with_nothing_on_the_other_end_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        // `canonicalize` fails on this and `symlink_metadata` does not, which
+        // is the whole difference between "not there yet" and "there, and
+        // pointing somewhere this check cannot see".
+        std::os::unix::fs::symlink(outside.join("planted.redb"), root.join("graph.redb"))
+            .expect("symlink");
+
+        let config = Config::parse("db = \"graph.redb\"\n").expect("parses");
+        let e = config
+            .db_path(&root)
+            .expect_err("a link to nothing is not containment");
+        assert!(e.contains(DB_OUTSIDE_ROOT), "{e}");
+
+        // A link to nothing *inside* the root is refused by the same rule and
+        // for the same reason: where a link lands is not knowable from a
+        // target that is not there, and this function only ever answers what
+        // it can show.
+        std::os::unix::fs::symlink(root.join("later.redb"), root.join("inner.redb"))
+            .expect("symlink");
+        let config = Config::parse("db = \"inner.redb\"\n").expect("parses");
+        assert!(config.db_path(&root).is_err(), "an unresolvable component");
+
+        // …and an ordinary path that simply does not exist yet is still fine,
+        // because that is the normal case: the store is created by the scan.
         let config = Config::parse("db = \"build/graph.redb\"\n").expect("parses");
         assert_eq!(
             config.db_path(&root).expect("inside the root"),
