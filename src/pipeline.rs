@@ -1114,6 +1114,12 @@ pub fn source_files_with<L: Language>(
 ) -> Result<(Vec<PathBuf>, Vec<FileError>), String> {
     let mut out = Vec::new();
     let mut errors = Vec::new();
+    // Resolved once: every link found under this walk is asked the same
+    // question about the same tree, and the answer cannot change while the
+    // walk runs. `None` when the root will not resolve — the walk is about to
+    // fail on it below, and a comparison against nothing would refuse files
+    // for a reason that is not theirs.
+    let real_root = root.canonicalize().ok();
     for entry in ignore::WalkBuilder::new(root)
         .overrides(filter.overrides())
         .build()
@@ -1150,7 +1156,32 @@ pub fn source_files_with<L: Language>(
         let owned = path
             .extension()
             .is_some_and(|ext| L::extensions().iter().any(|want| ext == *want));
-        if !owned || !path.is_file() {
+        if !owned {
+            continue;
+        }
+        // `follow_links` is off, so the walk hands back the link rather than
+        // its target — and `is_file` below follows it anyway. A link inside
+        // the repository pointing outside it would therefore be read, and its
+        // definitions stored under a repo-relative key as though that file
+        // were part of this tree. It is not, and a scan is a measurement of
+        // *this* tree: every name in the graph is a claim about what is in it.
+        //
+        // Where the target lands, not whether there is a link. A link whose
+        // target is inside the repository is an ordinary file of it and is
+        // read as one — the measured Haskell corpus links two of its own
+        // modules into a sub-package, and refusing those would drop them and
+        // move a committed baseline.
+        if entry.path_is_symlink() && escapes_root(real_root.as_deref(), path) {
+            errors.push(FileError {
+                path: walk_path(root, path),
+                message: "a symbolic link whose target is outside the scanned \
+                          repository, so its definitions are not this tree's to \
+                          claim"
+                    .to_string(),
+            });
+            continue;
+        }
+        if !path.is_file() {
             continue;
         }
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
@@ -1182,6 +1213,19 @@ pub fn source_files_with<L: Language>(
         out.push(path.to_path_buf());
     }
     Ok((out, errors))
+}
+
+/// Whether a symbolic link's target lies outside the scanned tree.
+///
+/// `false` whenever the question cannot be answered — a dangling link, a root
+/// that will not resolve. A link pointing at nothing is not a file the
+/// `is_file` check accepts either, so nothing is read on that path regardless,
+/// and answering "outside" would name a file for a reason nobody established.
+fn escapes_root(real_root: Option<&Path>, path: &Path) -> bool {
+    let (Some(real_root), Ok(target)) = (real_root, path.canonicalize()) else {
+        return false;
+    };
+    !target.starts_with(real_root)
 }
 
 /// Whether a walk failure is about the scanned root itself rather than
