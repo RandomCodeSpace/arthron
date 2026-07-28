@@ -35,8 +35,12 @@
 
 #![cfg(unix)]
 
+// Only the Linux-gated non-UTF-8-filename test spells a name in raw bytes,
+// so its two imports carry the same gate.
+#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -310,7 +314,13 @@ fn a_root_the_walk_cannot_reach_fails_the_scan_instead_of_measuring_zero() {
     );
 }
 
+// Linux only, not merely Unix: APFS enforces valid-UTF-8 filenames, so the
+// fixture write itself fails with "Illegal byte sequence" (os error 92) on
+// macOS — the input this test needs cannot exist there. That is the platform
+// refusing the input, so there is nothing to test on macOS; this is not a
+// skip of a real scenario.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_path_that_is_not_utf8_is_named_rather_than_keyed_lossily() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
