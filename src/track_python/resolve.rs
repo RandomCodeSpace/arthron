@@ -1053,7 +1053,7 @@ impl PyResolver {
         // excluding a category from both terms is how a number rises without
         // anything improving. What stops that being a way to cheat is that
         // the `local_binding` count is itself gated — flask's rises from 150
-        // to 2,160 in the same commit, and a baseline rebase has to state
+        // to 2,146 in the same commit, and a baseline rebase has to state
         // both.
         //
         // What is deliberately *not* local stays the load-bearing half:

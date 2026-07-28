@@ -11,7 +11,69 @@ Decisions and their rationale — including what was rejected — live in
 
 ## [Unreleased]
 
+### Changed
+
+- **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
+  deliberate re-base of seven baselines.** The ratified rule is that a
+  reference whose root is a parameter, local variable or receiver binding names
+  a thing that is not a node by decision, so it is reported beside `external`
+  and excluded from **both** terms of the resolution rate. Go, TypeScript and
+  JavaScript already read it that way; Java and Python applied it only when the
+  *whole* target was the bound name, so `f.m()` sat outside both rate terms in
+  Go and inside them in Java, and the two rates were computed over
+  differently-sized denominators. Separately, the Go extractor emitted only
+  calls and imports, so "tier 1: call sites, imports and type uses" was not
+  true of Go; `ref-type` now emits a reference for every written type position.
+  Baselines are re-based, not compared, because what is *in* the rate's terms
+  changed. Measured, release build, cold store:
+
+  | baseline | resolved | unresolved | external | local_binding | rate |
+  |---|---:|---:|---:|---:|---:|
+  | `go-codeiq` | 4,467 → 7,906 | 799 | 6,085 → 12,210 | 4,276 → 4,308 | 84.8% → **90.8%** |
+  | `go-caddy` | 3,006 → 9,738 | 1,815 → 1,821 | 9,571 → 19,201 | 9,425 → 9,601 | 62.4% → **84.2%** |
+  | `go-probes` | 17 | 0 | 0 → 26 | 1 | 100.0% |
+  | `java-commons-lang` | 39,591 → 34,217 | 19,093 → 16,279 | 68,297 → 63,385 | 2,062 → 15,162 | 67.5% → **67.8%** |
+  | `java-gson` | 16,074 → 12,885 | 7,215 → 6,105 | 18,187 → 16,737 | 957 → 6,706 | 69.0% → **67.9%** |
+  | `python-django` | 19,103 | 13,764 → 6,185 | 13,326 | 826 → 8,405 | 58.1% → **75.5%** |
+  | `python-flask` | 1,192 → 1,185 | 2,847 → 877 | 2,336 → 2,317 | 150 → 2,146 | 29.5% → **57.5%** |
+
+  The other eighteen baselines are byte-identical, including both TypeScript
+  and both JavaScript corpora and all fourteen tier-2 baselines, whose
+  `local_binding` is still zero.
+
+  **Attributed per reference, not inferred from the totals.** In Java and
+  Python not one reference was added or removed and every reference that
+  changed outcome moved *into* `local_binding` — 13,100 on commons-lang (5,374
+  from `resolved`, 4,912 from `external`, 2,814 from an unresolved reason),
+  5,749 on gson, 7,579 on django, 1,996 on flask — and nothing moved in any
+  other direction. In Go not one pre-existing reference changed its answer at
+  all: every moved occurrence is a new type use, 9,596 on codeiq and 16,544 on
+  caddy, all of kind `type-use`. Neither change touches the other's languages,
+  measured by re-running each corpus with the other change reverted.
+
+  **A rate that rises here is not an improvement.** Excluding a class from both
+  terms is exactly how a rate rises with nothing linked better, and Python's
+  does: django's `NeedsTypeInference` falls 10,256 → 2,677 and flask's 2,119 →
+  186 because those references are now `local_binding`, not because any of them
+  reached a definition. The `local_binding` column is gated for drift for this
+  reason and a re-base has to state it.
+
 ### Fixed
+
+- **Two Go definition defects the new type-use surface exposed.** `def-type`
+  read only `type_spec`, so a package-level `type X = Y` declared no node —
+  free while Go emitted no type uses, and 57 codeiq / 7 caddy
+  `NoMatchingDefinition` rows the moment it did; it now reads `type_alias` too,
+  which is the whole of the `DefKind::Type` census moving 229 → 232 on codeiq
+  and 507 → 511 on caddy. And `case nil:` in a type switch is a
+  `type_identifier` in this grammar, now answered from the predeclared block
+  rather than left unmatched. After both, `NoMatchingDefinition` is 123 on
+  codeiq and 269 on caddy — unchanged from before the wave.
+- **Two Java external nodes that claimed a package which does not exist.**
+  `Outer.NonStaticInner` and `Enclosing<T>.Inner` in gson's `TypeTokenTest`
+  name method-local classes (JLS §14.3); their two-segment targets escaped the
+  narrow local rule and were filed as `External("Outer")` and
+  `External("Enclosing")`. gson's stored external census is 36 → 34.
 
 - **A repository's `db` may no longer name a store outside the tree through a
   link with nothing on the other end.** The containment check canonicalises the

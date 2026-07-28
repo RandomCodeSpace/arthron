@@ -52,7 +52,7 @@ breakdown of every unresolved reason:
 
 ```console
 $ arthron scan corpus/go/codeiq
-go           resolved 4467     external 6085     local-binding 4276     unresolved 799      rate 84.8% (tier 1: call-graph resolution)
+go           resolved 7906     external 12210    local-binding 4308     unresolved 799      rate 90.8% (tier 1: call-graph resolution)
              NoMatchingDefinition 123
              NeedsTypeInference 676
 ```
@@ -173,17 +173,29 @@ sites, imports and type uses.
 
 | language | corpus | resolved | unresolved | rate |
 |---|---|---:|---:|---:|
-| Go | `codeiq` `853efde` | 4,467 | 799 | **84.8%** |
-| Go | `caddy` `853efde` | 3,006 | 1,815 | **62.4%** |
+| Go | `codeiq` `853efde` | 7,906 | 799 | **90.8%** |
+| Go | `caddy` `853efde` | 9,738 | 1,821 | **84.2%** |
 | Go | `probes` `synthetic` | 17 | 0 | **100.0%** † |
-| Java | `commons-lang` `598dfc1` | 39,591 | 19,093 | **67.5%** |
-| Java | `gson` `3ff35d6` | 16,074 | 7,215 | **69.0%** |
+| Java | `commons-lang` `598dfc1` | 34,217 | 16,279 | **67.8%** |
+| Java | `gson` `3ff35d6` | 12,885 | 6,105 | **67.9%** |
 | JavaScript | `fastify` `94bcbcc` | 2,795 | 1,640 | **63.0%** |
 | JavaScript | `express` `dbac741` | 2,267 | 5,553 | **29.0%** |
 | TypeScript | `vue-core` `fa2885d` | 26,297 | 27,945 | **48.5%** |
 | TypeScript | `zod` `1fb56a5` | 10,043 | 26,821 | **27.2%** |
-| Python | `django` `af67523` | 19,103 | 13,764 | **58.1%** |
-| Python | `flask` `22d9247` | 1,192 | 2,847 | **29.5%** |
+| Python | `django` `af67523` | 19,103 | 6,185 | **75.5%** |
+| Python | `flask` `22d9247` | 1,185 | 877 | **57.5%** |
+
+Seven of these eleven numbers moved in one deliberate re-base, and none of them
+moved because anything was linked better. Two changes landed together: every
+tier-1 track now applies the same rule for a reference rooted at a parameter,
+local or receiver — it is reported beside `external`, outside **both** terms of
+the rate — and the Go track now emits type uses, which the other four already
+did. The first takes references *out* of both terms, so it can raise a rate
+without linking anything: Python's rose 17 and 28 points that way, and 7,579
+django references moved from `NeedsTypeInference` to `local_binding` without one
+of them being resolved. Read the rate next to the `local_binding` column in
+[`baselines/`](baselines), which is gated for drift exactly so this cannot be
+done quietly.
 
 ### Tier 2 — definitions, structure and imports; no verified call edges
 
