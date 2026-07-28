@@ -64,9 +64,10 @@ same code path with a changed set of everything, so there is no separate
 incremental mode that can silently skip work.
 
 ```bash
-arthron query def   crypto.Verify
-arthron query refs  crypto.Verify
-arthron query impact crypto.Verify --depth 3
+cd ./my-repo                              # or pass --db ./my-repo/.arthron/graph.redb
+arthron query def    'crypto#Verify'
+arthron query refs   'crypto#Verify'
+arthron query impact 'crypto#Verify' --depth 3
 ```
 
 The definition and its declaring sites; every stored reference row that resolved
@@ -74,7 +75,16 @@ to it; and what transitively reaches it, layer by layer — the blast radius of 
 change. A name may be a full FQN or any suffix of one that starts at a
 separator; a suffix several nodes end is answered with *all* of them and exit
 code 1, because picking one would be a guess. The store is opened read-only: a
-query never creates or rebuilds it.
+query never creates or rebuilds it — a query is not a scan, so a missing store
+is an error rather than a rebuild.
+
+Two things to get right, both of which the shell will tell you about
+immediately. A query reads `.arthron/graph.redb` **relative to the working
+directory**, not to whatever path was last scanned, so either `cd` into the
+repository or point `--db` at its store. And the separator inside an FQN is the
+language's own: Go's package/symbol boundary is `#`, so this definition's full
+name is `example.com/app/pkg/crypto#Verify` and `crypto#Verify` is a suffix of
+it that starts at a separator. `crypto.Verify` is not, and matches nothing.
 
 ```bash
 arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
@@ -112,6 +122,14 @@ db = ".arthron/graph.redb"
 [tracks]
 java = false                # switch a live track off for this repository
 ```
+
+The `[tracks]` keys are track names, not language names, and the two differ in
+one place: **`ecma` is the single track that owns JavaScript and TypeScript**,
+so `ecma = false` switches off both and neither `javascript` nor `typescript`
+is a key. The full set is `go`, `java`, `ecma`, `python`, `cpp`, `csharp`,
+`kotlin`, `swift`, `ruby`, `php`, `rust`, `scala`, `dart`, `elixir`,
+`haskell`, `lua`, `bash`, `hcl` — eighteen tracks over nineteen languages, and
+a rejected key prints the list.
 
 An unrecognised key is refused **by name** rather than ignored — at the top
 level and under `[tracks]` — because a silent typo means scanning a different
@@ -170,11 +188,13 @@ things.
 
 Tier 2 is honest rather than degraded: you get symbols, structure and imports,
 you do not get call edges, and the tool says which is which instead of inventing
-the difference. Five tier-2 tracks declare themselves **best effort** in their
-own module docs — Bash, Dart, Elixir, Haskell and HCL — meaning the track reads
-a deliberately narrow slice of that language's reference surface, so the
+the difference. Six tier-2 tracks declare themselves **best effort** in their
+own module docs — Bash, Dart, Elixir, Haskell, HCL and Lua — meaning the track
+reads a deliberately narrow slice of that language's reference surface, so the
 denominator is small by design and the definition census beside it carries most
-of the weight.
+of the weight. Best effort constrains how much of a language is read; it does
+not make the number optional. All six are gated in CI on the same terms as the
+other nineteen baselines, and a regression in any of them fails the build.
 
 † `probes` is a synthetic corpus, written to pin resolver behaviour rather than
 sampled from a real project. It is listed because it is gated like the others,
@@ -227,7 +247,16 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 |---|---|---|
 | Peak RSS | **< 512 MB (hard)** | 337.1 MiB cold-scanning kubernetes v1.36.3, 1,789,247 lines — 66% of the ceiling, six runs spanning 0.2% |
 | Cold index throughput | < 60 s / 1M lines | ~17 s / 1M lines on the same scan |
-| Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes — a miss, recorded as a finding rather than hidden |
+| Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes **on the pre-Wave-3 build** — a miss, recorded as a finding rather than hidden, and not yet re-measured |
+
+The first two rows are the shipped build. The third is not, and the column
+says so rather than letting three numbers read as one benchmark run: warm
+timing was last measured on the binary whose cold RSS was 729 MiB, and the
+memory work that replaced it was explicitly not aimed at the warm path (warm
+cost is per-file re-read and re-hash). Warm RSS improved 13% on the same
+change; warm wall time has not been re-run on the reference hardware, so the
+number here is the last one that was actually executed and it is labelled
+rather than refreshed by inference.
 
 The RSS number is the interesting one: it was **729.0 MiB** and failed the hard
 gate. Bounding it — per-500-file commits on every phase, a capped redb page
