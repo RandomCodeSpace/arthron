@@ -158,6 +158,55 @@ fn the_json_document_carries_the_track_that_found_no_project() {
     );
 }
 
+/// The document must not disagree with itself over a store that outlives one
+/// scan. `Store::report` counts rows, and rows survive a manifest that broke
+/// after they were written — so the same document carried "go measured
+/// nothing" beside the tally of the scan before it, and `gate --db` on that
+/// store would re-base a baseline onto numbers no scan produced.
+#[test]
+fn a_layout_that_broke_since_the_last_scan_reports_no_tally_from_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = dir.path().join("kept.redb");
+    fixture(root);
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+
+    let first = scan_repo(root, &db).expect("the scan answers");
+    assert!(
+        tallied(&first).contains(&"go"),
+        "the fixture has to measure Go for this test to mean anything: {:?}",
+        tallied(&first),
+    );
+
+    // The manifest breaks; the `.go` files and the rows they wrote stay.
+    write(root, "go.mod", "this is not a go.mod\n");
+    let second = scan_repo(root, &db).expect("the scan answers");
+    assert!(
+        errored(&second, Lang::Go.name()).is_some(),
+        "the track stopped saying it measured nothing: {:?}",
+        second.file_errors,
+    );
+    assert!(
+        !tallied(&second).contains(&"go"),
+        "the report claimed a Go tally the run did not measure: {:?}",
+        tallied(&second),
+    );
+    // The other tracks are untouched, and the rows are still there to be
+    // measured again once the manifest is readable.
+    assert!(
+        tallied(&second).contains(&"python"),
+        "suppressing one language took another's answer with it: {:?}",
+        tallied(&second),
+    );
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+    let third = scan_repo(root, &db).expect("the scan answers");
+    assert_eq!(
+        third.per_lang.get(&Lang::Go.code()),
+        first.per_lang.get(&Lang::Go.code()),
+        "the rows were forgotten rather than left for the next readable scan",
+    );
+}
+
 #[test]
 fn a_manifest_that_is_there_is_untouched_by_any_of_this() {
     // The fix must not turn into "Go never runs": with a `go.mod` the track

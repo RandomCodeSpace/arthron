@@ -212,6 +212,21 @@ pub fn scan<L: Language>(
         Err(e) => {
             let store = Store::open(db_path)?;
             let mut report = store.report()?;
+            // The rows stay; the *tally* does not. `Store::report` counts
+            // whatever the store holds, which after an earlier scan of a tree
+            // whose manifest has since broken is a number this run did not
+            // measure — and the same document would then carry both that
+            // number and the line below saying the track measured nothing.
+            // A reader cannot act on a document that disagrees with itself,
+            // and `gate --db` on a persistent store would re-base a baseline
+            // onto rows no scan produced. Saying nothing about this language
+            // is the honest answer: a gate reads a missing tally as nothing
+            // to measure and refuses, which is what "measured nothing" means.
+            //
+            // Forgetting the rows instead would be the *dishonest* answer:
+            // this track cannot read the layout, so it is in no position to
+            // say which of the language's files are gone.
+            report.per_lang.remove(&L::LANG.code());
             file_errors.insert(
                 L::LANG.name().to_string(),
                 format!(
@@ -907,15 +922,32 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
     // track's report is returned — see below — so without this merge a
     // failure the Go walk found would be gone by the time Python finished.
     let mut file_errors: BTreeMap<String, String> = BTreeMap::new();
+    // Languages no track stood behind this run. Only the last track's report
+    // is returned and every report is `Store::report`, which counts the whole
+    // store — so a language its own track left out of its own report is back
+    // in a later track's, with a number nobody claimed. A track is the only
+    // authority on its own languages, and this is where that answer is kept
+    // until the loop ends.
+    let mut unmeasured: Vec<u8> = Vec::new();
     for track in REGISTRY {
         let Some(scan) = track.scan else {
             continue; // not live: owns no file, contributes nothing
         };
         if !config.track_enabled(track.name) {
+            // Not asked, so it says nothing either way: a switched-off track
+            // leaves the store's rows and their tally exactly as the last
+            // scan left them.
             switched_off = true;
             continue;
         }
         let measured = scan(root, db_path, &filter)?;
+        unmeasured.extend(
+            track
+                .langs
+                .iter()
+                .map(|lang| lang.code())
+                .filter(|code| !measured.per_lang.contains_key(code)),
+        );
         file_errors.extend(
             measured
                 .file_errors
@@ -936,6 +968,9 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
             "no language track is enabled in this build".to_string()
         }
     })?;
+    for code in unmeasured {
+        report.per_lang.remove(&code);
+    }
     report.file_errors = named(file_errors);
     Ok(report)
 }
@@ -1175,8 +1210,8 @@ pub fn source_files_with<L: Language>(
             errors.push(FileError {
                 path: walk_path(root, path),
                 message: "a symbolic link whose target is outside the scanned \
-                          repository, so its definitions are not this tree's to \
-                          claim"
+                          repository, so whatever is on the other end of it is \
+                          not this tree's to claim"
                     .to_string(),
             });
             continue;
