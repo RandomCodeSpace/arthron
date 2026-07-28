@@ -1,0 +1,57 @@
+id: include
+language: cpp
+rule:
+  kind: preproc_include
+---
+id: decl
+language: cpp
+rule:
+  kind: declaration
+---
+id: def-namespace
+language: cpp
+rule:
+  kind: namespace_definition
+---
+id: def-namespace-alias
+language: cpp
+rule:
+  kind: namespace_alias_definition
+---
+id: def-record
+language: cpp
+rule:
+  any:
+    - kind: class_specifier
+    - kind: struct_specifier
+    - kind: union_specifier
+---
+id: def-enum
+language: cpp
+rule:
+  kind: enum_specifier
+---
+id: def-enumerator
+language: cpp
+rule:
+  kind: enumerator
+---
+id: def-function
+language: cpp
+rule:
+  kind: function_definition
+---
+id: def-member
+language: cpp
+rule:
+  kind: field_declaration
+---
+id: def-typedef
+language: cpp
+rule:
+  kind: type_definition
+---
+id: def-alias
+language: cpp
+rule:
+  kind: alias_declaration

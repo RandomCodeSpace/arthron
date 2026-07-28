@@ -5,7 +5,8 @@
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
 //! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
-//! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, and `tests/probes.rs` for
+//! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, `tests/cpp_corpus.rs`,
+//! and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -61,6 +62,7 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/scala-upickle.toml", "tests/scala_corpus.rs"),
     ("baselines/csharp-serilog.toml", "tests/csharp_corpus.rs"),
     ("baselines/swift-alamofire.toml", "tests/swift_corpus.rs"),
+    ("baselines/cpp-fmt.toml", "tests/cpp_corpus.rs"),
 ];
 
 #[test]
