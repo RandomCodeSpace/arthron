@@ -202,8 +202,14 @@ struct WorkflowStep {
 /// The corpus-gate workflow, read as text: its triggers, the gate job's own
 /// keys, and the job's steps.
 struct GateJob {
-    /// Everything under the workflow's `on:` key.
-    triggers: Vec<String>,
+    /// Everything under the workflow's `on:` key, as `(indentation, content)`.
+    ///
+    /// The indentation is load-bearing and was not kept once. `pull_request:`
+    /// and `pull_request:` with `branches: [no-such-branch]` nested under it
+    /// are the same line; what tells them apart is whether the line after it
+    /// is indented one level further in. See
+    /// [`the_corpus_gate_job_itself_has_no_soft_failure_path`].
+    triggers: Vec<(usize, String)>,
     /// The job's own keys — `name`, `runs-on`, `timeout-minutes`, `steps`.
     keys: Vec<(String, String)>,
     steps: Vec<WorkflowStep>,
@@ -225,10 +231,10 @@ fn gate_job() -> GateJob {
         .iter()
         .position(|(indent, content)| *indent == 0 && content == "on:")
         .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no `on:` block, so nothing triggers it"));
-    let triggers: Vec<String> = lines[on + 1..]
+    let triggers: Vec<(usize, String)> = lines[on + 1..]
         .iter()
         .take_while(|(indent, _)| *indent > 0)
-        .map(|(_, content)| content.clone())
+        .cloned()
         .collect();
 
     let jobs = lines
@@ -482,6 +488,29 @@ fn no_gate_step_can_pass_without_measuring() {
              verdict is the command's exit status and a wrapper is where that gets lost",
             step.name,
         );
+        // And exactly the two flags a comparison needs. The fourth way a gate
+        // step passes without measuring is not a wrapper, an `if:` or a soft
+        // failure — it is the command's own `--rebase`, which `src/main.rs`
+        // takes before `evaluate` is ever called: the step overwrites the
+        // baseline it exists to enforce with whatever this build measured,
+        // prints what it wrote, and exits 0. Against a baseline holding
+        // `resolved = 999999` the same step exits 1 without the flag and 0
+        // with it. Twenty-five of those is a corpus gate that self-approves
+        // every regression it sees, forever, in green.
+        //
+        // An allow-list, not a deny-list: `--rebase` is the flag that does it
+        // today, and the next one has not been written yet.
+        let flags: Vec<&str> = run
+            .split_whitespace()
+            .filter(|w| w.starts_with("--"))
+            .collect();
+        assert_eq!(
+            flags,
+            ["--language", "--baseline"],
+            "{GATE_WORKFLOW}: step `{}` passes {flags:?}; a gate step names a corpus, a \
+             language and a baseline, and does nothing else to the baseline",
+            step.name,
+        );
     }
 }
 
@@ -532,9 +561,33 @@ fn the_corpus_gate_job_itself_has_no_soft_failure_path() {
 
     // And it has to run where a merge is decided. A workflow that triggers
     // only on `push` reports the regression after it has landed.
+    //
+    // Unqualified, which is the half a `starts_with` could not see. A
+    // `pull_request:` key carrying `branches: [no-such-branch]` or
+    // `paths: ['docs/**']` is still a `pull_request` trigger by that reading,
+    // and still never runs the gate on a pull request that changes code —
+    // the same failure the comment above describes, reached from the other
+    // side. The filter is a line of its own, nested one level in, so what
+    // separates a real trigger from a decorative one is whether anything is
+    // nested under the key at all.
+    let at = job
+        .triggers
+        .iter()
+        .position(|(_, content)| content == "pull_request:")
+        .unwrap_or_else(|| {
+            panic!(
+                "{GATE_WORKFLOW}: no bare `pull_request:` trigger, so a red gate blocks \
+                 nothing: {:?}",
+                job.triggers,
+            )
+        });
+    let (indent, _) = job.triggers[at];
     assert!(
-        job.triggers.iter().any(|t| t.starts_with("pull_request")),
-        "{GATE_WORKFLOW}: no `pull_request` trigger, so a red gate blocks nothing: {:?}",
-        job.triggers,
+        job.triggers[at + 1..]
+            .first()
+            .is_none_or(|(next, _)| *next <= indent),
+        "{GATE_WORKFLOW}: `pull_request` is qualified by `{}`, so the gate can be \
+         filtered off the pull requests it exists to block",
+        job.triggers[at + 1].1,
     );
 }
