@@ -13,9 +13,10 @@
 //!    is outside the repository by construction.
 //! 2. **A literal carrying no `/`** is searched for on `$PATH` first, and
 //!    read from the working directory when `$PATH` does not supply it. `$PATH`
-//!    is an environment variable, not a repository fact; the root is probed
-//!    and the miss says the name belongs to something this build did not
-//!    index.
+//!    is an environment variable, not a repository fact, so the root is the
+//!    half of that lookup a scan can perform: it is probed, a hit resolves
+//!    like any other literal, and only the miss says the name belongs to
+//!    something this build did not index.
 //! 3. **A specifier that is not a literal** resolves against nothing.
 //!    [`UnresolvedReason::DynamicModuleSpecifier`], never a guess.
 //!

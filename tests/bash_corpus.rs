@@ -39,6 +39,13 @@
 //! honest denominator with the right reason on every miss is the deliverable;
 //! the 91-function census below is what the track is actually for.
 //!
+//! One consequence is worth stating where it can be seen: with nothing
+//! resolved here, the only branch of the resolver that can return `Resolved`
+//! is exercised by **zero** rows in this file, so a regression in it would
+//! move no count below and would pass the ratchet. `tests/bash_fixture.rs`
+//! is where that branch is covered, over a tree written by the test rather
+//! than a vendored corpus.
+//!
 //! **`load` contributes nothing, and that is not a gap.** It is not shell
 //! syntax — bats defines it as a function in
 //! `lib/bats-core/test_functions.bash` — and its call sites are all in
