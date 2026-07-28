@@ -285,24 +285,23 @@ public class Generic<T extends Bound, U> {
 "#,
         ),
     ]);
-    assert_eq!(
-        scan.one("t.tag", RefKind::Call),
-        "RESOLVED com.acme#Bound.tag/0"
-    );
+    // The field form is what X-07 is measured on: a field is a node, so the
+    // declared-type lookup still runs on it. The parameter beside it is the
+    // same declared type read through a *local*, which the uniform
+    // root-binding rule takes out of the rate — the type variable is resolved
+    // identically either way, and only one of the two is a node.
     assert_eq!(
         scan.one("value.tag", RefKind::Call),
         "RESOLVED com.acme#Bound.tag/0",
     );
+    assert_eq!(scan.one("t.tag", RefKind::Call), "LocalBinding");
     // §4.6: an unbounded type variable erases to `Object`, whose members are
     // external and never a definition of this repository.
-    assert_eq!(
-        scan.one("u.hashCode", RefKind::Call),
-        "EXTERNAL jdk:java.lang"
-    );
     assert_eq!(
         scan.one("free.hashCode", RefKind::Call),
         "EXTERNAL jdk:java.lang",
     );
+    assert_eq!(scan.one("u.hashCode", RefKind::Call), "LocalBinding");
 }
 
 /// The tree the overload-set cases are measured in.
@@ -594,6 +593,13 @@ public class Low extends Mid {
 }
 
 /// H-01: a member declared two files above the receiver's type resolves.
+///
+/// The receiver is a *field* and not a parameter, here and in every H-01 case
+/// below. A field is a node, so a reference through one stays in both terms of
+/// the resolution rate; a parameter is not, and the uniform root-binding rule
+/// on [`arthron::UnresolvedReason::LocalBinding`] answers it before the
+/// supertype closure is ever consulted. Writing these on a parameter would
+/// measure the policy instead of the closure.
 #[test]
 fn a_member_two_levels_up_a_cross_file_hierarchy_resolves() {
     let mut files = tower_tree();
@@ -601,7 +607,8 @@ fn a_member_two_levels_up_a_cross_file_hierarchy_resolves() {
         "com/acme/UseTower.java",
         r#"package com.acme;
 public class UseTower {
-    void go(Low l) {
+    Low l;
+    void go() {
         l.low();
         l.mid();
         l.top();
@@ -635,7 +642,8 @@ fn a_member_no_type_in_the_hierarchy_declares_is_still_unindexed() {
         "com/acme/UseAbsent.java",
         r#"package com.acme;
 public class UseAbsent {
-    void go(Low l) {
+    Low l;
+    void go() {
         l.absent();
     }
 }
@@ -687,7 +695,9 @@ public class Knot extends Loop {
             "com/acme/UseRunner.java",
             r#"package com.acme;
 public class UseRunner {
-    void go(Job j, Loop k) {
+    Job j;
+    Loop k;
+    void go() {
         j.describe();
         k.spin();
     }
@@ -738,7 +748,8 @@ public class Both extends BaseSpeak implements Chatty {
             "com/acme/UseBoth.java",
             r#"package com.acme;
 public class UseBoth {
-    void go(Both b) {
+    Both b;
+    void go() {
         b.speak();
     }
 }
@@ -781,7 +792,9 @@ public class Sub extends Named {
             "com/acme/UseNamed.java",
             r#"package com.acme;
 public class UseNamed {
-    void go(Sub s, Object o) {
+    Sub s;
+    Object o;
+    void go() {
         s.toString();
         o.hashCode();
     }
@@ -857,7 +870,8 @@ public interface Beta extends Alpha { default String m() { return "beta"; } }
                 "com/acme/UseImpl.java",
                 r#"package com.acme;
 public class UseImpl {
-    String go(Impl impl) { return impl.m(); }
+    Impl impl;
+    String go() { return impl.m(); }
 }
 "#
                 .to_string(),

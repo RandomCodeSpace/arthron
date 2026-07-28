@@ -13,6 +13,6 @@ corpus = "corpus/go/probes"
 commit = "synthetic"
 language = "go"
 resolved = 17
-external = 0
+external = 26
 local_binding = 1
 unresolved = 0

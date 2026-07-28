@@ -156,6 +156,26 @@ fn call(
     }
 }
 
+/// A written type name that resolves to Go's universe scope.
+///
+/// Every probe below writes `int` and `string` in signatures and struct
+/// fields, and each is a reference like any other — a predeclared name is
+/// still a name, and the resolver says so with `External(go:builtin)` rather
+/// than leaving it out of the count. `count` is a parameter because two `int`
+/// results of one function share a row key, and the row records how many
+/// sites it stands for.
+fn builtin_type(enclosing: String, raw_target: &str, count: u32) -> Site {
+    Site {
+        enclosing,
+        raw_target: raw_target.to_string(),
+        kind: RefKind::TypeUse.code(),
+        argc: None,
+        locally_bound: false,
+        count,
+        outcome: "External(go:builtin)".to_string(),
+    }
+}
+
 /// An import clause. Arity is `None`, not `Some(0)`: an import takes no
 /// arguments, which is a different fact from taking zero.
 fn import(enclosing: String, raw_target: &str, outcome: &str) -> Site {
@@ -217,10 +237,14 @@ fn expect_definition(snapshot: &Snapshot, fqn: &str, kind: DefKind, sites: &[(&s
 
 /// Assert a file owns no reference row at all.
 ///
-/// Not a formality: `expect_sites` pins the rows of the five files that carry
+/// Not a formality: `expect_sites` pins the rows of the files that carry
 /// references, and the pin in `the_probe_pin_holds` pins the totals — but a
-/// regression that invented a row in one of these twelve files and lost one
+/// regression that invented a row in one of the remaining files and lost one
 /// elsewhere would satisfy both. Saying "none" out loud is what closes that.
+///
+/// Fewer files qualify than once did. Every probe writes `int` or `string`
+/// somewhere in a signature, and those are references now, so a file with no
+/// call and no import is no longer a file with no row.
 fn expect_no_sites(snapshot: &Snapshot, file: &str) {
     expect_sites(snapshot, file, vec![]);
 }
@@ -294,10 +318,17 @@ fn a_clause_header_resolves_its_right_hand_side_to_the_outer_binding() {
         &snapshot,
         "clauseheader/clauseheader.go",
         vec![
-            // `BodyIsLocal` is the contrast case and owns no row at all: a
+            // `BodyIsLocal` is the contrast case and owns no *call* row: a
             // bare identifier read is not a reference, so there is nothing
-            // here for a scope bug to misfile — which is what makes the three
-            // header rows below the whole of this file's outcome.
+            // there for a scope bug to misfile — which is what makes the
+            // three header rows below the whole of this file's call outcome.
+            // Its result type is a written name like every other, and the
+            // five type rows are what say the shadowing never reached one.
+            builtin_type(q("/clauseheader#BodyIsLocal"), "int", 1),
+            builtin_type(q("/clauseheader#ForHeader"), "int", 1),
+            builtin_type(q("/clauseheader#IfHeader"), "int", 1),
+            builtin_type(q("/clauseheader#Producer"), "int", 1),
+            builtin_type(q("/clauseheader#SwitchHeader"), "string", 1),
             call(
                 q("/clauseheader#ForHeader"),
                 "Producer",
@@ -343,6 +374,10 @@ fn a_shadowed_call_and_its_package_level_twin_are_two_rows() {
         &snapshot,
         "shadowpair/shadowpair.go",
         vec![
+            // `Emit`'s result, `Pair`'s two results, the `var inner string`
+            // and the block-local literal's result: four sites, one row.
+            builtin_type(q("/shadowpair#Emit"), "string", 1),
+            builtin_type(q("/shadowpair#Pair"), "string", 4),
             call(
                 q("/shadowpair#Pair"),
                 "Emit",
@@ -360,16 +395,19 @@ fn a_shadowed_call_and_its_package_level_twin_are_two_rows() {
         ],
     );
 
-    // And the edge exists exactly once: the block-local call owes none.
+    // And the call edge exists exactly once: the block-local call owes none.
+    // Counted by kind, because `Pair` also owes a type-use edge to the
+    // universe scope for the `string`s in its signature — a different kind of
+    // edge, from a different reference, and not what this probe is about.
     let pair = arthron::model::node_id(Lang::Go.domain(), &q("/shadowpair#Pair"));
     let from_pair = snapshot
         .edges
         .iter()
-        .filter(|(src, _, _)| *src == pair)
+        .filter(|(src, _, kind)| *src == pair && *kind == RefKind::Call.code())
         .count();
     assert_eq!(
         from_pair, 1,
-        "Pair owes exactly one edge, to the package-level Emit"
+        "Pair owes exactly one call edge, to the package-level Emit"
     );
 }
 
@@ -418,8 +456,20 @@ fn build_exclusive_twins_keep_both_declaration_sites() {
     assert_eq!(report.fqn_collisions, 1);
     // Neither twin references anything, so neither owns a row. A twin that
     // grew one would be a build-constraint bug wearing a reference's clothes.
-    expect_no_sites(&snapshot, "buildtwin/twin_linux.go");
-    expect_no_sites(&snapshot, "buildtwin/twin_other.go");
+    // `func Twin() string` on one side, `type Twin struct{ Name string }` on
+    // the other: two files, one written `string` each, and the enclosers
+    // differ because a struct field sits at package level where a result type
+    // sits inside the function.
+    expect_sites(
+        &snapshot,
+        "buildtwin/twin_linux.go",
+        vec![builtin_type(q("/buildtwin#Twin"), "string", 1)],
+    );
+    expect_sites(
+        &snapshot,
+        "buildtwin/twin_other.go",
+        vec![builtin_type(q("/buildtwin"), "string", 1)],
+    );
 }
 
 #[test]
@@ -496,12 +546,21 @@ fn two_variants_of_one_package_name_resolve_to_their_own_directories() {
         DefKind::Function,
         &[("pkgrename/beta/beta.go", 12)],
     );
-    expect_no_sites(&snapshot, "pkgrename/alpha/alpha.go");
-    expect_no_sites(&snapshot, "pkgrename/beta/beta.go");
+    expect_sites(
+        &snapshot,
+        "pkgrename/alpha/alpha.go",
+        vec![builtin_type(q("/pkgrename/alpha#Name"), "string", 1)],
+    );
+    expect_sites(
+        &snapshot,
+        "pkgrename/beta/beta.go",
+        vec![builtin_type(q("/pkgrename/beta#Name"), "string", 1)],
+    );
     expect_sites(
         &snapshot,
         "pkgrename/consumer.go",
         vec![
+            builtin_type(q("/pkgrename#Both"), "string", 2),
             call(
                 q("/pkgrename#Both"),
                 "alpha.Name",
@@ -619,7 +678,14 @@ fn a_nested_module_is_excluded_and_its_definitions_never_appear() {
     // Neither file references anything, so the fence is visible in the rows
     // as well as in the nodes: the excluded file owns none because it was
     // never read, and the owned one owns none because it names nothing.
-    expect_no_sites(&snapshot, "modfence/modfence.go");
+    expect_sites(
+        &snapshot,
+        "modfence/modfence.go",
+        vec![builtin_type(q("/modfence#Rooted"), "string", 1)],
+    );
+    // The nested module is another module: this scan reads none of its
+    // references, and the `string` in *its* signature is not this scan's to
+    // count.
     expect_no_sites(&snapshot, "modfence/nested/nested.go");
 }
 
@@ -754,12 +820,21 @@ fn a_dotted_directory_and_a_dotted_fqn_are_two_nodes() {
         DefKind::Function,
         &[("dotted/p.Foo/pfoo.go", 11)],
     );
-    expect_no_sites(&snapshot, "dotted/p/p.go");
-    expect_no_sites(&snapshot, "dotted/p.Foo/pfoo.go");
+    expect_sites(
+        &snapshot,
+        "dotted/p/p.go",
+        vec![builtin_type(q("/dotted/p#Foo"), "string", 1)],
+    );
+    expect_sites(
+        &snapshot,
+        "dotted/p.Foo/pfoo.go",
+        vec![builtin_type(q("/dotted/p.Foo#Bar"), "string", 1)],
+    );
     expect_sites(
         &snapshot,
         "dotted/consumer.go",
         vec![
+            builtin_type(q("/dotted#Both"), "string", 2),
             call(
                 q("/dotted#Both"),
                 "p.Foo",
@@ -880,23 +955,35 @@ fn only_the_directory_decides_which_clause_is_an_external_test_package() {
         DefKind::Function,
         &[("testpkg/api_test/api_ext_test.go", 13)],
     );
-    expect_no_sites(&snapshot, "testpkg/api/api.go");
-    expect_no_sites(&snapshot, "testpkg/api_test/api.go");
+    expect_sites(
+        &snapshot,
+        "testpkg/api/api.go",
+        vec![builtin_type(q("/testpkg/api#Serve"), "string", 1)],
+    );
+    expect_sites(
+        &snapshot,
+        "testpkg/api_test/api.go",
+        vec![builtin_type(q("/testpkg/api_test#Serve"), "string", 1)],
+    );
     expect_sites(
         &snapshot,
         "testpkg/api_test/api_test.go",
-        vec![call(
-            q("/testpkg/api_test#CallServe"),
-            "Serve",
-            0,
-            false,
-            &format!("Resolved({})", q("/testpkg/api_test#Serve")),
-        )],
+        vec![
+            builtin_type(q("/testpkg/api_test#CallServe"), "string", 1),
+            call(
+                q("/testpkg/api_test#CallServe"),
+                "Serve",
+                0,
+                false,
+                &format!("Resolved({})", q("/testpkg/api_test#Serve")),
+            ),
+        ],
     );
     expect_sites(
         &snapshot,
         "testpkg/api/api_ext_test.go",
         vec![
+            builtin_type(q("/testpkg/api!test#ExerciseServe"), "string", 1),
             call(
                 q("/testpkg/api!test#ExerciseServe"),
                 "api.Serve",
@@ -915,6 +1002,7 @@ fn only_the_directory_decides_which_clause_is_an_external_test_package() {
         &snapshot,
         "testpkg/api_test/api_ext_test.go",
         vec![
+            builtin_type(q("/testpkg/api_test!test#ExerciseServe"), "string", 1),
             call(
                 q("/testpkg/api_test!test#ExerciseServe"),
                 "api_test.Serve",
@@ -963,6 +1051,24 @@ fn an_in_package_test_files_the_same_way_warm_as_cold() {
 
 // -- the whole corpus ------------------------------------------------------
 
+/// Whether a repo-relative file sits under a directory that declares its own
+/// `go.mod` — a module this scan does not own.
+fn in_a_nested_module(root: &Path, rel: &str) -> bool {
+    let mut dir = match rel.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => return false, // a file at the module root
+    };
+    loop {
+        if root.join(dir).join("go.mod").is_file() {
+            return true;
+        }
+        match dir.rsplit_once('/') {
+            Some((parent, _)) => dir = parent,
+            None => return false,
+        }
+    }
+}
+
 #[test]
 fn every_probe_reference_has_exactly_one_stored_outcome() {
     // The never-drop rule, on a corpus small enough to read: the four reported
@@ -981,6 +1087,19 @@ fn every_probe_reference_has_exactly_one_stored_outcome() {
             .expect("a walked path is under the corpus")
             .to_string_lossy()
             .replace('\\', "/");
+        // The walk reaches every `.go` file under the root; the *scan* owns
+        // only the files of this module. A directory with a `go.mod` of its
+        // own is another module — `modfence/nested` is one, on purpose — and
+        // its references belong to a scan nobody ran. Counting them here
+        // would read a deliberate exclusion as a dropped reference.
+        //
+        // The exclusion is stated by path and not by "produced no rows",
+        // which would be circular and would hide the drop this test exists to
+        // catch. `a_nested_module_is_excluded_and_its_definitions_never_appear`
+        // is what holds the exclusion itself honest.
+        if in_a_nested_module(corpus, &rel) {
+            continue;
+        }
         let source =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         extracted += extract(&rel, &source).refs.len() as u64;

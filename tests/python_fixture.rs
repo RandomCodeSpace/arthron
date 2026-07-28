@@ -118,6 +118,9 @@ fn fixture(root: &Path) {
             "from .core import Client\n",
             "from . import util\n",
             "\n",
+            "typed: Client = Client()\n",
+            "typed.send(1)\n",
+            "\n",
             "\n",
             "def run(c: Client):\n",
             "    c.send(1)\n",
@@ -163,6 +166,13 @@ fn fixture(root: &Path) {
         concat!(
             "import nowhere_at_all\n",
             "from .nothing import gone\n",
+            "\n",
+            "\n",
+            "loose = make()\n",
+            "\n",
+            "\n",
+            "def module_level(value):\n",
+            "    return loose.render()\n",
             "\n",
             "\n",
             "def untyped(value):\n",
@@ -317,10 +327,11 @@ fn a_python_tree_resolves_across_files_and_names_what_it_cannot() {
 
     // -- calls ------------------------------------------------------------
 
-    // E-05: `c` is a parameter, and reading its annotation is not inference.
-    // This is the assertion that stops `LocalBinding` from swallowing it.
+    // E-05: reading an annotation is not inference, and the annotation table
+    // is still measured — on a receiver that is a *node*. A module top level
+    // binds nodes, so `typed` is one and its member keeps its edge.
     assert_eq!(
-        outcome(&rows, "app/service.py", RefKind::Call, "c.send"),
+        outcome(&rows, "app/service.py", RefKind::Call, "typed.send"),
         resolved("app.core#Client.send"),
     );
     // E-07: a chain longer than two segments, resolvable because its prefix is
@@ -359,16 +370,26 @@ fn a_python_tree_resolves_across_files_and_names_what_it_cannot() {
 
     // -- the honest floor -------------------------------------------------
 
-    // E-06: the receiver is a parameter with no annotation. The largest bucket
-    // and the correct one; it must not become `LocalBinding`, which would take
-    // it out of both terms of the rate.
+    // E-06: a receiver that is a node and that nobody annotated. The bucket
+    // is about the fact nobody wrote down — the type — so its content has to
+    // be a reference the rate still counts, and a module-level binding is one.
+    assert_reason(
+        &outcome(&rows, "app/hard.py", RefKind::Call, "loose.render"),
+        "NeedsTypeInference",
+        "an unannotated module-level receiver",
+    );
+    // The uniform root-binding rule, at both depths: a parameter is not a
+    // node, so neither the bare name nor a member hung off it is one.
     assert_reason(
         &outcome(&rows, "app/hard.py", RefKind::Call, "value.render"),
-        "NeedsTypeInference",
-        "an unannotated receiver",
+        "LocalBinding",
+        "a member of an unannotated parameter",
     );
-    // …whereas the *whole* target being one block-bound name really is a local
-    // binding, and is the only shape that is.
+    assert_reason(
+        &outcome(&rows, "app/service.py", RefKind::Call, "c.send"),
+        "LocalBinding",
+        "a member of an annotated parameter — an annotation does not make a node",
+    );
     assert_reason(
         &outcome(&rows, "app/hard.py", RefKind::Call, "helper"),
         "LocalBinding",

@@ -71,12 +71,20 @@ const BASELINE: &str = "baselines/python-django.toml";
 /// `NoMatchingDefinition` and into `Generated` relabels 19 references from
 /// "not found" to "the target is generated code" and moves nothing this file
 /// otherwise gates.
+///
+/// `NeedsTypeInference` reads 2677 and not 10256 because the root-binding
+/// rule took 7579 references out of this bucket and into `local_binding`.
+/// Not one of them is linked any better than it was: `c.send()` where `c` is
+/// a parameter is the same unreachable name it always was, now filed under
+/// the reason that says so. It is the whole of django's rate movement, and
+/// the reason the re-based baseline has to be read with its `local_binding`
+/// column beside its rate.
 const DJANGO_REASONS: &[(&str, u64)] = &[
     ("DynamicDispatch", 87),
     ("Generated", 13),
     ("NeedsExpressionType", 1609),
     ("NeedsReceiverType", 136),
-    ("NeedsTypeInference", 10256),
+    ("NeedsTypeInference", 2677),
     ("NoMatchingDefinition", 294),
     ("ProjectLayoutUnknown", 1),
     ("UnindexedSupertype", 1209),
@@ -85,16 +93,21 @@ const DJANGO_REASONS: &[(&str, u64)] = &[
 
 /// flask's, exactly. Ten buckets rather than nine — flask imports modules this
 /// tree does not vendor, so `ModuleNotFound` is real here and empty on django.
+///
+/// Three buckets moved with the root-binding rule and every one of them moved
+/// *out*, into `local_binding`: `NeedsTypeInference` 2119 -> 186,
+/// `UnindexedSupertype` 156 -> 120, `NoMatchingDefinition` 71 -> 70. Nothing
+/// arrived from anywhere.
 const FLASK_REASONS: &[(&str, u64)] = &[
     ("DynamicDispatch", 1),
     ("Generated", 88),
     ("ModuleNotFound", 12),
     ("NeedsExpressionType", 143),
     ("NeedsReceiverType", 5),
-    ("NeedsTypeInference", 2119),
-    ("NoMatchingDefinition", 71),
+    ("NeedsTypeInference", 186),
+    ("NoMatchingDefinition", 70),
     ("ProjectLayoutUnknown", 33),
-    ("UnindexedSupertype", 156),
+    ("UnindexedSupertype", 120),
     ("UnknownPackage", 219),
 ];
 

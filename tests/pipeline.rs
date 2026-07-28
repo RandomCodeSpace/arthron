@@ -74,12 +74,14 @@ fn scan_reports_honest_per_language_counts() {
     let go = &report.per_lang[&Lang::Go.code()];
 
     // Calls: util.Parse + helper resolved. Imports: example.com/app/util
-    // resolved. fmt import + fmt.Println external. missing() unresolved
-    // (NoMatchingDefinition), pool.Close() unresolved (NeedsTypeInference).
-    // conn.Close() names a parameter, so it is a local binding — reported,
-    // and outside both terms of the rate.
-    assert_eq!(go.resolved, 3);
-    assert_eq!(go.external, 2);
+    // resolved. Type uses: `Conn` in `var pool Conn` and in `Serve`'s
+    // signature, both resolved. fmt import + fmt.Println external, and
+    // `Parse`'s two `string`s are Go universe names, so external too.
+    // missing() unresolved (NoMatchingDefinition), pool.Close() unresolved
+    // (NeedsTypeInference). conn.Close() names a parameter, so it is a local
+    // binding — reported, and outside both terms of the rate.
+    assert_eq!(go.resolved, 5);
+    assert_eq!(go.external, 4);
     assert_eq!(go.local_binding, 1);
     assert_eq!(
         go.unresolved[&reason_code(&UnresolvedReason::NoMatchingDefinition)],
@@ -95,7 +97,7 @@ fn scan_reports_honest_per_language_counts() {
         "a local binding never enters the unresolved map",
     );
     let rate = arthron::resolution_rate(go.resolved, go.unresolved_total()).unwrap();
-    assert!((rate - 0.6).abs() < 1e-9);
+    assert!((rate - 5.0 / 7.0).abs() < 1e-9);
 }
 
 #[test]
@@ -112,10 +114,15 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
     //
     // Hand-counted for `fixture`:
     //   util/util.go      0 imports, 0 calls
+    //                     2 type uses (`string` twice — the parameter and
+    //                                  the result of `Parse`)
     //   server/server.go  2 imports ("fmt", "example.com/app/util")
     //                     6 calls   (fmt.Println, util.Parse, helper,
     //                                missing, conn.Close, pool.Close)
-    const EXPECTED_REFERENCES: u64 = 8;
+    //                     2 type uses (`Conn` in `var pool Conn` and in
+    //                                  `Serve`'s signature; `type Conn
+    //                                  struct{}` declares and does not name)
+    const EXPECTED_REFERENCES: u64 = 12;
 
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
@@ -276,8 +283,8 @@ fn an_external_reference_gets_a_node_and_an_edge() {
 
     let report = scan_go(dir.path(), &db).expect("scan succeeds");
     let tally = &report.per_lang[&Lang::Go.code()];
-    assert_eq!(tally.resolved, 3);
-    assert_eq!(tally.external, 2);
+    assert_eq!(tally.resolved, 5);
+    assert_eq!(tally.external, 4);
     assert_eq!(tally.local_binding, 1);
     assert_eq!(tally.unresolved_total(), 2);
 
@@ -321,11 +328,18 @@ fn an_external_reference_gets_a_node_and_an_edge() {
 }
 
 #[test]
-fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
+fn a_receiver_shadowing_an_import_resolves_to_its_own_type_not_the_import() {
     // The receiver `h` shadows `import h "net/http"` for the whole of
-    // `Handle`, so `h.reset()` names a local. Linking it to the import is a
-    // wrong edge, and a wrong edge is strictly worse than an unresolved
-    // reference: the miss would have been counted, the wrong edge is not.
+    // `Handle`, so `h.reset()` names the receiver's own method. Linking it to
+    // the import is a wrong edge, and a wrong edge is strictly worse than an
+    // unresolved reference: the miss would have been counted, the wrong edge
+    // is not.
+    //
+    // It is not excluded to achieve that. A receiver is Go's `this`, so the
+    // site resolves against the type the signature states — the same
+    // declared-type lookup Java, Python, JavaScript and TypeScript run for
+    // `this.reset()` — and lands on the right definition, in both terms of
+    // the rate.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
@@ -336,6 +350,7 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
             "package server\n\n",
             "import h \"net/http\"\n\n",
             "type Handler struct{}\n\n",
+            "func (h *Handler) reset() {}\n\n",
             "func (h *Handler) Handle() {\n",
             "\th.reset()\n",
             "}\n\n",
@@ -357,6 +372,15 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
         ),
         "the receiver shadows the import: this edge is a lie",
     );
+    assert!(
+        links(
+            &store,
+            "example.com/app/server#Handler.Handle",
+            "example.com/app/server#Handler.reset",
+            RefKind::Call,
+        ),
+        "the receiver's own method is the edge, and it is a real one",
+    );
     // One function away the same `h` really is the import, and that edge
     // must survive — the fix is a binding rule, not a blanket suppression.
     assert!(links(
@@ -366,12 +390,16 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
         RefKind::Call,
     ));
 
-    // The reference is reported, not deleted: one local binding, on its own
-    // line, and both terms of the rate are untouched by it.
     let tally = &report.per_lang[&Lang::Go.code()];
-    assert_eq!(tally.local_binding, 1);
+    assert_eq!(
+        tally.local_binding, 0,
+        "a member selected through a receiver is never a local binding",
+    );
     assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
-    assert_eq!(tally.resolved, 0);
+    assert_eq!(
+        tally.resolved, 3,
+        "`h.reset` and the two `Handler` receiver type uses",
+    );
     assert_eq!(tally.external, 2, "the import and the genuine `h` use");
 }
 

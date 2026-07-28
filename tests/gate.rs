@@ -90,8 +90,13 @@ fn a_rebased_baseline_gates_the_scan_it_was_recorded_from() {
     assert_eq!(parsed.commit, "0000000");
     // The counts are the fixture's, measured — not a guess written into a
     // file that would then gate every later run.
-    assert_eq!(parsed.counts.resolved, 3);
-    assert_eq!(parsed.counts.external, 2);
+    //
+    // Two of the five resolved are type uses: `Conn` in `var pool Conn` and
+    // in `func Serve(conn Conn)`. Two of the four external are the `string`
+    // in `Parse`'s signature and its result, which are Go universe names;
+    // `fmt` and the `fmt.Println` call are the other two.
+    assert_eq!(parsed.counts.resolved, 5);
+    assert_eq!(parsed.counts.external, 4);
     assert_eq!(parsed.counts.local_binding, 1);
     assert_eq!(parsed.counts.unresolved, 2);
 
@@ -119,7 +124,7 @@ fn a_baseline_claiming_a_higher_rate_fails_the_gate() {
     assert_eq!(code(&recorded), 0, "{}", stderr(&recorded));
 
     let text = fs::read_to_string(&baseline).unwrap();
-    fs::write(&baseline, text.replace("resolved = 3", "resolved = 4")).unwrap();
+    fs::write(&baseline, text.replace("resolved = 5", "resolved = 6")).unwrap();
 
     let failed = gate(&root, &baseline, &dir.path().join("gate.redb"), &[]);
     assert_eq!(code(&failed), 1, "{}", stderr(&failed));

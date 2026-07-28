@@ -186,10 +186,15 @@ const CODEIQ: Census = Census {
     files: 397,
     // `Module` is one per file: every file declares the package its
     // definitions live in, whether or not anything else parsed.
+    //
+    // `Type` counts 232 and not 229 because `def-type` now reads `type_alias`
+    // as well as `type_spec`: codeiq writes exactly three package-level
+    // `type X = Y` declarations, and until Go emitted type uses nothing in
+    // the tree could tell that they declared no node.
     defs: &[
         (DefKind::Function, 1545),
         (DefKind::Method, 614),
-        (DefKind::Type, 229),
+        (DefKind::Type, 232),
         (DefKind::Const, 276),
         (DefKind::Var, 619),
         (DefKind::Module, 397),
@@ -200,12 +205,17 @@ const CODEIQ: Census = Census {
     stored: &[
         (DefKind::Function, 1429),
         (DefKind::Method, 614),
-        (DefKind::Type, 229),
+        (DefKind::Type, 232),
         (DefKind::Const, 276),
         (DefKind::Var, 619),
     ],
     packages: 50,
-    externals: 81,
+    // 84 and not 81: `io/fs`, `sync` and `testing` are imported here and
+    // *used* only in type position — `fs.FS`, `sync.Mutex`, `testing.T` —
+    // so the store held `std:io/fs` for the import and nothing for the use
+    // until type uses were emitted. Every other new Go reference in this
+    // corpus reached a package it already had a node for.
+    externals: 84,
     pinned: &[
         (
             "github.com/randomcodespace/codeiq/internal/analyzer#Analyzer",
@@ -247,16 +257,29 @@ const CODEIQ: Census = Census {
             "cmd/extcheck/main.go",
             1,
         ),
+        // An alias, and the one shape the widened `def-type` rule added: it
+        // is a node of kind `Type`, so a use of `Node` reaches it rather than
+        // landing on `NoMatchingDefinition`. Named, because the census only
+        // says three appeared.
+        (
+            "github.com/randomcodespace/codeiq/internal/parser#Node",
+            NodeKind::Definition(DefKind::Type),
+            "internal/parser/walk.go",
+            13,
+        ),
     ],
 };
 
 /// caddy: 314 files, and the tree whose definitions collide.
 const CADDY: Census = Census {
     files: 314,
+    // `Type` counts 511 and not 507 for the same reason codeiq's counts 232:
+    // caddy writes exactly four package-level `type X = Y` declarations, and
+    // `def-type` reads `type_alias` now.
     defs: &[
         (DefKind::Function, 1139),
         (DefKind::Method, 1425),
-        (DefKind::Type, 507),
+        (DefKind::Type, 511),
         (DefKind::Const, 170),
         (DefKind::Var, 546),
         (DefKind::Module, 314),
@@ -269,12 +292,15 @@ const CADDY: Census = Census {
     stored: &[
         (DefKind::Function, 1009),
         (DefKind::Method, 1425),
-        (DefKind::Type, 507),
+        (DefKind::Type, 511),
         (DefKind::Const, 169),
         (DefKind::Var, 209),
     ],
     packages: 47,
-    externals: 241,
+    // 249 and not 241, and the same shape as codeiq's 84: `crypto`,
+    // `crypto/ed25519`, `crypto/rsa`, `crypto/x509/pkix`, `flag`, `hash`,
+    // `math/big` and `sync/atomic` are each imported and used only as a type.
+    externals: 249,
     pinned: &[
         (
             "github.com/caddyserver/caddy/v2/modules/caddyhttp#Server",
@@ -317,6 +343,13 @@ const CADDY: Census = Census {
             NodeKind::Package,
             "modules/caddyhttp/push/caddyfile.go",
             15,
+        ),
+        // caddy's half of the alias pin — see codeiq's `#Node`.
+        (
+            "github.com/caddyserver/caddy/v2/modules/caddyhttp#LoggableHTTPHeader",
+            NodeKind::Definition(DefKind::Type),
+            "modules/caddyhttp/marshalers.go",
+            65,
         ),
     ],
 };
@@ -599,14 +632,24 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
 /// Go's resolver runs no type checker, so a receiver whose type is not stated
 /// in the file is honestly unresolved — that is `NeedsTypeInference`, and it
 /// is most of this. `NoMatchingDefinition` is the rest: a name this build
-/// indexed a package for and found nothing under.
-const CODEIQ_REASONS: &[(&str, u64)] =
-    &[("NeedsTypeInference", 676), ("NoMatchingDefinition", 123)];
+/// indexed a package for and found nothing under. `NeedsReceiverType` is the
+/// third and smallest: a member selected through the method's own receiver,
+/// whose type *is* stated, that the receiver type does not itself declare —
+/// Go promotes an embedded type's members and this track indexes neither
+/// embedding nor struct fields.
+const CODEIQ_REASONS: &[(&str, u64)] = &[
+    ("NeedsReceiverType", 3),
+    ("NeedsTypeInference", 758),
+    ("NoMatchingDefinition", 123),
+];
 
-/// caddy's, exactly. Twice the tree and the same two reasons in the same
+/// caddy's, exactly. Twice the tree and the same three reasons in the same
 /// proportion, which is the point of measuring two corpora.
-const CADDY_REASONS: &[(&str, u64)] =
-    &[("NeedsTypeInference", 1546), ("NoMatchingDefinition", 269)];
+const CADDY_REASONS: &[(&str, u64)] = &[
+    ("NeedsReceiverType", 123),
+    ("NeedsTypeInference", 2308),
+    ("NoMatchingDefinition", 269),
+];
 
 /// One baseline per corpus, never one aggregated number. They are written by
 /// the command and by nothing else:

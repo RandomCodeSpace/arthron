@@ -18,10 +18,17 @@ language: go
 rule:
   kind: method_declaration
 ---
+# `type A B` and `type A = B` are two node kinds in this grammar and one
+# declaration in the language: both put `A` in the package block. Reading only
+# `type_spec` cost nothing while Go emitted no type uses — nothing ever named
+# an alias — and became 57 `NoMatchingDefinition` rows on the Go corpus the
+# moment it did.
 id: def-type
 language: go
 rule:
-  kind: type_spec
+  any:
+    - kind: type_spec
+    - kind: type_alias
 ---
 id: def-const
 language: go
@@ -37,3 +44,34 @@ id: ref-call
 language: go
 rule:
   kind: call_expression
+---
+# Every written type name. One kind is enough: the Go grammar routes every
+# type position — parameter, result, receiver, struct field, embedded field,
+# composite literal, conversion, assertion, type-switch case, alias right-hand
+# side, generic argument and constraint — through `type_identifier`, and a
+# qualified `pkg.T` writes its `name` half as one too. Which of those a
+# particular node is, and whether it is a *declaration* rather than a use, is
+# decided in Rust, where the ancestor chain is available.
+#
+# Kinds deliberately absent:
+#   qualified_type - its `name` child is already a `type_identifier`; matching
+#                    both would emit `pkg.T` twice.
+#   package_identifier
+#                  - the `pkg` half of `pkg.T`, read from the qualified node.
+#   field_identifier
+#                  - a struct field's *name*, which declares rather than names.
+#   identifier     - a type parameter's own name in `[T any]`, and the `T` in
+#                    `T(x)`, which the grammar already routes through
+#                    `ref-call` as a conversion. Emitting them here would
+#                    count one site twice.
+#
+# One shape reaches `type_identifier` in *callee* position and so is not a type
+# use at all: `Generic[T](x)`. An explicit instantiation is unambiguously a
+# type, so the grammar files the whole call as a `type_conversion_expression`
+# and `ref-call` — which matches `call_expression` — never sees it. The site is
+# reported as the `Call` it is; `instantiated_callee` in `extract_go.rs` is
+# where, and it is still one row for one site.
+id: ref-type
+language: go
+rule:
+  kind: type_identifier

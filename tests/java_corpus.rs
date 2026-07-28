@@ -50,26 +50,26 @@ const CORPORA: &[(&str, &str, &str)] = &[
 /// `AmbiguousOverload` dominates because this corpus is overload sets without
 /// the argument types to discriminate them, and `NeedsExpressionType` is the
 /// honest cost of not running a type checker on `f().m()`. The two are
-/// different facts and the gate cannot tell them apart: moving all 10302 of
+/// different facts and the gate cannot tell them apart: moving all 9218 of
 /// the first into `NoMatchingDefinition` leaves every gated integer where it
 /// was.
 const COMMONS_LANG_REASONS: &[(&str, u64)] = &[
-    ("AmbiguousOverload", 10302),
+    ("AmbiguousOverload", 9218),
     ("NeedsExpressionType", 6566),
-    ("NeedsTypeInference", 1969),
-    ("NoMatchingDefinition", 162),
-    ("UnindexedSupertype", 94),
+    ("NeedsTypeInference", 342),
+    ("NoMatchingDefinition", 123),
+    ("UnindexedSupertype", 30),
 ];
 
 /// gson's, exactly. The same five reasons in a different mixture — generics
 /// threaded through `TypeAdapter<T>` push `NeedsExpressionType` past
 /// `AmbiguousOverload`, which commons-lang never does.
 const GSON_REASONS: &[(&str, u64)] = &[
-    ("AmbiguousOverload", 2234),
+    ("AmbiguousOverload", 1282),
     ("NeedsExpressionType", 4713),
-    ("NeedsTypeInference", 208),
-    ("NoMatchingDefinition", 47),
-    ("UnindexedSupertype", 13),
+    ("NeedsTypeInference", 72),
+    ("NoMatchingDefinition", 37),
+    ("UnindexedSupertype", 1),
 ];
 
 /// Whether the corpus has been cloned in.
@@ -304,7 +304,14 @@ const GSON: Census = Census {
     // Fourteen: thirteen packages plus the JPMS descriptor, which declares a
     // module and no package and is the one commons-lang has nothing like.
     packages: 14,
-    externals: 36,
+    // 34 and not 36. `TypeTokenTest` declares `Outer` and `Enclosing<T>` as
+    // method-local classes (JLS §14.3), and `Outer.NonStaticInner` and
+    // `Enclosing<T>.Inner` used to escape the narrow local rule because their
+    // targets are two segments long — leaving two external nodes claiming
+    // that packages named `Outer` and `Enclosing` exist outside this
+    // repository. Under the root-binding rule they are `LocalBinding`, which
+    // is true, and the two nodes are gone. Nothing else stopped being reached.
+    externals: 34,
     pinned: &[
         (
             "com.google.gson#Gson",
