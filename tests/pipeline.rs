@@ -74,12 +74,14 @@ fn scan_reports_honest_per_language_counts() {
     let go = &report.per_lang[&Lang::Go.code()];
 
     // Calls: util.Parse + helper resolved. Imports: example.com/app/util
-    // resolved. fmt import + fmt.Println external. missing() unresolved
-    // (NoMatchingDefinition), pool.Close() unresolved (NeedsTypeInference).
-    // conn.Close() names a parameter, so it is a local binding — reported,
-    // and outside both terms of the rate.
-    assert_eq!(go.resolved, 3);
-    assert_eq!(go.external, 2);
+    // resolved. Type uses: `Conn` in `var pool Conn` and in `Serve`'s
+    // signature, both resolved. fmt import + fmt.Println external, and
+    // `Parse`'s two `string`s are Go universe names, so external too.
+    // missing() unresolved (NoMatchingDefinition), pool.Close() unresolved
+    // (NeedsTypeInference). conn.Close() names a parameter, so it is a local
+    // binding — reported, and outside both terms of the rate.
+    assert_eq!(go.resolved, 5);
+    assert_eq!(go.external, 4);
     assert_eq!(go.local_binding, 1);
     assert_eq!(
         go.unresolved[&reason_code(&UnresolvedReason::NoMatchingDefinition)],
@@ -95,7 +97,7 @@ fn scan_reports_honest_per_language_counts() {
         "a local binding never enters the unresolved map",
     );
     let rate = arthron::resolution_rate(go.resolved, go.unresolved_total()).unwrap();
-    assert!((rate - 0.6).abs() < 1e-9);
+    assert!((rate - 5.0 / 7.0).abs() < 1e-9);
 }
 
 #[test]
@@ -112,10 +114,15 @@ fn every_extracted_reference_has_exactly_one_stored_outcome() {
     //
     // Hand-counted for `fixture`:
     //   util/util.go      0 imports, 0 calls
+    //                     2 type uses (`string` twice — the parameter and
+    //                                  the result of `Parse`)
     //   server/server.go  2 imports ("fmt", "example.com/app/util")
     //                     6 calls   (fmt.Println, util.Parse, helper,
     //                                missing, conn.Close, pool.Close)
-    const EXPECTED_REFERENCES: u64 = 8;
+    //                     2 type uses (`Conn` in `var pool Conn` and in
+    //                                  `Serve`'s signature; `type Conn
+    //                                  struct{}` declares and does not name)
+    const EXPECTED_REFERENCES: u64 = 12;
 
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
@@ -276,8 +283,8 @@ fn an_external_reference_gets_a_node_and_an_edge() {
 
     let report = scan_go(dir.path(), &db).expect("scan succeeds");
     let tally = &report.per_lang[&Lang::Go.code()];
-    assert_eq!(tally.resolved, 3);
-    assert_eq!(tally.external, 2);
+    assert_eq!(tally.resolved, 5);
+    assert_eq!(tally.external, 4);
     assert_eq!(tally.local_binding, 1);
     assert_eq!(tally.unresolved_total(), 2);
 
@@ -371,7 +378,10 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
     let tally = &report.per_lang[&Lang::Go.code()];
     assert_eq!(tally.local_binding, 1);
     assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
-    assert_eq!(tally.resolved, 0);
+    assert_eq!(
+        tally.resolved, 1,
+        "the receiver's own `Handler` is a type use like any other",
+    );
     assert_eq!(tally.external, 2, "the import and the genuine `h` use");
 }
 

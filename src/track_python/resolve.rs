@@ -619,7 +619,6 @@ impl PyResolver {
         cfg: &PyProject,
         scope: &PyScope,
         segments: &[String],
-        locally_bound: bool,
         walk: &Walk,
         probe: &dyn SymbolProbe,
         probed: &mut Vec<NodeId>,
@@ -657,17 +656,20 @@ impl PyResolver {
         // §4.2.2: builtins are the last scope searched, so this is reached
         // only after every binding and star candidate has missed (C-02).
         //
-        // `locally_bound` is asked first and `scope.bindings` second because
-        // they answer for different scopes and neither covers the other:
-        // §4.2.1 makes a name bound anywhere in a block local to that block,
-        // and `scope.bindings` is the *module* table, which never holds a
-        // local. Without the first test `filter = build_filter()` followed by
-        // `filter.apply()` would be answered by the builtin `filter` and leave
-        // both terms of the rate — the same escape `resolve_name` already
-        // refuses to allow through `LocalBinding`, arriving through a
-        // different door. The honest answer for a member of a local is the
-        // type of that local, which nobody wrote down.
-        if !locally_bound && !scope.bindings.contains_key(head) && is_builtin(head) {
+        // A local shadowing a builtin used to need a second test right here:
+        // `filter = build_filter()` followed by `filter.apply()` would
+        // otherwise be answered by the builtin `filter` and leave both terms
+        // of the rate through a door `resolve_name` had already shut for the
+        // bare name. It no longer does — the uniform root-binding rule
+        // returns `LocalBinding` for *every* locally-rooted reference before
+        // any candidate is generated, so nothing that reaches `miss` is
+        // locally bound and one door is all there is.
+        //
+        // `scope.bindings` is still asked, and answers a different question:
+        // it is the *module* table, which never held a local, and a module
+        // that binds `filter` at its top level shadows the builtin for the
+        // whole file (§4.2.1).
+        if !scope.bindings.contains_key(head) && is_builtin(head) {
             return Outcome::External(BUILTINS_PACKAGE.to_string());
         }
         // PEP 562: a module with `__getattr__` serves attributes that have no
@@ -1032,15 +1034,33 @@ impl PyResolver {
         if segments.is_empty() {
             return unresolved(UnresolvedReason::NoMatchingDefinition);
         }
-        // A name some enclosing block binds is not a node by design, so the
-        // *whole* target being that name is `LocalBinding` and nothing else.
+        // The uniform root-binding rule, written down on
+        // [`UnresolvedReason::LocalBinding`] and read the same way by all four
+        // tier-1 tracks: §4.2.1 makes a name bound anywhere in a function,
+        // lambda or comprehension block local to that block, and a local is
+        // not a node — so a reference whose leftmost segment is one is a
+        // `LocalBinding` however long the member path after it.
         //
-        // A *member of* it is not: `c.send()` names `send`, and `c` is only
-        // the receiver. Filing that under `LocalBinding` would take it out of
-        // both terms of the rate — which is exactly how a rate rises without
-        // anything being linked — so it stays in the denominator and goes on
-        // to the annotation table (E-05) and then to an honest reason.
-        if r.locally_bound && segments.len() == 1 {
+        // Depth used to matter here, and that was the divergence this closes.
+        // `c.send()` went on to E-05's annotation table and counted as
+        // `resolved` when the parameter carried an annotation, while Go,
+        // TypeScript and JavaScript had already taken the identical shape out
+        // of both rate terms — so Python's rate and Go's were computed over
+        // differently-sized denominators and could not be compared.
+        //
+        // This is the single largest rate movement of the change, and it
+        // moves *up*, which is the hazard `crate::resolution_rate` documents:
+        // excluding a category from both terms is how a number rises without
+        // anything improving. What stops that being a way to cheat is that
+        // the `local_binding` count is itself gated — flask's rises from 150
+        // to 2,160 in the same commit, and a baseline rebase has to state
+        // both.
+        //
+        // What is deliberately *not* local stays the load-bearing half:
+        // module and class blocks are not binding environments here
+        // (`is_binding_block`), so a module-level name is a node and
+        // `shared.send()` keeps its place in the denominator.
+        if r.locally_bound {
             return Resolution {
                 outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
                 candidates: Vec::new(),
@@ -1048,23 +1068,16 @@ impl PyResolver {
         }
         let mut candidates = Vec::new();
         let mut walk = Walk::default();
-        if !r.locally_bound {
-            Self::name_candidates(cfg, scope, probe, segments, &mut candidates, &mut walk);
-        }
+        Self::name_candidates(cfg, scope, probe, segments, &mut candidates, &mut walk);
         Self::annotation_candidates(cfg, scope, probe, r, segments, &mut candidates, &mut walk);
         let mut probed = Vec::new();
         match Self::probe_in_order(probe, &candidates, &mut probed) {
             Some(id) => with_walk(Outcome::Resolved(id), &walk, probed),
             None => {
-                let outcome = Self::miss(
-                    cfg,
-                    scope,
-                    segments,
-                    r.locally_bound,
-                    &walk,
-                    probe,
-                    &mut probed,
-                );
+                // `locally_bound` is false on every path that reaches here:
+                // the early return above is unconditional now, so `miss` is
+                // only ever asked about a name no enclosing block binds.
+                let outcome = Self::miss(cfg, scope, segments, &walk, probe, &mut probed);
                 with_walk(outcome, &walk, probed)
             }
         }
@@ -2183,11 +2196,15 @@ mod tests {
 
     #[test]
     fn a_local_shadowing_a_builtin_does_not_leave_the_rate_as_external() {
-        // C-02, and the same anti-gaming property `resolve_name` protects when
-        // it refuses to call a dotted target `LocalBinding`: a reference whose
-        // root is a function-local must not leave *both* terms of the rate.
-        // `scope.bindings` is the module table and never holds a local, so the
-        // builtin fallback's guard could not see the shadowing on its own.
+        // C-02. `External` is a *claim*: this reference reaches a name in a
+        // namespace outside the repository. For `filter.apply()` where
+        // `filter` is a function-local that claim is simply false, and the
+        // builtin fallback's own guard could not see the shadowing —
+        // `scope.bindings` is the module table and never holds a local.
+        //
+        // The uniform root-binding rule answers it first and answers it
+        // correctly: the root *is* a local, so the row says so. Both reasons
+        // sit outside the rate; only one of them is true.
         let cfg = project(&["pkg"]);
         let shadowed = concat!(
             "def build_filter():\n",
@@ -2205,7 +2222,7 @@ mod tests {
                 &["pkg.mod#build_filter"],
                 "filter.apply"
             ),
-            UnresolvedReason::NeedsTypeInference
+            UnresolvedReason::LocalBinding
         );
         // The guard must stay narrow. A bare builtin nobody shadowed is still
         // a real name from a real namespace outside the repository.
@@ -2275,7 +2292,9 @@ mod tests {
         );
         // The guard that must survive: a *bare* function whose first parameter
         // happens to be called `self` binds an ordinary local, and claiming a
-        // receiver would name a class that does not exist.
+        // receiver would name a class that does not exist. It is a parameter,
+        // so under the root-binding rule the answer is `LocalBinding` — the
+        // load-bearing half is that it is emphatically *not* `pkg.mod#C.helper`.
         let bare = concat!(
             "def run(self):\n",
             "    def cb():\n",
@@ -2283,14 +2302,14 @@ mod tests {
             "    return cb()\n",
         );
         assert_eq!(
-            reason(
+            outcome_of(
                 &cfg,
                 "pkg/mod.py",
                 bare,
                 &["pkg.mod#C.helper"],
                 "self.helper"
             ),
-            UnresolvedReason::NeedsTypeInference
+            Outcome::Unresolved(UnresolvedReason::LocalBinding)
         );
         // The other direction, and the reason "outermost" is scoped to the
         // enclosing class: a method of a class declared *inside* a function is
@@ -2348,10 +2367,16 @@ mod tests {
     }
 
     #[test]
-    fn an_annotated_parameter_resolves_without_any_inference() {
-        // E-05, and emphatically not `NeedsTypeInference`.
+    fn an_annotation_types_a_module_level_name_but_not_a_parameter() {
+        // E-05, and where the root-binding rule draws the line through it.
+        //
+        // An annotated *parameter* is still a parameter: a non-node binding
+        // environment binds it, so the member of it is `LocalBinding` and
+        // leaves the rate. This is the largest single movement the uniform
+        // policy makes to any published number, and it moves the rate *up*,
+        // so it is written down as a test rather than left to a corpus count.
         let cfg = project(&["pkg"]);
-        let source = concat!(
+        let param = concat!(
             "class Client:\n",
             "    def send(self):\n",
             "        pass\n",
@@ -2363,7 +2388,31 @@ mod tests {
             outcome_of(
                 &cfg,
                 "pkg/mod.py",
-                source,
+                param,
+                &["pkg.mod#Client.send"],
+                "c.send"
+            ),
+            Outcome::Unresolved(UnresolvedReason::LocalBinding)
+        );
+        // A module top level *is* a node, so the annotation table is still
+        // read and still links — which is what keeps E-05 measured rather
+        // than quietly retired by the policy above. The reference sits in the
+        // same block as the annotation, which is the table's own rule
+        // (`AnnotatedName`): an annotation types a name in one block and says
+        // nothing about a same-spelled name in another.
+        let module_level = concat!(
+            "class Client:\n",
+            "    def send(self):\n",
+            "        pass\n",
+            "\n",
+            "c: Client\n",
+            "c.send()\n",
+        );
+        assert_eq!(
+            outcome_of(
+                &cfg,
+                "pkg/mod.py",
+                module_level,
                 &["pkg.mod#Client.send"],
                 "c.send"
             ),
@@ -2373,13 +2422,18 @@ mod tests {
 
     #[test]
     fn an_unannotated_receiver_is_the_only_thing_in_the_inference_bucket() {
-        // E-06/I.1.
+        // E-06/I.1. The receiver has to be a *node* for the bucket to be
+        // about inference at all: a module-level name nobody annotated is one,
+        // and its type is the fact nobody wrote down. A parameter is not —
+        // the root-binding rule answers that one before any candidate is
+        // generated, which is why this shape and not `def f(c)` is what the
+        // bucket now holds.
         let cfg = project(&["pkg"]);
         assert_eq!(
             reason(
                 &cfg,
                 "pkg/mod.py",
-                "def f(c):\n    c.send()\n",
+                "c = make()\n\ndef f():\n    c.send()\n",
                 &[],
                 "c.send"
             ),
@@ -2388,24 +2442,41 @@ mod tests {
     }
 
     #[test]
-    fn a_member_of_a_local_is_never_filed_as_a_local_binding() {
-        // The anti-gaming property, stated as a test: `LocalBinding` sits
-        // outside *both* rate terms, so routing `c.send()` there would raise
-        // the rate while linking nothing.
+    fn a_member_of_a_local_is_a_local_binding_at_any_depth() {
+        // The root-binding rule, stated as a test: nothing outside `f` can
+        // name `c`, so nothing outside `f` can name `c.send` or `c.x.send`
+        // either. Depth does not change what a reference reaches.
         let cfg = project(&["pkg"]);
         let outcomes = outcomes(
             &cfg,
             "pkg/mod.py",
-            "def f(c):\n    c.send()\n    c()\n",
+            "def f(c):\n    c.send()\n    c.x.send()\n    c()\n",
             &[],
         );
-        let member = outcomes.iter().find(|(t, _)| t == "c.send").unwrap();
-        let whole = outcomes.iter().find(|(t, _)| t == "c").unwrap();
+        let local = |t: &str| {
+            let hit = outcomes.iter().find(|(raw, _)| raw == t);
+            assert_eq!(
+                hit.map(|(_, o)| o.clone()),
+                Some(Outcome::Unresolved(UnresolvedReason::LocalBinding)),
+                "`{t}` is rooted at a parameter",
+            );
+        };
+        local("c");
+        local("c.send");
+        local("c.x.send");
+        // The anti-gaming half, and the reason the rule stops where it does:
+        // `LocalBinding` sits outside *both* rate terms, so a *node* rooted
+        // reference must never reach it. A module top level is a node.
         assert_eq!(
-            member.1,
-            Outcome::Unresolved(UnresolvedReason::NeedsTypeInference)
+            reason(
+                &cfg,
+                "pkg/mod.py",
+                "c = make()\n\ndef f():\n    c.send()\n",
+                &[],
+                "c.send"
+            ),
+            UnresolvedReason::NeedsTypeInference,
         );
-        assert_eq!(whole.1, Outcome::Unresolved(UnresolvedReason::LocalBinding));
     }
 
     #[test]

@@ -63,6 +63,62 @@ pub enum UnresolvedReason {
     /// Policy-caused, not a language-support failure: reported on its own
     /// line beside `External` and excluded from both terms of the resolution
     /// rate.
+    ///
+    /// # The root-binding rule
+    ///
+    /// One rule, and every track reads it the same way. A reference is a
+    /// `LocalBinding` **iff** its target root is a name
+    /// ([`model::TargetRoot::Name`]) and, at the reference's site, some
+    /// enclosing binding environment that is **not a node** binds
+    /// `target.segments[0]` in the declaration space that segment is looked up
+    /// in.
+    ///
+    /// A **non-node binding environment** is every scope strictly inside a
+    /// nameable definition: function, method, constructor, lambda, closure and
+    /// comprehension bodies and their parameter lists; receivers; named
+    /// results; catch and `except` parameters; pattern and `instanceof`
+    /// variables; type parameters; and any block nested in one. Plus the type
+    /// declarations a language gives no canonical name — JLS §6.7 local and
+    /// anonymous classes, a Go `type` inside a function body.
+    ///
+    /// It is **not** the module, package or namespace top level, nor a class,
+    /// struct, interface or object body. What those bind *is* a node, and
+    /// calling one local would delete a real reference from both rate terms.
+    ///
+    /// **Depth is irrelevant.** `x`, `x.y` and `x.y.z` are all `LocalBinding`
+    /// when `x` is bound locally: nothing outside the block can name the thing
+    /// a member of a local hangs off, so the member is no more a node than the
+    /// local is.
+    ///
+    /// **`this`, `super` and expression roots are never `LocalBinding`** — no
+    /// name is looked up, so no binding can shadow one. **A field is never
+    /// local**: a field is a node.
+    ///
+    /// Java has one further producer, and it is not a question about a bound
+    /// *name*: a member found on the frame of a class §6.7 gives no canonical
+    /// name is `LocalBinding` too, because the type hosting it is not a node.
+    /// It shares the line because it shares the reason.
+    ///
+    /// # Why uniform
+    ///
+    /// Because the rate is compared across languages. This was implemented
+    /// three different ways — Go and ECMA broadly, Java and Python only when
+    /// the *whole* target was the bound name, and structurally never in the
+    /// tier-2 tracks — so `f.m()` sat outside both rate terms in Go and inside
+    /// them in Java, and the two numbers were computed over differently-sized
+    /// denominators. A per-language rate that is not measured over the same
+    /// surface is not a comparison, and the gate exists to be compared.
+    ///
+    /// Visibility stays per language: Go's end-of-declaration position rule,
+    /// ECMA hoisting, Python's "position never matters", Java's §6.3 ranges
+    /// and §6.5.1 MethodName carve-out are each that language's own. The rule
+    /// above is uniform about which *positions* bind, not about how a track
+    /// computes scope.
+    ///
+    /// The 14 tier-2 tracks emit `Import` references only, and every one of
+    /// them reports zero here. That zero is load-bearing — it is what makes a
+    /// tier-2 rate impossible to raise by reclassification — and this rule is
+    /// a no-op there rather than an exemption from it.
     LocalBinding,
     /// `x.M()` where `x` has a declared or annotated type stated in this file
     /// and that type is in the repository. Declared-type lookup, not inference.

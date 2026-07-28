@@ -21,6 +21,56 @@ const GO_BUILTINS: &[&str] = &[
     "min", "new", "panic", "print", "println", "real", "recover",
 ];
 
+/// The universe-scope names a Go *type position* can write.
+///
+/// A separate list from [`GO_BUILTINS`] and not a merge of it, because the two
+/// answer different questions and one of them is a trap: `min` is a builtin
+/// function and is not a type, and a `type_identifier` reading `min` would be
+/// a type this repository failed to find rather than a link to the universe.
+///
+/// Both are probed at the same point — last, after the package's own
+/// declarations and its internal dot-imports — because the universe is the
+/// outermost scope and a package may legally declare `type rune …`.
+/// `any` and `comparable` are here: they are predeclared names, whatever
+/// `any`'s alias-hood says about its definition. So is `nil`, which is not a
+/// type but is the one other universe name a type position may hold — a
+/// TypeSwitchCase may be written `case nil:`, and the grammar hands that over
+/// as a `type_identifier` like any other. Answering it from the universe is
+/// what stops a legal switch arm from being filed as arthron's own bug.
+///
+/// The alternative was to leave them out of the extractor the way
+/// `rules/typescript.yml` leaves out `predefined_type`. TypeScript can: its
+/// grammar has a distinct node for `string` and `void`. Go's does not — `int`
+/// is a `type_identifier` and so is `Node` — so suppressing them by *name* in
+/// the extractor would silently delete a real reference from any package that
+/// declares its own, and the reference would be gone from the count rather
+/// than reported outside it.
+const GO_UNIVERSE_TYPES: &[&str] = &[
+    "any",
+    "bool",
+    "byte",
+    "comparable",
+    "complex64",
+    "complex128",
+    "error",
+    "float32",
+    "float64",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "nil",
+    "rune",
+    "string",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+];
+
 /// Go, as the shared driver sees it.
 pub struct GoLang;
 
@@ -407,10 +457,32 @@ impl GoResolver {
                     }
                 }
                 // Nothing in scope defines the name. The universe scope is
-                // the outermost one, so a builtin is the answer only after
-                // every candidate has been probed and missed — otherwise a
-                // package-level `min` could never resolve.
-                let outcome = if GO_BUILTINS.contains(&name.as_str()) {
+                // the outermost one, so a predeclared name is the answer only
+                // after every candidate has been probed and missed —
+                // otherwise a package-level `min`, or a package-level
+                // `type rune …`, could never resolve.
+                //
+                // Which list answers depends on what the site wrote, and the
+                // grammar has already decided that: a `type_identifier` is a
+                // `TypeUse` and can only name a predeclared *type*, while
+                // everything reaching here from `ref-call` named a value.
+                // Merging the two lists would answer `min` — a builtin
+                // function — for a written type, which is not a type in any
+                // Go program.
+                //
+                // The split leaves one shape unimproved and says so rather
+                // than quietly widening: `int(x)` is a conversion the grammar
+                // routes through `call_expression`, so it arrives here as a
+                // `Call`, misses `GO_BUILTINS`, and is still
+                // `NoMatchingDefinition`. That was its answer before type
+                // uses existed and is a separate piece of work — teaching the
+                // resolver which single-argument calls are conversions —
+                // rather than something this list can fix by growing.
+                let universe = match r.kind {
+                    RefKind::TypeUse => GO_UNIVERSE_TYPES,
+                    _ => GO_BUILTINS,
+                };
+                let outcome = if universe.contains(&name.as_str()) {
                     Outcome::External("go:builtin".to_string())
                 } else {
                     Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)

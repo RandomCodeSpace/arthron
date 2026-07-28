@@ -174,20 +174,44 @@ fn short_declares(node: &SgNode) -> bool {
     node.children().any(|c| c.kind() == ":=")
 }
 
-/// Whether a `var_spec` / `const_spec` / `type_spec` declares `name`.
+/// Whether a `var_spec` / `const_spec` / `type_spec` / `type_alias` declares
+/// `name`.
 fn spec_binds(spec: &SgNode, name: &str) -> bool {
     let is_it =
         |n: &SgNode| matches!(&*n.kind(), "identifier" | "type_identifier") && n.text() == name;
     spec.field_children("name").any(|n| is_it(&n)) || spec.field("name").is_some_and(|n| is_it(&n))
 }
 
-/// Whether a statement in a block or case clause declares `name`.
-fn statement_binds(stmt: &SgNode, name: &str) -> bool {
+/// The spec kinds a `type_declaration` is built from. `type_alias` does not
+/// end in `_spec`, and a generic alias declares a name like any other.
+fn is_type_spec(kind: &str) -> bool {
+    matches!(kind, "type_spec" | "type_alias")
+}
+
+/// Whether a statement in a block or case clause declares `name` visibly at
+/// `site`.
+///
+/// Go gives values and types *different* starting points, and the difference
+/// is observable. "The scope of a constant or variable identifier declared
+/// inside a function begins at the end of the ConstSpec or VarSpec" — so
+/// `x := x()` names the outer `x`. "The scope of a type identifier declared
+/// inside a function begins at the identifier in the TypeSpec" — so
+/// `type ring struct{ next *ring }` names *itself*, and reading the value rule
+/// here would report that field as a package-level type that does not exist.
+fn statement_binds(stmt: &SgNode, name: &str, site: usize) -> bool {
     match &*stmt.kind() {
-        "short_var_declaration" => declares(stmt, name),
-        "var_declaration" | "const_declaration" | "type_declaration" => stmt
-            .children()
-            .any(|spec| spec.kind().ends_with("_spec") && spec_binds(&spec, name)),
+        "short_var_declaration" => stmt.range().end <= site && declares(stmt, name),
+        "var_declaration" | "const_declaration" => {
+            stmt.range().end <= site
+                && stmt
+                    .children()
+                    .any(|spec| spec.kind().ends_with("_spec") && spec_binds(&spec, name))
+        }
+        "type_declaration" => stmt.children().any(|spec| {
+            is_type_spec(&spec.kind())
+                && spec_binds(&spec, name)
+                && spec.field("name").is_some_and(|n| n.range().start <= site)
+        }),
         _ => false,
     }
 }
@@ -270,6 +294,44 @@ fn signature_binds(func: &SgNode, name: &str) -> bool {
     false
 }
 
+/// Whether a node's own `type_parameter_list` declares `name`.
+///
+/// Hung off functions, methods *and* type declarations, which is why this is
+/// separate from [`signature_binds`]: `type Box[T any] struct{ v T }` binds
+/// `T` in its own body at package level, where there is no enclosing function
+/// for the block walk to gate on. A type parameter's name is an `identifier`
+/// in this grammar, not a `type_identifier` — the constraint beside it is the
+/// `type_identifier`, and that one really is a reference.
+fn type_parameters_bind(node: &SgNode, name: &str) -> bool {
+    node.children()
+        .filter(|c| c.kind() == "type_parameter_list")
+        .any(|list| {
+            list.children()
+                .filter(|d| d.kind() == "type_parameter_declaration")
+                .any(|d| {
+                    d.children()
+                        .any(|n| n.kind() == "identifier" && n.text() == name)
+                })
+        })
+}
+
+/// Whether a method's *receiver* re-declares `name` as a type parameter.
+///
+/// `func (b *Box[T]) Get() T` writes `T` twice, and only the second is a
+/// reference: the receiver's type arguments declare the method's type
+/// parameters. Without this the result `T` would be reported
+/// `NoMatchingDefinition` — the bucket reserved for arthron's own bugs.
+fn receiver_type_parameters_bind(func: &SgNode, name: &str) -> bool {
+    let Some(receiver) = func.field("receiver") else {
+        return false;
+    };
+    receiver.dfs().any(|n| {
+        n.kind() == "type_arguments"
+            && n.dfs()
+                .any(|t| t.kind() == "type_identifier" && t.text() == name)
+    })
+}
+
 /// Whether some enclosing binder in this file binds `name` at this site.
 ///
 /// A *file-local verdict*, and the whole of it: every Go binder for a value
@@ -293,17 +355,28 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
     for ancestor in node.ancestors() {
         match &*ancestor.kind() {
             "function_declaration" | "method_declaration" | "func_literal" => {
-                if signature_binds(&ancestor, name) {
+                if signature_binds(&ancestor, name)
+                    || type_parameters_bind(&ancestor, name)
+                    || receiver_type_parameters_bind(&ancestor, name)
+                {
                     return true;
                 }
                 in_function = true;
             }
-            // Statements of a block, a case clause or a select clause.
+            // A generic type declaration is the one binder that is *not*
+            // inside a function: `type Box[T any] struct{ v T }` binds `T`
+            // over its own body at package level, so the `in_function` gate
+            // below would never let it through.
+            "type_spec" | "type_alias" => {
+                if type_parameters_bind(&ancestor, name) {
+                    return true;
+                }
+            }
+            // Statements of a block, a case clause or a select clause. The
+            // position rule lives in `statement_binds`, because values and
+            // types do not share one.
             "statement_list" => {
-                bound = bound
-                    || ancestor
-                        .children()
-                        .any(|s| s.range().end <= site && statement_binds(&s, name));
+                bound = bound || ancestor.children().any(|s| statement_binds(&s, name, site));
             }
             _ => bound = bound || header_binds(&ancestor, name, site),
         }
@@ -312,6 +385,67 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a `type_identifier` *declares* the name it writes rather than
+/// naming one.
+///
+/// Two positions do. A `type_spec` or `type_alias` `name` field is the
+/// declaration itself — and only the `name` field, because `type A = B`
+/// writes both halves as `type_identifier` and dropping `B` would delete a
+/// real reference. And a method receiver's type arguments re-declare the
+/// receiver type's parameters: in `func (b *Box[R]) Get() R` the first `R`
+/// binds and the second names.
+fn declares_its_own_name(node: &SgNode) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if is_type_spec(&parent.kind())
+        && parent
+            .field("name")
+            .is_some_and(|n| n.range() == node.range())
+    {
+        return true;
+    }
+    let mut in_type_arguments = false;
+    for a in node.ancestors() {
+        match &*a.kind() {
+            "type_arguments" => in_type_arguments = true,
+            "parameter_list" => {
+                return in_type_arguments
+                    && a.parent().is_some_and(|p| {
+                        p.kind() == "method_declaration"
+                            && p.field("receiver").is_some_and(|r| r.range() == a.range())
+                    });
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The site a `type_identifier` reference is written at, and its shape.
+///
+/// A `qualified_type` writes its package as a `package_identifier` and its
+/// member as the `type_identifier` this is called on, so the *qualified node*
+/// is the site: one reference for `pkg.T`, two segments, and the same shape a
+/// two-segment call already has. Everything else is one segment.
+fn type_use_site<'r>(node: &SgNode<'r>) -> (SgNode<'r>, RefTarget) {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "qualified_type"
+        && let Some(package) = parent.field("package")
+    {
+        let target = RefTarget {
+            root: TargetRoot::Name,
+            segments: vec![package.text().to_string(), node.text().to_string()],
+        };
+        return (parent, target);
+    }
+    let target = RefTarget {
+        root: TargetRoot::Name,
+        segments: vec![node.text().to_string()],
+    };
+    (node.clone(), target)
 }
 
 /// The number of arguments at a call site.
@@ -472,6 +606,31 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     argc: argument_count(&node),
                     enclosing: enclosing_definition(&node),
                     span: span_of(&node),
+                });
+            }
+            "ref-type" => {
+                if declares_its_own_name(&node) {
+                    continue;
+                }
+                let (site, target) = type_use_site(&node);
+                // Only the *root* of the chain can be bound, exactly as at a
+                // call site: `T` is a type parameter or a function-local
+                // `type`, and `pkg.T` is rooted at an import.
+                let locally_bound = match target.segments.first() {
+                    Some(root) => is_locally_bound(&site, root),
+                    None => false,
+                };
+                refs.push(Reference {
+                    kind: RefKind::TypeUse,
+                    // Go declares types and values in one namespace, so a type
+                    // consults the same table a call does.
+                    space: DeclSpace::Value,
+                    raw_target: site.text().to_string(),
+                    target,
+                    locally_bound,
+                    argc: None,
+                    enclosing: enclosing_definition(&site),
+                    span: span_of(&site),
                 });
             }
             _ => {}

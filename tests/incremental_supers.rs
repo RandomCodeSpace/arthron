@@ -113,9 +113,15 @@ public class Other {
 }
 "#;
 
+// The receiver is a field. A field is a node, so `m.top()` stays inside both
+// terms of the resolution rate and the supertype relation is what decides it;
+// a parameter would be answered `LocalBinding` by the uniform root-binding
+// rule on `arthron::UnresolvedReason::LocalBinding` before any hierarchy walk
+// ran, and this file would then measure the policy rather than invalidation.
 const USE: &str = r#"package com.acme;
 public class Use {
-    void go(Mid m) {
+    Mid m;
+    void go() {
         m.top();
     }
 }

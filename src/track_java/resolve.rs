@@ -1990,22 +1990,29 @@ impl Resolver<JavaLang> for JavaResolver {
             table: probe,
             seen: Vec::new(),
         };
-        // A reference whose *target* is the bound name itself: a type
-        // parameter (§4.4), a local class (§14.3), or the constructor of one.
-        // None is a node, so linking it would be a wrong edge.
+        // The uniform root-binding rule, written down on
+        // [`UnresolvedReason::LocalBinding`] and read the same way by all four
+        // tier-1 tracks: a reference whose leftmost segment some enclosing
+        // *non-node* region binds is a `LocalBinding`, however long the member
+        // path after it — `T`, a local class, `f.m()` and `f.x.y` alike.
         //
-        // A receiver that happens to be a local is deliberately *not* here:
-        // `f.m()` names `m`, which is a node, and X-02 is the whole reason the
-        // extractor states `f`'s declared type. Reading `locally_bound` the
-        // way Go does would delete most Java calls from both terms of the
-        // resolution rate and raise the number without linking anything.
-        if r.locally_bound
-            && r.target.segments.len() == 1
-            && matches!(
-                r.kind,
-                RefKind::TypeUse | RefKind::Inherit | RefKind::Annotation | RefKind::New
-            )
-        {
+        // Depth used to matter here, and that was the divergence this closes.
+        // `f.m()` was answered by X-02's declared-type lookup and counted as
+        // `resolved`, while Go, TypeScript and JavaScript had already taken
+        // the identical shape out of both rate terms — so Java's rate and
+        // Go's were computed over differently-sized denominators and could
+        // not be compared. That is the harm, and it is not cosmetic: a member
+        // of a local is not nameable from outside its block either, so X-02
+        // was measuring a smaller surface than its number implied.
+        //
+        // Two things this deliberately is not. A *field* is a node
+        // (`BindingKind::is_local` is false for one), so `field.m()` still
+        // resolves through the declared-type lookup; and §6.5.1 makes a bare
+        // `foo()` a MethodName no local can shadow, which the extractor
+        // answers before the flag is ever set. Both are visibility questions,
+        // and visibility stays per language: the policy is uniform about
+        // which *positions* bind, not about how each language computes scope.
+        if r.locally_bound {
             return Resolution {
                 outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
                 candidates: Vec::new(),
