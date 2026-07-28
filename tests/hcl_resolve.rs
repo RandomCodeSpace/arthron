@@ -202,6 +202,88 @@ fn an_address_that_is_no_package_and_no_path_counts_against_the_rate() {
 }
 
 #[test]
+fn a_package_address_shadowing_a_real_directory_counts_against_the_rate() {
+    // The shape the grammar alone cannot settle. `modules/network/vpc` is a
+    // valid registry address — `<namespace>/<name>/<provider>`, three bare
+    // words — and an ordinary in-repository layout spelled identically. When
+    // the directory is there the text is one dropped `./` from a reference
+    // this repository wrote, and `External` would carry it out of both terms
+    // of the rate; the answer that costs the rate is the only one that
+    // cannot launder a miss.
+    let got = only(
+        "main.tf",
+        "modules/network/vpc",
+        &["", "modules/network/vpc"],
+    );
+    assert_eq!(reason(&got), Some(&ModuleNotFound), "{got:?}");
+    // Relative to the file that wrote it, exactly as a local path is — a
+    // directory of that name elsewhere in the tree shadows nothing.
+    let got = only(
+        "examples/complete/main.tf",
+        "modules/network/vpc",
+        &[
+            "",
+            "examples/complete",
+            "examples/complete/modules/network/vpc",
+        ],
+    );
+    assert_eq!(reason(&got), Some(&ModuleNotFound), "{got:?}");
+    let got = only(
+        "examples/complete/main.tf",
+        "modules/network/vpc",
+        &["", "modules/network/vpc"],
+    );
+    assert_eq!(
+        got,
+        Outcome::External("modules/network/vpc".to_string()),
+        "a directory the caller cannot reach shadows nothing: {got:?}",
+    );
+}
+
+#[test]
+fn a_genuine_registry_address_stays_external_beside_a_full_directory_table() {
+    // The guard must not cost the corpus its one honest `External` row: the
+    // shadow is a directory that is really there, not any name that rhymes.
+    let got = only(
+        "examples/flow-log/main.tf",
+        "terraform-aws-modules/s3-bucket/aws",
+        &[
+            "",
+            "examples/flow-log",
+            "modules/flow-log",
+            "modules/vpc-endpoints",
+        ],
+    );
+    assert_eq!(
+        got,
+        Outcome::External("terraform-aws-modules/s3-bucket/aws".to_string()),
+        "{got:?}",
+    );
+}
+
+#[test]
+fn four_bare_words_are_no_address_and_never_external() {
+    // Terraform's four-segment form is `<host>/<namespace>/<name>/<provider>`
+    // and a host holds a dot or a port. Without that test the `External`
+    // bucket — the one that sits outside both terms of the rate — widens for
+    // any four-segment string at all.
+    for spec in [
+        "a/b/c/d",
+        "modules/team/network/vpc",
+        "localhost/corp/vpc/aws",
+    ] {
+        let got = only("main.tf", spec, &[""]);
+        assert_eq!(reason(&got), Some(&ModuleNotFound), "{spec}: {got:?}");
+    }
+    let got = only("main.tf", "app.terraform.io/example-corp/vpc/aws", &[""]);
+    assert_eq!(
+        got,
+        Outcome::External("app.terraform.io/example-corp/vpc/aws".to_string()),
+        "a real host in front is still a real address: {got:?}",
+    );
+}
+
+#[test]
 fn an_empty_literal_names_no_module() {
     let got = only("main.tf", "", &[""]);
     assert_eq!(reason(&got), Some(&ModuleNotFound), "{got:?}");

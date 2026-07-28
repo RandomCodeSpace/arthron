@@ -39,13 +39,24 @@
 //!
 //! - **`terraform { required_providers { … } }` is not an import.** Its
 //!   `source` sits in the same syntactic position as a module's and names a
-//!   different namespace — a *provider* registry address, which is never a
-//!   directory and never in this repository. Emitting it would add one
-//!   guaranteed [`crate::Outcome::External`] row per `versions.tf`, sixteen
-//!   in this corpus, to the bucket that sits outside both terms of the
-//!   resolution rate and can therefore only ever be inflated. HCL has no
-//!   dependency manifest separate from its source, so this is the manifest
-//!   half of the file, and it is read by nothing here.
+//!   different namespace — a *provider* registry address such as
+//!   `hashicorp/aws`, which is never a directory and never in this
+//!   repository. The resolver beside this file indexes directories and
+//!   grades module sources; a provider address is not a question it can
+//!   answer, and that namespace mismatch is the whole of the reason.
+//!   Measured rather than assumed, because the direction matters: a provider
+//!   address is two slash-segments and the module resolver's package grammar
+//!   accepts three or four, so each of the sixteen `versions.tf` files would
+//!   contribute one [`crate::UnresolvedReason::ModuleNotFound`] *inside* the
+//!   denominator, not one [`crate::Outcome::External`] row outside it — 23
+//!   resolved of 39, and the gated rate would read 59.0% instead of 100.0%.
+//!   So this refusal is the direction that flatters the rate, and it is
+//!   taken on the namespace ground alone; recorded plainly here, because a
+//!   rejected alternative whose stated reason points the other way is worse
+//!   than none. A track that wants providers owes them a provider-address
+//!   grammar and a bucket of their own, not a pass through this resolver.
+//!   HCL has no dependency manifest separate from its source, so this is the
+//!   manifest half of the file, and it is read by nothing here.
 //! - **`provider "aws" { … }` declares no node.** A provider configuration is
 //!   addressed `aws.alias` from a `provider =` meta-argument, which is
 //!   expression-level. The block is structure.

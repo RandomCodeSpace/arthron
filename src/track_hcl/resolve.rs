@@ -41,6 +41,19 @@
 //! `external` count is a baseline field besides, so any drift in it fails the
 //! gate and has to be re-based deliberately.
 //!
+//! The grammar settles most of it and there is exactly one shape it cannot.
+//! A registry address is `<namespace>/<name>/<provider>` — three bare words
+//! separated by slashes — and `modules/network/vpc` is an ordinary
+//! in-repository Terraform layout spelled identically. No reading of the
+//! text separates them, so the text is not asked twice: the resolver probes
+//! the directory the calling file would reach, and **a package address that
+//! shadows a directory this repository really has is
+//! [`crate::UnresolvedReason::ModuleNotFound`]**. One dropped `./` on a real
+//! in-repository module is then a miss that counts, not a row that leaves
+//! the measurement — which is the same principle as the paragraph above,
+//! applied at the one place the grammar runs out. The probe can only ever
+//! move a reference *into* the denominator, so it cannot lift a rate.
+//!
 //! # Why a local miss is `ModuleNotFound` and never `UnknownPackage`
 //!
 //! A local path names this repository by construction — it is relative to a
@@ -65,6 +78,12 @@
 //!   package address either, so it lands in `ModuleNotFound`. That is the
 //!   conservative direction: the corpus writes `../..` and `../../`, both of
 //!   which begin with `../`.
+//! - **A registry host is recognised by a dot or a port.** Terraform's
+//!   four-segment form is `<host>/<namespace>/<name>/<provider>`, and this
+//!   track reads the leading segment as a host only when it holds a `.` or a
+//!   `:`. A private registry served from a bare `localhost` is therefore
+//!   `ModuleNotFound` rather than `External` — the conservative direction,
+//!   and no such address is in the corpus.
 //! - **A sub-directory of a remote package** — `ns/name/provider//modules/x`
 //!   — is external under the package part alone. What the sub-directory holds
 //!   is inside somebody else's package and is not a node this graph has.
@@ -135,8 +154,39 @@ fn remote_package(spec: &str) -> Option<&str> {
     // a host in front, which is also the shape of the GitHub and Bitbucket
     // shorthands.
     let parts: Vec<&str> = package.split('/').collect();
-    let registry = matches!(parts.len(), 3 | 4) && parts.iter().all(|part| !part.is_empty());
-    registry.then_some(package)
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    match parts.len() {
+        3 => Some(package),
+        4 if is_host(parts[0]) => Some(package),
+        _ => None,
+    }
+}
+
+/// Whether a four-segment address's leading part can be the registry
+/// *hostname* Terraform's grammar requires there.
+///
+/// A host is a domain, optionally with a port; a registry namespace may hold
+/// neither a dot nor a colon. Without the test `a/b/c/d` — four bare words,
+/// no address Terraform can fetch — would be `External`, which widens the
+/// one bucket that sits outside both terms of the rate. A dotless, portless
+/// host such as a bare `localhost` is refused along with it: that costs the
+/// rate rather than widening `External`, which is the direction this module
+/// takes wherever it has a choice.
+fn is_host(segment: &str) -> bool {
+    segment.contains('.') || segment.contains(':')
+}
+
+/// The container this repository really has under a source that Terraform's
+/// grammar calls a package, if there is one.
+///
+/// The one ambiguity rule 2's grammar cannot settle; see the module docs.
+/// Returns the node so the miss still records what it probed.
+fn local_shadow(scope: &HclScope, spec: &str, probe: &dyn SymbolProbe) -> Option<NodeId> {
+    let dir = join_dir(&scope.dir, spec)?;
+    let id = node_id(Domain::Hcl, &module_fqn(&dir));
+    probe.probe(&id).is_some().then_some(id)
 }
 
 /// Where a source address's `//<subdir>` suffix starts, if it has one.
@@ -175,10 +225,18 @@ impl HclResolver {
             };
         }
         match remote_package(spec) {
-            // Rule 2.
-            Some(package) => Resolution {
-                outcome: Outcome::External(package.to_string()),
-                candidates: Vec::new(),
+            // Rule 2, with the one shape its grammar cannot settle decided
+            // against the rate: an address that also names a directory this
+            // repository has is a dropped `./`, and a miss that counts.
+            Some(package) => match local_shadow(scope, spec, probe) {
+                Some(id) => Resolution {
+                    outcome: Outcome::Unresolved(UnresolvedReason::ModuleNotFound),
+                    candidates: vec![id],
+                },
+                None => Resolution {
+                    outcome: Outcome::External(package.to_string()),
+                    candidates: Vec::new(),
+                },
             },
             // Neither a path Terraform reads nor a package it fetches.
             None => unresolved(UnresolvedReason::ModuleNotFound),
@@ -366,6 +424,19 @@ mod tests {
     }
 
     #[test]
+    fn a_four_segment_address_needs_a_host_in_front() {
+        // `<host>/<namespace>/<name>/<provider>`: a host holds a dot or a
+        // port and a namespace holds neither, so four bare words are no
+        // address Terraform can fetch and must not widen `External`.
+        assert!(is_host("app.terraform.io"));
+        assert!(is_host("registry.terraform.io"));
+        assert!(is_host("example.com:8443"));
+        assert!(!is_host("a"));
+        assert!(!is_host("localhost"));
+        assert!(!is_host("terraform-aws-modules"));
+    }
+
+    #[test]
     fn only_an_address_terraform_can_fetch_is_a_package() {
         for package in [
             "terraform-aws-modules/s3-bucket/aws",
@@ -391,6 +462,11 @@ mod tests {
             "a//b",
             "..",
             "/abs/path",
+            // Four segments with no host in front: not an address, and
+            // `External` is the one bucket a wrong answer here would widen.
+            "a/b/c/d",
+            "modules/team/network/vpc",
+            "localhost/example-corp/vpc/aws",
         ] {
             assert_eq!(remote_package(neither), None, "{neither}");
         }
