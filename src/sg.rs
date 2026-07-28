@@ -119,6 +119,17 @@ impl SourceTree {
         Self::parse(SupportLang::Kotlin, source)
     }
 
+    /// Parse Bash source — `.sh` and `.bash` alike.
+    ///
+    /// One grammar for both: the extension records what a repository calls a
+    /// script and what it calls a sourced library, not which dialect it is
+    /// written in. `.bats` is **not** parsed here and is not claimed by the
+    /// language: the shell grammar does not reject a `@test "name" { … }`
+    /// block, it misreads one — see [`crate::model::Lang::extensions`].
+    pub fn parse_bash(source: &str) -> Self {
+        Self::parse(SupportLang::Bash, source)
+    }
+
     /// Parse Scala source.
     ///
     /// One grammar for every dialect: Scala 2 and Scala 3 differ in surface
@@ -127,6 +138,70 @@ impl SourceTree {
     /// repository that cross-builds writes both in one tree.
     pub fn parse_scala(source: &str) -> Self {
         Self::parse(SupportLang::Scala, source)
+    }
+
+    /// Parse Swift source.
+    ///
+    /// One grammar for every `.swift` file, a SwiftPM manifest included: a
+    /// `Package.swift` is an ordinary Swift program that the package manager
+    /// runs, not a configuration dialect, and reading it under a second
+    /// parser would be inventing a language the toolchain does not have.
+    pub fn parse_swift(source: &str) -> Self {
+        Self::parse(SupportLang::Swift, source)
+    }
+
+    /// Parse C++ source.
+    ///
+    /// One grammar for every extension [`crate::model::Lang::Cpp`] claims.
+    /// `.c` and `.h` are deliberately not among them — a C translation unit
+    /// read under the C++ grammar is the wrong language — so nothing here
+    /// has to guess which dialect a file is written in.
+    pub fn parse_cpp(source: &str) -> Self {
+        Self::parse(SupportLang::Cpp, source)
+    }
+
+    /// Parse HCL source.
+    ///
+    /// One grammar for every HCL dialect the extension list claims — today
+    /// only `.tf`. The grammar reads a Terraform configuration as a flat
+    /// sequence of `block`s and `attribute`s and knows nothing about which
+    /// block types Terraform gives meaning to, which is why every such
+    /// judgement is the extractor's and none of it is here.
+    pub fn parse_hcl(source: &str) -> Self {
+        Self::parse(SupportLang::Hcl, source)
+    }
+
+    /// Parse Lua source.
+    ///
+    /// One grammar for every dialect: LuaJIT and PUC Lua 5.1 through 5.4
+    /// differ in library surface and in `goto`/integer-division spellings the
+    /// same tree-sitter grammar reads, and a repository that supports several
+    /// runtimes writes them in one tree. A rockspec is Lua too — it is a
+    /// chunk of assignments — and phase 0 parses it with this same function
+    /// rather than pattern-matching its bytes.
+    pub fn parse_lua(source: &str) -> Self {
+        Self::parse(SupportLang::Lua, source)
+    }
+
+    /// Parse a YAML document.
+    ///
+    /// Not a source language and not claimed by any track: `pubspec.yaml` is
+    /// Dart's manifest, and phase 0 reads it with the grammar its own format
+    /// has rather than with a line scanner. No walk ever reaches a `.yaml`
+    /// file — [`crate::model::Lang::for_extension`] answers `None` for it —
+    /// so this parses a manifest a resolver names explicitly and nothing
+    /// else.
+    pub fn parse_yaml(source: &str) -> Self {
+        Self::parse(SupportLang::Yaml, source)
+    }
+
+    /// Parse Dart source.
+    ///
+    /// One grammar for every `.dart` file: Dart has no dialects, and a
+    /// library, a `part` file and a test are the same language read the same
+    /// way — only the walk decides which of them a scan reads.
+    pub fn parse_dart(source: &str) -> Self {
+        Self::parse(SupportLang::Dart, source)
     }
 
     /// Parse Haskell source.
@@ -333,6 +408,95 @@ rule:
         }
     }
 
+    /// Bash, which [`one_match`] cannot check the same way for the second
+    /// form: tree-sitter-bash names the `name` field on a
+    /// `function_definition` written either way, but `function f { … }` and
+    /// `f() { … }` are two spellings the grammar must both reach.
+    #[test]
+    fn parses_bash() {
+        let yaml = "id: t\nlanguage: bash\nrule:\n  kind: function_definition\n";
+        one_match(
+            &SourceTree::parse_bash("hi() {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
+        // The `function` keyword form, with and without parentheses.
+        one_match(
+            &SourceTree::parse_bash("function hi {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
+    }
+
+    /// Lua, which [`one_match`] cannot check the same way for every shape:
+    /// tree-sitter-lua names a `name` field on a function declaration, but
+    /// the name of `function M.foo()` is a `dot_index_expression` rather than
+    /// an identifier. The point of the test is the same one every grammar
+    /// check here makes — the grammar is compiled into this build at all.
+    #[test]
+    fn parses_lua() {
+        one_match(
+            &SourceTree::parse_lua("local function hi() end\n"),
+            "id: t\nlanguage: lua\nrule:\n  kind: function_declaration\n",
+            "function_declaration",
+            "hi",
+        );
+    }
+
+    /// HCL, which [`one_match`] cannot check: tree-sitter-hcl names no `name`
+    /// field on a block — the block type and its labels are positional
+    /// children — so the block type is the first `identifier` and every label
+    /// after it is a `string_lit` or a bare `identifier`. The point of the
+    /// test is the same as every other one here: the grammar is compiled into
+    /// this build, and a missing one would match nothing.
+    #[test]
+    fn parses_hcl() {
+        let rules =
+            Rules::compile("id: t\nlanguage: hcl\nrule:\n  kind: block\n").expect("rules compile");
+        let tree = SourceTree::parse_hcl("resource \"aws_vpc\" \"this\" {\n  cidr = 1\n}\n");
+        let found = tree.matches(&rules);
+        assert_eq!(found.len(), 1, "expected one block");
+        let (_, node) = &found[0];
+        assert_eq!(node.kind(), "block");
+        let head: Vec<String> = node
+            .children()
+            .take_while(|c| c.kind() != "block_start")
+            .map(|c| c.text().to_string())
+            .collect();
+        assert_eq!(head, ["resource", "\"aws_vpc\"", "\"this\""]);
+    }
+
+    #[test]
+    fn parses_dart() {
+        one_match(
+            &SourceTree::parse_dart("class Greeter { void hi() {} }\n"),
+            "id: t\nlanguage: dart\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    /// YAML, which no track claims and one reads: Dart's `pubspec.yaml` is
+    /// parsed with the grammar its own format has rather than with a line
+    /// scanner, and this is what notices if that grammar ever stops being
+    /// compiled in.
+    #[test]
+    fn parses_yaml() {
+        let rules = Rules::compile("id: t\nlanguage: yaml\nrule:\n  kind: block_mapping_pair\n")
+            .expect("rules compile");
+        let tree = SourceTree::parse_yaml("name: collection\ndev_dependencies:\n  test: any\n");
+        let found = tree.matches(&rules);
+        assert_eq!(found.len(), 3, "two top-level pairs and one nested");
+        let (_, node) = &found[0];
+        assert_eq!(node.field("key").expect("a pair has a key").text(), "name");
+        assert_eq!(
+            node.field("value").expect("a pair has a value").text(),
+            "collection",
+        );
+    }
+
     /// Haskell, which [`one_match`] cannot check the same way: a declaration's
     /// `name` field is a `name` node rather than an identifier, and the file's
     /// module header is a `header` rather than a declaration. The point of the
@@ -386,6 +550,26 @@ rule:
             "id: t\nlanguage: scala\nrule:\n  kind: class_definition\n",
             "class_definition",
             "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_swift() {
+        one_match(
+            &SourceTree::parse_swift("class Greeter { func hi() {} }\n"),
+            "id: t\nlanguage: swift\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_cpp() {
+        one_match(
+            &SourceTree::parse_cpp("namespace fmt { }\n"),
+            "id: t\nlanguage: cpp\nrule:\n  kind: namespace_definition\n",
+            "namespace_definition",
+            "fmt",
         );
     }
 }

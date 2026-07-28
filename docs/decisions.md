@@ -4,6 +4,74 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-27 — Batch 2 tier-2 tracks: C# 100.0%, Kotlin 89.5%, Scala 42.3%; the gate learns to see a dropped reference
+
+| language | corpus | resolved | external | unresolved | rate |
+|---|---|---|---|---|---|
+| C# | serilog 6d9fc0b | 53 | 36 | 0 | **100.0%** |
+| Kotlin | okio 6604edb | 683 | 1,136 | 80 | **89.5%** |
+| Scala | upickle 87e0b24 | 267 | 0 | 364 | **42.3%** |
+
+The spread is the import models, not the tracks. Serilog resolves through
+three `GlobalUsings.cs` files and SDK implicit usings, so its per-file `using`
+surface is tiny and fully in-repo. okio's 1,136 external imports are the
+multiplatform stdlib surface. upickle's 42.3% is an honest floor:
+`UnknownPackage 309` — without reading `build.mill`'s dependency list the
+resolver cannot tell an external package from a mistyped in-repo one, so it
+refuses to guess `External`; reading the build definition is the recorded
+promotion path.
+
+**The core change this batch forced (landed as its own PR per the
+frozen-core rule): the gate refuses a shrinking denominator.** The C#
+review noticed that at a 100% baseline a *dropped* `Resolved` row was
+invisible to the gate, and at any baseline a dropped `Unresolved` row read
+as an improvement — rack's 291/50 drifting to 291/49 passed. The gate now
+fails with `denominator_shrank` when measured `resolved + unresolved` falls
+below the baseline's; growth stays legal. This also mechanically enforces
+the capability re-base rule: a landing that reclassifies `Unresolved` →
+`External` must re-base, not compare.
+
+**The batch-1 laundering shape recurred and is now a named class.** Nested
+`namespace Alpha { namespace Beta { … } }` declared `Beta`, not
+`Alpha.Beta`, so a `using` of an in-repo namespace was classified
+`External` — the resolver's own bug landing outside both rate terms. Fixed
+with namespace composition; the census caught two more C# grammar
+surprises (tree-sitter flattens `params` parameters; `using static`
+scoping) that count-based tests would have slept through.
+
+---
+
+## 2026-07-27 — Wave 3: the RSS ceiling holds — 729 MiB becomes 337 MiB
+
+The robustness wave closed the benchmark entry's hard-gate failure.
+Kubernetes (1,789,247 lines) cold-scan peak RSS: **729.0 MiB → 337.1 MiB**,
+66% of the 512 MB ceiling, six runs spanning 0.2%. No timing regression
+(~17 s per 1M lines against the 60 s target); warm RSS improved 13%.
+
+**What was corpus-sized:** the whole-event redb write transaction (+236 MB
+at peak — redb holds a transaction's dirty pages until commit), redb's
+default 1 GiB page cache (against a 257 MB store nothing was ever evicted,
+so the floor became the database's size), and phase-2 batches that borrowed
+the entire extracted-fact set. **What bounds it now:** every phase commits
+per 500 files (the design doc's measured 60 ms/500-file figure), the cache
+is capped at 96 MiB on both open paths, and phase 2 consumes facts per
+file. Java's marginal slope fell 2.38 → 0.74 kB/line, moving its projected
+ceiling crossing from ~264k to ~658k lines.
+
+**Byte-identity was proven at graph level, not tally level:** pre- and
+post-change binaries scanned five corpora into separate stores and every
+blake3 digest of the full snapshot — files, nodes, rows, edges, candidates,
+supertypes — matched.
+
+Also landed: a held store is refused by name instead of deadlocking (both
+open paths, bounded tests); unreadable and undecodable files are reported
+per file, never dropped and never fatal; a stepped-over file loses its
+currency claim; an absent root fails cleanly.
+*Rejected:* chasing the 1 s warm target in this wave (warm cost is per-file
+re-read and re-hash, orthogonal to batching); raising the ceiling.
+
+---
+
 ## 2026-07-27 — First tier-2 tracks live: Rust 98.0%, Ruby 85.3%, PHP 67.9%
 
 Three tracks landed in parallel from one batch, each measured against its

@@ -18,7 +18,7 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Fourteen cold scans of real repositories. Generous, but bounded: a hung
+    # Seventeen cold scans of real repositories. Generous, but bounded: a hung
     # scan must not sit on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
@@ -112,3 +112,12 @@ jobs:
 
       - name: Gate php / guzzle
         run: ./target/release/arthron gate corpus/php/guzzle --language php --baseline baselines/php-guzzle.toml
+
+      - name: Gate csharp / serilog
+        run: ./target/release/arthron gate corpus/csharp/serilog --language csharp --baseline baselines/csharp-serilog.toml
+
+      - name: Gate kotlin / okio
+        run: ./target/release/arthron gate corpus/kotlin/okio --language kotlin --baseline baselines/kotlin-okio.toml
+
+      - name: Gate scala / upickle
+        run: ./target/release/arthron gate corpus/scala/upickle --language scala --baseline baselines/scala-upickle.toml

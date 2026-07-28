@@ -1,0 +1,68 @@
+id: directive
+language: dart
+rule:
+  any:
+    - kind: library_import
+    - kind: library_export
+    - kind: part_directive
+    - kind: part_of_directive
+---
+id: def-class
+language: dart
+rule:
+  any:
+    - kind: class_declaration
+    - kind: mixin_declaration
+    - kind: extension_declaration
+    - kind: extension_type_declaration
+---
+id: def-enum
+language: dart
+rule:
+  kind: enum_declaration
+---
+id: def-enum-constant
+language: dart
+rule:
+  kind: enum_constant
+---
+id: def-typedef
+language: dart
+rule:
+  kind: type_alias
+---
+id: def-function
+language: dart
+rule:
+  kind: function_signature
+---
+id: def-getter
+language: dart
+rule:
+  kind: getter_signature
+---
+id: def-setter
+language: dart
+rule:
+  kind: setter_signature
+---
+id: def-operator
+language: dart
+rule:
+  kind: operator_signature
+---
+id: def-constructor
+language: dart
+rule:
+  any:
+    - kind: constructor_signature
+    - kind: constant_constructor_signature
+    - kind: factory_constructor_signature
+    - kind: redirecting_factory_constructor_signature
+---
+id: def-variable
+language: dart
+rule:
+  any:
+    - kind: initialized_identifier
+    - kind: static_final_declaration
