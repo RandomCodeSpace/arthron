@@ -140,6 +140,26 @@ impl SourceTree {
         Self::parse(SupportLang::Scala, source)
     }
 
+    /// Parse Swift source.
+    ///
+    /// One grammar for every `.swift` file, a SwiftPM manifest included: a
+    /// `Package.swift` is an ordinary Swift program that the package manager
+    /// runs, not a configuration dialect, and reading it under a second
+    /// parser would be inventing a language the toolchain does not have.
+    pub fn parse_swift(source: &str) -> Self {
+        Self::parse(SupportLang::Swift, source)
+    }
+
+    /// Parse C++ source.
+    ///
+    /// One grammar for every extension [`crate::model::Lang::Cpp`] claims.
+    /// `.c` and `.h` are deliberately not among them — a C translation unit
+    /// read under the C++ grammar is the wrong language — so nothing here
+    /// has to guess which dialect a file is written in.
+    pub fn parse_cpp(source: &str) -> Self {
+        Self::parse(SupportLang::Cpp, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -357,6 +377,26 @@ rule:
             "id: t\nlanguage: scala\nrule:\n  kind: class_definition\n",
             "class_definition",
             "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_swift() {
+        one_match(
+            &SourceTree::parse_swift("class Greeter { func hi() {} }\n"),
+            "id: t\nlanguage: swift\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_cpp() {
+        one_match(
+            &SourceTree::parse_cpp("namespace fmt { }\n"),
+            "id: t\nlanguage: cpp\nrule:\n  kind: namespace_definition\n",
+            "namespace_definition",
+            "fmt",
         );
     }
 }
