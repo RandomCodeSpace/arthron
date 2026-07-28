@@ -196,7 +196,35 @@ pub fn scan<L: Language>(
         return Ok(report);
     }
 
-    let mut cfg = rs.config(root, &index).map_err(|e| e.message)?;
+    // Phase 0 could not establish this language's project layout: no manifest
+    // where its resolver looks, or one it cannot read. That is this track's
+    // precondition and nobody else's — nothing else in the registry was ever
+    // asked about this file — so it must not be the whole scan's failure. The
+    // track contributes nothing and says so through the same channel that
+    // carries every other thing a scan reached and could not turn into facts,
+    // keyed by the language rather than by a file, because the missing thing
+    // is the project and not a file the walk found. Every other track still
+    // runs, and whatever the store already holds for this one is left exactly
+    // as the last scan left it: a scan that could not read the layout is in no
+    // position to say which of this language's files are gone.
+    let mut cfg = match rs.config(root, &index) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let store = Store::open(db_path)?;
+            let mut report = store.report()?;
+            file_errors.insert(
+                L::LANG.name().to_string(),
+                format!(
+                    "no {} project here, so this track measured nothing and every \
+                     other language's answer is unaffected: {}",
+                    L::LANG.name(),
+                    e.message,
+                ),
+            );
+            report.file_errors = named(file_errors);
+            return Ok(report);
+        }
+    };
     let store = Store::open(db_path)?;
 
     // The manifest is a scan input the walk never hashes, and it decides

@@ -54,15 +54,19 @@ pub fn scan(report: &Report, config: &Config) -> Value {
     })
 }
 
-/// The files a scan reached and could not read.
+/// What a scan reached and could not turn into facts.
 ///
 /// An array and not a count, because a count nobody can act on is a count
 /// nobody looks at: the whole point of recording these is that the paths are
 /// there. Empty on every clean scan, and always present — a reader never has
 /// to tell "no failures" from "this build did not report them".
 ///
-/// One entry per file, so the count is the array's length. Additive, so
-/// [`SCHEMA`] does not move: a reader that ignores unknown keys is unaffected.
+/// Mostly one entry per file. The exception is a track whose project layout
+/// could not be established, whose entry is keyed by the language's name: what
+/// was missing there is the *project*, not a file the walk found, and that
+/// track's silence in `languages` needs saying out loud somewhere. Additive,
+/// so [`SCHEMA`] does not move: a reader that ignores unknown keys, and one
+/// that only prints these, are both unaffected.
 fn file_errors(errors: &[FileError]) -> Value {
     Value::Array(
         errors
@@ -282,12 +286,18 @@ pub const HELP: &str = concat!(
     "                        null for a stored language code this build has\n",
     "                        no name for\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
-    "  file_errors      [{ path, error }] — files the walk reached and could\n",
-    "                   not read: no permission, not UTF-8, gone mid-walk, or\n",
-    "                   a directory it could not descend into. The scan keeps\n",
-    "                   going and measures the rest, so this is how a smaller\n",
-    "                   file set than the tree holds becomes visible. One\n",
-    "                   entry per file; empty when every file read cleanly.\n",
+    "  file_errors      [{ path, error }] — what the scan reached and could not\n",
+    "                   turn into facts: a file with no permission, not UTF-8,\n",
+    "                   gone mid-walk, a directory it could not descend into,\n",
+    "                   or a symbolic link whose target is outside the scanned\n",
+    "                   tree. One further entry has a language name for its\n",
+    "                   `path` rather than a file: that language's project\n",
+    "                   layout could not be established — no manifest where its\n",
+    "                   resolver looks — so that one track measured nothing and\n",
+    "                   has no `languages` entry, while every other track ran.\n",
+    "                   The scan keeps going either way, which is how a smaller\n",
+    "                   file set than the tree holds becomes visible. Empty when\n",
+    "                   every file read cleanly.\n",
     "  config           the settings this run read, which decide the file set\n",
     "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
