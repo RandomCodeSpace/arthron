@@ -30,7 +30,7 @@
 //!
 //! The measured corpus has exactly one such module and it is its own name:
 //! `busted` matches `busted.lua` under `?.lua` and `busted/init.lua` under
-//! `?/init.lua`, at **54 call sites**. Lua does not call that ambiguous — it
+//! `?/init.lua`, at **53 call sites**. Lua does not call that ambiguous — it
 //! searches `package.path` in order and deterministically loads whichever
 //! pattern comes first — so [`UnresolvedReason::AmbiguousExport`], whose own
 //! definition requires that *the language* call the result ambiguous, does
@@ -69,15 +69,16 @@
 //! # Why the miss reason is `ModuleNotFound` and not `UnknownPackage`
 //!
 //! `UnknownPackage` asserts that the target names a package **outside the
-//! repository**. This corpus disproves that for three of its own sites:
-//! `require 'cl_test_module'` names `spec/cl_test_module.lua`, a file that is
-//! right here, addressed under the module name it has when the runner starts
-//! in `spec/` — and the same file is required as `spec.cl_test_module` from
-//! the root, where it resolves. Nothing in the text tells that case apart
-//! from `require 'pl.path'`. `ModuleNotFound` — *the specifier is a literal
-//! and resolved to no module under the configured resolution* — is true of
-//! both without asserting where either lives, and a reason that is never
-//! wrong beats a reason that is usually right.
+//! repository**. One site in this corpus disproves that, and one is enough:
+//! `require('cl_test_module')` in `spec/cl_lua_path.lua` names
+//! `spec/cl_test_module.lua`, a file that is right here, addressed under the
+//! module name it has when the runner starts in `spec/` — and the same file
+//! is required as `spec.cl_test_module` from `spec/insulate_file2.lua`, under
+//! the repository root, where it resolves. Nothing in the text tells that
+//! case apart from `require 'pl.path'`. `ModuleNotFound` — *the specifier is
+//! a literal and resolved to no module under the configured resolution* — is
+//! true of both without asserting where either lives, and a reason that is
+//! never wrong beats a reason that is usually right.
 //!
 //! # `LocalBinding` does not apply here
 //!

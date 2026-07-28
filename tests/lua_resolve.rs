@@ -90,7 +90,7 @@ fn the_init_pattern_answers_when_the_plain_one_does_not() {
 
 #[test]
 fn two_patterns_that_both_name_a_file_are_a_layout_this_tree_does_not_state() {
-    // busted's own shape, at 54 call sites: `busted.lua` matches `?.lua` and
+    // busted's own shape, at 53 call sites: `busted.lua` matches `?.lua` and
     // `busted/init.lua` matches `?/init.lua`. Which one `require` loads is
     // decided by the order of the patterns in `package.path` when the process
     // starts, and the corpus proves that order is not a property of the tree.

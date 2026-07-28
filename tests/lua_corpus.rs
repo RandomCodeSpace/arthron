@@ -71,10 +71,10 @@ const DYNAMIC: u64 = 7;
 /// The corpus provenance counted 58 by scanning the text. Parsing agrees
 /// exactly, which is the point of restating it: the two methods disagree
 /// about the *sites* — a text scan cannot tell `require 'busted'` from
-/// `describe('tests require "busted"', ...)`, and four of the corpus's
-/// `require` mentions are inside description strings — and agreeing on the
-/// name set is what says the disagreement is the scanner's and not this
-/// extractor's.
+/// `describe('tests require "busted"', ...)`, and six of the corpus's
+/// `require` mentions, spread over four files, are inside description
+/// strings — and agreeing on the name set is what says the disagreement is
+/// the scanner's and not this extractor's.
 const DISTINCT_TARGETS: usize = 58;
 
 /// The `build.modules` map the pinned rockspec states.
@@ -359,8 +359,8 @@ fn the_lua_track_drops_nothing_and_holds_its_baseline() {
     assert_eq!(measured.unresolved, 153);
 
     // The floor, named. Every literal that names no module under the
-    // configured resolution — Penlight, `say`, `luassert`, and the three
-    // `cl_test_module` sites whose file is right here under a root the
+    // configured resolution — Penlight, `say`, `luassert`, and the one
+    // `cl_test_module` site whose file is right here under a root the
     // repository root is not.
     assert_eq!(reasons.get("ModuleNotFound").copied(), Some(93));
     // `require 'busted'`: `busted.lua` matches `?.lua`, `busted/init.lua`
