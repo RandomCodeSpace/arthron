@@ -5,7 +5,10 @@
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
 //! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
-//! `tests/csharp_corpus.rs`, `tests/elixir_corpus.rs`, and `tests/probes.rs` for
+//! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, `tests/cpp_corpus.rs`,
+//! `tests/bash_corpus.rs`, `tests/hcl_corpus.rs`, `tests/lua_corpus.rs`,
+//! `tests/dart_corpus.rs`, `tests/haskell_corpus.rs`, `tests/elixir_corpus.rs`,
+//! and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -60,6 +63,28 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/kotlin-okio.toml", "tests/kotlin_corpus.rs"),
     ("baselines/scala-upickle.toml", "tests/scala_corpus.rs"),
     ("baselines/csharp-serilog.toml", "tests/csharp_corpus.rs"),
+    ("baselines/swift-alamofire.toml", "tests/swift_corpus.rs"),
+    ("baselines/cpp-fmt.toml", "tests/cpp_corpus.rs"),
+    // Best-effort tier 2: the same mechanism over a denominator of six. The
+    // corpus was vendored because none of its `source` targets is a literal
+    // path, so this ratchet holds a rate of 0.0% and the drift checks on
+    // `external` and `local_binding` — both zero — are what make it
+    // un-gameable. See `tests/bash_corpus.rs` for the argument.
+    ("baselines/bash-bats-core.toml", "tests/bash_corpus.rs"),
+    // Best effort, which is a statement about how much of the language the
+    // track reads and not about how honestly it reports it: HCL has no import
+    // statement at all, so its denominator is 24 `module` sources over 65
+    // files and the definition census beside it carries the weight.
+    (
+        "baselines/hcl-terraform-aws-vpc.toml",
+        "tests/hcl_corpus.rs",
+    ),
+    ("baselines/lua-busted.toml", "tests/lua_corpus.rs"),
+    // Tier 2, best effort: definitions, structure and the URIs the library
+    // directives name — no `show`/`hide` combinator is a reference, so this
+    // denominator is smaller than a full tier-2 track's by design.
+    ("baselines/dart-collection.toml", "tests/dart_corpus.rs"),
+    ("baselines/haskell-aeson.toml", "tests/haskell_corpus.rs"),
     ("baselines/elixir-plug.toml", "tests/elixir_corpus.rs"),
 ];
 

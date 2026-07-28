@@ -1,0 +1,9 @@
+id: def-function
+language: bash
+rule:
+  kind: function_definition
+---
+id: command
+language: bash
+rule:
+  kind: command
