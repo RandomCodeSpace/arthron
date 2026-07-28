@@ -7,7 +7,8 @@
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
 //! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, `tests/cpp_corpus.rs`,
 //! `tests/bash_corpus.rs`, `tests/hcl_corpus.rs`, `tests/lua_corpus.rs`,
-//! `tests/dart_corpus.rs`, `tests/haskell_corpus.rs`, and `tests/probes.rs` for
+//! `tests/dart_corpus.rs`, `tests/haskell_corpus.rs`, `tests/elixir_corpus.rs`,
+//! and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -84,6 +85,7 @@ const GATED: &[(&str, &str)] = &[
     // denominator is smaller than a full tier-2 track's by design.
     ("baselines/dart-collection.toml", "tests/dart_corpus.rs"),
     ("baselines/haskell-aeson.toml", "tests/haskell_corpus.rs"),
+    ("baselines/elixir-plug.toml", "tests/elixir_corpus.rs"),
 ];
 
 #[test]
