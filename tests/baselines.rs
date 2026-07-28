@@ -5,8 +5,8 @@
 //! `tests/corpus.rs` for Go, `tests/java_corpus.rs`, `tests/corpus_ecma.rs`,
 //! `tests/corpus_python.rs`, `tests/php_corpus.rs`, `tests/ruby_corpus.rs`,
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
-//! `tests/csharp_corpus.rs`, and `tests/probes.rs` for
-//! the probe pin — because
+//! `tests/csharp_corpus.rs`, `tests/haskell_corpus.rs`, and `tests/probes.rs`
+//! for the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
 //! it, which looks exactly like a passing gate and is the absence of one.
@@ -60,6 +60,7 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/kotlin-okio.toml", "tests/kotlin_corpus.rs"),
     ("baselines/scala-upickle.toml", "tests/scala_corpus.rs"),
     ("baselines/csharp-serilog.toml", "tests/csharp_corpus.rs"),
+    ("baselines/haskell-aeson.toml", "tests/haskell_corpus.rs"),
 ];
 
 #[test]

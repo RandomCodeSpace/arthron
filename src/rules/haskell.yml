@@ -1,0 +1,52 @@
+id: header
+language: haskell
+rule:
+  kind: header
+---
+id: import
+language: haskell
+rule:
+  kind: import
+---
+id: def-data
+language: haskell
+rule:
+  any:
+    - kind: data_type
+    - kind: newtype
+---
+id: def-data-instance
+language: haskell
+rule:
+  kind: data_instance
+---
+id: def-type
+language: haskell
+rule:
+  any:
+    - kind: type_synomym
+    - kind: type_family
+    - kind: data_family
+---
+id: def-class
+language: haskell
+rule:
+  kind: class
+---
+id: def-value
+language: haskell
+rule:
+  any:
+    - kind: signature
+    - kind: function
+    - kind: bind
+---
+id: def-pattern
+language: haskell
+rule:
+  kind: pattern_synonym
+---
+id: def-foreign
+language: haskell
+rule:
+  kind: foreign_import
