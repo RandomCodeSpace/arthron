@@ -43,6 +43,15 @@
 //!   indexes libraries by path, so nothing here could resolve it and no
 //!   reference is emitted; the URI spelling — the only one modern Dart writes
 //!   — is emitted and resolved.
+//! - **`part of` points the way its URI does, not the way containment does.**
+//!   `part of 'lib.dart'` in `p.dart` says that `lib.dart` *contains*
+//!   `p.dart`, so the containment runs from `lib.dart` to `p.dart` — the
+//!   opposite of the reference emitted here, which runs from the file that
+//!   wrote the directive to the library its URI names. No [`RefKind`] spells
+//!   containment, and minting one for a directive the measured corpus never
+//!   writes is not a trade this track makes. The URI is resolved and the
+//!   library is the right one; the *direction* is approximate, and this is
+//!   where that is written down rather than left to be rediscovered.
 //! - **A part file's declarations belong to its part, not to its library.**
 //!   Dart says a `part` file's declarations are the *enclosing* library's.
 //!   This track roots every FQN at the file that wrote the declaration, so a

@@ -99,6 +99,11 @@ const SCHEMES: &[(&str, u64)] = &[
     // `our_own_package_uri_naming_no_file_misses_rather_than_leaving_the_repository`
     // in `tests/dart_resolve.rs` — and this census is what would notice if a
     // future corpus did exercise it.
+    //
+    // The other way a declared name stays inside the rate — a `path:` entry
+    // placing the package in this tree — is likewise unexercised here: this
+    // manifest states no `path:`. `tests/dart_fixture.rs` writes a repository
+    // that does and scans it end to end.
     ("declared-package", 20),
     // 27 imports and 27 exports, the whole of `lib/`'s internal wiring.
     ("relative", 54),

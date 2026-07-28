@@ -47,10 +47,12 @@
 //!   the manifest.** A `dart:` URI is external because the language reserves
 //!   that scheme for the SDK — no repository file can be addressed by one — and
 //!   a `package:<name>` URI is external only when `pubspec.yaml` declares
-//!   `<name>`. This repository's own package name is tested first, so a
-//!   self-referencing `package:` URI is an in-repository lookup that can miss
-//!   and never an `External` that cannot. See [`resolve`] for why that
-//!   ordering is the whole defence against laundering a rate.
+//!   `<name>` and does *not* place it inside this tree with a `path:`. This
+//!   repository's own package name is tested first, and a `path:` dependency
+//!   is a lookup under that package's own `lib/`, so a `package:` URI naming
+//!   anything this repository contains is a lookup that can miss and never an
+//!   `External` that cannot. See [`resolve`] for why that ordering is the
+//!   whole defence against laundering a rate.
 //!
 //! A baseline is recorded with `arthron gate --rebase`. Dart's rate is Dart's
 //! own and is never averaged into anyone else's.

@@ -8,10 +8,14 @@
 //!
 //! 1. **`dart:<library>`** names an SDK library. Always [`crate::Outcome::External`].
 //! 2. **`package:<name>/<path>`** names a file in package `<name>`'s `lib/`
-//!    directory. When `<name>` is what `pubspec.yaml` calls *this* package the
-//!    lookup is in-repository — `lib/<path>` — and a miss is
+//!    directory, and the manifest is the only thing that says where that
+//!    directory is. When `<name>` is what `pubspec.yaml` calls *this* package
+//!    the lookup is in-repository — `lib/<path>` — and a miss is
 //!    [`UnresolvedReason::ModuleNotFound`]. When the manifest declares
-//!    `<name>` as a dependency it is `External`. When it declares neither it
+//!    `<name>` with a `path:` it has placed the package inside this
+//!    repository too, so the lookup is `<dir>/lib/<path>` and a miss is
+//!    `ModuleNotFound` again. When it declares `<name>` any other way — pub,
+//!    git, hosted — it is `External`. When it does not declare it at all it
 //!    is [`UnresolvedReason::UnknownPackage`], and when there is no manifest
 //!    at all it is [`UnresolvedReason::ProjectLayoutUnknown`] — arthron's own
 //!    gap, not a statement about the name.
@@ -43,9 +47,17 @@
 //! `pubspec.yaml` declares and the two must never share a node.
 //!
 //! The laundering that *is* possible here is the `package:` one, and rule 2 is
-//! written in the order that prevents it: this repository's own package name
+//! written in the order that prevents it. This repository's own package name
 //! is tested **first**, so `package:collection/src/algorithms.dart` is a
-//! lookup in `lib/` that can miss, and never an `External` that cannot.
+//! lookup in `lib/` that can miss, and never an `External` that cannot. A
+//! dependency the manifest places inside the tree with a `path:` is tested the
+//! same way and for the same reason: the files behind such a URI are ones the
+//! walk reached and stored, so answering it `External` would move a reference
+//! whose target *is* an in-repository node out of both terms of the rate.
+//! Getting that second one wrong is not cosmetic. In a multi-package
+//! repository — melos, a federated plugin — the cross-package imports are
+//! exactly the linking that matters, and calling every one of them external
+//! leaves a track that links nothing between packages printing a full rate.
 //!
 //! # `LocalBinding` does not apply here
 //!
@@ -64,7 +76,7 @@ use crate::model::{
 };
 use crate::track_dart::extract::{DartExtractor, DartHeader, UriForm};
 use crate::track_dart::lang::{DartLang, decl_fqn, library_fqn};
-use crate::track_dart::project::{DartProject, layout};
+use crate::track_dart::project::{DartDep, DartProject, LIB, layout};
 
 /// The scheme an SDK library URI carries.
 const SDK_SCHEME: &str = "dart";
@@ -226,9 +238,9 @@ impl DartResolver {
         }
     }
 
-    /// `package:<name>/<path>`: this repository's own package first, so a
-    /// self-reference is a lookup that can miss rather than an `External` that
-    /// cannot.
+    /// `package:<name>/<path>`: every name this repository *contains* first —
+    /// its own package, then any dependency a `path:` places inside the tree —
+    /// so each is a lookup that can miss rather than an `External` that cannot.
     fn package(cfg: &DartProject, name: &str, rest: &str, probe: &dyn SymbolProbe) -> Resolution {
         // This repository's own package, tested before anything else, so a
         // self-reference is an in-repository lookup that can miss.
@@ -241,22 +253,40 @@ impl DartResolver {
                 None => unresolved(UnresolvedReason::ModuleNotFound),
             };
         }
-        if cfg.declares(name) {
-            return Resolution {
+        match cfg.dep(name) {
+            // A `path:` says the package is a directory of this repository,
+            // whose `.dart` files the walk already reached and stored — so
+            // this is an in-repository lookup, and a miss under it is a miss.
+            Some(DartDep::Local(dir)) => {
+                // The directory is stated relative to the manifest, and the
+                // manifest this build reads is the one at the root.
+                let Some(base) = join_path("", &format!("{dir}/{LIB}")) else {
+                    // A `path:` climbing above the repository root, or
+                    // anchored at a filesystem one: a directory this scan
+                    // never walked and cannot see into. Arthron's own gap,
+                    // counted against the rate rather than waved through —
+                    // nothing here proves no in-repository file is behind it.
+                    return unresolved(UnresolvedReason::ProjectLayoutUnknown);
+                };
+                match join_path(&base, rest) {
+                    Some(path) => probe_path(&path, probe),
+                    None => unresolved(UnresolvedReason::ModuleNotFound),
+                }
+            }
+            Some(DartDep::External) => Resolution {
                 outcome: crate::Outcome::External(name.to_string()),
                 candidates: Vec::new(),
-            };
+            },
+            // Without a manifest nothing in the tree says which package this
+            // repository is, so the failure is arthron's own inference rather
+            // than a statement about the name — which is a different fact from
+            // a name the manifest was read and did not declare.
+            None => unresolved(if cfg.package.is_none() {
+                UnresolvedReason::ProjectLayoutUnknown
+            } else {
+                UnresolvedReason::UnknownPackage
+            }),
         }
-        // Without a manifest nothing in the tree says which package this
-        // repository is, so the failure is arthron's own inference rather than
-        // a statement about the name — which is a different fact from a name
-        // the manifest was read and did not declare.
-        let reason = if cfg.package.is_none() {
-            UnresolvedReason::ProjectLayoutUnknown
-        } else {
-            UnresolvedReason::UnknownPackage
-        };
-        unresolved(reason)
     }
 }
 
@@ -432,7 +462,10 @@ mod tests {
     fn project(package: Option<&str>, deps: &[&str], manifest: bool) -> DartProject {
         DartProject {
             package: package.map(str::to_string),
-            dependencies: deps.iter().map(|d| (*d).to_string()).collect(),
+            dependencies: deps
+                .iter()
+                .map(|d| ((*d).to_string(), DartDep::External))
+                .collect(),
             manifest,
         }
     }

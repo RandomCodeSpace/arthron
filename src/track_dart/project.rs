@@ -27,18 +27,28 @@
 //!   repository say this name comes from outside?", and a test file importing
 //!   a dev dependency is as declared as a library file importing a runtime
 //!   one.
+//! - **A dependency entry's `path:`**, which answers that question the other
+//!   way: the package is a directory *of this repository*, and its `lib/` is
+//!   one the walk has already reached. A `git:`, a hosted spec or a bare
+//!   version constraint says the source is fetched. That difference is the
+//!   difference between a `package:` URI this build can look up and one it
+//!   cannot, so it is recorded — [`DartDep::Local`] against
+//!   [`DartDep::External`] — rather than flattened into "declared".
 //! - **`pubspec.lock`, `.dart_tool/package_config.json`** are not read. The
 //!   first names a resolved graph rather than a declaration; the second is
 //!   build output that a checkout need not carry, and reading it would make
 //!   the measured rate depend on whether `dart pub get` had been run.
-//! - **Nested `pubspec.yaml` files.** A workspace of several packages declares
-//!   names this build does not see, and their `package:` URIs miss with a
-//!   reason rather than resolve by accident. The fix is a decision about which
-//!   root a name maps against, not a loop.
+//! - **Nested `pubspec.yaml` files.** Only the root manifest is read, so a
+//!   member package is placed exactly when the root's own dependency list
+//!   places it with a `path:` — which is the shape a workspace root writes.
+//!   A name only a *member's* manifest declares is one this build does not
+//!   see, and its `package:` URIs miss with a reason rather than resolve by
+//!   accident. The fix is a decision about which root a name maps against,
+//!   not a loop.
 //!
 //! No file is executed and no network call is made, here or anywhere.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -55,6 +65,26 @@ pub const LIB: &str = "lib";
 /// repository.
 const DEPENDENCY_KEYS: &[&str] = &["dependencies", "dev_dependencies", "dependency_overrides"];
 
+/// The key inside a dependency entry that names a directory of this
+/// repository instead of a place to fetch the package from.
+const PATH_KEY: &str = "path";
+
+/// Where the manifest says a declared dependency's source lives.
+///
+/// The distinction is load-bearing rather than descriptive: it decides whether
+/// a `package:<name>/…` URI is a lookup in this repository that can miss, or a
+/// name that leaves the measurement entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DartDep {
+    /// A package inside this repository, at the directory the entry's `path:`
+    /// names — as written, and relative to the manifest, which this build
+    /// reads only at the root.
+    Local(String),
+    /// A package this repository does not contain: fetched from pub, from a
+    /// git remote, or from a hosted registry.
+    External,
+}
+
 /// What the project's layout decides for every Dart URI in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DartProject {
@@ -64,9 +94,10 @@ pub struct DartProject {
     /// `package:` URI cannot be told from the outside, which is
     /// [`crate::UnresolvedReason::ProjectLayoutUnknown`] rather than a guess.
     pub package: Option<String>,
-    /// Package names the manifest declares as dependencies, runtime,
-    /// development and override alike.
-    pub dependencies: BTreeSet<String>,
+    /// Package names the manifest declares as dependencies — runtime,
+    /// development and override alike — each with what it says about where
+    /// that package's source lives.
+    pub dependencies: BTreeMap<String, DartDep>,
     /// Whether a `pubspec.yaml` was found and parsed at the repository root.
     pub manifest: bool,
 }
@@ -82,9 +113,11 @@ impl DartProject {
         (self.package.as_deref() == Some(pkg) && !rest.is_empty()).then(|| format!("{LIB}/{rest}"))
     }
 
-    /// Whether the manifest declares this package name as a dependency.
-    pub fn declares(&self, pkg: &str) -> bool {
-        self.dependencies.contains(pkg)
+    /// What the manifest says about where a declared package lives, or `None`
+    /// for a name it does not declare at all — which is a different fact and
+    /// gets a different reason.
+    pub fn dep(&self, pkg: &str) -> Option<&DartDep> {
+        self.dependencies.get(pkg)
     }
 
     /// A stable fingerprint of everything phase 0 read.
@@ -94,8 +127,17 @@ impl DartProject {
             out.push_str(name);
         }
         out.push('\u{1}');
-        for dep in &self.dependencies {
-            out.push_str(dep);
+        for (name, source) in &self.dependencies {
+            out.push_str(name);
+            // Where a dependency lives is part of the fingerprint as much as
+            // that it exists: the same name gaining a `path:` re-roots every
+            // `package:` URI naming it, from outside this repository to
+            // inside it. The separator is a byte no package name and no path
+            // carries, so a name and a directory cannot be confused.
+            if let DartDep::Local(dir) = source {
+                out.push('\u{2}');
+                out.push_str(dir);
+            }
             out.push('\n');
         }
         out.push('\u{1}');
@@ -140,20 +182,29 @@ rule:
     - kind: flow_pair
 ";
 
-/// What one `pubspec.yaml` declares: its package name, and its dependency
-/// names.
+/// What one `pubspec.yaml` declares: its package name, its dependency names,
+/// and which of those it places inside this repository.
 ///
 /// Depth is what makes this a parser rather than a scanner. A pair with no
 /// enclosing pair is a pubspec key; a pair one level under a dependency key
 /// is a package name; a `url:` two levels under one is neither, and an
-/// indentation heuristic is exactly what mistakes it for a package.
-fn read_pubspec(source: &str) -> (Option<String>, BTreeSet<String>) {
+/// indentation heuristic is exactly what mistakes it for a package. Depth is
+/// also the whole of what tells `path:` the location from `path:` the very
+/// popular pub package — the first sits two levels under a dependency key and
+/// the second one.
+///
+/// The cost, stated: one name is one entry here, so a package declared in two
+/// blocks keeps the last `path:` any of them wrote rather than the one pub's
+/// override precedence would pick. That errs toward an in-repository lookup
+/// that can miss, never toward an `External` that cannot.
+fn read_pubspec(source: &str) -> (Option<String>, BTreeMap<String, DartDep>) {
     static RULES: OnceLock<Rules> = OnceLock::new();
     let rules =
         RULES.get_or_init(|| Rules::compile(PAIR_RULES).expect("the pubspec rule compiles"));
 
     let mut package = None;
-    let mut dependencies = BTreeSet::new();
+    let mut dependencies: BTreeMap<String, DartDep> = BTreeMap::new();
+    let mut paths: BTreeMap<String, String> = BTreeMap::new();
     let tree = SourceTree::parse_yaml(source);
     for (_, pair) in tree.matches(rules) {
         let Some(key) = pair.field("key").as_ref().and_then(scalar) else {
@@ -169,9 +220,29 @@ fn read_pubspec(source: &str) -> (Option<String>, BTreeSet<String>) {
                     .filter(|s| !s.is_empty());
             }
             [outer] if DEPENDENCY_KEYS.contains(&outer.as_str()) => {
-                dependencies.insert(key);
+                dependencies.entry(key).or_insert(DartDep::External);
+            }
+            [outer, dep] if DEPENDENCY_KEYS.contains(&outer.as_str()) && key == PATH_KEY => {
+                if let Some(dir) = pair
+                    .field("value")
+                    .as_ref()
+                    .and_then(scalar)
+                    .filter(|s| !s.is_empty())
+                {
+                    paths.insert(dep.clone(), dir);
+                }
             }
             _ => {}
+        }
+    }
+    // Joined after the walk rather than during it: a pair and the pair
+    // enclosing it arrive in whatever order the rule matched them, so a
+    // `path:` may be read before the dependency name it belongs to.
+    for (name, dir) in paths {
+        // A `path:` under a name no dependency block declared is not a
+        // dependency, and no entry is invented for it.
+        if let Some(slot) = dependencies.get_mut(&name) {
+            *slot = DartDep::Local(dir);
         }
     }
     (package, dependencies)
@@ -214,6 +285,11 @@ fn unquote(text: &str, quote: char) -> String {
 mod tests {
     use super::*;
 
+    /// The dependency names one manifest declares, with where each lives.
+    fn deps(map: &BTreeMap<String, DartDep>) -> Vec<(&str, &DartDep)> {
+        map.iter().map(|(n, d)| (n.as_str(), d)).collect()
+    }
+
     const COLLECTION: &str = "\
 name: collection
 version: 1.19.1
@@ -227,11 +303,66 @@ dev_dependencies:
 
     #[test]
     fn the_package_name_and_its_dependencies_are_read() {
-        let (package, deps) = read_pubspec(COLLECTION);
+        let (package, got) = read_pubspec(COLLECTION);
         assert_eq!(package.as_deref(), Some("collection"));
         assert_eq!(
-            deps.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["dart_flutter_team_lints", "test"],
+            deps(&got),
+            [
+                ("dart_flutter_team_lints", &DartDep::External),
+                ("test", &DartDep::External),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_path_dependency_is_a_directory_and_everything_else_is_outside() {
+        // The shape a workspace root writes, and the one an `External` for
+        // every declared name gets wrong: `member` is a directory of this
+        // repository whose `lib/` the walk already reached.
+        let (_, got) = read_pubspec(
+            "name: app\ndependencies:\n  member:\n    path: pkgs/member\n  \
+             remote:\n    git:\n      url: https://x.invalid/remote\n  http: ^1.0.0\n",
+        );
+        assert_eq!(
+            deps(&got),
+            [
+                ("http", &DartDep::External),
+                ("member", &DartDep::Local("pkgs/member".to_string())),
+                ("remote", &DartDep::External),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_dependency_called_path_is_not_a_path_entry() {
+        // `path` is one of pub's most depended-on packages, and it is a
+        // dependency name one level under the block — never a location, which
+        // is two. Depth is the whole of what tells them apart.
+        let (_, got) = read_pubspec(
+            "name: app\ndependencies:\n  path: ^1.8.0\n  \
+             odd:\n    path: ../odd\n",
+        );
+        assert_eq!(
+            deps(&got),
+            [
+                ("odd", &DartDep::Local("../odd".to_string())),
+                ("path", &DartDep::External),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_override_states_a_path_as_much_as_a_dependency_does() {
+        let (_, got) = read_pubspec(
+            "name: app\ndev_dependencies:\n  fixture: {path: 'test/fixture'}\n\
+             dependency_overrides:\n  other:\n    path: ./pkgs/other\n",
+        );
+        assert_eq!(
+            deps(&got),
+            [
+                ("fixture", &DartDep::Local("test/fixture".to_string())),
+                ("other", &DartDep::Local("./pkgs/other".to_string())),
+            ],
         );
     }
 
@@ -239,39 +370,41 @@ dev_dependencies:
     fn a_nested_dependency_block_contributes_its_package_and_not_its_fields() {
         // The shape a line scanner gets wrong: `url` and `ref` are three
         // levels down and are not package names.
-        let (_, deps) = read_pubspec(
+        let (_, got) = read_pubspec(
             "name: app\ndependencies:\n  a: ^1.0.0\n  b:\n    git:\n      url: https://x.invalid/b\n      ref: main\n",
         );
         assert_eq!(
-            deps.iter().map(String::as_str).collect::<Vec<_>>(),
+            got.keys().map(String::as_str).collect::<Vec<_>>(),
             ["a", "b"]
         );
     }
 
     #[test]
     fn quoted_and_flow_spellings_are_the_same_declaration() {
-        let (package, deps) =
+        let (package, got) =
             read_pubspec("name: \"app\"\ndev_dependencies: {test: any, 'lints': ^1.0.0}\n");
         assert_eq!(package.as_deref(), Some("app"));
         assert_eq!(
-            deps.iter().map(String::as_str).collect::<Vec<_>>(),
+            got.keys().map(String::as_str).collect::<Vec<_>>(),
             ["lints", "test"]
         );
     }
 
     #[test]
     fn overrides_are_declarations_too_and_a_sequence_is_not() {
-        let (_, deps) = read_pubspec(
+        let (_, got) = read_pubspec(
             "name: app\ndependency_overrides:\n  a: any\ntopics:\n - collections\n - x\n",
         );
-        assert_eq!(deps.iter().map(String::as_str).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(got.keys().map(String::as_str).collect::<Vec<_>>(), ["a"]);
     }
 
     #[test]
     fn a_package_urs_own_path_is_lib_and_only_for_its_own_name() {
         let cfg = DartProject {
             package: Some("collection".to_string()),
-            dependencies: ["test".to_string()].into_iter().collect(),
+            dependencies: [("test".to_string(), DartDep::External)]
+                .into_iter()
+                .collect(),
             manifest: true,
         };
         assert_eq!(
@@ -282,8 +415,8 @@ dev_dependencies:
         // the manifest declares it.
         assert_eq!(cfg.own_package_path("test", "test.dart"), None);
         assert_eq!(cfg.own_package_path("nowhere", "x.dart"), None);
-        assert!(cfg.declares("test"));
-        assert!(!cfg.declares("collection"));
+        assert_eq!(cfg.dep("test"), Some(&DartDep::External));
+        assert_eq!(cfg.dep("collection"), None);
     }
 
     #[test]
@@ -307,25 +440,35 @@ dev_dependencies:
         .expect("nested pubspec");
         let cfg = layout(dir.path()).expect("layout");
         assert_eq!(cfg.package.as_deref(), Some("collection"));
-        assert!(!cfg.declares("http"), "a nested manifest was read");
+        assert_eq!(cfg.dep("http"), None, "a nested manifest was read");
     }
 
     #[test]
     fn the_digest_moves_when_the_layout_does_and_not_otherwise() {
         let a = DartProject {
             package: Some("collection".to_string()),
-            dependencies: BTreeSet::new(),
+            dependencies: BTreeMap::new(),
             manifest: true,
         };
         let mut b = a.clone();
         assert_eq!(a.digest(), b.digest());
-        b.dependencies.insert("test".to_string());
+        b.dependencies.insert("test".to_string(), DartDep::External);
         assert_ne!(a.digest(), b.digest());
+        // The same name placed inside this repository is a different graph:
+        // every `package:test/…` URI moves from outside the rate to a lookup
+        // under `pkgs/test/lib/` that can miss.
+        let mut local = a.clone();
+        local
+            .dependencies
+            .insert("test".to_string(), DartDep::Local("pkgs/test".to_string()));
+        assert_ne!(b.digest(), local.digest());
         // A package name and a dependency name cannot be confused for one
         // another: the sections are separated by a byte no name carries.
         let c = DartProject {
             package: None,
-            dependencies: ["collection".to_string()].into_iter().collect(),
+            dependencies: [("collection".to_string(), DartDep::External)]
+                .into_iter()
+                .collect(),
             manifest: true,
         };
         assert_ne!(a.digest(), c.digest());

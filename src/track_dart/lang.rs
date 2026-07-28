@@ -76,6 +76,15 @@ impl Language for DartLang {
     /// real `.dart` files, and indexing either would mint in-repository
     /// definitions the repository did not write — which inflates a resolution
     /// rate by giving misses somewhere to land.
+    ///
+    /// The cost, stated: the walk matches these against *every* path
+    /// component, so a hand-written `lib/src/build/` — a real shape in the
+    /// builder ecosystem — is dropped too, and an import naming a file under
+    /// it is [`crate::UnresolvedReason::ModuleNotFound`]. That is the one
+    /// direction this may err in: a dropped file costs the rate and can never
+    /// raise it. Matching by component rather than by prefix is
+    /// [`crate::pipeline`]'s rule for every track, so narrowing it here is a
+    /// decision about the walk, not about Dart.
     fn skip_dirs() -> &'static [&'static str] {
         &[".dart_tool", "build"]
     }

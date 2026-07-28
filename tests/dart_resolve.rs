@@ -12,15 +12,31 @@ use arthron::lang::Resolver;
 use arthron::model::{Domain, NodeId, node_id};
 use arthron::track_dart::extract::extract;
 use arthron::track_dart::lang::library_fqn;
-use arthron::track_dart::project::DartProject;
+use arthron::track_dart::project::{DartDep, DartProject};
 use arthron::track_dart::resolve::DartResolver;
 use arthron::{Outcome, resolution_rate};
 
-/// A project with the given package name and declared dependencies.
+/// A project with the given package name and declared dependencies, each of
+/// them fetched from outside this repository.
 fn project(package: Option<&str>, deps: &[&str]) -> DartProject {
     DartProject {
         package: package.map(str::to_string),
-        dependencies: deps.iter().map(|d| (*d).to_string()).collect(),
+        dependencies: deps
+            .iter()
+            .map(|d| ((*d).to_string(), DartDep::External))
+            .collect(),
+        manifest: true,
+    }
+}
+
+/// A project whose one dependency the manifest places *inside* this
+/// repository, at the directory a `path:` entry names.
+fn with_path_dep(package: &str, dep: &str, dir: &str) -> DartProject {
+    DartProject {
+        package: Some(package.to_string()),
+        dependencies: [(dep.to_string(), DartDep::Local(dir.to_string()))]
+            .into_iter()
+            .collect(),
         manifest: true,
     }
 }
@@ -221,6 +237,67 @@ fn a_declared_dependency_is_external_and_an_undeclared_one_is_not() {
         &[],
     );
     assert_eq!(reason(&undeclared), Some(&UnknownPackage), "{undeclared:?}");
+}
+
+#[test]
+fn a_path_dependency_is_a_lookup_under_its_own_package_and_not_an_external() {
+    // The second half of the laundering defence. A `path:` entry states that
+    // the package is a directory of this repository, so its `lib/` is one the
+    // walk reached — and answering the URI `External` would take a reference
+    // whose target *is* an in-repository node out of both terms of the rate.
+    let cfg = with_path_dep("rootpkg", "other_pkg", "pkgs/other");
+    let got = only(
+        &cfg,
+        "lib/main.dart",
+        "import 'package:other_pkg/other.dart';\n",
+        &["pkgs/other/lib/other.dart"],
+    );
+    assert!(resolved_to(&got, "pkgs/other/lib/other.dart"), "{got:?}");
+    // A `./` prefix is the same directory: pub writes both.
+    let dotted = with_path_dep("rootpkg", "other_pkg", "./pkgs/other");
+    let got = only(
+        &dotted,
+        "lib/main.dart",
+        "import 'package:other_pkg/src/deep.dart';\n",
+        &["pkgs/other/lib/src/deep.dart"],
+    );
+    assert!(resolved_to(&got, "pkgs/other/lib/src/deep.dart"), "{got:?}");
+}
+
+#[test]
+fn a_path_dependency_naming_no_file_misses_rather_than_leaving_the_repository() {
+    // Same rule as this repository's own package: the lookup is complete, so
+    // a literal that named none of the walked files really named no module
+    // here — and the miss is counted, not laundered.
+    let cfg = with_path_dep("rootpkg", "other_pkg", "pkgs/other");
+    let got = only(
+        &cfg,
+        "lib/main.dart",
+        "import 'package:other_pkg/gone.dart';\n",
+        &["pkgs/other/lib/other.dart"],
+    );
+    assert_eq!(reason(&got), Some(&ModuleNotFound), "{got:?}");
+    assert!(
+        !matches!(got, Outcome::External(_)),
+        "an in-repository package URI was laundered as external: {got:?}",
+    );
+}
+
+#[test]
+fn a_path_dependency_pointing_above_the_repository_root_is_arthrons_own_gap() {
+    // `path: ../sibling` from the root names a directory this scan never
+    // walked and cannot see into. Nothing here proves no in-repository file
+    // is behind the URI — a symlink is enough — so it is arthron's own gap,
+    // counted against the rate rather than waved through as external.
+    let cfg = with_path_dep("rootpkg", "sibling", "../sibling");
+    let got = only(
+        &cfg,
+        "lib/main.dart",
+        "import 'package:sibling/s.dart';\n",
+        &[],
+    );
+    assert_eq!(reason(&got), Some(&ProjectLayoutUnknown), "{got:?}");
+    assert!(!matches!(got, Outcome::External(_)), "{got:?}");
 }
 
 #[test]
