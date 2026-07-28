@@ -11,6 +11,20 @@
 //! make phase 2's replace delete what phase 1 just wrote for the same file,
 //! and the symptom would look like "some definitions randomly missing".
 //!
+//! Ownership carries a second obligation, and it is what makes an
+//! interrupted scan survivable: **a file may be recorded current only once
+//! every one of its facts is committed.** A phase writing half a file's facts
+//! withdraws the store's currency claim in the same transaction, and
+//! [`Store::apply_refs`] — the last half — is the only thing that gives it
+//! back. The same transaction withdraws the claim of every *other* file whose
+//! stored resolution consulted an identity it moved, because the candidate
+//! index says exactly which those are. So a process killed between two
+//! commits leaves a store that knows what it no longer knows: the next scan
+//! re-reads precisely the files whose answers this one falsified, and lands
+//! on the graph a cold scan of the same tree builds. Nothing else recovers
+//! it — a content hash that outlives the facts it vouches for is a file no
+//! later scan has any reason to look at again.
+//!
 //! One write transaction per batch, and a batch is a fixed number of files
 //! rather than the whole event (500 files in one transaction measured 60ms
 //! against 216ms as 500 separate transactions). What the bound buys is this
@@ -22,12 +36,14 @@
 //! [`crate::pipeline::scan`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use bincode::{Decode, Encode, config};
 use redb::{
     Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
-    ReadableTable, TableDefinition,
+    ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 
 use crate::UnresolvedReason;
@@ -89,6 +105,61 @@ const CONFIG_DIGEST_KEY: &str = "config_digest";
 /// hunting for a second one that does not exist.
 pub const HELD_FOR_WRITING: &str =
     "the store is held open for writing by another handle — a scan is already running against it";
+
+/// What both open paths say about bytes that are not a graph.
+///
+/// redb makes a database in two steps: it sizes the file and syncs it, and
+/// only then writes the magic number that says the bytes are a database —
+/// deliberately, so that a half-made file can never be mistaken for a whole
+/// one. The cost of that safety is that the window has no exit: a process
+/// killed inside it leaves a file every later open refuses, with no repair
+/// path and nothing in redb's own words (`I/O error: invalid data`) to say
+/// which file or what to do about it.
+///
+/// [`Store::open`] does not leave one any more — a store that does not exist
+/// yet is built beside its path and published whole, so the path holds either
+/// nothing or a database. This sentence is for the two cases that remain: a
+/// file an older build wedged, and a `--db` aimed at something that was never
+/// a store. Both read the same from here, and both end the same way — and not
+/// by arthron's hand. A graph is a cache the tree can always rebuild, but the
+/// bytes at a path the caller named are the caller's to delete.
+pub const NOT_A_STORE: &str = "not an arthron store — an interrupted first scan left it \
+     half-made, or the path is not a graph at all; delete the file and re-run `arthron scan`";
+
+/// What a read-only open says about a store an interrupted scan left behind.
+///
+/// redb marks a store as needing recovery while a write transaction is in
+/// flight and clears the mark when it lands, so a scan killed between the two
+/// leaves the mark set. Recovery is a *write*, which a reader cannot do and
+/// must not: repairing a store in order to answer a question is the one thing
+/// [`ReadStore`] exists not to do. redb's own words — `Database repair
+/// aborted.` — name neither the store nor the way out.
+///
+/// The refusal is wider than the damage, on purpose. The mark says a scan
+/// died; it does not say the graph is wrong, and a store can carry it while
+/// being byte-for-byte what the finished scan would have written. Nothing in
+/// the file distinguishes those two, so answering out of one would mean
+/// answering out of the ones that *are* torn — and the way out is one command
+/// that fixes both, because a scan re-reads every file whose claim the killed
+/// one withdrew.
+pub const NEEDS_RECOVERY: &str =
+    "an interrupted scan left this store needing recovery — re-run `arthron scan`";
+
+/// What a query says about a store that is readable but not wholly current.
+///
+/// A [`FILES`] row with an empty value is the store saying it holds facts for
+/// a file it no longer claims are current — see [`Store::forget_hashes`] and
+/// the currency rule in this module's header. Two things leave one: a scan
+/// that could not read an owned file, and a scan that was killed between a
+/// file's two halves. A query cannot tell them apart and does not need to,
+/// because the consequence is the same either way — some of these answers
+/// were computed against a graph the store has since moved past.
+///
+/// Said on stderr and never on stdout: the answer is still the best one the
+/// store has, `--json` stays one document, and the exit code stays what the
+/// question deserved. What is not acceptable is saying it silently.
+pub const NOT_ALL_CURRENT: &str = "this store no longer claims to be current for some of its files; \
+     answers touching them may be stale — re-run `arthron scan`";
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
@@ -435,6 +506,27 @@ pub struct RefRecord {
     pub lang: u8,
 }
 
+/// What one phase-1 transaction leaves for the event that ran it.
+///
+/// Two answers, because a batch changes two things at once: which identities
+/// exist, and which files' stored answers about them are still worth
+/// anything.
+#[derive(Debug, Clone, Default)]
+pub struct DefOutcome {
+    /// The identities that ended this call with a *definition* declared in
+    /// more than one file — see [`Store::apply_defs`].
+    pub colliding: Vec<NodeId>,
+    /// The files whose currency claim this call withdrew, because an
+    /// identity their stored resolution consulted moved underneath them.
+    ///
+    /// The event has to re-resolve every one of them before it ends: the
+    /// claim is withdrawn *inside* the transaction that invalidates the
+    /// file, so that a scan killed here leaves a store that knows what it no
+    /// longer knows, and [`Store::apply_refs`] is the only thing that puts
+    /// the claim back.
+    pub invalidated: BTreeSet<String>,
+}
+
 /// Everything phase 1 writes, one entry per file, applied in one transaction.
 #[derive(Debug, Clone, Default)]
 pub struct DefBatch {
@@ -650,19 +742,35 @@ impl Store {
     /// A store some other handle already holds is refused, immediately and by
     /// name — see [`HELD_FOR_WRITING`]. There is one writer, and a second one
     /// is told so rather than left waiting for the first to finish.
+    ///
+    /// # Creation is all-or-nothing
+    ///
+    /// A store that does not exist yet — or a path holding no bytes at all,
+    /// which is the same thing to redb — is **not** made at its own path. It
+    /// is made beside it, at [`staging_path`], and published only once it is a
+    /// database — because the window in which it is not one has no exit. redb
+    /// sizes the file and syncs it before writing the magic number, so a
+    /// process killed between those two leaves bytes that every later open
+    /// refuses, forever, with no repair path: the first scan of a repository
+    /// wedges its own store and only `rm` gets past it. Building beside the
+    /// path and publishing whole means the path holds either nothing — which
+    /// the next scan reads as "cold scan" and heals by definition — or a
+    /// database. See [`NOT_A_STORE`].
+    ///
+    /// Publication is a [`fs::hard_link`], which refuses to replace a path
+    /// that exists, and *that* refusal is the point: two scans that both found
+    /// no store both build one, and the loser must not unlink the winner's
+    /// store out from under a handle already writing into it. The loser drops
+    /// its own and opens the winner's, where redb's lock refuses it by name
+    /// exactly as it would have before.
     pub fn open(path: &Path) -> Result<Self, String> {
+        if !holds_bytes(path) {
+            create_beside(path)?;
+        }
         let db = redb::Builder::new()
             .set_cache_size(CACHE_BYTES)
             .create(path)
-            .map_err(|e| match e {
-                // Named rather than passed through: redb says only
-                // `Database already open. Cannot acquire lock.`, which names
-                // no file and no holder — see [`HELD_FOR_WRITING`].
-                redb::DatabaseError::DatabaseAlreadyOpen => {
-                    format!("{}: {HELD_FOR_WRITING}", path.display())
-                }
-                other => format!("{}: {other}", path.display()),
-            })?;
+            .map_err(|e| open_failure(path, e))?;
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         {
             let stored = {
@@ -769,40 +877,87 @@ impl Store {
     /// second one in, and an identity a later batch takes back is flagged all
     /// the same. A caller spanning batches therefore collects these and asks
     /// [`Store::definition_collisions`] which of them survived the event.
-    pub fn apply_defs(&self, batch: &DefBatch) -> Result<Vec<NodeId>, String> {
+    ///
+    /// # Currency
+    ///
+    /// This writes half of a file's facts, so the same transaction
+    /// **withdraws the store's claim that the file is current**: the other
+    /// half is still the previous event's, and [`Store::apply_refs`] is what
+    /// puts the claim back once it lands. A scan killed between the two
+    /// therefore leaves a file the next scan re-reads, instead of a file
+    /// claiming to be current for work that never finished.
+    ///
+    /// The same transaction withdraws the claim of every *other* file whose
+    /// stored resolution consulted an identity this batch moved. Phase 1 is
+    /// where a definition appears, disappears, or changes meaning, and every
+    /// row that probed it — hit or miss — holds an answer that no longer
+    /// stands. The event widens to those files itself, but the widening lives
+    /// in memory and the commit does not: recording the invalidation in the
+    /// transaction that *causes* it is what makes an interrupted scan
+    /// recoverable rather than silently wrong. They are named back to the
+    /// caller so that the running event re-resolves them and restores their
+    /// claims.
+    pub fn apply_defs(&self, batch: &DefBatch) -> Result<DefOutcome, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
         let mut colliding = Vec::new();
+        let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
             let mut owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
-            let mut touched: BTreeSet<NodeId> = BTreeSet::new();
+            let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
+            let cands = txn
+                .open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
+            // What every identity this transaction touches meant *before* it
+            // ran, captured at the first write to each. Comparing that with
+            // what it means at the end separates an identity whose meaning
+            // moved from one a file merely re-asserted: a woken file rewrites
+            // its own half unchanged, and invalidating its probers for that
+            // would cascade an event across a repository.
+            let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
             for file in &batch.files {
                 let previous: DefOwned = read_owned(&owned, &file.path)?.unwrap_or_default();
                 for id in &previous.nodes {
+                    note_payload(&nodes, &mut before, id)?;
                     drop_site(&mut nodes, id, &file.path)?;
-                    touched.insert(*id);
                 }
                 let mut ids = Vec::with_capacity(file.nodes.len());
                 let mut seen: HashSet<NodeId> = HashSet::with_capacity(file.nodes.len());
                 for (id, record) in &file.nodes {
+                    note_payload(&nodes, &mut before, id)?;
                     upsert_node(&mut nodes, id, record.clone())?;
                     if seen.insert(*id) {
                         ids.push(*id);
                     }
-                    touched.insert(*id);
                 }
                 write_owned(&mut owned, &file.path, &DefOwned { nodes: ids })?;
+                // Half of this file's facts are now this event's and the
+                // other half is still the last one's. The store may not claim
+                // the file is current until `apply_refs` lands the rest.
+                withdraw_claim(&mut files, &file.path)?;
             }
-            for id in &touched {
-                if let Some(record) = read_node(&nodes, id)?
-                    && record.is_definition_collision()
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
+            for (id, was) in &before {
+                let record = read_node(&nodes, id)?;
+                if record
+                    .as_ref()
+                    .is_some_and(NodeRecord::is_definition_collision)
                 {
                     colliding.push(*id);
                 }
+                if record.map(|record| record.payload()).as_ref() != was.as_ref() {
+                    moved.insert(*id);
+                }
             }
+            let rewritten: HashSet<&str> =
+                batch.files.iter().map(|file| file.path.as_str()).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
         }
         txn.commit().map_err(|e| e.to_string())?;
-        Ok(colliding)
+        Ok(DefOutcome {
+            colliding,
+            invalidated,
+        })
     }
 
     /// Which of these identities a *definition* is declared for in more than
@@ -839,26 +994,66 @@ impl Store {
     /// the size of the tree carrying nothing. Removal is also what keeps a
     /// warm store byte-identical to a cold one, which the snapshot oracle
     /// compares.
-    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<(), String> {
+    ///
+    /// Carries the same currency rule [`Store::apply_defs`] does, for the
+    /// same reason: what a type sits under decides every member lookup
+    /// beneath it, so a row that moves invalidates the files that read it,
+    /// and the invalidation is committed with the row rather than after it.
+    /// The files it withdrew are named back to the caller.
+    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<BTreeSet<String>, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let invalidated;
         {
             let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
+            let cands = txn
+                .open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
+            // The identities whose relation this transaction moves. A file's
+            // row is its own contribution to a merged relation, so a
+            // contribution that changed is an identity whose closure may have
+            // — the over-approximation costs a re-resolve and never an answer.
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
             for file in &batch.files {
-                if file.types.is_empty() {
+                let previous: BTreeMap<NodeId, SuperRecord> =
+                    match supers.get(file.path.as_str()).map_err(|e| e.to_string())? {
+                        Some(guard) => decode::<Vec<(NodeId, SuperRecord)>>(guard.value())?
+                            .into_iter()
+                            .collect(),
+                        None => BTreeMap::new(),
+                    };
+                let mut rows = file.types.clone();
+                rows.sort_by_key(|row| row.0);
+                let stated: BTreeMap<NodeId, &SuperRecord> =
+                    rows.iter().map(|(id, record)| (*id, record)).collect();
+                for id in previous.keys().chain(stated.keys()) {
+                    if previous.get(id) != stated.get(id).copied() {
+                        moved.insert(*id);
+                    }
+                }
+                // This is a third of a file's facts, so the claim goes with
+                // the same rule phase 1 applies: only `apply_refs` restores
+                // it. Every file here has already been through `apply_defs`
+                // in this event, so this is a re-assertion — and it is the
+                // invariant that is worth stating locally, not the saving.
+                withdraw_claim(&mut files, &file.path)?;
+                if rows.is_empty() {
                     supers
                         .remove(file.path.as_str())
                         .map_err(|e| e.to_string())?;
                     continue;
                 }
-                let mut rows = file.types.clone();
-                rows.sort_by_key(|row| row.0);
                 let bytes = encode(&rows)?;
                 supers
                     .insert(file.path.as_str(), bytes.as_slice())
                     .map_err(|e| e.to_string())?;
             }
+            let rewritten: HashSet<&str> =
+                batch.files.iter().map(|file| file.path.as_str()).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
         }
-        txn.commit().map_err(|e| e.to_string())
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(invalidated)
     }
 
     /// The whole supertype relation, merged across the files that state it.
@@ -989,11 +1184,18 @@ impl Store {
     /// A file that stopped being the scan's — a nested manifest appeared
     /// above it — is a deletion by exactly this rule, which is the correct
     /// answer: its facts are no longer this graph's.
-    pub fn forget_files(&self, paths: &[String]) -> Result<(), String> {
+    ///
+    /// A deletion is the sharpest way an identity can move, so this carries
+    /// the same currency rule [`Store::apply_defs`] does: the files whose
+    /// stored resolution consulted an identity these files were the last to
+    /// declare lose their claim in this transaction, and are named back to
+    /// the caller to be re-resolved.
+    pub fn forget_files(&self, paths: &[String]) -> Result<BTreeSet<String>, String> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
             let mut refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
@@ -1006,6 +1208,14 @@ impl Store {
             let mut def_owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut ref_owned = txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
             let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            // What the identities these files declare meant before they went,
+            // and the identities whose supertype relation loses a
+            // contribution. External nodes are deliberately absent: no
+            // resolver can probe one — the `external:` prefix is unreachable
+            // from any candidate — so one appearing or going invalidates
+            // nothing.
+            let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
             for path in paths {
                 forget_ref_half(
                     &mut nodes, &mut refs, &mut edges, &mut rev, &mut cands, &ref_owned, path,
@@ -1013,15 +1223,33 @@ impl Store {
                 ref_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
                 if let Some(previous) = read_owned::<DefOwned>(&def_owned, path)? {
                     for id in &previous.nodes {
+                        note_payload(&nodes, &mut before, id)?;
                         drop_site(&mut nodes, id, path)?;
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
+                if let Some(guard) = supers.get(path.as_str()).map_err(|e| e.to_string())? {
+                    for (id, _) in decode::<Vec<(NodeId, SuperRecord)>>(guard.value())? {
+                        moved.insert(id);
+                    }
+                }
                 supers.remove(path.as_str()).map_err(|e| e.to_string())?;
                 files.remove(path.as_str()).map_err(|e| e.to_string())?;
             }
+            for (id, was) in &before {
+                if read_node(&nodes, id)?
+                    .map(|record| record.payload())
+                    .as_ref()
+                    != was.as_ref()
+                {
+                    moved.insert(*id);
+                }
+            }
+            let gone: HashSet<&str> = paths.iter().map(String::as_str).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &gone)?;
         }
-        txn.commit().map_err(|e| e.to_string())
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(invalidated)
     }
 
     /// Take back the store's claim that these files' facts are current,
@@ -1368,6 +1596,160 @@ impl Store {
     }
 }
 
+/// Where a store that does not exist yet is built before it is published.
+///
+/// A sibling of the store's own path, so the publication below is a link
+/// within one directory and therefore within one filesystem — a store staged
+/// under `/tmp` and published onto another mount could not be linked at all.
+/// The name is derived rather than unique on purpose: it is the *lock*. Two
+/// scans that both find no store both open this one path, and redb's
+/// `flock(2)` refuses the second exactly as it refuses a second writer on a
+/// store that already exists. A unique name per process would let both build
+/// one and both publish.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".new");
+    PathBuf::from(name)
+}
+
+/// Turn redb's word for a failed open into one that names the store and the
+/// way out.
+///
+/// Shared by both open paths for the two failures that read the same from
+/// either side. redb says `Database already open. Cannot acquire lock.` and
+/// `I/O error: invalid data`, and neither names a file, a holder, or a
+/// remedy — see [`HELD_FOR_WRITING`] and [`NOT_A_STORE`].
+fn open_failure(path: &Path, e: redb::DatabaseError) -> String {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => {
+            format!("{}: {HELD_FOR_WRITING}", path.display())
+        }
+        e if is_not_a_database(&e) => format!("{}: {NOT_A_STORE}", path.display()),
+        other => format!("{}: {other}", path.display()),
+    }
+}
+
+/// Whether redb refused these bytes because they are not a database.
+///
+/// The magic number is absent: the file was never finished being created, or
+/// it was never a store. redb reports both as an `InvalidData` I/O error,
+/// which is the one redb failure that no retry and no repair gets past.
+fn is_not_a_database(e: &redb::DatabaseError) -> bool {
+    matches!(
+        e,
+        redb::DatabaseError::Storage(redb::StorageError::Io(io))
+            if io.kind() == std::io::ErrorKind::InvalidData
+    )
+}
+
+/// Build an empty database beside `path` and publish it there whole.
+///
+/// Called only when nothing at `path` holds bytes. What it leaves is a *bare*
+/// redb
+/// database — no schema stamp and no tables — because that is the state
+/// [`Store::open`] already knows how to finish, and giving the same work two
+/// implementations is how they drift apart. A process killed after the
+/// publication and before the stamp lands opens a store whose generation is
+/// absent, which is the wipe-and-rebuild path, unchanged.
+fn create_beside(path: &Path) -> Result<(), String> {
+    let staging = staging_path(path);
+    {
+        let build = || {
+            redb::Builder::new()
+                .set_cache_size(CACHE_BYTES)
+                .create(&staging)
+        };
+        let _db = match build() {
+            Ok(db) => db,
+            // Another scan is building the same store right now. Its path is
+            // the one worth naming: the staging file is an implementation
+            // detail of the store the caller asked for.
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(format!("{}: {HELD_FOR_WRITING}", path.display()));
+            }
+            // A staging file an earlier scan was killed while making. Nobody
+            // holds it — the lock above would have said so — and the name is
+            // arthron's own, derived from the store the caller named, so this
+            // is the one file it may take back. Truncated in place rather
+            // than unlinked, so that a scan racing this one locks the same
+            // inode and is refused instead of building a second store.
+            Err(e) if is_not_a_database(&e) => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&staging)
+                    .map_err(|e| format!("{}: {e}", staging.display()))?;
+                build().map_err(|e| open_failure(&staging, e))?
+            }
+            Err(other) => return Err(open_failure(&staging, other)),
+        };
+        // Dropped here: the file is closed and its lock released before the
+        // link, so the store the caller ends up with is the one `Store::open`
+        // opens by name below, holding the only handle anybody has to it.
+    }
+    publish(&staging, path)
+}
+
+/// Move a finished staging database onto the store's own path.
+///
+/// [`fs::hard_link`] and not [`fs::rename`], because rename replaces. Two
+/// scans that both found no store race here, and a rename by the loser would
+/// unlink the winner's store while the winner is writing into it — leaving a
+/// scan that reports a rate for a graph nothing can ever read. A link refuses
+/// an occupied path, so the loser simply drops what it built and opens what
+/// it found.
+///
+/// The rename is the fallback for a filesystem with no links at all (FAT),
+/// where the choice is between a small race and no store whatsoever.
+fn publish(staging: &Path, path: &Path) -> Result<(), String> {
+    let mut linked = fs::hard_link(staging, path).is_ok();
+    // A path holding no bytes is not a store and is not data — a `touch` is
+    // the usual way one gets there. redb would initialise it where it lies,
+    // which is the window all of this exists to close, so it is taken out of
+    // the way. The link is *retried* rather than assumed: a scan that
+    // published a real store into the gap still wins it.
+    if !linked && !holds_bytes(path) {
+        let _ = fs::remove_file(path);
+        linked = fs::hard_link(staging, path).is_ok();
+    }
+    if linked || path.exists() {
+        let _ = fs::remove_file(staging);
+    } else {
+        fs::rename(staging, path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    sync_dir(path);
+    Ok(())
+}
+
+/// Whether a path holds anything a store could be read out of.
+///
+/// A missing file and an empty one are the same answer, because they are the
+/// same answer to redb: both are a database it is willing to make from
+/// nothing. Everything else — a real store, a wedged one, a tarball someone
+/// aimed `--db` at — holds bytes, and bytes at a path the caller named are
+/// never taken away by a scan.
+fn holds_bytes(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
+}
+
+/// Make the new directory entry durable, best effort.
+///
+/// The link is what publishes the store, and a link is a directory write. The
+/// file's own bytes are already synced — redb did that before it wrote the
+/// magic number — so the worst a lost entry costs is a store that is not
+/// there, which the next scan reads as "nothing here yet" and rebuilds. That
+/// is why this is best effort: platforms that will not open a directory as a
+/// file lose nothing that is not already recoverable.
+fn sync_dir(path: &Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
 /// A read-only handle on a graph some earlier scan wrote.
 ///
 /// A separate type rather than a mode of [`Store`], because the two differ in
@@ -1401,20 +1783,25 @@ impl std::fmt::Debug for ReadStore {
 impl ReadStore {
     /// Open an existing store for reading only.
     ///
-    /// Three failures, each named rather than collapsed into "cannot open":
-    /// the file is not there, a scan is holding it for writing, or it was
-    /// written under a different schema generation. The last is a refusal and
-    /// not a wipe: a reader that rebuilt the store to satisfy itself would
-    /// destroy a graph whose owner never asked for one.
+    /// Five failures, each named rather than collapsed into "cannot open":
+    /// the file is not there, a scan is holding it for writing, an
+    /// interrupted scan left it needing recovery, it is not a store at all,
+    /// or it was written under a different schema generation. The last two
+    /// are refusals and not repairs: a reader that rebuilt the store to
+    /// satisfy itself would destroy a graph whose owner never asked for one —
+    /// see [`NEEDS_RECOVERY`] and [`NOT_A_STORE`].
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = redb::Builder::new()
             .set_cache_size(CACHE_BYTES)
             .open_read_only(path)
             .map_err(|e| match e {
-                redb::DatabaseError::DatabaseAlreadyOpen => {
-                    format!("{}: {HELD_FOR_WRITING}", path.display())
+                // Recovery is a write. redb aborts it under a read-only open
+                // rather than doing it, which is the right answer and an
+                // unreadable way of giving it — see [`NEEDS_RECOVERY`].
+                redb::DatabaseError::RepairAborted => {
+                    format!("{}: {NEEDS_RECOVERY}", path.display())
                 }
-                other => format!("{}: {other}", path.display()),
+                other => open_failure(path, other),
             })?;
         let store = ReadStore { db };
         match store.schema_version()? {
@@ -1428,6 +1815,37 @@ impl ReadStore {
                 found.map_or_else(|| "absent".to_string(), |v| v.to_string()),
             )),
         }
+    }
+
+    /// The files the store holds facts for and no longer claims are current.
+    ///
+    /// The one predicate that says a store is not wholly answerable: a
+    /// [`FILES`] row whose value is not a hash. Both things that leave one —
+    /// a scan that could not read an owned file, and a scan killed between a
+    /// file's two halves — mean the same to a reader, and the reader is the
+    /// only surface that can say so, because the scan that would have said it
+    /// is the one that did not finish. See [`NOT_ALL_CURRENT`].
+    ///
+    /// A count and not the paths: every caller of this asks one question —
+    /// may I answer without a caveat — and materialising a path per file
+    /// would make the caveat cost a whole-table string allocation on a store
+    /// where the answer is almost always zero.
+    pub fn not_current(&self) -> Result<usize, String> {
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        // A store no scan ever wrote to has no `files` table, which is no
+        // files rather than a failure — the same reading `schema_version`
+        // gives an absent `meta`.
+        let Ok(table) = txn.open_table(FILES) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for entry in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            if <[u8; 32]>::try_from(value.value()).is_err() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// The generation stamped in [`META`], if the store carries one.
@@ -1577,6 +1995,109 @@ fn read_node<T: ReadableTable<&'static [u8; 16], &'static [u8]>>(
         return Ok(None);
     };
     decode(guard.value()).map(Some)
+}
+
+/// What an identity meant before this transaction touched it, recorded once.
+///
+/// Called immediately before the first write to a node, and never again for
+/// that node in the same transaction: the point of comparison is the graph as
+/// the transaction found it, not as it left it halfway through.
+fn note_payload(
+    table: &NodeTable<'_>,
+    before: &mut BTreeMap<NodeId, Option<NodePayload>>,
+    id: &NodeId,
+) -> Result<(), String> {
+    if before.contains_key(id) {
+        return Ok(());
+    }
+    let payload = read_node(table, id)?.map(|record| record.payload());
+    before.insert(*id, payload);
+    Ok(())
+}
+
+/// Withdraw the store's claim that a file's stored facts are current, and
+/// record the file as one the store holds facts for if it does not already.
+///
+/// What a transaction writing *part* of a file's facts owes: the claim is a
+/// statement about the whole file, and until every half is committed there is
+/// no whole to make it about. Minting the row is half the point — a file
+/// whose definitions are stored under no [`FILES`] row is a file no walk can
+/// ever read as deleted, so its nodes would outlive it with nothing left to
+/// name them.
+fn withdraw_claim(files: &mut BytesTable<'_>, path: &str) -> Result<(), String> {
+    let withdrawn = files
+        .get(path)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|guard| guard.value().is_empty());
+    if !withdrawn {
+        files
+            .insert(path, [].as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Withdraw the claim for a file the store already knows, and leave one it
+/// does not alone.
+///
+/// The difference from [`withdraw_claim`] is deliberate: this is called for
+/// *other people's* files, and minting a row for one the store holds nothing
+/// about would make the next walk that does not reach it look like a deletion
+/// of nothing — the same trap [`Store::forget_hashes`] avoids.
+fn withdraw_known(files: &mut BytesTable<'_>, path: &str) -> Result<(), String> {
+    let claimed = files
+        .get(path)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|guard| !guard.value().is_empty());
+    if claimed {
+        files
+            .insert(path, [].as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Withdraw the currency claim of every file whose stored resolution
+/// consulted an identity this transaction moved, and name them.
+///
+/// The candidate index is the record of what each resolver read — hits and
+/// misses alike — so it is exactly the list of rows an identity's meaning
+/// moving invalidates. Writing the withdrawal *here*, inside the transaction
+/// that moved the identity, is what makes a scan killed a moment later
+/// recoverable: the store no longer claims to be current for a file whose
+/// answer it has just falsified, so the next scan re-reads it.
+///
+/// `rewritten` is the transaction's own files, which are being replaced in
+/// full and have had their claims withdrawn already.
+///
+/// The empty-index short circuit is what keeps a cold scan free: phase 1 runs
+/// to completion before the first candidate is written, so on a store nobody
+/// has resolved into yet there is nothing here to invalidate and no lookup
+/// worth making.
+fn invalidate_probers(
+    cands: &CandidateTable<'_>,
+    files: &mut BytesTable<'_>,
+    moved: &BTreeSet<NodeId>,
+    rewritten: &HashSet<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    if moved.is_empty() || cands.is_empty().map_err(|e| e.to_string())? {
+        return Ok(out);
+    }
+    for id in moved {
+        for value in cands.get(id).map_err(|e| e.to_string())? {
+            let guard = value.map_err(|e| e.to_string())?;
+            let (file, _) = guard.value();
+            if rewritten.contains(file) || out.contains(file) {
+                continue;
+            }
+            out.insert(file.to_string());
+        }
+    }
+    for path in &out {
+        withdraw_known(files, path)?;
+    }
+    Ok(out)
 }
 
 fn read_owned<T: Decode<()>>(table: &BytesTable<'_>, path: &str) -> Result<Option<T>, String> {
@@ -1852,7 +2373,13 @@ mod tests {
                 )],
             }],
         };
-        assert!(store.apply_defs(&defs).expect("apply defs").is_empty());
+        assert!(
+            store
+                .apply_defs(&defs)
+                .expect("apply defs")
+                .colliding
+                .is_empty()
+        );
 
         let row = key("pkg/b.go", "Foo");
         let refs = RefBatch {
@@ -1877,7 +2404,17 @@ mod tests {
 
         assert_eq!(store.file_hash("pkg/b.go").unwrap(), Some([7u8; 32]));
         assert_eq!(store.file_hash("missing.go").unwrap(), None);
-        assert_eq!(store.known_files().unwrap(), vec!["pkg/b.go".to_string()]);
+        // Both files, and only one of them current. `pkg/a.go` is here on
+        // the strength of its phase-1 half alone, with no hash: the store
+        // holds facts for it, so a walk that stops reaching it has to read
+        // that as a deletion — a definition stored under no file row is a
+        // node nothing can ever take away. Its claim is withdrawn until
+        // `apply_refs` lands the other half.
+        assert_eq!(
+            store.known_files().unwrap(),
+            vec!["pkg/a.go".to_string(), "pkg/b.go".to_string()]
+        );
+        assert_eq!(store.file_hash("pkg/a.go").unwrap(), None);
         assert!(store.symbol_entries().unwrap().contains_key(&def));
         assert_eq!(store.candidate_rows(&def).unwrap(), vec![row]);
         assert!(store.has_edge(&caller, &def, 0).unwrap());
@@ -2001,7 +2538,7 @@ mod tests {
         let batch = DefBatch {
             files: vec![declare("pkg/a_linux.go", 3), declare("pkg/a_darwin.go", 4)],
         };
-        let colliding = store.apply_defs(&batch).expect("apply defs");
+        let colliding = store.apply_defs(&batch).expect("apply defs").colliding;
         assert_eq!(colliding, vec![twin], "only the definition collides");
         assert_eq!(store.report().unwrap().fqn_collisions, 1);
         // Both attributions survive: neither declaration overwrote the other.

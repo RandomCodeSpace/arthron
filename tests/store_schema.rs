@@ -152,7 +152,14 @@ fn a_version_mismatch_forces_a_cold_rescan() {
                 files: vec![refs_of("pkg/b.go", "Foo", go("m/pkg#Foo"))],
             })
             .expect("apply refs");
-        assert_eq!(store.known_files().unwrap(), ["pkg/b.go"]);
+        // Both files, and for different reasons. `pkg/b.go` has a hash:
+        // every half of it is stored. `pkg/a.go` has only a phase-1 half, so
+        // the store records that it holds facts for it and withdraws the
+        // claim that they are current — which is what keeps a walk that stops
+        // reaching it able to read that as a deletion.
+        assert_eq!(store.known_files().unwrap(), ["pkg/a.go", "pkg/b.go"]);
+        assert_eq!(store.file_hash("pkg/a.go").unwrap(), None);
+        assert!(store.file_hash("pkg/b.go").unwrap().is_some());
     }
 
     // A store written under any other generation is dropped, not migrated:

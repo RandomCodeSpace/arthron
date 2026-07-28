@@ -330,3 +330,171 @@ fn the_gate_reads_the_corpus_config_and_ignores_its_db_key() {
     let recorded = fs::read_to_string(&baseline).expect("the baseline was written");
     assert!(recorded.contains("language = \"go\""), "{recorded}");
 }
+
+/// A repository you did not write is still a repository you may scan, and its
+/// `arthron.toml` is its text — not yours. The `db` key names where a scan
+/// writes, so a value that leaves the scanned tree lets the tree pick a file
+/// anywhere this process can write and replace it. The command-line `--db`
+/// flag is the other half of the same rule and stays free: you typing a path
+/// is you saying it.
+#[test]
+fn a_config_db_may_not_climb_out_of_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let victim = dir.path().join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("graph.redb"), b"someone else's store\n").unwrap();
+    fixture(&repo);
+    write(&repo, "arthron.toml", "db = \"../victim/graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("inside the repository"),
+        "the refusal has to say what the rule is: {stderr}",
+    );
+    assert!(
+        stderr.contains("--db"),
+        "the refusal has to say which path is allowed to leave: {stderr}",
+    );
+    assert_eq!(
+        fs::read(victim.join("graph.redb")).unwrap(),
+        b"someone else's store\n",
+        "the scan wrote over a store outside the tree it was asked to scan",
+    );
+}
+
+#[test]
+fn a_config_db_that_is_absolute_is_refused_however_ordinary_it_looks() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let elsewhere = dir.path().join("elsewhere.redb");
+    fixture(&repo);
+    write(
+        &repo,
+        "arthron.toml",
+        &format!("db = \"{}\"\n", elsewhere.display()),
+    );
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(!elsewhere.exists(), "the scan wrote outside the repository");
+}
+
+/// Lexical containment is not containment: `db = "out/graph.redb"` stays
+/// inside the tree as a string and leaves it as a path when `out` is a link.
+#[cfg(unix)]
+#[test]
+fn a_config_db_under_a_symlinked_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fixture(&repo);
+    std::os::unix::fs::symlink(&outside, repo.join("out")).unwrap();
+    write(&repo, "arthron.toml", "db = \"out/graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        !outside.join("graph.redb").exists(),
+        "the scan followed a link out of the repository",
+    );
+}
+
+/// A link with nothing on the other end passes `lstat` and fails
+/// `canonicalize`, and the containment walk used to read that failure as
+/// "not there yet" and step over it to the parent — which is inside the root,
+/// so the whole path was called contained and the store was created *through*
+/// the link. One planted link, one file written anywhere this process can
+/// write, exit 0, nothing said. The second run was refused, because by then
+/// the target existed; the first had already done it.
+#[cfg(unix)]
+#[test]
+fn a_config_db_that_is_a_link_to_nothing_is_refused_before_it_creates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let victim_parent = dir.path().join("victim_parent");
+    fs::create_dir_all(&victim_parent).unwrap();
+    fixture(&repo);
+    let planted = victim_parent.join("planted.redb");
+    // The target does not exist: that is the whole point of the case.
+    std::os::unix::fs::symlink(&planted, repo.join("graph.redb")).unwrap();
+    write(&repo, "arthron.toml", "db = \"graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("inside the repository"),
+        "the refusal has to say what the rule is: {stderr}",
+    );
+    assert!(
+        !planted.exists(),
+        "the scan created a file outside the repository it was asked to scan",
+    );
+    // And again, because the hole was self-limiting rather than closed: a
+    // second run must be refused for the same reason and not because the
+    // first one made the target exist.
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!planted.exists(), "the second run created it instead");
+}
+
+/// The same hole one level down: `sub/graph.redb` where `sub` exists and
+/// `sub/graph.redb` is the dangling link. Lexically inside, and the deepest
+/// existing component is inside too.
+#[cfg(unix)]
+#[test]
+fn a_nested_config_db_that_is_a_link_to_nothing_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fixture(&repo);
+    fs::create_dir_all(repo.join("sub")).unwrap();
+    let planted = outside.join("planted.redb");
+    std::os::unix::fs::symlink(&planted, repo.join("sub/graph.redb")).unwrap();
+    write(&repo, "arthron.toml", "db = \"sub/graph.redb\"\n");
+
+    let out = arthron(&["scan", repo.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        !planted.exists(),
+        "the scan wrote through the link: {stderr}"
+    );
+}
+
+/// The flag is the person, the file is the repository. Only one of them is an
+/// authority about where this machine's files may be written.
+#[test]
+fn the_db_flag_may_name_a_store_the_config_may_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let outside = dir.path().join("outside.redb");
+    fixture(&repo);
+    // The same value the config is refused for, typed on the command line.
+    write(&repo, "arthron.toml", "db = \"../outside.redb\"\n");
+
+    let out = arthron(&[
+        "scan",
+        repo.to_str().unwrap(),
+        "--db",
+        outside.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(outside.exists(), "the flag did not get its way");
+}
