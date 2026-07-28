@@ -1,4 +1,20 @@
 //! `arthron` CLI. Printing only — analysis logic lives in the library.
+//!
+//! # Exit codes
+//!
+//! Three, meaning the same three things on every command, because the number
+//! is what a script reads:
+//!
+//! - **0** — the command ran and this is the answer.
+//! - **1** — the command ran and the answer is *no*: a gate regression, a
+//!   query that matched nothing or matched several. Never an error.
+//! - **2** — nothing was measured: usage, I/O, or the environment.
+//!
+//! `scan` has no verdict to fail, so `scan` never returns 1. Everything that
+//! can go wrong for it — a store another scan is holding, a root that is not
+//! there, a directory it cannot create, a config file that will not parse — is
+//! a 2. That distinction is the point: a build may retry a 2 and must never
+//! retry a 1, and a lock collision answering 1 made the two indistinguishable.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -30,8 +46,13 @@ const EXIT_GATE_FAILED: u8 = 1;
 /// neither means the run failed. A store that would not open is
 /// [`EXIT_USAGE`] instead, because then there is no answer at all.
 const EXIT_NO_ANSWER: u8 = 1;
-/// Exit code for usage and I/O problems: nothing was measured, so neither a
-/// pass nor a failure may be reported.
+/// Exit code for usage, I/O and environment problems: nothing was measured, so
+/// neither a pass nor a failure may be reported.
+///
+/// The environment half is what keeps 1 meaning one thing. A store another
+/// scan is holding is not a worse measurement, it is no measurement, and a
+/// build that cannot tell the two apart either retries a real regression or
+/// fails a run that only needed to wait.
 const EXIT_USAGE: u8 = 2;
 
 /// Where a query looks for the graph when `--db` is not given: the path
@@ -50,6 +71,11 @@ macro_rules! outln {
         let _ = std::fmt::Write::write_fmt(&mut $buf, format_args!($($arg)*));
         $buf.push('\n');
     }};
+}
+
+/// `eprintln!` that cannot take a finished run down with it. See [`note`].
+macro_rules! noteln {
+    ($($arg:tt)*) => { note(format_args!($($arg)*)) };
 }
 
 /// Write a finished answer to stdout, and return the code the answer carries.
@@ -73,10 +99,33 @@ fn emit(text: &str, answered: ExitCode) -> ExitCode {
         Ok(()) => answered,
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => answered,
         Err(e) => {
-            eprintln!("arthron: writing stdout: {e}");
+            noteln!("arthron: writing stdout: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
+}
+
+/// Write one line to stderr, and never let that write end the run.
+///
+/// `eprintln!` panics when the write fails: exit 101 and a backtrace, which no
+/// script can tell from a real crash. Stderr being full, or closed by a reader
+/// that left, is not a failure of the work this program just did — a scan that
+/// measured a tree and then had an advisory line to add must not die of the
+/// advisory. Same rule as [`emit`], on the other stream: assemble, write once,
+/// and a delivery failure is not the run's failure.
+///
+/// Dropping the *write* is not dropping the *fact*. Every call site here that
+/// is reporting a failure returns a non-zero exit code of its own, and that
+/// code is what a script reads: a sentence nobody could receive still leaves
+/// the truth about the run in the one channel left. An advisory has no such
+/// code to carry and none is invented for it — it was advisory.
+fn note(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut text = args.to_string();
+    text.push('\n');
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
 
 #[derive(Parser)]
@@ -92,7 +141,14 @@ enum Command {
     /// resolution rates.
     ///
     /// Settings may also come from `arthron.toml` at the repository root; a
-    /// flag given here wins over the file.
+    /// flag given here wins over the file. The file's `db` must name a store
+    /// inside the scanned repository; `--db` here may name any path, because
+    /// the person typing it is the one saying so.
+    ///
+    /// Exit codes: 0 the scan answered, 2 usage, I/O or the environment — a
+    /// config that will not parse, a root that is not there, a store another
+    /// scan is holding. Never 1: a scan has no verdict to fail, and 1 is
+    /// reserved for one that does.
     #[command(after_long_help = json::CONFIG_HELP)]
     Scan {
         /// Repository root.
@@ -107,8 +163,10 @@ enum Command {
     },
     /// Scan a corpus and compare its counts against a committed baseline.
     ///
-    /// Exit codes: 0 pass (or a successful --rebase), 1 gate failure, 2 usage
-    /// or I/O error. The baseline's `corpus` and `commit` fields are
+    /// Exit codes: 0 pass (or a successful --rebase), 1 gate failure — the run
+    /// worked and the numbers are worse — and 2 for usage, I/O or the
+    /// environment, where nothing was measured at all. The baseline's
+    /// `corpus` and `commit` fields are
     /// provenance: printed, never verified — a vendored corpus snapshot
     /// carries no git metadata to check them against.
     ///
@@ -158,7 +216,9 @@ enum Command {
     /// exit code 1, and the list to choose from — because picking one would
     /// be a guess.
     ///
-    /// Exit codes: 0 answered, 1 no match or ambiguous, 2 usage or I/O error.
+    /// Exit codes: 0 answered, 1 no match or ambiguous — both are answers —
+    /// and 2 for usage, I/O or the environment, including a store a scan is
+    /// holding open for writing.
     Query {
         #[command(subcommand)]
         verb: QueryVerb,
@@ -234,14 +294,14 @@ fn main() -> ExitCode {
         Command::Query { verb, db, json } => match working_db(db) {
             Ok(db_path) => run_query(&verb, &db_path, json),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 ExitCode::from(EXIT_USAGE)
             }
         },
         Command::Mcp { db } => match working_db(db) {
             Ok(db_path) => run_mcp(db_path),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 ExitCode::from(EXIT_USAGE)
             }
         },
@@ -269,7 +329,7 @@ fn working_db(db: Option<PathBuf>) -> Result<PathBuf, String> {
     let root = PathBuf::from(".");
     let config = Config::load(&root)?;
     Ok(config
-        .db_path(&root)
+        .db_path(&root)?
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DB)))
 }
 
@@ -287,7 +347,7 @@ fn run_mcp(db_path: PathBuf) -> ExitCode {
         Err(e) => {
             // A broken pipe or an unreadable stdin: the transport itself
             // failed, so there is nowhere to send a JSON-RPC error.
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -298,20 +358,44 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
     let config = match Config::load(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    // The flag wins over the file: a person naming a store on the command
-    // line has said something more specific than the repository has.
-    let db_path = db
-        .or_else(|| config.db_path(path))
-        .unwrap_or_else(|| path.join(".arthron/graph.redb"));
+    // The flag wins over the file, and winning means the file's `db` is not
+    // read at all — including not being checked. A person naming a store on
+    // the command line has said something more specific than the repository
+    // has, and is the only authority here about where this machine is written
+    // to: the file's own `db` may not leave the tree it sits in.
+    let db_path = match db {
+        Some(flag) => flag,
+        None => match config.db_path(path) {
+            Ok(configured) => configured.unwrap_or_else(|| path.join(".arthron/graph.redb")),
+            Err(e) => {
+                noteln!("arthron: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
+    // Asked before anything is created, because creating the store's
+    // directory would otherwise be what brings the scanned root into
+    // existence. The default store is `<root>/.arthron/graph.redb`, so
+    // `create_dir_all` on its parent makes every missing component of the
+    // root along the way; the walk then succeeds over the empty tree it just
+    // made and the run answers 0 with a report of zeros — the shape
+    // `scan_repo_with` refuses to return, arrived at by materialising the
+    // thing whose absence was the failure. With `--db` elsewhere the same
+    // invocation already answered 2, so the code depended on where the store
+    // happened to sit.
+    if let Err(e) = std::fs::metadata(path) {
+        noteln!("arthron: {}: {e}", path.display());
+        return ExitCode::from(EXIT_USAGE);
+    }
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("arthron: creating {}: {e}", parent.display());
-        return ExitCode::FAILURE;
+        noteln!("arthron: creating {}: {e}", parent.display());
+        return ExitCode::from(EXIT_USAGE);
     }
     match scan_repo_with(path, &db_path, &config) {
         Ok(report) => {
@@ -322,9 +406,14 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
                 emit(&report_text(&report), ExitCode::SUCCESS)
             }
         }
+        // Nothing was measured, so this is [`EXIT_USAGE`] and never
+        // [`EXIT_GATE_FAILED`]: every way a scan can fail is environmental —
+        // a store another scan holds, a root that is not there, a store that
+        // will not open — and a scan has no verdict that could make 1 mean
+        // anything here.
         Err(e) => {
-            eprintln!("arthron: {e}");
-            ExitCode::FAILURE
+            noteln!("arthron: {e}");
+            ExitCode::from(EXIT_USAGE)
         }
     }
 }
@@ -340,7 +429,7 @@ fn print_json(doc: &serde_json::Value, answered: ExitCode) -> ExitCode {
     match json::render(doc) {
         Ok(text) => emit(&format!("{text}\n"), answered),
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -370,7 +459,7 @@ fn warn_if_include_matched_nothing(config: &Config, report: &arthron::store::Rep
     if measured > 0 {
         return;
     }
-    eprintln!(
+    noteln!(
         "arthron: `include` is set and this scan measured no reference at all — \
          the globs may match no file. A bare directory name matches the \
          directory and not the files under it: `include = [\"src\"]` reads \
@@ -425,14 +514,14 @@ fn run_gate(
         .map(|l| l.name())
         .collect();
     let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
-        eprintln!(
+        noteln!(
             "arthron: unknown language `{language}`; one of: {}",
             gateable.join(", ")
         );
         return ExitCode::from(EXIT_USAGE);
     };
     if !gateable.contains(&lang.name()) {
-        eprintln!(
+        noteln!(
             "arthron: language `{language}` is registered but its track is not live in \
              this build, so there is nothing to gate; one of: {}",
             gateable.join(", "),
@@ -445,7 +534,7 @@ fn run_gate(
     let config = match Config::load(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -455,13 +544,13 @@ fn run_gate(
         Ok(text) => match parse_baseline(&text) {
             Ok(b) => Some(b),
             Err(e) => {
-                eprintln!("arthron: {}: {e}", baseline_path.display());
+                noteln!("arthron: {}: {e}", baseline_path.display());
                 return ExitCode::from(EXIT_USAGE);
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            eprintln!("arthron: reading {}: {e}", baseline_path.display());
+            noteln!("arthron: reading {}: {e}", baseline_path.display());
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -471,7 +560,7 @@ fn run_gate(
     {
         // Rates are per language and never aggregated, so a baseline for one
         // language must never be compared against another's scan.
-        eprintln!(
+        noteln!(
             "arthron: {}: baseline is for language `{}`, this scan measures `{}`",
             baseline_path.display(),
             b.language,
@@ -487,7 +576,7 @@ fn run_gate(
         None => match scratch_dir() {
             Ok(d) => (d.0.join("gate.redb"), Some(d)),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         },
@@ -495,7 +584,7 @@ fn run_gate(
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("arthron: creating {}: {e}", parent.display());
+        noteln!("arthron: creating {}: {e}", parent.display());
         return ExitCode::from(EXIT_USAGE);
     }
 
@@ -505,7 +594,7 @@ fn run_gate(
     let report = match scan_repo_with(path, &db_path, &config) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -542,7 +631,7 @@ fn run_gate(
         ) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         };
@@ -573,7 +662,7 @@ fn run_gate(
         }
     } else {
         let Some(baseline) = existing else {
-            eprintln!("arthron: {shown} does not exist; record it with --rebase",);
+            noteln!("arthron: {shown} does not exist; record it with --rebase",);
             return ExitCode::from(EXIT_USAGE);
         };
         let verdict = evaluate(&baseline, &measured);
@@ -695,13 +784,13 @@ fn report_verdict(
         GateVerdict::Fail(failures) => {
             let code = emit(&text, ExitCode::from(EXIT_GATE_FAILED));
             for failure in failures {
-                eprintln!("gate: FAIL — {failure}");
+                noteln!("gate: FAIL — {failure}");
             }
             code
         }
         GateVerdict::Error(e) => {
             let code = emit(&text, ExitCode::from(EXIT_USAGE));
-            eprintln!("gate: error — {e}");
+            noteln!("gate: error — {e}");
             code
         }
     }
@@ -810,14 +899,14 @@ fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
     let store = match ReadStore::open(db_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
     let index = match NameIndex::build(&store) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("arthron: {}: {e}", db_path.display());
+            noteln!("arthron: {}: {e}", db_path.display());
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -841,7 +930,7 @@ fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
     match outcome {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }

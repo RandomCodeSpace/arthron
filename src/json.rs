@@ -54,15 +54,19 @@ pub fn scan(report: &Report, config: &Config) -> Value {
     })
 }
 
-/// The files a scan reached and could not read.
+/// What a scan reached and could not turn into facts.
 ///
 /// An array and not a count, because a count nobody can act on is a count
 /// nobody looks at: the whole point of recording these is that the paths are
 /// there. Empty on every clean scan, and always present — a reader never has
 /// to tell "no failures" from "this build did not report them".
 ///
-/// One entry per file, so the count is the array's length. Additive, so
-/// [`SCHEMA`] does not move: a reader that ignores unknown keys is unaffected.
+/// Mostly one entry per file. The exception is a track whose project layout
+/// could not be established, whose entry is keyed by the language's name: what
+/// was missing there is the *project*, not a file the walk found, and that
+/// track's silence in `languages` needs saying out loud somewhere. Additive,
+/// so [`SCHEMA`] does not move: a reader that ignores unknown keys, and one
+/// that only prints these, are both unaffected.
 fn file_errors(errors: &[FileError]) -> Value {
     Value::Array(
         errors
@@ -258,8 +262,18 @@ pub const HELP: &str = concat!(
     "\n",
     "Field names are stable public API from 0.0.1, versioned by the `schema`\n",
     "field. Adding a field does not move it; removing one or changing what one\n",
-    "means does. Only measurements are documents: a usage or I/O error is a\n",
-    "line on stderr and a non-zero exit in both modes.\n",
+    "means does. Only measurements are documents: a usage, I/O or environment\n",
+    "error is a line on stderr and a non-zero exit in both modes.\n",
+    "\n",
+    "Exit codes mean the same three things on every command:\n",
+    "  0  the command ran and this is the answer\n",
+    "  1  the command ran and the answer is no — a gate regression, a query\n",
+    "     that matched nothing or matched several. Never an error, so a build\n",
+    "     must never retry it.\n",
+    "  2  nothing was measured: usage, I/O or the environment — a config that\n",
+    "     will not parse, a root that is not there, a store another scan is\n",
+    "     holding open for writing. `scan` has no verdict to fail and so never\n",
+    "     returns 1; every failure it can have is one of these.\n",
     "\n",
     "scan\n",
     "  schema           JSON contract version (integer)\n",
@@ -282,12 +296,18 @@ pub const HELP: &str = concat!(
     "                        null for a stored language code this build has\n",
     "                        no name for\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
-    "  file_errors      [{ path, error }] — files the walk reached and could\n",
-    "                   not read: no permission, not UTF-8, gone mid-walk, or\n",
-    "                   a directory it could not descend into. The scan keeps\n",
-    "                   going and measures the rest, so this is how a smaller\n",
-    "                   file set than the tree holds becomes visible. One\n",
-    "                   entry per file; empty when every file read cleanly.\n",
+    "  file_errors      [{ path, error }] — what the scan reached and could not\n",
+    "                   turn into facts: a file with no permission, not UTF-8,\n",
+    "                   gone mid-walk, a directory it could not descend into,\n",
+    "                   or a symbolic link whose target is outside the scanned\n",
+    "                   tree. One further entry has a language name for its\n",
+    "                   `path` rather than a file: that language's project\n",
+    "                   layout could not be established — no manifest where its\n",
+    "                   resolver looks — so that one track measured nothing and\n",
+    "                   has no `languages` entry, while every other track ran.\n",
+    "                   The scan keeps going either way, which is how a smaller\n",
+    "                   file set than the tree holds becomes visible. Empty when\n",
+    "                   every file read cleanly.\n",
     "  config           the settings this run read, which decide the file set\n",
     "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
@@ -341,11 +361,18 @@ pub const CONFIG_HELP: &str = concat!(
     "arthron.toml",
     "` at the scanned root, if it is there. Every\n",
     "key is optional; an unknown key is an error naming the key. A `--db` flag\n",
-    "wins over the file's `db`.\n",
+    "wins over the file's `db`, and winning means the file's `db` is not read.\n",
     "\n",
     "  include = [\"src/**\"]          globs a file must match to be read\n",
     "  exclude = [\"**/vendor/**\"]    globs that keep a file out; wins over include\n",
-    "  db      = \"build/graph.redb\"  the graph, relative to the scanned root\n",
+    "  db      = \"build/graph.redb\"  the graph, relative to the scanned root, and\n",
+    "                                refused if it leaves it: no absolute path, no\n",
+    "                                `..` past the root, no symlinked parent. A\n",
+    "                                scan reads repositories it did not write, so\n",
+    "                                the repository does not choose which of this\n",
+    "                                machine's files a scan replaces. `--db` on\n",
+    "                                the command line is free to name anything:\n",
+    "                                you typing it is you saying it.\n",
     "  [tracks]\n",
     "  java    = false               keep a live language track out of the scan;\n",
     "                                a track this build lacks cannot be switched on",

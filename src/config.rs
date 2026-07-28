@@ -29,7 +29,8 @@
 //! the same last-match-wins rule a `.gitignore` uses.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use ignore::overrides::{Override, OverrideBuilder};
 
@@ -37,6 +38,12 @@ use crate::registry::REGISTRY;
 
 /// The file a repository states its scan settings in, at its root.
 pub const CONFIG_FILE: &str = "arthron.toml";
+
+/// Why a `db` value that leaves the scanned tree is refused.
+///
+/// One constant so the refusal, the `--help` text and the tests cannot drift
+/// apart about what the rule is.
+pub const DB_OUTSIDE_ROOT: &str = "`db` must name a file inside the repository being scanned";
 
 /// Every key [`CONFIG_FILE`] accepts at the top level, in the order the
 /// "known keys" half of an error message lists them.
@@ -130,13 +137,106 @@ impl Config {
         FileFilter::new(root, &self.include, &self.exclude)
     }
 
-    /// The configured database path, resolved against the repository root.
+    /// The configured database path, resolved against the repository root —
+    /// and refused when it is not under it.
     ///
-    /// An absolute value in the file is used as it stands; a relative one is
-    /// relative to the repository, not to the working directory, so the same
-    /// file means the same store from wherever `arthron` is run.
-    pub fn db_path(&self, root: &Path) -> Option<PathBuf> {
-        self.db.as_ref().map(|db| root.join(db))
+    /// Relative to the repository rather than to the working directory, so the
+    /// same file means the same store from wherever `arthron` is run. Inside
+    /// it, always: `db` says where a scan *writes*, and a scan reads
+    /// repositories this machine did not write. A value free to leave the root
+    /// would let a scanned tree pick any file this process can open and
+    /// replace it, which is the whole of the attack — so an absolute path, a
+    /// `..` that climbs past the root, and a component that is a symbolic link
+    /// out of the tree are all refused by name.
+    ///
+    /// The command-line `--db` flag is under no such rule and never passes
+    /// through here. The person typing a path is the authority about this
+    /// machine's files; a file sitting inside a scanned tree is not.
+    pub fn db_path(&self, root: &Path) -> Result<Option<PathBuf>, String> {
+        self.db.as_deref().map(|db| contained(root, db)).transpose()
+    }
+}
+
+/// `db` resolved against `root`, or why it does not stay inside it.
+///
+/// Two passes, because either alone leaves a hole. The lexical pass drops
+/// `.`, applies `..` and refuses anything absolute or climbing past the root;
+/// its *result* is what gets used, so `link/../graph.redb` names
+/// `<root>/graph.redb` whatever `link` points at. The filesystem pass then
+/// canonicalises the deepest part of that result which exists and checks it is
+/// still under the canonical root, which is what catches a directory inside
+/// the repository that is a symbolic link out of it. The deepest *existing*
+/// part is what there is to ask about: the store itself usually does not exist
+/// until the scan creates it — and "does not exist" means `symlink_metadata`
+/// finds nothing, not merely that `canonicalize` failed, because a link with
+/// nothing on the other end fails the second while passing the first.
+fn contained(root: &Path, db: &Path) -> Result<PathBuf, String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "{DB_OUTSIDE_ROOT}; `{}` {why}. A scan reads repositories this \
+             machine did not write, so the repository does not get to choose \
+             which of this machine's files a scan replaces — pass `--db` on \
+             the command line to put the store outside the scanned tree.",
+            db.display(),
+        ))
+    };
+    let mut kept: Vec<OsString> = Vec::new();
+    for component in db.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => kept.push(part.to_os_string()),
+            Component::ParentDir => {
+                if kept.pop().is_none() {
+                    return refuse("climbs out of it");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return refuse("is an absolute path"),
+        }
+    }
+    if kept.is_empty() {
+        return refuse("names the repository root itself rather than a file in it");
+    }
+    let path = root.join(kept.iter().collect::<PathBuf>());
+    // A root that cannot be resolved is a root the scan is about to fail on
+    // anyway, and guessing at containment against a path that is not there
+    // would refuse valid configurations. Lexical containment stands on its own.
+    let Ok(real_root) = root.canonicalize() else {
+        return Ok(path);
+    };
+    let mut probe = path.clone();
+    loop {
+        match probe.canonicalize() {
+            Ok(real) if real.starts_with(&real_root) => return Ok(path),
+            Ok(_) => return refuse("resolves outside it"),
+            // `canonicalize` fails for two different reasons, and only one of
+            // them means "not there yet". A component `symlink_metadata`
+            // answers for is a component that *exists* — a symbolic link
+            // whose target does not is the ordinary case — and walking past
+            // one to its parent would find the parent inside the root and
+            // call the whole path contained. `Store::open` then creates the
+            // file *through* the link, at whatever path the scanned
+            // repository put on the other end of it, which is the one thing
+            // this function exists to prevent. Once is enough: the target
+            // exists after the first scan, so only the second is refused.
+            //
+            // Refusing is the safe direction here whatever the cause. A
+            // component that will not resolve cannot be shown to stay inside
+            // the root, and the reader's fix is the same either way — name
+            // the store on the command line, or point the link at a file.
+            Err(_) if probe.symlink_metadata().is_ok() => {
+                return refuse(
+                    "has a component that exists but does not resolve, usually a \
+                     symbolic link with nothing on the other end, so nothing shows \
+                     where it would be written",
+                );
+            }
+            // Not there yet: ask the same question of its parent, down to the
+            // root, which does exist.
+            Err(_) => match probe.parent() {
+                Some(parent) if parent != probe => probe = parent.to_path_buf(),
+                _ => return Ok(path),
+            },
+        }
     }
 }
 
@@ -359,16 +459,106 @@ mod tests {
     fn the_db_path_is_relative_to_the_repository() {
         let config = Config::parse("db = \"build/graph.redb\"\n").expect("parses");
         assert_eq!(
-            config.db_path(Path::new("/repo")),
+            config.db_path(Path::new("/repo")).expect("inside the root"),
             Some(PathBuf::from("/repo/build/graph.redb")),
         );
-        // An absolute value stands on its own.
-        let config = Config::parse("db = \"/tmp/graph.redb\"\n").expect("parses");
         assert_eq!(
-            config.db_path(Path::new("/repo")),
-            Some(PathBuf::from("/tmp/graph.redb")),
+            Config::default()
+                .db_path(Path::new("/repo"))
+                .expect("no db"),
+            None,
         );
-        assert_eq!(Config::default().db_path(Path::new("/repo")), None);
+        // `.` and a `..` that comes back are spelling, not escape, and the
+        // path that is used is the normalised one — so no component of it can
+        // be a link that resolves somewhere else.
+        let config = Config::parse("db = \"./a/../build/graph.redb\"\n").expect("parses");
+        assert_eq!(
+            config.db_path(Path::new("/repo")).expect("inside the root"),
+            Some(PathBuf::from("/repo/build/graph.redb")),
+        );
+    }
+
+    #[test]
+    fn a_db_that_leaves_the_repository_is_refused_and_says_which_path_may() {
+        for value in [
+            "/tmp/graph.redb",
+            "../graph.redb",
+            "a/../../graph.redb",
+            ".",
+        ] {
+            let config = Config::parse(&format!("db = \"{value}\"\n")).expect("parses");
+            let e = config
+                .db_path(Path::new("/repo"))
+                .expect_err("a db outside the repository is refused");
+            assert!(e.contains(DB_OUTSIDE_ROOT), "{value}: {e}");
+            // The refusal is only useful if it says what *is* allowed to point
+            // outside the tree, because that is the thing the reader wants.
+            assert!(e.contains("--db"), "{value}: {e}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_db_under_a_symlinked_directory_is_refused_though_it_reads_as_inside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::os::unix::fs::symlink(&outside, root.join("out")).expect("symlink");
+
+        let config = Config::parse("db = \"out/graph.redb\"\n").expect("parses");
+        let e = config
+            .db_path(&root)
+            .expect_err("a linked parent is not containment");
+        assert!(e.contains(DB_OUTSIDE_ROOT), "{e}");
+
+        // …and a real directory of the same shape is fine, so the check is
+        // about where the path resolves and not about having subdirectories.
+        std::fs::create_dir_all(root.join("build")).expect("mkdir build");
+        let config = Config::parse("db = \"build/graph.redb\"\n").expect("parses");
+        assert_eq!(
+            config.db_path(&root).expect("inside the root"),
+            Some(root.join("build/graph.redb")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_db_that_is_a_link_with_nothing_on_the_other_end_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir repo");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        // `canonicalize` fails on this and `symlink_metadata` does not, which
+        // is the whole difference between "not there yet" and "there, and
+        // pointing somewhere this check cannot see".
+        std::os::unix::fs::symlink(outside.join("planted.redb"), root.join("graph.redb"))
+            .expect("symlink");
+
+        let config = Config::parse("db = \"graph.redb\"\n").expect("parses");
+        let e = config
+            .db_path(&root)
+            .expect_err("a link to nothing is not containment");
+        assert!(e.contains(DB_OUTSIDE_ROOT), "{e}");
+
+        // A link to nothing *inside* the root is refused by the same rule and
+        // for the same reason: where a link lands is not knowable from a
+        // target that is not there, and this function only ever answers what
+        // it can show.
+        std::os::unix::fs::symlink(root.join("later.redb"), root.join("inner.redb"))
+            .expect("symlink");
+        let config = Config::parse("db = \"inner.redb\"\n").expect("parses");
+        assert!(config.db_path(&root).is_err(), "an unresolvable component");
+
+        // …and an ordinary path that simply does not exist yet is still fine,
+        // because that is the normal case: the store is created by the scan.
+        let config = Config::parse("db = \"build/graph.redb\"\n").expect("parses");
+        assert_eq!(
+            config.db_path(&root).expect("inside the root"),
+            Some(root.join("build/graph.redb")),
+        );
     }
 
     #[test]

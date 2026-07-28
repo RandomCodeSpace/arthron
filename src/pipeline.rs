@@ -196,7 +196,50 @@ pub fn scan<L: Language>(
         return Ok(report);
     }
 
-    let mut cfg = rs.config(root, &index).map_err(|e| e.message)?;
+    // Phase 0 could not establish this language's project layout: no manifest
+    // where its resolver looks, or one it cannot read. That is this track's
+    // precondition and nobody else's — nothing else in the registry was ever
+    // asked about this file — so it must not be the whole scan's failure. The
+    // track contributes nothing and says so through the same channel that
+    // carries every other thing a scan reached and could not turn into facts,
+    // keyed by the language rather than by a file, because the missing thing
+    // is the project and not a file the walk found. Every other track still
+    // runs, and whatever the store already holds for this one is left exactly
+    // as the last scan left it: a scan that could not read the layout is in no
+    // position to say which of this language's files are gone.
+    let mut cfg = match rs.config(root, &index) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let store = Store::open(db_path)?;
+            let mut report = store.report()?;
+            // The rows stay; the *tally* does not. `Store::report` counts
+            // whatever the store holds, which after an earlier scan of a tree
+            // whose manifest has since broken is a number this run did not
+            // measure — and the same document would then carry both that
+            // number and the line below saying the track measured nothing.
+            // A reader cannot act on a document that disagrees with itself,
+            // and `gate --db` on a persistent store would re-base a baseline
+            // onto rows no scan produced. Saying nothing about this language
+            // is the honest answer: a gate reads a missing tally as nothing
+            // to measure and refuses, which is what "measured nothing" means.
+            //
+            // Forgetting the rows instead would be the *dishonest* answer:
+            // this track cannot read the layout, so it is in no position to
+            // say which of the language's files are gone.
+            report.per_lang.remove(&L::LANG.code());
+            file_errors.insert(
+                L::LANG.name().to_string(),
+                format!(
+                    "no {} project here, so this track measured nothing and every \
+                     other language's answer is unaffected: {}",
+                    L::LANG.name(),
+                    e.message,
+                ),
+            );
+            report.file_errors = named(file_errors);
+            return Ok(report);
+        }
+    };
     let store = Store::open(db_path)?;
 
     // The manifest is a scan input the walk never hashes, and it decides
@@ -879,15 +922,32 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
     // track's report is returned — see below — so without this merge a
     // failure the Go walk found would be gone by the time Python finished.
     let mut file_errors: BTreeMap<String, String> = BTreeMap::new();
+    // Languages no track stood behind this run. Only the last track's report
+    // is returned and every report is `Store::report`, which counts the whole
+    // store — so a language its own track left out of its own report is back
+    // in a later track's, with a number nobody claimed. A track is the only
+    // authority on its own languages, and this is where that answer is kept
+    // until the loop ends.
+    let mut unmeasured: Vec<u8> = Vec::new();
     for track in REGISTRY {
         let Some(scan) = track.scan else {
             continue; // not live: owns no file, contributes nothing
         };
         if !config.track_enabled(track.name) {
+            // Not asked, so it says nothing either way: a switched-off track
+            // leaves the store's rows and their tally exactly as the last
+            // scan left them.
             switched_off = true;
             continue;
         }
         let measured = scan(root, db_path, &filter)?;
+        unmeasured.extend(
+            track
+                .langs
+                .iter()
+                .map(|lang| lang.code())
+                .filter(|code| !measured.per_lang.contains_key(code)),
+        );
         file_errors.extend(
             measured
                 .file_errors
@@ -908,6 +968,9 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
             "no language track is enabled in this build".to_string()
         }
     })?;
+    for code in unmeasured {
+        report.per_lang.remove(&code);
+    }
     report.file_errors = named(file_errors);
     Ok(report)
 }
@@ -1086,6 +1149,12 @@ pub fn source_files_with<L: Language>(
 ) -> Result<(Vec<PathBuf>, Vec<FileError>), String> {
     let mut out = Vec::new();
     let mut errors = Vec::new();
+    // Resolved once: every link found under this walk is asked the same
+    // question about the same tree, and the answer cannot change while the
+    // walk runs. `None` when the root will not resolve — the walk is about to
+    // fail on it below, and a comparison against nothing would refuse files
+    // for a reason that is not theirs.
+    let real_root = root.canonicalize().ok();
     for entry in ignore::WalkBuilder::new(root)
         .overrides(filter.overrides())
         .build()
@@ -1122,7 +1191,32 @@ pub fn source_files_with<L: Language>(
         let owned = path
             .extension()
             .is_some_and(|ext| L::extensions().iter().any(|want| ext == *want));
-        if !owned || !path.is_file() {
+        if !owned {
+            continue;
+        }
+        // `follow_links` is off, so the walk hands back the link rather than
+        // its target — and `is_file` below follows it anyway. A link inside
+        // the repository pointing outside it would therefore be read, and its
+        // definitions stored under a repo-relative key as though that file
+        // were part of this tree. It is not, and a scan is a measurement of
+        // *this* tree: every name in the graph is a claim about what is in it.
+        //
+        // Where the target lands, not whether there is a link. A link whose
+        // target is inside the repository is an ordinary file of it and is
+        // read as one — the measured Haskell corpus links two of its own
+        // modules into a sub-package, and refusing those would drop them and
+        // move a committed baseline.
+        if entry.path_is_symlink() && escapes_root(real_root.as_deref(), path) {
+            errors.push(FileError {
+                path: walk_path(root, path),
+                message: "a symbolic link whose target is outside the scanned \
+                          repository, so whatever is on the other end of it is \
+                          not this tree's to claim"
+                    .to_string(),
+            });
+            continue;
+        }
+        if !path.is_file() {
             continue;
         }
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
@@ -1154,6 +1248,19 @@ pub fn source_files_with<L: Language>(
         out.push(path.to_path_buf());
     }
     Ok((out, errors))
+}
+
+/// Whether a symbolic link's target lies outside the scanned tree.
+///
+/// `false` whenever the question cannot be answered — a dangling link, a root
+/// that will not resolve. A link pointing at nothing is not a file the
+/// `is_file` check accepts either, so nothing is read on that path regardless,
+/// and answering "outside" would name a file for a reason nobody established.
+fn escapes_root(real_root: Option<&Path>, path: &Path) -> bool {
+    let (Some(real_root), Ok(target)) = (real_root, path.canonicalize()) else {
+        return false;
+    };
+    !target.starts_with(real_root)
 }
 
 /// Whether a walk failure is about the scanned root itself rather than

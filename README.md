@@ -90,11 +90,26 @@ it that starts at a separator. `crypto.Verify` is not, and matches nothing.
 arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
 ```
 
-Scans a corpus and compares its counts against a committed baseline. Exit 0
-pass, 1 regression, 2 usage or I/O error — this is what makes a resolution-rate
-regression fail a build. `--rebase` overwrites the baseline with what the run
-measured, which is how the ratchet moves up: by a deliberate commit, never by a
-number quietly drifting.
+Scans a corpus and compares its counts against a committed baseline — this is
+what makes a resolution-rate regression fail a build. `--rebase` overwrites the
+baseline with what the run measured, which is how the ratchet moves up: by a
+deliberate commit, never by a number quietly drifting.
+
+### Exit codes
+
+Three, meaning the same three things on every command, because the number is
+what a build script reads.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command ran and this is the answer. |
+| `1` | The command ran and the answer is **no**: a gate regression, a query that matched nothing or matched several. Never an error — never retry it. |
+| `2` | Nothing was measured: usage, I/O or the environment. A config that will not parse, a root that is not there, a store another scan is holding open for writing. Safe to retry. |
+
+`scan` has no verdict to fail, so `scan` never returns `1`; every failure it can
+have is a `2`. A store somebody else is scanning against is the case that
+matters in CI: it is a `2`, not the `1` a regression uses, so a build can wait
+and try again without ever masking a real one.
 
 `scan`, `gate` and `query` each take `--json` and print one document instead
 of the report.
@@ -117,11 +132,19 @@ with no config behaves exactly as it would without one.
 ```toml
 include = ["src/**"]        # a whitelist: with any include, an unmatched file is not read
 exclude = ["**/vendor/**"]  # wins over include, last-match-wins like .gitignore
-db = ".arthron/graph.redb"
+db = ".arthron/graph.redb"  # where the graph goes, relative to this repository
 
 [tracks]
 java = false                # switch a live track off for this repository
 ```
+
+The `db` key must stay **inside** the repository: an absolute path, a `..`
+that climbs past the root, or a parent directory that is a symlink out of the
+tree is refused with exit 2 and nothing is scanned. A scan reads repositories
+you did not write, and `db` says where a scan *writes* — so the repository does
+not get to choose which of your files a scan replaces. The command-line `--db`
+flag is deliberately free to name anything, inside the tree or out: you typing
+a path is you saying it, and a file sitting in a scanned tree is not.
 
 The `[tracks]` keys are track names, not language names, and the two differ in
 one place: **`ecma` is the single track that owns JavaScript and TypeScript**,

@@ -11,6 +11,35 @@ Decisions and their rationale — including what was rejected — live in
 
 ## [Unreleased]
 
+### Fixed
+
+- **A repository's `db` may no longer name a store outside the tree through a
+  link with nothing on the other end.** The containment check canonicalises the
+  deepest existing component of the resolved `db` path and asks whether it is
+  under the root. A dangling symbolic link answers `lstat` and fails
+  `canonicalize`, and that failure read as "not there yet", so the walk stepped
+  past the link to its parent — inside the root — and called the whole path
+  contained. The store was then created *through* the link: one arbitrary file,
+  anywhere the process could write, from a scanned repository's own
+  `arthron.toml`, at exit 0 with nothing said. A component that exists and does
+  not resolve is now refused, because it cannot be shown to stay inside the
+  root. Reachable from `arthron scan` and from the MCP `scan` tool.
+- **A scan of a root that is not there answers 2 whatever `--db` says.**
+  Creating the store's directory ran first, and the default store lives at
+  `<root>/.arthron/graph.redb` — so `create_dir_all` made the missing root, the
+  walk found the empty tree it had just made, and the run answered 0 with a
+  report of zeros. With `--db` elsewhere the same invocation already answered 2,
+  so the exit code depended on where the store happened to sit. The root is now
+  checked before anything is created.
+- **A track whose project layout it cannot read reports no tally for its
+  language.** The rows an earlier scan wrote stay in the store — a track that
+  cannot read the layout is in no position to say which files are gone — but
+  `scan` no longer prints their tally beside the line saying the track measured
+  nothing, and `gate --db <persistent store>` no longer re-bases a baseline onto
+  numbers this run did not produce.
+- A symbolic link out of the tree is now named as such whatever is on the other
+  end of it; the message no longer says "definitions" about a directory.
+
 ## [0.0.1] - 2026-07-28
 
 First release with an engine in it. `arthron scan` builds a real cross-file
