@@ -86,13 +86,37 @@ pub enum UnresolvedReason {
     /// calling one local would delete a real reference from both rate terms.
     ///
     /// **Depth is irrelevant.** `x`, `x.y` and `x.y.z` are all `LocalBinding`
-    /// when `x` is bound locally: nothing outside the block can name the thing
-    /// a member of a local hangs off, so the member is no more a node than the
-    /// local is.
+    /// when `x` is bound locally. This is the rule's expensive half and it is
+    /// a *policy*, not a claim about the target: `obj.field` where `obj` is a
+    /// parameter often does name a node with a perfectly good FQN, and the
+    /// resolver had already found it in thousands of corpus rows before this
+    /// rule took them out. What the reason asserts is narrower — the reference
+    /// is not evidence about cross-file linking, because reaching its target
+    /// needs the type of a binding no other file can see. The edges it costs
+    /// are counted, per corpus, in `CHANGELOG.md`.
     ///
     /// **`this`, `super` and expression roots are never `LocalBinding`** — no
     /// name is looked up, so no binding can shadow one. **A field is never
     /// local**: a field is a node.
+    ///
+    /// **A receiver is `this`, whatever the language spells it.** Go writes it
+    /// as an ordinary bound name (`func (t *T) M()`), Python as an ordinary
+    /// parameter (`def m(self)`), Java, JavaScript and TypeScript as a
+    /// keyword. All five mean one thing, so all five report one thing: a
+    /// member selected *through* the receiver — `t.helper()`, `self.helper()`,
+    /// `this.helper()` — is **never** `LocalBinding`, because the rule above
+    /// never reaches it. The extractor roots such a site at
+    /// [`model::TargetRoot::This`], where no name is looked up and so no
+    /// binding can shadow one; it resolves against the type the enclosing
+    /// method already states, which is the strongest declared-type evidence
+    /// any of the five gives, and a miss is
+    /// [`UnresolvedReason::NeedsReceiverType`] inside both rate terms.
+    ///
+    /// Naming the receiver *alone* is a name lookup, and the rule does reach
+    /// it: a bare `t()` on a func-typed receiver names the receiver value,
+    /// which is no more a node than a parameter is, and that is
+    /// `LocalBinding`. So is a receiver's *type parameter* — the `R` in
+    /// `func (b *Box[R]) Get() R` is a type parameter, not the receiver.
     ///
     /// Java has one further producer, and it is not a question about a bound
     /// *name*: a member found on the frame of a class §6.7 gives no canonical
@@ -108,6 +132,13 @@ pub enum UnresolvedReason {
     /// them in Java, and the two numbers were computed over differently-sized
     /// denominators. A per-language rate that is not measured over the same
     /// surface is not a comparison, and the gate exists to be compared.
+    ///
+    /// The receiver carve-out above is the same argument run the other way.
+    /// A method calling a sibling method on its own object is the commonest
+    /// shape in object-oriented code; while Go alone read its receiver as a
+    /// local, that shape sat outside both of Go's rate terms and inside
+    /// everyone else's — worth 5.1 points on `caddy` and 0.7 on `codeiq`, in
+    /// Go's favour, for a shape Go resolves as well as Java does.
     ///
     /// Visibility stays per language: Go's end-of-declaration position rule,
     /// ECMA hoisting, Python's "position never matters", Java's §6.3 ranges
@@ -200,12 +231,14 @@ impl<Id, Package> Outcome<Id, Package> {
 /// in-repository linking:
 ///
 /// - `External` — a link to a dependency outside the repository.
-/// - [`UnresolvedReason::LocalBinding`] — a reference to a name some
-///   enclosing block binds. Locals are not nodes by design, so this bucket
-///   is policy-caused rather than a gap in language support. It is reported
-///   on its own line beside `External` and never counted as unresolved;
-///   folding it into the denominator would fill the gate with a category
-///   nothing can ever fix.
+/// - [`UnresolvedReason::LocalBinding`] — a reference whose target *root* is
+///   a name some enclosing block binds, at any depth. Locals are not nodes by
+///   design, so this bucket is policy-caused rather than a gap in language
+///   support. It is reported on its own line beside `External` and never
+///   counted as unresolved; folding it into the denominator would fill the
+///   gate with a category nothing can ever fix. Read
+///   [`UnresolvedReason::LocalBinding`] for the whole rule, including what a
+///   receiver does — which is not this.
 ///
 /// Excluding a category from both terms is also how a rate can rise without
 /// anything improving, which is why the gate tracks the `LocalBinding` and

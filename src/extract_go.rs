@@ -152,6 +152,58 @@ fn call_target(function: &SgNode) -> RefTarget {
     }
 }
 
+/// Whether this type-use site stands in the *callee* position of a call.
+///
+/// `Generic[MyInt](1)` is a call, and the grammar disagrees: an explicit
+/// instantiation is unambiguously a type, so tree-sitter parses the whole
+/// thing as a `type_conversion_expression` over a `generic_type` and
+/// `ref-call` — which matches `call_expression` — never sees it. The site
+/// then produced one row, a `TypeUse` naming a *function*.
+///
+/// `src/rules/go.yml` states the rule this restores: whatever stands in the
+/// callee position of a call written in call syntax is a `Call`, which is
+/// already how the bare-identifier conversion `MyInt(3)` is reported. One
+/// row either way; this only stops it lying about which kind it is.
+///
+/// The type *arguments* are untouched — `MyInt` is a written type name and
+/// still its own reference.
+fn instantiated_callee(site: &SgNode) -> bool {
+    let Some(generic) = site.parent() else {
+        return false;
+    };
+    if generic.kind() != "generic_type"
+        || generic
+            .children()
+            .next()
+            .is_none_or(|head| head.range() != site.range())
+    {
+        return false;
+    }
+    generic.parent().is_some_and(|call| {
+        call.kind() == "type_conversion_expression"
+            && call
+                .children()
+                .find(SgNode::is_named)
+                .is_some_and(|t| t.range() == generic.range())
+    })
+}
+
+/// Re-root a receiver-rooted target at [`TargetRoot::This`].
+///
+/// `t.M()` inside `func (t *T) …` is `this.M()`: the leading segment names
+/// the receiver, so it is dropped and what remains is the member path. `Err`
+/// carries the target back unchanged when nothing is selected through the
+/// receiver — a bare `t()`, which names the receiver value and not a member.
+fn receiver_target(target: RefTarget) -> Result<RefTarget, RefTarget> {
+    if target.segments.len() < 2 {
+        return Err(target);
+    }
+    Ok(RefTarget {
+        root: TargetRoot::This { qualifier: vec![] },
+        segments: target.segments[1..].to_vec(),
+    })
+}
+
 /// Whether an `expression_list` of declaration targets names `name`.
 fn list_binds(list: &SgNode, name: &str) -> bool {
     list.children()
@@ -275,6 +327,9 @@ fn header_binds(clause: &SgNode, name: &str, site: usize) -> bool {
 /// grammar. Only the *direct* parameter lists are read: a `func(inner int)`
 /// parameter type carries a list of its own, and the names in it belong to
 /// that type rather than to this body.
+///
+/// Which of those lists matched is not recorded here — [`binder_of`] asks
+/// [`receiver_binds`] separately, because a receiver is not an ordinary local.
 fn signature_binds(func: &SgNode, name: &str) -> bool {
     for list in func.children().filter(|c| c.kind() == "parameter_list") {
         for decl in list.children() {
@@ -292,6 +347,28 @@ fn signature_binds(func: &SgNode, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a method's *receiver* names `name`.
+///
+/// Only the `receiver` parameter list, which is what separates Go's spelling
+/// of `this` from an ordinary parameter. Go has no `this` keyword: the
+/// receiver *is* the name a method uses to reach its own value, and its type
+/// is written in the signature — the strongest declared-type evidence any
+/// tier-1 language gives. So a member selected through it is not a local
+/// binding; see [`Binder`].
+fn receiver_binds(func: &SgNode, name: &str) -> bool {
+    let Some(receiver) = func.field("receiver") else {
+        return false;
+    };
+    receiver.children().any(|decl| {
+        matches!(
+            &*decl.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) && decl
+            .children()
+            .any(|n| n.kind() == "identifier" && n.text() == name)
+    })
 }
 
 /// Whether a node's own `type_parameter_list` declares `name`.
@@ -332,12 +409,29 @@ fn receiver_type_parameters_bind(func: &SgNode, name: &str) -> bool {
     })
 }
 
-/// Whether some enclosing binder in this file binds `name` at this site.
+/// What binds `name` at a site, when anything in this file does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binder {
+    /// Nothing inside a nameable definition binds it: package level answers.
+    None,
+    /// A parameter, named result, type parameter, or a name some enclosing
+    /// block declares. Not a node by design; see
+    /// [`crate::UnresolvedReason::LocalBinding`].
+    Local,
+    /// The enclosing method's *receiver*, and no inner binder shadows it.
+    ///
+    /// Go's spelling of `this`. Every other tier-1 language writes this shape
+    /// as `this.m()` or `self.m()` and resolves it by declared-type lookup;
+    /// so does Go, from the type its own signature states.
+    Receiver,
+}
+
+/// Which enclosing binder in this file binds `name` at this site.
 ///
 /// A *file-local verdict*, and the whole of it: every Go binder for a value
-/// name is decidable from one file's AST, which is why a `bool` is all that
-/// crosses the extractor/resolver boundary. The extractor states the fact;
-/// the resolver still owns the outcome.
+/// name is decidable from one file's AST, which is why nothing richer than
+/// this crosses the extractor/resolver boundary. The extractor states the
+/// fact; the resolver still owns the outcome.
 ///
 /// Two rules are not optional. A declared identifier's scope starts at the
 /// end of its declaration, so a binder inside a block is visible only when
@@ -345,9 +439,13 @@ fn receiver_type_parameters_bind(func: &SgNode, name: &str) -> bool {
 /// exempt, binding the whole body. And package level is not a binding
 /// environment: with no function, method or literal above it, a reference
 /// can never name a local.
-fn is_locally_bound(node: &SgNode, name: &str) -> bool {
+///
+/// The innermost binder wins, which is why `bound` is read *before* the
+/// signature: `func (t *T) M() { t := other(); t.n() }` names the block's
+/// `t`, not the receiver.
+fn binder_of(node: &SgNode, name: &str) -> Binder {
     if name == "_" {
-        return false; // the blank identifier declares nothing
+        return Binder::None; // the blank identifier declares nothing
     }
     let site = node.range().start;
     let mut bound = false;
@@ -355,11 +453,17 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
     for ancestor in node.ancestors() {
         match &*ancestor.kind() {
             "function_declaration" | "method_declaration" | "func_literal" => {
+                if bound {
+                    return Binder::Local; // an inner block shadows the signature
+                }
+                if receiver_binds(&ancestor, name) {
+                    return Binder::Receiver;
+                }
                 if signature_binds(&ancestor, name)
                     || type_parameters_bind(&ancestor, name)
                     || receiver_type_parameters_bind(&ancestor, name)
                 {
-                    return true;
+                    return Binder::Local;
                 }
                 in_function = true;
             }
@@ -369,7 +473,7 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
             // below would never let it through.
             "type_spec" | "type_alias" => {
                 if type_parameters_bind(&ancestor, name) {
-                    return true;
+                    return Binder::Local;
                 }
             }
             // Statements of a block, a case clause or a select clause. The
@@ -381,10 +485,21 @@ fn is_locally_bound(node: &SgNode, name: &str) -> bool {
             _ => bound = bound || header_binds(&ancestor, name, site),
         }
         if bound && in_function {
-            return true;
+            return Binder::Local;
         }
     }
-    false
+    Binder::None
+}
+
+/// Whether some enclosing binder in this file makes `name` a non-node.
+///
+/// The type-position answer, and the receiver counts here: Go declares types
+/// and values in one namespace, so `func (T *T) m()` really does shadow the
+/// package-level type `T` inside that body, and a `type_identifier` reaching
+/// the receiver is naming something no longer nameable from outside. A value
+/// position asks [`binder_of`] instead, because there the receiver is `this`.
+fn is_locally_bound(node: &SgNode, name: &str) -> bool {
+    binder_of(node, name) != Binder::None
 }
 
 /// Whether a `type_identifier` *declares* the name it writes rather than
@@ -593,9 +708,25 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                 // `x` a parameter names a local however long the member
                 // path is, which is why the shape carries a root rather
                 // than a `Local` variant.
-                let locally_bound = match (&target.root, target.segments.first()) {
-                    (TargetRoot::Name, Some(root)) => is_locally_bound(&node, root),
-                    _ => false,
+                let (target, locally_bound) = match (&target.root, target.segments.first()) {
+                    (TargetRoot::Name, Some(root)) => match binder_of(&node, root) {
+                        Binder::None => (target, false),
+                        Binder::Local => (target, true),
+                        // Go's `this`. `t.M()` is the shape every other
+                        // tier-1 language writes `this.M()` and resolves from
+                        // the declared type, so it carries the same root and
+                        // gets the same treatment — in both terms of the
+                        // rate, never on the `local_binding` line.
+                        //
+                        // A *bare* `t()` is different: a func-typed receiver
+                        // called directly names the receiver value itself,
+                        // which is no more a node than a parameter is.
+                        Binder::Receiver => match receiver_target(target) {
+                            Ok(this) => (this, false),
+                            Err(bare) => (bare, true),
+                        },
+                    },
+                    _ => (target, false),
                 };
                 refs.push(Reference {
                     kind: RefKind::Call,
@@ -620,15 +751,24 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     Some(root) => is_locally_bound(&site, root),
                     None => false,
                 };
+                // `Generic[MyInt](1)` is a call the grammar files as a
+                // conversion. Same row, same target, honest kind. A
+                // conversion holds exactly one operand, so the arity is not
+                // read from the tree — there is nothing else it could be.
+                let (kind, argc) = if instantiated_callee(&site) {
+                    (RefKind::Call, Some(1))
+                } else {
+                    (RefKind::TypeUse, None)
+                };
                 refs.push(Reference {
-                    kind: RefKind::TypeUse,
+                    kind,
                     // Go declares types and values in one namespace, so a type
                     // consults the same table a call does.
                     space: DeclSpace::Value,
                     raw_target: site.text().to_string(),
                     target,
                     locally_bound,
-                    argc: None,
+                    argc,
                     enclosing: enclosing_definition(&site),
                     span: span_of(&site),
                 });
@@ -832,7 +972,16 @@ func helper() {
         assert!(named(&["newRegistry"]));
         assert!(named(&["fmt", "Println"]));
         assert!(named(&["h", "ListenAndServe"]));
-        assert!(named(&["h", "reset"]));
+        // `h.reset()` is the receiver's own method: Go's `this.reset()`, so
+        // the root is `This` and the leading `h` is gone.
+        assert!(!named(&["h", "reset"]));
+        let this: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(c.target.root, TargetRoot::This { .. }))
+            .collect();
+        assert_eq!(this.len(), 1);
+        assert_eq!(this[0].raw_target, "h.reset");
+        assert_eq!(this[0].target.segments, ["reset"]);
         // h.reset().apply() → the innermost operand is a call, not a name.
         let expr: Vec<_> = calls
             .iter()
@@ -915,18 +1064,72 @@ func helper() {
     }
 
     #[test]
-    fn a_receiver_shadowing_an_import_is_locally_bound() {
+    fn a_receiver_shadowing_an_import_is_rooted_at_this_and_not_at_the_name() {
         // The worst of the false-edge bugs, and the pattern is in this
         // module's own fixture: `func (h *Handler)` beside
         // `import h "net/http"`. `h.reset()` names the receiver, so linking
         // it to the import is a wrong edge — strictly worse than an
         // unresolved reference, because a miss is counted and a wrong edge
         // is not.
+        //
+        // The flag is not what stops it. A receiver is Go's `this`, so the
+        // site is re-rooted: there is no leading `h` left for the import
+        // table to be asked about, which is a stronger guarantee than
+        // "locally bound" ever was, and it is the same shape Java, Python,
+        // JavaScript and TypeScript all resolve rather than exclude.
         let f = facts();
-        assert!(bound(&f, "h.reset"), "the receiver shadows the import");
+        let reset = call_refs(&f)
+            .into_iter()
+            .find(|c| c.raw_target == "h.reset")
+            .expect("no call site `h.reset`");
+        assert!(!reset.locally_bound, "a receiver is `this`, not a local");
+        assert_eq!(reset.target.root, TargetRoot::This { qualifier: vec![] });
+        assert_eq!(reset.target.segments, ["reset"]);
         // The same `h`, one function away, really is the import.
         assert!(!bound(&f, "h.ListenAndServe"));
         assert!(!bound(&f, "fmt.Println"));
+    }
+
+    #[test]
+    fn an_inner_binder_shadows_the_receiver() {
+        // The innermost binder wins, and the receiver is not exempt: once a
+        // block re-declares the name, the site names that and nothing else.
+        let f = extract(
+            "main.go",
+            concat!(
+                "package main\n\n",
+                "type T struct{}\n\n",
+                "func (t *T) M() {\n",
+                "\tt.before()\n",
+                "\tt := other()\n",
+                "\tt.after()\n",
+                "}\n",
+            ),
+        );
+        let before = call_refs(&f)
+            .into_iter()
+            .find(|c| c.raw_target == "t.before")
+            .expect("`t.before`");
+        assert_eq!(before.target.root, TargetRoot::This { qualifier: vec![] });
+        assert!(!before.locally_bound);
+        assert!(bound(&f, "t.after"), "the short var declaration wins");
+    }
+
+    #[test]
+    fn a_bare_call_of_a_func_typed_receiver_is_still_a_local_binding() {
+        // `type F func(); func (f F) run() { f() }` names the receiver
+        // *value*, not a member of it. That value is no more a node than a
+        // parameter is, so it stays on the `local_binding` line — the
+        // carve-out is for what is selected *through* a receiver.
+        let f = extract(
+            "main.go",
+            concat!(
+                "package main\n\n",
+                "type F func()\n\n",
+                "func (f F) run() {\n\tf()\n}\n",
+            ),
+        );
+        assert!(bound(&f, "f"), "a bare receiver call names the receiver");
     }
 
     #[test]

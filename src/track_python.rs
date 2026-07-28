@@ -27,9 +27,9 @@
 //! # The honesty posture, and what it costs
 //!
 //! Python's unresolved floor is the largest of the four tier-1 languages and
-//! is **supposed** to be. `x.m()` where `x` has no annotation genuinely needs
-//! type inference; `self.client.get()` genuinely needs the type of an
-//! attribute nobody declared. Both are
+//! is **supposed** to be. `x.m()` where `x` is a module-level name with no
+//! annotation genuinely needs type inference; `self.client.get()` genuinely
+//! needs the type of an attribute nobody declared. Both are
 //! [`crate::UnresolvedReason::NeedsTypeInference`], and a first measurement
 //! that is mostly that reason is the correct measurement.
 //!
@@ -37,12 +37,19 @@
 //! [`crate::UnresolvedReason::LocalBinding`] and `External` sit outside *both*
 //! terms of the rate:
 //!
-//! - **Widening `LocalBinding`.** Only a reference whose *whole* target is one
-//!   block-bound name is a local binding. `c.send()` where `c` is a parameter
-//!   names `send`, which is a node; it stays in the denominator and goes to
-//!   the annotation table (E-05) and then to an honest reason. A function-local
-//!   `import os` reports `locally_bound` for the very name it introduces
-//!   (B-18) and still resolves as the module reference it is.
+//! - **Widening `LocalBinding` further.** The rule this track applies is the
+//!   uniform root-binding rule stated on
+//!   [`crate::UnresolvedReason::LocalBinding`], and it is already the broad
+//!   one: `c.send()` where `c` is a parameter *is* a local binding, at any
+//!   depth, and 7,579 django references left
+//!   [`crate::UnresolvedReason::NeedsTypeInference`] for that bucket without
+//!   one of them being resolved. What is left to widen is the part that must
+//!   not move — `self.m()` is a receiver and stays in both terms (E-01);
+//!   module-level and class-level names are nodes and stay in both terms; a
+//!   function-local `import os` reports `locally_bound` for the very name it
+//!   introduces (B-18) and still resolves as the module reference it is.
+//!   Every one of those is checked by `tests/local_binding.rs`, in all five
+//!   tier-1 languages, against the same fixtures.
 //! - **Widening `External`.** Go decides "standard library?" by asking whether
 //!   the first path segment contains a dot. That test is *inverted* for Python
 //!   — every third-party top-level name has no dot either — so [`stdlib`]

@@ -52,9 +52,10 @@ breakdown of every unresolved reason:
 
 ```console
 $ arthron scan corpus/go/codeiq
-go           resolved 7906     external 12210    local-binding 4308     unresolved 799      rate 90.8% (tier 1: call-graph resolution)
+go           resolved 8016     external 12210    local-binding 4113     unresolved 884      rate 90.1% (tier 1: call-graph resolution)
              NoMatchingDefinition 123
-             NeedsTypeInference 676
+             NeedsTypeInference 758
+             NeedsReceiverType 3
 ```
 
 The graph is stored at `<PATH>/.arthron/graph.redb` unless `--db` says
@@ -173,8 +174,8 @@ sites, imports and type uses.
 
 | language | corpus | resolved | unresolved | rate |
 |---|---|---:|---:|---:|
-| Go | `codeiq` `853efde` | 7,906 | 799 | **90.8%** |
-| Go | `caddy` `853efde` | 9,738 | 1,821 | **84.2%** |
+| Go | `codeiq` `853efde` | 8,016 | 884 | **90.1%** |
+| Go | `caddy` `853efde` | 10,208 | 2,700 | **79.1%** |
 | Go | `probes` `synthetic` | 17 | 0 | **100.0%** † |
 | Java | `commons-lang` `598dfc1` | 34,217 | 16,279 | **67.8%** |
 | Java | `gson` `3ff35d6` | 12,885 | 6,105 | **67.9%** |
@@ -185,17 +186,39 @@ sites, imports and type uses.
 | Python | `django` `af67523` | 19,103 | 6,185 | **75.5%** |
 | Python | `flask` `22d9247` | 1,185 | 877 | **57.5%** |
 
-Seven of these eleven numbers moved in one deliberate re-base, and none of them
-moved because anything was linked better. Two changes landed together: every
-tier-1 track now applies the same rule for a reference rooted at a parameter,
-local or receiver — it is reported beside `external`, outside **both** terms of
-the rate — and the Go track now emits type uses, which the other four already
-did. The first takes references *out* of both terms, so it can raise a rate
-without linking anything: Python's rose 17 and 28 points that way, and 7,579
-django references moved from `NeedsTypeInference` to `local_binding` without one
-of them being resolved. Read the rate next to the `local_binding` column in
-[`baselines/`](baselines), which is gated for drift exactly so this cannot be
-done quietly.
+Six of these eleven numbers moved in one deliberate re-base — Go's two real
+corpora, both Java corpora, both Python corpora. `probes` is byte-identical on
+every column this table prints. Three changes landed together, and they do not
+move a rate for the same reason:
+
+1. **One `LocalBinding` rule.** A reference whose *root* is a parameter or a
+   local is reported beside `external`, outside **both** terms of the rate,
+   however long the member path after it. This takes references *out* of both
+   terms, so it can raise a rate without linking anything: Python's rose 17 and
+   28 points that way, and 7,579 django references moved from
+   `NeedsTypeInference` to `local_binding` without one of them being resolved.
+2. **A receiver is not a local, in any of the five.** Go alone read its own
+   receiver as one, so `t.helper()` sat outside both of Go's rate terms while
+   the identical `this.helper()` and `self.helper()` were resolved and counted
+   everywhere else — the commonest shape in object-oriented code, excluded in
+   one language and not the other four. Go now resolves it against the type its
+   own signature states, exactly as Java and Python do. That costs `caddy` 5.1
+   points and `codeiq` 0.7, and gains them 470 and 110 real edges.
+3. **The Go track now emits type uses**, which the other four already did, so
+   "call sites, imports and type uses" is now true of all five. This is the
+   opposite of the first: `caddy`'s rate rose because 6,732 references that had
+   no row at all now resolve — coverage, not reclassification.
+
+Read the rate next to the `local_binding` column in [`baselines/`](baselines),
+which is gated for drift exactly so the first kind cannot be done quietly.
+
+What the first change costs is *edges*, and the counts are in
+[`CHANGELOG.md`](CHANGELOG.md): 5,374 commons-lang and 3,189 gson occurrences
+that `arthron query` and the MCP server used to answer with a definition are
+reported on the `local_binding` line instead — 13.6% and 19.8% of those
+corpora's resolved edges. The reason claims the reference is not evidence about
+cross-file linking, because reaching its target needs the type of a binding no
+other file can see. It does not claim the target has no name.
 
 ### Tier 2 — definitions, structure and imports; no verified call edges
 

@@ -411,11 +411,65 @@ impl GoResolver {
         }
     }
 
+    /// `t.M()` inside `func (t *T) …` — Go's spelling of `this.M()`.
+    ///
+    /// The receiver's type is written in the method's own signature, so this
+    /// is a declared-type lookup and not inference: the enclosing definition
+    /// already carries the receiver type name, and a method's FQN is
+    /// `{pkg}#{Type}.{name}`. Java's `this.m()` (X-02) and Python's `self.m()`
+    /// (E-01) resolve the same shape the same way; before this the Go track
+    /// alone called it a local binding and left it outside both terms of the
+    /// rate, which made a Go rate and a Java rate two different measurements.
+    ///
+    /// A miss is [`UnresolvedReason::NeedsReceiverType`] and not
+    /// [`UnresolvedReason::NoMatchingDefinition`]: the lookup table is *not*
+    /// complete here. Go promotes the members of an embedded field into the
+    /// outer type's method set, and this track indexes neither embedding nor
+    /// struct fields, so a name absent from `{pkg}#{Type}` may still be a
+    /// perfectly ordinary member of it. Blaming the repository for that would
+    /// put arthron's own missing work in the bucket reserved for its bugs.
+    pub fn resolve_receiver(
+        &self,
+        scope: &FileScope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        let unresolved = |reason| Resolution {
+            outcome: Outcome::Unresolved(reason),
+            candidates: vec![],
+        };
+        // `t.a.b()`: the receiver of `b` is the field `a`, whose type this
+        // file does not state. `NeedsReceiverType` would claim a declared
+        // type that was never written, and `LocalBinding` would claim the
+        // receiver is not a node — it is the one thing here that certainly
+        // is one.
+        let [member] = r.target.segments.as_slice() else {
+            return unresolved(UnresolvedReason::NeedsTypeInference);
+        };
+        // The encloser of a method is `[ReceiverType, MethodName]`. Anything
+        // else means the receiver's type name could not be read.
+        let owner = match r.enclosing.as_ref().map(|e| e.path.as_slice()) {
+            Some([owner, _]) if !owner.is_empty() => owner,
+            _ => return unresolved(UnresolvedReason::NeedsReceiverType),
+        };
+        let id = node_id(Domain::Go, &format!("{}#{owner}.{member}", scope.pkg_path));
+        let outcome = if probe.probe(&id).is_some() {
+            Outcome::Resolved(id)
+        } else {
+            Outcome::Unresolved(UnresolvedReason::NeedsReceiverType)
+        };
+        Resolution {
+            outcome,
+            candidates: vec![id],
+        }
+    }
+
     /// Classify a call reference against a file's scope.
     ///
     /// The dispatch is on `(root, segments.len())`. A name root with one
     /// segment is a package-block lookup; with two it is Go's
-    /// `QualifiedIdent`, read against the import table. Anything else — a
+    /// `QualifiedIdent`, read against the import table. A `this` root is the
+    /// receiver, handled by [`Self::resolve_receiver`]. Anything else — a
     /// longer chain, or a root that is not a name — needs the type of an
     /// expression, which this resolver does not compute.
     pub fn resolve_call(
@@ -429,6 +483,9 @@ impl GoResolver {
             outcome: Outcome::Unresolved(UnresolvedReason::NeedsTypeInference),
             candidates: vec![],
         };
+        if matches!(r.target.root, TargetRoot::This { .. }) {
+            return self.resolve_receiver(scope, r, probe);
+        }
         if r.target.root != TargetRoot::Name {
             return needs_inference();
         }
@@ -1231,8 +1288,9 @@ mod tests {
         assert_eq!(expr.outcome, inference);
         assert!(expr.candidates.is_empty());
 
-        // Go emits neither of these, and the resolver must not invent an
-        // answer if one ever appears.
+        // A `this` root with no enclosing method states a receiver type it
+        // never wrote: `NeedsReceiverType`, never the import table and never
+        // an invented edge.
         let this = r.resolve_call(
             &cfg,
             &call(RefTarget {
@@ -1242,7 +1300,59 @@ mod tests {
             &scope(),
             &t,
         );
-        assert_eq!(this.outcome, inference);
+        assert_eq!(
+            this.outcome,
+            Outcome::Unresolved(UnresolvedReason::NeedsReceiverType),
+        );
+    }
+
+    #[test]
+    fn a_receiver_resolves_against_the_type_its_own_signature_states() {
+        // Go's `this.m()`. The encloser carries `[ReceiverType, Method]` and
+        // a method's FQN is `{pkg}#{Type}.{name}`, so this is a declared-type
+        // lookup — the same one Java's X-02 and Python's E-01 perform for the
+        // same shape, which is why all five tier-1 languages now count it in
+        // both terms of the rate instead of one language alone excluding it.
+        let r = GoResolver;
+        let cfg = module();
+        let s = scope();
+        let helper = node_id(Domain::Go, "example.com/app/server#Conn.helper");
+        let mut table = HashSet::new();
+        table.insert(helper);
+
+        let mut site = call(RefTarget {
+            root: TargetRoot::This { qualifier: vec![] },
+            segments: vec!["helper".into()],
+        });
+        site.enclosing = Some(Encloser {
+            path: vec!["Conn".into(), "Run".into()],
+            kind: DefKind::Method,
+        });
+        let hit = Resolver::resolve(&r, &cfg, &s, &site, &table);
+        assert_eq!(hit.outcome, Outcome::Resolved(helper));
+        assert_eq!(hit.candidates, vec![helper], "exactly what was probed");
+
+        // A member the receiver type does not declare is not this
+        // repository's bug: Go promotes an embedded type's members into the
+        // outer method set, and this track indexes neither embedding nor
+        // struct fields. `NoMatchingDefinition` would blame the corpus for
+        // arthron's own missing work.
+        let mut miss = site.clone();
+        miss.target.segments = vec!["promoted".into()];
+        assert_eq!(
+            Resolver::resolve(&r, &cfg, &s, &miss, &table).outcome,
+            Outcome::Unresolved(UnresolvedReason::NeedsReceiverType),
+        );
+
+        // `t.a.b()`: the receiver of `b` is the field `a`, and no file states
+        // its type. That is inference, and saying `NeedsReceiverType` would
+        // claim a declared type nobody wrote.
+        let mut deep = site.clone();
+        deep.target.segments = vec!["a".into(), "b".into()];
+        assert_eq!(
+            Resolver::resolve(&r, &cfg, &s, &deep, &table).outcome,
+            Outcome::Unresolved(UnresolvedReason::NeedsTypeInference),
+        );
     }
 
     #[test]

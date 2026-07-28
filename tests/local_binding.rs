@@ -8,14 +8,23 @@
 //! > node* binds the leftmost segment in the declaration space that segment is
 //! > looked up in. Depth is irrelevant: `x`, `x.y` and `x.y.z` are all
 //! > `LocalBinding` when `x` is. `this`/`super`/expression roots never are,
-//! > and a field is never local because a field is a node.
+//! > and a field is never local because a field is a node. A **receiver** is
+//! > `this`, whatever the language spells it — never a local, in any of the
+//! > five.
 //!
 //! Before this file existed the tree implemented that rule three different
 //! ways — Go and ECMA broadly, Java and Python only when the *whole* target
 //! was the bound name — so `f.m()` was outside both terms of the resolution
 //! rate in Go and inside them in Java. One number could not be compared with
 //! another. Every assertion below is therefore a cross-language one: the same
-//! shape, written in four languages, asserted to land in the same bucket.
+//! shape, written in five languages, asserted to land in the same bucket.
+//!
+//! The receiver case is the mirror of that and gets all five together, in
+//! [`a_receiver_is_never_a_local_binding_in_any_tier_one_language`]: Go writes
+//! its receiver as an ordinary bound name and Python writes it as an ordinary
+//! parameter, so a rule phrased only about bound names put the commonest
+//! shape in object-oriented code outside Go's rate terms and inside everyone
+//! else's.
 //!
 //! These are name-asserting on purpose. A test that counted `LocalBinding`
 //! rows would pass just as well if the resolver had put a *resolvable* call
@@ -322,4 +331,157 @@ fn typescript_reports_a_member_of_a_local_as_a_local_binding() {
         scan.one("helper", RefKind::Call),
         "resolved core.ts#value:helper"
     );
+}
+
+// -- JavaScript -------------------------------------------------------------
+
+#[test]
+fn javascript_reports_a_member_of_a_local_as_a_local_binding() {
+    // The fifth language. `scan_ecma` owns both, but only TypeScript was
+    // pinned here, so nothing checked that the ECMA track answered the same
+    // for a `.js` file as for a `.ts` one.
+    let scan = render(
+        &[
+            ("package.json", r#"{"name":"app","type":"module"}"#),
+            (
+                "core.js",
+                "export class Client { send() {} }\nexport function helper() {}\n",
+            ),
+            (
+                "service.js",
+                concat!(
+                    "import { Client, helper } from './core.js';\n",
+                    "export const shared = new Client();\n",
+                    "export function run(param) {\n",
+                    "  const local = new Client();\n",
+                    "  local.send();\n",
+                    "  param.send();\n",
+                    "  shared.send();\n",
+                    "  helper();\n",
+                    "}\n",
+                ),
+            ),
+        ],
+        arthron::track_ecma::scan_ecma,
+    );
+
+    assert_eq!(scan.one("local.send", RefKind::Call), "LocalBinding");
+    assert_eq!(scan.one("param.send", RefKind::Call), "LocalBinding");
+    assert_ne!(
+        scan.one("shared.send", RefKind::Call),
+        "LocalBinding",
+        "a module-level binding is a node, not a local",
+    );
+    assert_eq!(
+        scan.one("helper", RefKind::Call),
+        "resolved core.js#value:helper"
+    );
+}
+
+// -- The receiver, in all five ----------------------------------------------
+
+/// A method calling a sibling method on its own object, five ways.
+///
+/// One shape, and before this it landed in five different places. Go answered
+/// `LocalBinding` — its receiver is an ordinary bound name, so a rule phrased
+/// about bound names caught it — and Java, Python, JavaScript and TypeScript
+/// all resolved it by declared-type lookup and counted it in both terms of the
+/// rate. That is worth 5.1 points on `caddy` and 0.7 on `codeiq`, in Go's
+/// favour, on the commonest shape there is in object-oriented code; a rate
+/// measured over a denominator one language shrinks is not a comparison.
+///
+/// Every assertion names the definition, not the bucket: a test that only
+/// asserted "not `LocalBinding`" would pass if the reference had been given
+/// some other honest-sounding reason instead of the edge it should have.
+#[test]
+fn a_receiver_is_never_a_local_binding_in_any_tier_one_language() {
+    let go = render(
+        &[
+            ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+            (
+                "app.go",
+                concat!(
+                    "package app\n\n",
+                    "type T struct{}\n\n",
+                    "func (t *T) helper() {}\n\n",
+                    "func (t *T) Run() {\n\tt.helper()\n}\n",
+                ),
+            ),
+        ],
+        arthron::pipeline::scan_go,
+    );
+    assert_eq!(
+        go.one("t.helper", RefKind::Call),
+        "resolved example.com/app#T.helper",
+    );
+
+    let java = render(
+        &[(
+            "app/T.java",
+            concat!(
+                "package app;\n",
+                "public class T {\n",
+                "    void helper() {}\n",
+                "    void run() { this.helper(); }\n",
+                "}\n",
+            ),
+        )],
+        arthron::track_java::scan_java,
+    );
+    assert_eq!(
+        java.one("this.helper", RefKind::Call),
+        "resolved app#T.helper/0",
+    );
+
+    let python = render(
+        &[
+            ("pyproject.toml", "[project]\nname = \"fixture\"\n"),
+            ("app/__init__.py", ""),
+            (
+                "app/t.py",
+                concat!(
+                    "class T:\n",
+                    "    def helper(self):\n",
+                    "        return 1\n",
+                    "\n",
+                    "    def run(self):\n",
+                    "        return self.helper()\n",
+                ),
+            ),
+        ],
+        arthron::track_python::resolve::scan_python,
+    );
+    assert_eq!(
+        python.one("self.helper", RefKind::Call),
+        "resolved app.t#T.helper",
+    );
+
+    for (ext, files) in [
+        (
+            "ts",
+            vec![
+                ("package.json", r#"{"name":"app","type":"module"}"#),
+                (
+                    "t.ts",
+                    "export class T {\n  helper() {}\n  run() { this.helper(); }\n}\n",
+                ),
+            ],
+        ),
+        (
+            "js",
+            vec![
+                ("package.json", r#"{"name":"app","type":"module"}"#),
+                (
+                    "t.js",
+                    "export class T {\n  helper() {}\n  run() { this.helper(); }\n}\n",
+                ),
+            ],
+        ),
+    ] {
+        let ecma = render(&files, arthron::track_ecma::scan_ecma);
+        assert_eq!(
+            ecma.one("this.helper", RefKind::Call),
+            format!("resolved t.{ext}#value:T.prototype.helper"),
+        );
+    }
 }

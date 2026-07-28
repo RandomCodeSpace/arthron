@@ -15,22 +15,36 @@ Decisions and their rationale — including what was rejected — live in
 
 - **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
   deliberate re-base of seven baselines.** The ratified rule is that a
-  reference whose root is a parameter, local variable or receiver binding names
-  a thing that is not a node by decision, so it is reported beside `external`
-  and excluded from **both** terms of the resolution rate. Go, TypeScript and
-  JavaScript already read it that way; Java and Python applied it only when the
-  *whole* target was the bound name, so `f.m()` sat outside both rate terms in
-  Go and inside them in Java, and the two rates were computed over
-  differently-sized denominators. Separately, the Go extractor emitted only
-  calls and imports, so "tier 1: call sites, imports and type uses" was not
-  true of Go; `ref-type` now emits a reference for every written type position.
-  Baselines are re-based, not compared, because what is *in* the rate's terms
-  changed. Measured, release build, cold store:
+  reference whose root is a parameter or a local variable names a thing that is
+  not a node by decision, so it is reported beside `external` and excluded from
+  **both** terms of the resolution rate. Go, TypeScript and JavaScript already
+  read it that way; Java and Python applied it only when the *whole* target was
+  the bound name, so `f.m()` sat outside both rate terms in Go and inside them
+  in Java, and the two rates were computed over differently-sized denominators.
+
+  A **receiver is not a local**, and that half of the rule went the other way.
+  Go has no `this` keyword — the receiver is the name a method uses to reach
+  its own value — and Go alone filed a member selected through it as a local
+  binding. Java, Python, JavaScript and TypeScript all resolve `this.m()` /
+  `self.m()` by declared-type lookup and count it in both rate terms, so the
+  commonest shape in object-oriented code sat outside Go's denominator and
+  inside everyone else's. Go now resolves `t.m()` against the receiver type its
+  own signature states, which is the strongest declared-type evidence any of
+  the five gives; a member the receiver type does not itself declare is
+  `NeedsReceiverType` rather than `NoMatchingDefinition`, because this track
+  indexes neither Go embedding nor struct fields and the lookup table is
+  therefore not complete.
+
+  Separately, the Go extractor emitted only calls and imports, so "tier 1: call
+  sites, imports and type uses" was not true of Go; `ref-type` now emits a
+  reference for every written type position. Baselines are re-based, not
+  compared, because what is *in* the rate's terms changed. Measured, release
+  build, cold store:
 
   | baseline | resolved | unresolved | external | local_binding | rate |
   |---|---:|---:|---:|---:|---:|
-  | `go-codeiq` | 4,467 → 7,906 | 799 | 6,085 → 12,210 | 4,276 → 4,308 | 84.8% → **90.8%** |
-  | `go-caddy` | 3,006 → 9,738 | 1,815 → 1,821 | 9,571 → 19,201 | 9,425 → 9,601 | 62.4% → **84.2%** |
+  | `go-codeiq` | 4,467 → 8,016 | 799 → 884 | 6,085 → 12,210 | 4,276 → 4,113 | 84.8% → **90.1%** |
+  | `go-caddy` | 3,006 → 10,208 | 1,815 → 2,700 | 9,571 → 19,201 | 9,425 → 8,252 | 62.4% → **79.1%** |
   | `go-probes` | 17 | 0 | 0 → 26 | 1 | 100.0% |
   | `java-commons-lang` | 39,591 → 34,217 | 19,093 → 16,279 | 68,297 → 63,385 | 2,062 → 15,162 | 67.5% → **67.8%** |
   | `java-gson` | 16,074 → 12,885 | 7,215 → 6,105 | 18,187 → 16,737 | 957 → 6,706 | 69.0% → **67.9%** |
@@ -46,10 +60,17 @@ Decisions and their rationale — including what was rejected — live in
   changed outcome moved *into* `local_binding` — 13,100 on commons-lang (5,374
   from `resolved`, 4,912 from `external`, 2,814 from an unresolved reason),
   5,749 on gson, 7,579 on django, 1,996 on flask — and nothing moved in any
-  other direction. In Go not one pre-existing reference changed its answer at
-  all: every moved occurrence is a new type use, 9,596 on codeiq and 16,544 on
-  caddy, all of kind `type-use`. Neither change touches the other's languages,
-  measured by re-running each corpus with the other change reverted.
+  other direction. In Go two things moved rows and they are separable. Every
+  *added* occurrence is a type use, 9,596 on codeiq and 16,544 on caddy, all of
+  kind `type-use`, of which 3,439 and 6,732 resolve to a definition that had no
+  row at all before. Every *pre-existing* occurrence that changed its answer is
+  rooted at a method receiver — 195 on codeiq and 1,349 on caddy, counted at
+  the extractor by re-rooting — and every one of them left `local_binding`, 110
+  and 470 of them for `resolved` and the rest for `NeedsTypeInference` (the
+  `t.a.b()` shape, whose real receiver is the field `a`) or `NeedsReceiverType`
+  (3 and 123). No other Go occurrence changed its outcome or its count. The
+  changes do not touch each other's languages, measured by re-running each
+  corpus with the other reverted.
 
   **A rate that rises here is not an improvement.** Excluding a class from both
   terms is exactly how a rate rises with nothing linked better, and Python's
@@ -57,6 +78,16 @@ Decisions and their rationale — including what was rejected — live in
   186 because those references are now `local_binding`, not because any of them
   reached a definition. The `local_binding` column is gated for drift for this
   reason and a re-base has to state it.
+
+  **And what it costs is edges.** The 5,374 commons-lang and 3,189 gson
+  occurrences that moved from `resolved` to `local_binding` are 13.6% and 19.8%
+  of those corpora's resolved edges, and they are gone from the graph
+  `arthron query` reads and the MCP server serves — for many of them the
+  resolver had already produced the `NodeId`, and the store still holds the
+  node. `LocalBinding` does not claim the target is unnameable; it claims the
+  reference is not evidence about cross-file linking, because reaching its
+  target needs the type of a binding no other file can see. Python loses
+  almost nothing this way: django 0 and flask 7.
 
 ### Fixed
 
@@ -69,6 +100,16 @@ Decisions and their rationale — including what was rejected — live in
   `type_identifier` in this grammar, now answered from the predeclared block
   rather than left unmatched. After both, `NoMatchingDefinition` is 123 on
   codeiq and 269 on caddy — unchanged from before the wave.
+- **`Generic[T](x)` was reported as a type use naming a function, and as no
+  call at all.** An explicit instantiation is unambiguously a type, so the Go
+  grammar files the whole call as a `type_conversion_expression` over a
+  `generic_type` and the `call_expression` rule never saw it; the only row the
+  site produced was a `TypeUse` whose target was a `DefKind::Function`. The
+  callee position of a call written in call syntax is now reported as the
+  `Call` it is — still exactly one row for one site, and the type *arguments*
+  are unaffected. No published number moves: there is no explicit
+  instantiation in `codeiq`, `caddy` or `probes`, counted syntactically over
+  all 728 files.
 - **Two Java external nodes that claimed a package which does not exist.**
   `Outer.NonStaticInner` and `Enclosing<T>.Inner` in gson's `TypeTokenTest`
   name method-local classes (JLS §14.3); their two-segment targets escaped the

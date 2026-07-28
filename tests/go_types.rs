@@ -528,3 +528,56 @@ fn go_a_nil_type_switch_case_names_the_predeclared_nil() {
     assert_eq!(scan.type_use("nil"), "external go:builtin");
     assert_eq!(scan.type_use("Real"), "resolved example.com/app#Real");
 }
+
+/// `Generic[MyInt](1)` is a call, and the grammar says otherwise.
+///
+/// An explicit instantiation is unambiguously a type, so tree-sitter parses
+/// the whole call as a `type_conversion_expression` over a `generic_type` —
+/// the `call_expression` rule never sees it. The one row the site produced was
+/// therefore a `TypeUse` whose target was a `DefKind::Function`, which is not
+/// a type in any Go program. The row is now the `Call` it always was.
+///
+/// Still one row for one site: the pin below is `count`, not `one`, because
+/// emitting both kinds would be the other half of this bug.
+#[test]
+fn go_an_explicit_instantiation_is_a_call_and_not_a_type_use() {
+    let scan = render(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "app.go",
+            concat!(
+                "package app\n\n",
+                "type MyInt int\n\n",
+                "type Box[T any] struct{ v T }\n\n",
+                "func Generic[T any](v T) T { return v }\n\n",
+                "func Uses() {\n",
+                "\t_ = Generic[MyInt](1)\n",
+                "\tvar b Box[MyInt]\n",
+                "\t_ = b\n",
+                "}\n",
+            ),
+        ),
+    ]);
+
+    assert_eq!(scan.count("Generic", RefKind::Call), 1);
+    assert_eq!(
+        scan.count("Generic", RefKind::TypeUse),
+        0,
+        "the callee of a call is not a written type name",
+    );
+    assert_eq!(
+        scan.one("Generic", RefKind::Call),
+        "resolved example.com/app#Generic",
+    );
+    // The type *arguments* are untouched. `MyInt` is written twice, in the
+    // instantiation and in the `var`, and both are ordinary type uses — one
+    // row, because the two sites share a key inside one encloser, and no
+    // `Call` row at all.
+    assert_eq!(scan.count("MyInt", RefKind::TypeUse), 1);
+    assert_eq!(scan.count("MyInt", RefKind::Call), 0);
+    assert_eq!(scan.type_use("MyInt"), "resolved example.com/app#MyInt");
+    // A generic type in a *type* position stays a type use — only the callee
+    // position moves.
+    assert_eq!(scan.type_use("Box"), "resolved example.com/app#Box");
+    assert_eq!(scan.count("Box", RefKind::Call), 0);
+}

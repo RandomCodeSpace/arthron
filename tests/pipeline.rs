@@ -328,11 +328,18 @@ fn an_external_reference_gets_a_node_and_an_edge() {
 }
 
 #[test]
-fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
+fn a_receiver_shadowing_an_import_resolves_to_its_own_type_not_the_import() {
     // The receiver `h` shadows `import h "net/http"` for the whole of
-    // `Handle`, so `h.reset()` names a local. Linking it to the import is a
-    // wrong edge, and a wrong edge is strictly worse than an unresolved
-    // reference: the miss would have been counted, the wrong edge is not.
+    // `Handle`, so `h.reset()` names the receiver's own method. Linking it to
+    // the import is a wrong edge, and a wrong edge is strictly worse than an
+    // unresolved reference: the miss would have been counted, the wrong edge
+    // is not.
+    //
+    // It is not excluded to achieve that. A receiver is Go's `this`, so the
+    // site resolves against the type the signature states — the same
+    // declared-type lookup Java, Python, JavaScript and TypeScript run for
+    // `this.reset()` — and lands on the right definition, in both terms of
+    // the rate.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
@@ -343,6 +350,7 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
             "package server\n\n",
             "import h \"net/http\"\n\n",
             "type Handler struct{}\n\n",
+            "func (h *Handler) reset() {}\n\n",
             "func (h *Handler) Handle() {\n",
             "\th.reset()\n",
             "}\n\n",
@@ -364,6 +372,15 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
         ),
         "the receiver shadows the import: this edge is a lie",
     );
+    assert!(
+        links(
+            &store,
+            "example.com/app/server#Handler.Handle",
+            "example.com/app/server#Handler.reset",
+            RefKind::Call,
+        ),
+        "the receiver's own method is the edge, and it is a real one",
+    );
     // One function away the same `h` really is the import, and that edge
     // must survive — the fix is a binding rule, not a blanket suppression.
     assert!(links(
@@ -373,14 +390,15 @@ fn a_receiver_shadowing_an_import_does_not_produce_an_edge() {
         RefKind::Call,
     ));
 
-    // The reference is reported, not deleted: one local binding, on its own
-    // line, and both terms of the rate are untouched by it.
     let tally = &report.per_lang[&Lang::Go.code()];
-    assert_eq!(tally.local_binding, 1);
+    assert_eq!(
+        tally.local_binding, 0,
+        "a member selected through a receiver is never a local binding",
+    );
     assert_eq!(tally.unresolved_total(), 0, "{:?}", tally.unresolved);
     assert_eq!(
-        tally.resolved, 1,
-        "the receiver's own `Handler` is a type use like any other",
+        tally.resolved, 3,
+        "`h.reset` and the two `Handler` receiver type uses",
     );
     assert_eq!(tally.external, 2, "the import and the genuine `h` use");
 }

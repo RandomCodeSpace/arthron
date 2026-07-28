@@ -632,14 +632,24 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
 /// Go's resolver runs no type checker, so a receiver whose type is not stated
 /// in the file is honestly unresolved — that is `NeedsTypeInference`, and it
 /// is most of this. `NoMatchingDefinition` is the rest: a name this build
-/// indexed a package for and found nothing under.
-const CODEIQ_REASONS: &[(&str, u64)] =
-    &[("NeedsTypeInference", 676), ("NoMatchingDefinition", 123)];
+/// indexed a package for and found nothing under. `NeedsReceiverType` is the
+/// third and smallest: a member selected through the method's own receiver,
+/// whose type *is* stated, that the receiver type does not itself declare —
+/// Go promotes an embedded type's members and this track indexes neither
+/// embedding nor struct fields.
+const CODEIQ_REASONS: &[(&str, u64)] = &[
+    ("NeedsReceiverType", 3),
+    ("NeedsTypeInference", 758),
+    ("NoMatchingDefinition", 123),
+];
 
-/// caddy's, exactly. Twice the tree and the same two reasons in the same
+/// caddy's, exactly. Twice the tree and the same three reasons in the same
 /// proportion, which is the point of measuring two corpora.
-const CADDY_REASONS: &[(&str, u64)] =
-    &[("NeedsTypeInference", 1552), ("NoMatchingDefinition", 269)];
+const CADDY_REASONS: &[(&str, u64)] = &[
+    ("NeedsReceiverType", 123),
+    ("NeedsTypeInference", 2308),
+    ("NoMatchingDefinition", 269),
+];
 
 /// One baseline per corpus, never one aggregated number. They are written by
 /// the command and by nothing else:

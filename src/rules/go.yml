@@ -64,6 +64,13 @@ rule:
 #                    `T(x)`, which the grammar already routes through
 #                    `ref-call` as a conversion. Emitting them here would
 #                    count one site twice.
+#
+# One shape reaches `type_identifier` in *callee* position and so is not a type
+# use at all: `Generic[T](x)`. An explicit instantiation is unambiguously a
+# type, so the grammar files the whole call as a `type_conversion_expression`
+# and `ref-call` — which matches `call_expression` — never sees it. The site is
+# reported as the `Call` it is; `instantiated_callee` in `extract_go.rs` is
+# where, and it is still one row for one site.
 id: ref-type
 language: go
 rule:
