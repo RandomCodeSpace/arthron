@@ -129,6 +129,27 @@ impl SourceTree {
         Self::parse(SupportLang::Scala, source)
     }
 
+    /// Parse a YAML document.
+    ///
+    /// Not a source language and not claimed by any track: `pubspec.yaml` is
+    /// Dart's manifest, and phase 0 reads it with the grammar its own format
+    /// has rather than with a line scanner. No walk ever reaches a `.yaml`
+    /// file — [`crate::model::Lang::for_extension`] answers `None` for it —
+    /// so this parses a manifest a resolver names explicitly and nothing
+    /// else.
+    pub fn parse_yaml(source: &str) -> Self {
+        Self::parse(SupportLang::Yaml, source)
+    }
+
+    /// Parse Dart source.
+    ///
+    /// One grammar for every `.dart` file: Dart has no dialects, and a
+    /// library, a `part` file and a test are the same language read the same
+    /// way — only the walk decides which of them a scan reads.
+    pub fn parse_dart(source: &str) -> Self {
+        Self::parse(SupportLang::Dart, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -315,6 +336,35 @@ rule:
                 .expect("the declaration names a type");
             assert_eq!(name.text(), "Greeter");
         }
+    }
+
+    #[test]
+    fn parses_dart() {
+        one_match(
+            &SourceTree::parse_dart("class Greeter { void hi() {} }\n"),
+            "id: t\nlanguage: dart\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    /// YAML, which no track claims and one reads: Dart's `pubspec.yaml` is
+    /// parsed with the grammar its own format has rather than with a line
+    /// scanner, and this is what notices if that grammar ever stops being
+    /// compiled in.
+    #[test]
+    fn parses_yaml() {
+        let rules = Rules::compile("id: t\nlanguage: yaml\nrule:\n  kind: block_mapping_pair\n")
+            .expect("rules compile");
+        let tree = SourceTree::parse_yaml("name: collection\ndev_dependencies:\n  test: any\n");
+        let found = tree.matches(&rules);
+        assert_eq!(found.len(), 3, "two top-level pairs and one nested");
+        let (_, node) = &found[0];
+        assert_eq!(node.field("key").expect("a pair has a key").text(), "name");
+        assert_eq!(
+            node.field("value").expect("a pair has a value").text(),
+            "collection",
+        );
     }
 
     #[test]
