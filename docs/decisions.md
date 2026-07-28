@@ -4,6 +4,41 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-28 — 0.0.1 published
+
+`arthron 0.0.1` is on crates.io, tagged `v0.0.1` (signed). Every ratified
+publish condition was met and verified, not assumed: all twenty-five corpus
+gates green on main; CI green on Linux, macOS and Windows; docs rewritten
+against the committed baselines (every quoted rate re-derived, every console
+block asserted byte-identical to real output); the perf evidence recorded in
+this log; `cargo publish --dry-run` clean with the package inspected — 125
+files, corpus/baselines/docs/tests/.github verified absent.
+
+**What the first 3-OS run caught, recorded because both are classes:**
+
+- *The gate wrote a file it could not read back* (Windows). `write_baseline`
+  recorded the corpus path with `\`; `parse_baseline` refuses escapes by
+  design, so the next run exited with a usage error and an empty document.
+  Fixed at the single construction point, and the write-side validator now
+  refuses everything the reader refuses — a writer must never outrun its
+  reader.
+- *A fixture the platform cannot produce is not a skipped test* (macOS).
+  APFS refuses non-UTF-8 filenames, so the non-UTF-8-path test is gated to
+  Linux with the reason in the comment.
+
+**The packaging near-miss, recorded as a standing rule:** an unanchored
+`include` pattern in `Cargo.toml` follows gitignore semantics and matched at
+any depth — cargo followed the corpus symlink and packaged twenty-one
+license files from the private corpus repository. Caught by inspecting
+`cargo package --list`, fixed by anchoring every pattern. The list is
+inspected, never trusted.
+
+**Rejected for 0.0.1:** cargo-dist binary releases (rides a later 0.0.x —
+crates.io is the distribution the conditions named); publishing to public
+npm (GitHub-Packages reservation stands).
+
+---
+
 ## 2026-07-28 — Tier 2 complete: fourteen tracks, twenty-five gates, every number measured
 
 The last eight tracks landed — batch 3 (Swift, C++), the `.h` amendment, and
