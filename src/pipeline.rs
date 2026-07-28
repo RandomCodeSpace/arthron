@@ -1323,6 +1323,15 @@ pub fn source_files_with<L: Language>(
         }
         out.push(path.to_path_buf());
     }
+    // The walk hands files back in the order the filesystem lists them, which
+    // differs between machines: the same corpus on a developer box and on a CI
+    // runner produced stored graphs that differed by one `Type`. Where two
+    // definitions collide on one identity the survivor is whichever was written
+    // last, so read order decided the graph's shape — a measurement nobody
+    // could reproduce elsewhere. Sorting here makes the file set a property of
+    // the tree rather than of the filesystem that holds it. `errors` is left in
+    // discovery order: it is a report, and it keys no identity.
+    out.sort();
     Ok((out, errors))
 }
 
