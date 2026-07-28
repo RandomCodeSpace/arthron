@@ -3,6 +3,24 @@ name: Auto-merge
 # Enables GitHub auto-merge on every non-draft PR. The merge itself still
 # waits for the branch-protection required checks on main; a red check
 # blocks it. Draft PRs opt out until marked ready for review.
+#
+# Everything this workflow does is delegate to branch protection, and branch
+# protection lives in repository settings rather than in this repository — so
+# a check that exists and is not *required* is a check auto-merge will happily
+# merge past. The contexts that have to be listed as required on `main`, in
+# full:
+#
+#   fmt, clippy, test                    (ci.yml, ubuntu-latest)
+#   fmt, clippy, test (macos-latest)     (ci.yml)
+#   fmt, clippy, test (windows-latest)   (ci.yml)
+#   MSRV                                 (ci.yml)
+#   audit                                (ci.yml)
+#   corpus gates                         (gate.yml — the resolution rates)
+#
+# Job names are those contexts, which is why ci.yml names its matrix legs
+# explicitly instead of letting the runner label them: adding a platform adds
+# a context that is green-by-default until someone requires it, and renaming
+# one drops a required check with no error anywhere.
 on:
   pull_request:
     types: [opened, reopened, ready_for_review]

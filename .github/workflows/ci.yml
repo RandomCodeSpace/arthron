@@ -10,7 +10,15 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, test (${{ matrix.os }})
+    # Each leg's name is its branch-protection context, so the names are data
+    # and not decoration. The Linux leg keeps the exact string it had before
+    # this matrix existed — renaming it would silently drop the required check
+    # on main, which is the same hazard gate.yml warns about for itself, and
+    # `.github/workflows/automerge.yml` turns a dropped required check
+    # straight into a merge. The two new legs are new contexts and have to be
+    # added to branch protection deliberately; see automerge.yml for the list
+    # that has to be required.
+    name: ${{ matrix.context }}
     runs-on: ${{ matrix.os }}
     strategy:
       # One platform's failure must not hide another's. A cross-platform bug
@@ -27,6 +35,11 @@ jobs:
           # would show up.
           - os: ubuntu-latest
             lint: true
+            context: "fmt, clippy, test"
+          - os: macos-latest
+            context: "fmt, clippy, test (macos-latest)"
+          - os: windows-latest
+            context: "fmt, clippy, test (windows-latest)"
     steps:
       - uses: actions/checkout@v5
 
@@ -67,7 +80,15 @@ jobs:
       # three platforms, which is why no deploy key is needed off Linux. What
       # runs here is everything else: the fixtures, the store, the resolver
       # units, the CLI and the JSON shapes. `.github/workflows/gate.yml` is the
-      # job that fetches the corpus and makes the rates block a merge.
+      # job that fetches the corpus and makes the rates block a merge, and
+      # `tests/baselines.rs` — which reads no corpus, so it runs here — is what
+      # makes a baseline missing from that workflow fail.
+      #
+      # `tests/scan_errors.rs` is `#![cfg(unix)]`: its subject is `chmod 000`
+      # and non-UTF-8 filenames, and `std::os::unix` does not exist on Windows,
+      # so without the gate this step would not fail its assertions on the
+      # Windows leg — it would fail to compile the test binary and never run
+      # any test at all.
       - name: Tests
         run: cargo test --all-features
 
