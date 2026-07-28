@@ -48,6 +48,8 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_ruby::extract::{ImportForm, extract};
 use arthron::track_ruby::resolve::scan_ruby;
 
+mod support;
+
 const CORPUS: &str = "corpus/ruby/rack";
 const BASELINE: &str = "baselines/ruby-rack.toml";
 
@@ -174,7 +176,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 fn the_ruby_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

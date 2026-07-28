@@ -80,6 +80,8 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_bash::extract::{SourceForm, extract};
 use arthron::track_bash::resolve::scan_bash;
 
+mod support;
+
 const CORPUS: &str = "corpus/bash/bats-core";
 const BASELINE: &str = "baselines/bash-bats-core.toml";
 
@@ -254,7 +256,7 @@ fn the_corpus_surface_is_the_owned_extensions_only() {
 fn the_bash_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

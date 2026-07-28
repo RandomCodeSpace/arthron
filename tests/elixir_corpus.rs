@@ -70,6 +70,8 @@ use arthron::track_elixir::extract::extract;
 use arthron::track_elixir::lang::ElixirLang;
 use arthron::track_elixir::resolve::scan_elixir;
 
+mod support;
+
 const CORPUS: &str = "corpus/elixir/plug";
 const BASELINE: &str = "baselines/elixir-plug.toml";
 
@@ -330,7 +332,7 @@ const DOCUMENTED_ONLY: &[(&str, usize)] = &[
 fn the_elixir_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
     let walked = source_files::<ElixirLang>(corpus).expect("walking the corpus");

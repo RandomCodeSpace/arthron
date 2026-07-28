@@ -57,6 +57,8 @@ use arthron::store::{NodeRecord, ReadStore, Store, StoredOutcome};
 use arthron::track_haskell::extract::extract;
 use arthron::track_haskell::resolve::{HsResolver, scan_haskell};
 
+mod support;
+
 const CORPUS: &str = "corpus/haskell/aeson";
 const BASELINE: &str = "baselines/haskell-aeson.toml";
 
@@ -342,7 +344,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 fn the_haskell_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

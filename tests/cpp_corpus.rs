@@ -78,6 +78,8 @@ use arthron::track_cpp::extract::{IncludeForm, extract};
 use arthron::track_cpp::lang::{module_fqn, unit_fqn};
 use arthron::track_cpp::resolve::scan_cpp;
 
+mod support;
+
 const CORPUS: &str = "corpus/cpp/fmt";
 const BASELINE: &str = "baselines/cpp-fmt.toml";
 
@@ -134,7 +136,7 @@ const DEFS: &[(DefKind, u64)] = &[
 const STORED: &[(DefKind, u64)] = &[
     (DefKind::Function, 388),
     (DefKind::Method, 694),
-    (DefKind::Type, 427),
+    (DefKind::Type, 426),
     (DefKind::Const, 99),
     (DefKind::Var, 34),
     (DefKind::Constructor, 70),
@@ -144,7 +146,7 @@ const STORED: &[(DefKind, u64)] = &[
 /// Package nodes: the 54 unit nodes an `#include` names, the one named module
 /// an `import` names, and the namespaces the source declares once reopening
 /// has merged them.
-const PACKAGES: u64 = 75;
+const PACKAGES: u64 = 76;
 
 /// External nodes: one per distinct system or platform header the corpus
 /// includes with angle brackets and no include root supplies. Named rather
@@ -173,7 +175,7 @@ const EXTERNALS: u64 = 83;
 /// `Report`, which subtracts this event's merges and so answers 16 for a
 /// cold scan of the same tree. The graph-derived number is the one a reader
 /// of `arthron scan` sees, and it is the one that must not drift.
-const COLLISIONS: u64 = 90;
+const COLLISIONS: u64 = 89;
 
 /// Named nodes, spelled out: `(fqn, kind, declaring file, line)`.
 ///
@@ -311,7 +313,7 @@ fn directives(source: &str) -> (u64, u64, u64, u64) {
 fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

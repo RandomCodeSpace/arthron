@@ -17,12 +17,15 @@ use std::path::Path;
 use arthron::gate::{
     Counts, FORMAT, GateVerdict, evaluate, is_renderable, parse_baseline, render_baseline,
 };
-use arthron::model::{DefKind, Lang, RefKind, reason_name};
+use arthron::model::{DefKind, Lang, RefKind, node_id, reason_name};
 use arthron::pipeline::source_files;
-use arthron::store::Store;
+use arthron::query::{NodeKind, definition};
+use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_php::extract::extract;
 use arthron::track_php::lang::PhpLang;
 use arthron::track_php::resolve::scan_php;
+
+mod support;
 
 const CORPUS: &str = "corpus/php/guzzle";
 const BASELINE: &str = "baselines/php-guzzle.toml";
@@ -34,7 +37,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("composer.json").is_file() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 
@@ -158,6 +161,135 @@ fn the_extractor_reads_the_php_corpus_without_losing_its_invariants() {
             ("type", 159),
         ],
     );
+}
+
+/// Definition nodes the store holds after merging, by kind.
+///
+/// The extractor's census is asserted in
+/// `the_extractor_reads_the_php_corpus_without_losing_its_invariants` above;
+/// this is the same tally read back out of the store, and the pair is the
+/// point. The extractor's says nothing was lost on the way in; this one says
+/// nothing was lost or over-merged on the way through, which is a different
+/// claim and the one a `redb::insert` that overwrites silently could break.
+///
+/// `DefKind::Module` is absent because a namespace is filed as a *package*
+/// node rather than a definition; those are [`PACKAGES`]. Every other kind
+/// matches the extractor exactly — guzzle declares no two classes under one
+/// FQN — so a number that drops here and not there is a store bug and
+/// nothing else.
+const STORED: &[(DefKind, u64)] = &[
+    (DefKind::Function, 9),
+    (DefKind::Method, 2707),
+    (DefKind::Type, 159),
+    (DefKind::Const, 113),
+    (DefKind::Field, 160),
+];
+
+/// Package nodes: thirteen distinct namespaces, out of the 133 namespace
+/// clauses the 131 files write. That collapse is the merge doing its job —
+/// `namespace GuzzleHttp;` is written at the top of most of `src/`.
+const PACKAGES: u64 = 13;
+
+/// External nodes: the composer packages guzzle names and this scan does not
+/// index.
+const EXTERNALS: u64 = 4;
+
+/// Named definitions, spelled out: `(fqn, kind, declaring file, line)`.
+///
+/// A census pins the scale; these pin the shape. `Client::$config` cannot be
+/// right unless a declared property is separated from a method of the same
+/// class, and `ClientInterface::MAJOR_VERSION!` cannot be right unless an
+/// interface constant is a constant — the reserved `!` is what keeps it from
+/// colliding with a method of that name.
+const PINNED: &[(&str, NodeKind, &str, u32)] = &[
+    (
+        "GuzzleHttp#Client",
+        NodeKind::Definition(DefKind::Type),
+        "src/Client.php",
+        29,
+    ),
+    (
+        "GuzzleHttp#Client::$config",
+        NodeKind::Definition(DefKind::Field),
+        "src/Client.php",
+        37,
+    ),
+    (
+        "GuzzleHttp#Client::__construct()",
+        NodeKind::Definition(DefKind::Method),
+        "src/Client.php",
+        163,
+    ),
+    (
+        "GuzzleHttp#ClientInterface::MAJOR_VERSION!",
+        NodeKind::Definition(DefKind::Const),
+        "src/ClientInterface.php",
+        27,
+    ),
+    (
+        "GuzzleHttp#Utils::addStreamHandler()",
+        NodeKind::Definition(DefKind::Method),
+        "src/Utils.php",
+        215,
+    ),
+    // The namespace itself, filed as a package: one identity for the clause
+    // most of `src/` repeats.
+    ("GuzzleHttp", NodeKind::Package, "src/AuthMiddleware.php", 5),
+];
+
+#[test]
+fn the_stored_php_definition_census_is_exact() {
+    // The half the extractor census above cannot reach. A definition that
+    // survives extraction and is lost, or merged away, on the way into the
+    // store moves no rate — the rate is over imports — and no extractor
+    // tally either, because that one never opens the store.
+    let corpus = Path::new(CORPUS);
+    if !corpus_present(corpus) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("graph.redb");
+    scan_php(corpus, &db).expect("scan");
+
+    let read = ReadStore::open(&db).expect("the store opens for reading");
+    let mut stored: BTreeMap<u8, u64> = BTreeMap::new();
+    let (mut packages, mut externals) = (0u64, 0u64);
+    read.for_each_node(|_, record| {
+        match record {
+            NodeRecord::Definition { kind, .. } => *stored.entry(kind).or_default() += 1,
+            NodeRecord::Package { .. } => packages += 1,
+            NodeRecord::External { .. } => externals += 1,
+        }
+        Ok(())
+    })
+    .expect("walking the node table");
+    println!("stored defs {stored:?} packages {packages} externals {externals}");
+    let want: BTreeMap<u8, u64> = STORED.iter().map(|(k, n)| (k.code(), *n)).collect();
+    assert_eq!(stored, want, "the stored definition census moved");
+    assert_eq!(packages, PACKAGES, "the stored package census moved");
+    assert_eq!(externals, EXTERNALS, "the stored external census moved");
+
+    for (fqn, kind, file, line) in PINNED {
+        let id = node_id(Lang::Php.domain(), fqn);
+        let def = definition(&read, &id)
+            .unwrap_or_else(|e| panic!("{fqn}: {e}"))
+            .unwrap_or_else(|| panic!("{fqn} is not in the store"));
+        assert_eq!(def.node.name, *fqn);
+        assert_eq!(def.node.kind, *kind, "{fqn}");
+        // A namespace is declared by every file that writes the clause, so
+        // only the sites in the file this pin names are worth printing.
+        let here: Vec<u32> = def
+            .declarations
+            .iter()
+            .filter(|d| d.file == *file)
+            .map(|d| d.line)
+            .collect();
+        assert!(
+            here.contains(line),
+            "{fqn} is not declared at {file}:{line} — {} site(s) in that file, at {here:?}",
+            here.len(),
+        );
+    }
 }
 
 #[test]

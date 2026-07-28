@@ -160,18 +160,178 @@ struct GateStep {
     baseline: String,
 }
 
-/// Every `arthron gate` invocation in [`GATE_WORKFLOW`], and the number of
-/// step headers they were parsed out of.
-fn gate_steps() -> (Vec<GateStep>, usize) {
+/// A YAML line that carries something: blank lines and whole-line comments
+/// are dropped, so a comment can neither hide a key nor invent one, and what
+/// is left is `(indentation, content)`.
+fn significant(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .map(|l| (l.len() - l.trim_start().len(), l.trim().to_string()))
+        .collect()
+}
+
+/// `key: value` from a mapping line, with a leading `- ` list marker removed.
+///
+/// `None` for anything that is not a key — a block-scalar continuation line,
+/// a bare sequence item — so a `run:` body cannot be mistaken for a step key.
+fn split_key(line: &str) -> Option<(String, String)> {
+    let line = line.strip_prefix("- ").unwrap_or(line);
+    let (key, rest) = line.split_once(':')?;
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((key.to_string(), rest.trim().to_string()))
+}
+
+/// One step of the gate job.
+struct WorkflowStep {
+    /// Its `name:`, or the empty string for a step that declares none.
+    name: String,
+    /// Its own keys — the header's, plus every mapping line one level in.
+    /// Nested values (`with:`, a `run: |` body) are not keys and are not here.
+    keys: Vec<(String, String)>,
+    /// The whole step, comments and blank lines removed, as one string. What
+    /// the soft-failure scan reads, because a `|| true` can sit in a block
+    /// scalar where no key parser would find it.
+    block: String,
+}
+
+/// The corpus-gate workflow, read as text: its triggers, the gate job's own
+/// keys, and the job's steps.
+struct GateJob {
+    /// Everything under the workflow's `on:` key, as `(indentation, content)`.
+    ///
+    /// The indentation is load-bearing and was not kept once. `pull_request:`
+    /// and `pull_request:` with `branches: [no-such-branch]` nested under it
+    /// are the same line; what tells them apart is whether the line after it
+    /// is indented one level further in. See
+    /// [`the_corpus_gate_job_itself_has_no_soft_failure_path`].
+    triggers: Vec<(usize, String)>,
+    /// The job's own keys — `name`, `runs-on`, `timeout-minutes`, `steps`.
+    keys: Vec<(String, String)>,
+    steps: Vec<WorkflowStep>,
+}
+
+/// Read [`GATE_WORKFLOW`] into a [`GateJob`].
+///
+/// Indentation-driven rather than YAML-parsed, for the reason the header
+/// gives: the crate has no cause to carry a YAML parser. The shape is
+/// asserted rather than assumed at every step — a file this reader cannot
+/// split into a job with steps panics here, instead of yielding an empty set
+/// that every test below would pass against.
+fn gate_job() -> GateJob {
     let text = std::fs::read_to_string(GATE_WORKFLOW)
         .unwrap_or_else(|e| panic!("reading {GATE_WORKFLOW}: {e}"));
-    let headers = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("- name: Gate "))
+    let lines = significant(&text);
+
+    let on = lines
+        .iter()
+        .position(|(indent, content)| *indent == 0 && content == "on:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no `on:` block, so nothing triggers it"));
+    let triggers: Vec<(usize, String)> = lines[on + 1..]
+        .iter()
+        .take_while(|(indent, _)| *indent > 0)
+        .cloned()
+        .collect();
+
+    let jobs = lines
+        .iter()
+        .position(|(indent, content)| *indent == 0 && content == "jobs:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no `jobs:` block"));
+    let (job_indent, header) = lines
+        .get(jobs + 1)
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: `jobs:` declares nothing"));
+    assert_eq!(
+        header, "gates:",
+        "{GATE_WORKFLOW}: the first job is not `gates:`; this reader checks that one",
+    );
+    let job_indent = *job_indent;
+    let body: Vec<&(usize, String)> = lines[jobs + 2..]
+        .iter()
+        .take_while(|(indent, _)| *indent > job_indent)
+        .collect();
+    assert!(!body.is_empty(), "{GATE_WORKFLOW}: the gates job is empty");
+
+    let key_indent = body[0].0;
+    let keys: Vec<(String, String)> = body
+        .iter()
+        .filter(|(indent, _)| *indent == key_indent)
+        .filter_map(|(_, content)| split_key(content))
+        .collect();
+
+    let steps_at = body
+        .iter()
+        .position(|(indent, content)| *indent == key_indent && content == "steps:")
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: the gates job declares no `steps:`"));
+    let step_lines: Vec<&(usize, String)> = body[steps_at + 1..]
+        .iter()
+        .take_while(|(indent, _)| *indent > key_indent)
+        .copied()
+        .collect();
+    assert!(!step_lines.is_empty(), "{GATE_WORKFLOW}: `steps:` is empty");
+    let step_indent = step_lines[0].0;
+    assert!(
+        step_lines[0].1.starts_with("- "),
+        "{GATE_WORKFLOW}: `steps:` does not begin with a list item",
+    );
+
+    let mut steps: Vec<WorkflowStep> = Vec::new();
+    let mut current: Vec<&(usize, String)> = Vec::new();
+    let finish = |block: &mut Vec<&(usize, String)>, out: &mut Vec<WorkflowStep>| {
+        if block.is_empty() {
+            return;
+        }
+        let keys: Vec<(String, String)> = block
+            .iter()
+            .filter(|(indent, _)| *indent <= step_indent + 2)
+            .filter_map(|(_, content)| split_key(content))
+            .collect();
+        let name = keys
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map_or(String::new(), |(_, v)| v.clone());
+        let text: Vec<&str> = block.iter().map(|(_, c)| c.as_str()).collect();
+        out.push(WorkflowStep {
+            name,
+            keys,
+            block: text.join("\n"),
+        });
+        block.clear();
+    };
+    for line in step_lines {
+        if line.0 == step_indent && line.1.starts_with("- ") {
+            finish(&mut current, &mut steps);
+        }
+        current.push(line);
+    }
+    finish(&mut current, &mut steps);
+    assert!(!steps.is_empty(), "{GATE_WORKFLOW}: no step was read");
+
+    GateJob {
+        triggers,
+        keys,
+        steps,
+    }
+}
+
+/// Every `arthron gate` invocation in [`GATE_WORKFLOW`], and the number of
+/// gate steps they were parsed out of.
+fn gate_steps() -> (Vec<GateStep>, usize) {
+    let job = gate_job();
+    let headers = job
+        .steps
+        .iter()
+        .filter(|s| s.name.starts_with("Gate "))
         .count();
     let mut steps = Vec::new();
-    for line in text.lines() {
-        let Some((_, invocation)) = line.split_once("arthron gate ") else {
+    for step in &job.steps {
+        let Some((_, run)) = step.keys.iter().find(|(k, _)| k == "run") else {
+            continue;
+        };
+        let Some((_, invocation)) = run.split_once("arthron gate ") else {
             continue;
         };
         let words: Vec<&str> = invocation.split_whitespace().collect();
@@ -187,7 +347,7 @@ fn gate_steps() -> (Vec<GateStep>, usize) {
             flag("--language"),
             flag("--baseline"),
         ) else {
-            panic!("{GATE_WORKFLOW}: cannot read a gate invocation from `{line}`");
+            panic!("{GATE_WORKFLOW}: cannot read a gate invocation from `{run}`");
         };
         steps.push(GateStep {
             corpus,
@@ -249,4 +409,346 @@ fn every_gate_step_names_the_corpus_and_language_its_baseline_records() {
             step.corpus, step.baseline, baseline.corpus,
         );
     }
+}
+
+/// The tokens that make a step, or a job, unable to fail.
+///
+/// Read as substrings of the step's text rather than as YAML keys on purpose:
+/// `continue-on-error` is a key, `|| true` is not, and both end the same way
+/// — a red command and a green check. Whole-line comments are already gone by
+/// the time this is applied, so prose about `|| true` costs nothing.
+const SOFT_FAILURE: &[&str] = &[
+    "continue-on-error",
+    "|| true",
+    "|| :",
+    "|| exit 0",
+    "; true",
+    "&& true",
+    "set +e",
+    "exit 0",
+];
+
+/// The one shape a gate step's command may have.
+///
+/// Anything else is a wrapper, and a wrapper is where an exit status goes to
+/// be discarded — `bash -c '… || true'`, a `set +e` above it, a `for` loop
+/// whose status is the last iteration's.
+const GATE_COMMAND: &str = "./target/release/arthron gate ";
+
+#[test]
+fn no_gate_step_can_pass_without_measuring() {
+    // The hole this closes, found by defeating the gate rather than by
+    // reading it: `every_gated_baseline_has_a_step_in_the_corpus_gate_workflow`
+    // counts steps, and a step carrying `continue-on-error: true` is still a
+    // step. Four baselines went on "passing" with their step's effect
+    // removed. A gate that cannot fail is not a gate, and counting is no way
+    // to tell the difference — so every gate step is checked for the three
+    // ways it could be neutralised: the key, the shell, and an `if:` that
+    // decides it does not apply today.
+    let job = gate_job();
+    let gates: Vec<&WorkflowStep> = job
+        .steps
+        .iter()
+        .filter(|s| s.name.starts_with("Gate "))
+        .collect();
+    assert_eq!(
+        gates.len(),
+        GATED.len(),
+        "{GATE_WORKFLOW} has {} gate steps for {} gated baselines",
+        gates.len(),
+        GATED.len(),
+    );
+
+    for step in &gates {
+        for token in SOFT_FAILURE {
+            assert!(
+                !step.block.contains(token),
+                "{GATE_WORKFLOW}: step `{}` carries `{token}`, so a regression it \
+                 measures cannot fail the job — which is indistinguishable from a pass",
+                step.name,
+            );
+        }
+        // `if:` is the quiet one: the step stays in the list, the job stays
+        // green, and the step is skipped. A gate that can decide it does not
+        // apply is a gate that can decide it never applies.
+        assert!(
+            !step.keys.iter().any(|(k, _)| k == "if"),
+            "{GATE_WORKFLOW}: step `{}` is conditional, so it can be skipped without \
+             anything going red",
+            step.name,
+        );
+        let (_, run) = step
+            .keys
+            .iter()
+            .find(|(k, _)| k == "run")
+            .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: step `{}` runs nothing", step.name));
+        assert!(
+            run.starts_with(GATE_COMMAND),
+            "{GATE_WORKFLOW}: step `{}` runs `{run}`, not `{GATE_COMMAND}…`; the job's \
+             verdict is the command's exit status and a wrapper is where that gets lost",
+            step.name,
+        );
+        // And exactly the two flags a comparison needs. The fourth way a gate
+        // step passes without measuring is not a wrapper, an `if:` or a soft
+        // failure — it is the command's own `--rebase`, which `src/main.rs`
+        // takes before `evaluate` is ever called: the step overwrites the
+        // baseline it exists to enforce with whatever this build measured,
+        // prints what it wrote, and exits 0. Against a baseline holding
+        // `resolved = 999999` the same step exits 1 without the flag and 0
+        // with it. Twenty-five of those is a corpus gate that self-approves
+        // every regression it sees, forever, in green.
+        //
+        // An allow-list, not a deny-list: `--rebase` is the flag that does it
+        // today, and the next one has not been written yet.
+        let flags: Vec<&str> = run
+            .split_whitespace()
+            .filter(|w| w.starts_with("--"))
+            .collect();
+        assert_eq!(
+            flags,
+            ["--language", "--baseline"],
+            "{GATE_WORKFLOW}: step `{}` passes {flags:?}; a gate step names a corpus, a \
+             language and a baseline, and does nothing else to the baseline",
+            step.name,
+        );
+    }
+}
+
+#[test]
+fn the_corpus_gate_job_itself_has_no_soft_failure_path() {
+    // The other half. Every step can be strict and the job still not block a
+    // merge: `continue-on-error` on the job, an `if:` on the job, a step
+    // earlier in the list that swallows the corpus checkout's failure, or a
+    // workflow that never runs on a pull request at all.
+    let job = gate_job();
+
+    for (key, value) in &job.keys {
+        assert_ne!(
+            key, "continue-on-error",
+            "{GATE_WORKFLOW}: the gates job is `continue-on-error: {value}`, so no step \
+             in it can fail the run",
+        );
+        assert_ne!(
+            key, "if",
+            "{GATE_WORKFLOW}: the gates job is conditional on `{value}`, so it can be \
+             skipped without anything going red",
+        );
+    }
+
+    // Not only the gate steps: a `continue-on-error` on the corpus checkout
+    // would hand every gate an empty tree, and `arthron gate` exits 2 for
+    // "nothing measured" precisely so that cannot be read as a pass — but the
+    // key has no legitimate use anywhere in this job, so none is allowed.
+    for step in &job.steps {
+        assert!(
+            !step.block.contains("continue-on-error"),
+            "{GATE_WORKFLOW}: step `{}` carries continue-on-error",
+            step.name,
+        );
+    }
+
+    // The job's name is the branch-protection context. Renaming it does not
+    // fail anything — it silently drops the required check on main, which is
+    // the same failure mode as a step that cannot fail, one level up.
+    assert_eq!(
+        job.keys
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_str()),
+        Some("corpus gates"),
+        "{GATE_WORKFLOW}: the job name is the branch-protection context",
+    );
+
+    // And it has to run where a merge is decided. A workflow that triggers
+    // only on `push` reports the regression after it has landed.
+    //
+    // Unqualified, which is the half a `starts_with` could not see. A
+    // `pull_request:` key carrying `branches: [no-such-branch]` or
+    // `paths: ['docs/**']` is still a `pull_request` trigger by that reading,
+    // and still never runs the gate on a pull request that changes code —
+    // the same failure the comment above describes, reached from the other
+    // side. The filter is a line of its own, nested one level in, so what
+    // separates a real trigger from a decorative one is whether anything is
+    // nested under the key at all.
+    let at = job
+        .triggers
+        .iter()
+        .position(|(_, content)| content == "pull_request:")
+        .unwrap_or_else(|| {
+            panic!(
+                "{GATE_WORKFLOW}: no bare `pull_request:` trigger, so a red gate blocks \
+                 nothing: {:?}",
+                job.triggers,
+            )
+        });
+    let (indent, _) = job.triggers[at];
+    assert!(
+        job.triggers[at + 1..]
+            .first()
+            .is_none_or(|(next, _)| *next <= indent),
+        "{GATE_WORKFLOW}: `pull_request` is qualified by `{}`, so the gate can be \
+         filtered off the pull requests it exists to block",
+        job.triggers[at + 1].1,
+    );
+}
+
+/// The one command the gate job may run the suite with.
+///
+/// Exact, and an allow-list for the reason a gate step's flags are: `--test
+/// corpus`, a test-name filter or an `--exclude` would leave this step in the
+/// list, green, running a subset — which is indistinguishable from running all
+/// of it, and is how one census stops executing without anything going red.
+const SUITE_COMMAND: &str = "cargo test --release --all-features";
+
+/// The environment variable that turns a skipped ratchet into a failed one,
+/// spelled as it appears under the step's `env:`.
+const REQUIRE_CORPUS: &str = "ARTHRON_REQUIRE_CORPUS: \"1\"";
+
+/// The corpus checkout, identified by where it puts the tree.
+const CORPUS_CHECKOUT: &str = "path: corpus";
+
+/// The skip line a corpus test may no longer print for itself, spelled in two
+/// halves so this file does not contain the string it forbids — and so the
+/// test below does not report itself as the first offender.
+const OWN_SKIP: &str = concat!("SKIP", ": no corpus");
+
+#[test]
+fn the_corpus_gate_workflow_runs_the_suite_where_the_corpus_exists() {
+    // The hole this closes is the one every other test in this file is one
+    // level below: the gate steps could all be strict, all be measured and
+    // all be required, and the *definition* censuses would still never run.
+    //
+    // `arthron gate` compares four integers — resolved, unresolved, external
+    // and local_binding. It counts no definitions. The censuses that do live
+    // in `cargo test`, and `.github/workflows/ci.yml` runs that with no
+    // corpus on purpose, so every one of them returns before measuring and is
+    // recorded as a pass. Deleting `DefKind::Method` from the Go, Rust or
+    // EcmaScript extractor moved none of the four integers, skipped every
+    // census that would have caught it, and was a green pull request.
+    //
+    // So the suite has to run in the one job that fetches the corpus, and
+    // this is the test that makes forgetting it fail — in a test file that
+    // itself reads no corpus, so it runs everywhere.
+    let job = gate_job();
+    let suites: Vec<usize> = job
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.keys
+                .iter()
+                .any(|(k, v)| k == "run" && v.starts_with("cargo test"))
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        suites.len(),
+        1,
+        "{GATE_WORKFLOW}: {} steps run `cargo test`; the corpus suite is one step and \
+         the job that has a corpus is the only place it means anything",
+        suites.len(),
+    );
+    let at = suites[0];
+    let suite = &job.steps[at];
+
+    let (_, run) = suite
+        .keys
+        .iter()
+        .find(|(k, _)| k == "run")
+        .expect("the step was selected by its run");
+    assert_eq!(
+        run, SUITE_COMMAND,
+        "{GATE_WORKFLOW}: step `{}` runs `{run}`, not `{SUITE_COMMAND}`; a filter here \
+         excludes a census while leaving the step that appears to run it",
+        suite.name,
+    );
+
+    // Without this the step is still only half a gate. Every corpus test
+    // returns early when its corpus is absent — correct on a machine that
+    // never fetched the private repository, and a lie here, where a skip
+    // means the checkout did not land where the test looked. The variable is
+    // what makes `tests/support::missing` fail instead of print.
+    assert!(
+        suite.block.lines().any(|l| l == REQUIRE_CORPUS),
+        "{GATE_WORKFLOW}: step `{}` does not set `{REQUIRE_CORPUS}`, so a corpus that \
+         did not check out is 1500 silent skips and a green job",
+        suite.name,
+    );
+
+    // And it is a gate, so the three ways a gate step is neutralised apply to
+    // it unchanged.
+    for token in SOFT_FAILURE {
+        assert!(
+            !suite.block.contains(token),
+            "{GATE_WORKFLOW}: step `{}` carries `{token}`",
+            suite.name,
+        );
+    }
+    assert!(
+        !suite.keys.iter().any(|(k, _)| k == "if"),
+        "{GATE_WORKFLOW}: step `{}` is conditional",
+        suite.name,
+    );
+
+    // Order is part of the claim: this step measures a corpus, so the corpus
+    // has to be on disk before it runs. After the checkout, and after the
+    // gate steps — the resolution rate is the primary gate and a regression
+    // in it must be named by the step that names the corpus.
+    let checkout = job
+        .steps
+        .iter()
+        .position(|s| s.block.lines().any(|l| l == CORPUS_CHECKOUT))
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no step checks the corpus out to `corpus/`"));
+    assert!(
+        checkout < at,
+        "{GATE_WORKFLOW}: step `{}` runs before the corpus is checked out",
+        suite.name,
+    );
+}
+
+#[test]
+fn every_corpus_skip_goes_through_the_one_guard() {
+    // `tests/support::missing` is where `ARTHRON_REQUIRE_CORPUS` is read, so
+    // a test file that prints its own skip line and returns is a ratchet the
+    // variable cannot reach: it goes on skipping in the gate job, where a
+    // skip is the ratchet not running. Every one of them went through a
+    // hand-written `println!` until this test existed.
+    //
+    // What it checks is narrow and worth stating: no test file may print the
+    // skip line itself, and a file whose name says it reads a corpus must
+    // call the guard. A new file that invents a different message and is not
+    // named for a corpus is outside both — the residue, named rather than
+    // implied.
+    let mut checked = 0;
+    for entry in std::fs::read_dir("tests").expect("tests/ is committed") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .to_string();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        assert!(
+            !text.contains(OWN_SKIP),
+            "tests/{name} prints its own corpus skip; call `support::missing` instead, \
+             which is what ARTHRON_REQUIRE_CORPUS turns into a failure",
+        );
+        if name.contains("corpus") {
+            assert!(
+                text.contains("support::missing"),
+                "tests/{name} is named for a corpus and never calls `support::missing`, \
+                 so an absent corpus there is a skip even in the job that fetches one",
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 19,
+        "only {checked} corpus test files were found; this test just stopped covering \
+         the ones it used to",
+    );
 }

@@ -15,6 +15,8 @@ use arthron::pipeline::source_files;
 use arthron::track_java::JavaLang;
 use arthron::track_java::extract::extract;
 
+mod support;
+
 /// Whether the Java corpus has been cloned in.
 ///
 /// It lives in RandomCodeSpace/arthron-corpus, cloned into ./corpus
@@ -24,7 +26,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.is_dir() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 

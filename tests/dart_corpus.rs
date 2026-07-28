@@ -57,6 +57,8 @@ use arthron::track_dart::extract::{UriForm, extract};
 use arthron::track_dart::lang::library_fqn;
 use arthron::track_dart::resolve::scan_dart;
 
+mod support;
+
 const CORPUS: &str = "corpus/dart/collection";
 const BASELINE: &str = "baselines/dart-collection.toml";
 
@@ -324,7 +326,7 @@ fn scheme_of(spec: &str) -> &'static str {
 fn the_dart_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

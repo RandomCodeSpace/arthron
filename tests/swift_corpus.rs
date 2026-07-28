@@ -60,6 +60,8 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_swift::extract::extract;
 use arthron::track_swift::resolve::scan_swift;
 
+mod support;
+
 const CORPUS: &str = "corpus/swift/alamofire";
 const BASELINE: &str = "baselines/swift-alamofire.toml";
 
@@ -339,7 +341,7 @@ const ABSENT: &[&str] = &["Alamofire.URLRequest", "Alamofire.URLSession", "URLRe
 fn the_swift_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 
