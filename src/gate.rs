@@ -92,8 +92,8 @@ pub type Measured = Counts;
 ///
 /// `corpus`, `commit` and `language` are written back out verbatim inside
 /// double quotes, and the file format carries no escapes, so none of them may
-/// contain a `"` or a newline. The gate command rejects such a value rather
-/// than writing a file it could not read back.
+/// contain a `"`, a `\` or a newline. The gate command rejects such a value
+/// rather than writing a file it could not read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     /// Baseline file format version. Always [`FORMAT`]; a file declaring any
@@ -372,8 +372,8 @@ pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
 /// the wrong run — a debug build, a warm store — can be reproduced and
 /// checked rather than trusted.
 ///
-/// [`Baseline`]'s provenance strings must contain no `"` and no newline; this
-/// function writes them verbatim.
+/// [`Baseline`]'s provenance strings must contain no `"`, no `\` and no
+/// newline; this function writes them verbatim.
 pub fn render_baseline(b: &Baseline) -> String {
     format!(
         "# arthron gate baseline — regenerate with:\n\
@@ -409,10 +409,12 @@ pub fn render_baseline(b: &Baseline) -> String {
 /// [`parse_baseline`] unchanged.
 ///
 /// The format has no escapes, so a `"` or a newline would produce a file this
-/// reader cannot read back. Checked before writing, never repaired: silently
-/// mangling provenance is how a baseline stops meaning what it says.
+/// reader cannot read back — and so would a `\`, which [`string_value`]
+/// rejects precisely because escapes do not exist. Checked before writing,
+/// never repaired: silently mangling provenance is how a baseline stops
+/// meaning what it says.
 pub fn is_renderable(value: &str) -> bool {
-    !value.contains('"') && !value.contains('\n') && !value.contains('\r')
+    !value.contains('"') && !value.contains('\\') && !value.contains('\n') && !value.contains('\r')
 }
 
 fn set_once<T>(slot: &mut Option<T>, key: &str, lineno: usize, value: T) -> Result<(), String> {
@@ -812,6 +814,9 @@ unresolved = 5075
         assert!(is_renderable("corpus/go/codeiq"));
         assert!(!is_renderable("corpus/\"quoted\""));
         assert!(!is_renderable("two\nlines"));
+        // `string_value` rejects `\` — escapes are not part of the format —
+        // so a value carrying one would be written and never read back.
+        assert!(!is_renderable("corpus\\go\\codeiq"));
     }
 
     #[test]

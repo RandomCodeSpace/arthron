@@ -629,7 +629,11 @@ fn write_baseline(
             baseline_path.display(),
         ));
     }
-    let corpus = corpus.display().to_string();
+    // `/`-separated on every platform, exactly like the repo-relative keys
+    // `rel_path` builds: on Windows `display()` spells the path with `\`,
+    // which `parse_baseline` rejects — the format has no escapes — so writing
+    // it verbatim records a baseline no later gate run could read back.
+    let corpus = corpus.display().to_string().replace('\\', "/");
     let commit = commit
         .map(str::to_string)
         .or_else(|| existing.map(|b| b.commit.clone()))
@@ -637,8 +641,8 @@ fn write_baseline(
     for (field, value) in [("corpus", &corpus), ("commit", &commit)] {
         if !is_renderable(value) {
             return Err(format!(
-                "`{field}` contains a quote or a newline, which this baseline \
-                 format cannot represent: {value:?}",
+                "`{field}` contains a quote, a backslash or a newline, which \
+                 this baseline format cannot represent: {value:?}",
             ));
         }
     }
