@@ -54,7 +54,12 @@
 //!   claim about the outside world, and the only evidence for it available
 //!   without a compiler is the repository's own `build-depends` naming
 //!   packages its manifests do not declare. A tree that names none has not
-//!   made that claim on this resolver's behalf.
+//!   made that claim on this resolver's behalf. Read it for what it is: one
+//!   boolean about the whole repository, not a per-name check. Every real
+//!   project depends on `base`, so in practice it is true and the guard above
+//!   plus the `external` count the gate pins are what actually bite. A
+//!   per-name check would need a package database, for the reason the next
+//!   section gives.
 //!
 //! Past all three, an import naming no home module **is** external, and that
 //! is a fact rather than an inference: a home module is exactly a file under a

@@ -48,13 +48,17 @@
 //! - **`deriving` clauses and standalone `deriving instance`.** Both create
 //!   instances, and instances are not nodes here for the reason above.
 //! - **An export list's `module M` clause.** `module UnitTests.OptionalFields.Common
-//!   ( module Data.Aeson, … )` re-exports a module by name — seven such
-//!   clauses in the measured corpus, all in one file. They are left out
+//!   ( module Data.Aeson, … )` re-exports a module by name — eight such
+//!   clauses in the measured corpus, in two files. They are left out
 //!   deliberately: the contract for this track is *import*-like references,
 //!   the module each clause names is one the same file already imports, and
 //!   the first clause of that list names the file's own module, which would
-//!   put an edge from a module to itself into the graph. The count is pinned
-//!   in the corpus acceptance so the omission stays a measured number.
+//!   put an edge from a module to itself into the graph. Seven are that one
+//!   list; the eighth is a lone `module X` in another file, re-exporting an
+//!   *alias* — `X` is bound by that file's own `import … as X` declarations
+//!   and names no module at all, so there is nothing for a reference to
+//!   spell. The count is pinned in the corpus acceptance so the omission
+//!   stays a measured number.
 //! - **`type` synonyms are `DefKind::Type`, not `DefKind::Alias`.** A synonym
 //!   really does alias, but it aliases a type *expression* rather than a
 //!   single declaration, and this track resolves no type use — so an alias
