@@ -269,7 +269,7 @@ fn working_db(db: Option<PathBuf>) -> Result<PathBuf, String> {
     let root = PathBuf::from(".");
     let config = Config::load(&root)?;
     Ok(config
-        .db_path(&root)
+        .db_path(&root)?
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DB)))
 }
 
@@ -302,11 +302,21 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    // The flag wins over the file: a person naming a store on the command
-    // line has said something more specific than the repository has.
-    let db_path = db
-        .or_else(|| config.db_path(path))
-        .unwrap_or_else(|| path.join(".arthron/graph.redb"));
+    // The flag wins over the file, and winning means the file's `db` is not
+    // read at all — including not being checked. A person naming a store on
+    // the command line has said something more specific than the repository
+    // has, and is the only authority here about where this machine is written
+    // to: the file's own `db` may not leave the tree it sits in.
+    let db_path = match db {
+        Some(flag) => flag,
+        None => match config.db_path(path) {
+            Ok(configured) => configured.unwrap_or_else(|| path.join(".arthron/graph.redb")),
+            Err(e) => {
+                eprintln!("arthron: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {

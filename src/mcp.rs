@@ -504,10 +504,14 @@ impl Server {
 /// an agent and one started from a shell must not be able to disagree.
 fn scan(root: &Path, db: Option<&Path>) -> Result<Value, String> {
     let config = Config::load(root)?;
-    let db_path = db
-        .map(Path::to_path_buf)
-        .or_else(|| config.db_path(root))
-        .unwrap_or_else(|| root.join(".arthron/graph.redb"));
+    // As on the command line: an explicit path wins and is taken as given,
+    // while the scanned repository's own `db` may not name a store outside it.
+    let db_path = match db {
+        Some(explicit) => explicit.to_path_buf(),
+        None => config
+            .db_path(root)?
+            .unwrap_or_else(|| root.join(".arthron/graph.redb")),
+    };
     if let Some(parent) = db_path.parent()
         && !parent.as_os_str().is_empty()
     {

@@ -117,11 +117,19 @@ with no config behaves exactly as it would without one.
 ```toml
 include = ["src/**"]        # a whitelist: with any include, an unmatched file is not read
 exclude = ["**/vendor/**"]  # wins over include, last-match-wins like .gitignore
-db = ".arthron/graph.redb"
+db = ".arthron/graph.redb"  # where the graph goes, relative to this repository
 
 [tracks]
 java = false                # switch a live track off for this repository
 ```
+
+The `db` key must stay **inside** the repository: an absolute path, a `..`
+that climbs past the root, or a parent directory that is a symlink out of the
+tree is refused with exit 2 and nothing is scanned. A scan reads repositories
+you did not write, and `db` says where a scan *writes* — so the repository does
+not get to choose which of your files a scan replaces. The command-line `--db`
+flag is deliberately free to name anything, inside the tree or out: you typing
+a path is you saying it, and a file sitting in a scanned tree is not.
 
 The `[tracks]` keys are track names, not language names, and the two differ in
 one place: **`ecma` is the single track that owns JavaScript and TypeScript**,
