@@ -7,7 +7,7 @@
 //! `tests/corpus_rust.rs`, `tests/kotlin_corpus.rs`, `tests/scala_corpus.rs`,
 //! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, `tests/cpp_corpus.rs`,
 //! `tests/bash_corpus.rs`, `tests/hcl_corpus.rs`, `tests/lua_corpus.rs`,
-//! and `tests/probes.rs` for
+//! `tests/dart_corpus.rs`, and `tests/probes.rs` for
 //! the probe pin — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
@@ -79,6 +79,10 @@ const GATED: &[(&str, &str)] = &[
         "tests/hcl_corpus.rs",
     ),
     ("baselines/lua-busted.toml", "tests/lua_corpus.rs"),
+    // Tier 2, best effort: definitions, structure and the URIs the library
+    // directives name — no `show`/`hide` combinator is a reference, so this
+    // denominator is smaller than a full tier-2 track's by design.
+    ("baselines/dart-collection.toml", "tests/dart_corpus.rs"),
 ];
 
 #[test]
