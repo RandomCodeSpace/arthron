@@ -204,6 +204,22 @@ impl SourceTree {
         Self::parse(SupportLang::Dart, source)
     }
 
+    /// Parse Haskell source.
+    ///
+    /// No preprocessing, and the pinned grammar's own handling of `LANGUAGE
+    /// CPP` is worth stating because it is asymmetric: a `#ifdef` line comes
+    /// back as a `cpp` node *beside* the declarations it guards, so the first
+    /// arm of a conditional is read as ordinary source — but `#else` and
+    /// everything under it are swallowed into one `cpp` node, so no later arm
+    /// is read at all. That is a measured shortfall, recorded in
+    /// [`crate::track_haskell::extract`] with the count the corpus pays for
+    /// it. Preprocessing instead would mean choosing a GHC version and a set
+    /// of `MIN_VERSION_*` macros the source never defines, and reporting a
+    /// graph no single reader of the source could see.
+    pub fn parse_haskell(source: &str) -> Self {
+        Self::parse(SupportLang::Haskell, source)
+    }
+
     /// Every `(rule id, node)` pair any rule matches, in rule order.
     pub fn matches<'r>(&'r self, rules: &'r Rules) -> Vec<(&'r str, SgNode<'r>)> {
         let mut out = Vec::new();
@@ -478,6 +494,52 @@ rule:
         assert_eq!(
             node.field("value").expect("a pair has a value").text(),
             "collection",
+        );
+    }
+
+    /// Haskell, which [`one_match`] cannot check the same way: a declaration's
+    /// `name` field is a `name` node rather than an identifier, and the file's
+    /// module header is a `header` rather than a declaration. The point of the
+    /// test is the same one every entry here makes — the grammar is compiled
+    /// into this build, and a missing one parses to error nodes and matches
+    /// nothing.
+    #[test]
+    fn parses_haskell() {
+        let tree = SourceTree::parse_haskell(
+            "module Data.Aeson where\n\nimport Data.Text (Text)\n\nnewtype Key = Key Text\n",
+        );
+        let rules = Rules::compile(
+            "id: h\nlanguage: haskell\nrule:\n  kind: header\n\
+             ---\nid: i\nlanguage: haskell\nrule:\n  kind: import\n\
+             ---\nid: n\nlanguage: haskell\nrule:\n  kind: newtype\n",
+        )
+        .expect("rules compile");
+        let found = tree.matches(&rules);
+        let ids: Vec<&str> = found.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, ["h", "i", "n"]);
+        assert_eq!(
+            found[0]
+                .1
+                .field("module")
+                .expect("the header names a module")
+                .text(),
+            "Data.Aeson",
+        );
+        assert_eq!(
+            found[1]
+                .1
+                .field("module")
+                .expect("the import names a module")
+                .text(),
+            "Data.Text",
+        );
+        assert_eq!(
+            found[2]
+                .1
+                .field("name")
+                .expect("the newtype has a name")
+                .text(),
+            "Key",
         );
     }
 
