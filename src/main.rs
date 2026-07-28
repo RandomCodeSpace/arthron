@@ -52,6 +52,11 @@ macro_rules! outln {
     }};
 }
 
+/// `eprintln!` that cannot take a finished run down with it. See [`note`].
+macro_rules! noteln {
+    ($($arg:tt)*) => { note(format_args!($($arg)*)) };
+}
+
 /// Write a finished answer to stdout, and return the code the answer carries.
 ///
 /// The reader leaving early — `| head`, `| less` quit, `| grep -q` satisfied,
@@ -73,10 +78,33 @@ fn emit(text: &str, answered: ExitCode) -> ExitCode {
         Ok(()) => answered,
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => answered,
         Err(e) => {
-            eprintln!("arthron: writing stdout: {e}");
+            noteln!("arthron: writing stdout: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
+}
+
+/// Write one line to stderr, and never let that write end the run.
+///
+/// `eprintln!` panics when the write fails: exit 101 and a backtrace, which no
+/// script can tell from a real crash. Stderr being full, or closed by a reader
+/// that left, is not a failure of the work this program just did — a scan that
+/// measured a tree and then had an advisory line to add must not die of the
+/// advisory. Same rule as [`emit`], on the other stream: assemble, write once,
+/// and a delivery failure is not the run's failure.
+///
+/// Dropping the *write* is not dropping the *fact*. Every call site here that
+/// is reporting a failure returns a non-zero exit code of its own, and that
+/// code is what a script reads: a sentence nobody could receive still leaves
+/// the truth about the run in the one channel left. An advisory has no such
+/// code to carry and none is invented for it — it was advisory.
+fn note(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut text = args.to_string();
+    text.push('\n');
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
 
 #[derive(Parser)]
@@ -234,14 +262,14 @@ fn main() -> ExitCode {
         Command::Query { verb, db, json } => match working_db(db) {
             Ok(db_path) => run_query(&verb, &db_path, json),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 ExitCode::from(EXIT_USAGE)
             }
         },
         Command::Mcp { db } => match working_db(db) {
             Ok(db_path) => run_mcp(db_path),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 ExitCode::from(EXIT_USAGE)
             }
         },
@@ -287,7 +315,7 @@ fn run_mcp(db_path: PathBuf) -> ExitCode {
         Err(e) => {
             // A broken pipe or an unreadable stdin: the transport itself
             // failed, so there is nowhere to send a JSON-RPC error.
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -298,7 +326,7 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
     let config = match Config::load(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -312,7 +340,7 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
         None => match config.db_path(path) {
             Ok(configured) => configured.unwrap_or_else(|| path.join(".arthron/graph.redb")),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         },
@@ -320,7 +348,7 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("arthron: creating {}: {e}", parent.display());
+        noteln!("arthron: creating {}: {e}", parent.display());
         return ExitCode::FAILURE;
     }
     match scan_repo_with(path, &db_path, &config) {
@@ -333,7 +361,7 @@ fn run_scan(path: &Path, db: Option<PathBuf>, as_json: bool) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::FAILURE
         }
     }
@@ -350,7 +378,7 @@ fn print_json(doc: &serde_json::Value, answered: ExitCode) -> ExitCode {
     match json::render(doc) {
         Ok(text) => emit(&format!("{text}\n"), answered),
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -380,7 +408,7 @@ fn warn_if_include_matched_nothing(config: &Config, report: &arthron::store::Rep
     if measured > 0 {
         return;
     }
-    eprintln!(
+    noteln!(
         "arthron: `include` is set and this scan measured no reference at all — \
          the globs may match no file. A bare directory name matches the \
          directory and not the files under it: `include = [\"src\"]` reads \
@@ -435,14 +463,14 @@ fn run_gate(
         .map(|l| l.name())
         .collect();
     let Some(lang) = Lang::ALL.iter().copied().find(|l| l.name() == language) else {
-        eprintln!(
+        noteln!(
             "arthron: unknown language `{language}`; one of: {}",
             gateable.join(", ")
         );
         return ExitCode::from(EXIT_USAGE);
     };
     if !gateable.contains(&lang.name()) {
-        eprintln!(
+        noteln!(
             "arthron: language `{language}` is registered but its track is not live in \
              this build, so there is nothing to gate; one of: {}",
             gateable.join(", "),
@@ -455,7 +483,7 @@ fn run_gate(
     let config = match Config::load(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -465,13 +493,13 @@ fn run_gate(
         Ok(text) => match parse_baseline(&text) {
             Ok(b) => Some(b),
             Err(e) => {
-                eprintln!("arthron: {}: {e}", baseline_path.display());
+                noteln!("arthron: {}: {e}", baseline_path.display());
                 return ExitCode::from(EXIT_USAGE);
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            eprintln!("arthron: reading {}: {e}", baseline_path.display());
+            noteln!("arthron: reading {}: {e}", baseline_path.display());
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -481,7 +509,7 @@ fn run_gate(
     {
         // Rates are per language and never aggregated, so a baseline for one
         // language must never be compared against another's scan.
-        eprintln!(
+        noteln!(
             "arthron: {}: baseline is for language `{}`, this scan measures `{}`",
             baseline_path.display(),
             b.language,
@@ -497,7 +525,7 @@ fn run_gate(
         None => match scratch_dir() {
             Ok(d) => (d.0.join("gate.redb"), Some(d)),
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         },
@@ -505,7 +533,7 @@ fn run_gate(
     if let Some(parent) = db_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        eprintln!("arthron: creating {}: {e}", parent.display());
+        noteln!("arthron: creating {}: {e}", parent.display());
         return ExitCode::from(EXIT_USAGE);
     }
 
@@ -515,7 +543,7 @@ fn run_gate(
     let report = match scan_repo_with(path, &db_path, &config) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -552,7 +580,7 @@ fn run_gate(
         ) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("arthron: {e}");
+                noteln!("arthron: {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         };
@@ -583,7 +611,7 @@ fn run_gate(
         }
     } else {
         let Some(baseline) = existing else {
-            eprintln!("arthron: {shown} does not exist; record it with --rebase",);
+            noteln!("arthron: {shown} does not exist; record it with --rebase",);
             return ExitCode::from(EXIT_USAGE);
         };
         let verdict = evaluate(&baseline, &measured);
@@ -705,13 +733,13 @@ fn report_verdict(
         GateVerdict::Fail(failures) => {
             let code = emit(&text, ExitCode::from(EXIT_GATE_FAILED));
             for failure in failures {
-                eprintln!("gate: FAIL — {failure}");
+                noteln!("gate: FAIL — {failure}");
             }
             code
         }
         GateVerdict::Error(e) => {
             let code = emit(&text, ExitCode::from(EXIT_USAGE));
-            eprintln!("gate: error — {e}");
+            noteln!("gate: error — {e}");
             code
         }
     }
@@ -820,14 +848,14 @@ fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
     let store = match ReadStore::open(db_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
     let index = match NameIndex::build(&store) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("arthron: {}: {e}", db_path.display());
+            noteln!("arthron: {}: {e}", db_path.display());
             return ExitCode::from(EXIT_USAGE);
         }
     };
@@ -851,7 +879,7 @@ fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
     match outcome {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("arthron: {e}");
+            noteln!("arthron: {e}");
             ExitCode::from(EXIT_USAGE)
         }
     }
