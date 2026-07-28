@@ -1,0 +1,59 @@
+# Kotlin extraction rules.
+#
+# One rule, not one per construct, for the reason `php.yml` and `java.yml`
+# give: a rule per node kind walks every file once per rule, while a single
+# `any:` of kinds is one pre-order traversal whose order is document order.
+#
+# The list is an inventory of the grammar surface this extractor reads.
+# Nothing here decides what a node *means*: whether a `function_declaration`
+# is a top-level function or a method, whether a `property_declaration` is a
+# `const`, and whether the ancestor chain above any of them can be named at
+# all are decided in Rust, where the ancestors are available.
+#
+# Kinds deliberately absent, and each one is the tier-2 contract rather than
+# an omission — a tier-2 language that emitted them un-gated would claim
+# tier-1 coverage:
+#   call_expression, navigation_expression, callable_reference
+#                             - call sites and method references. Tier 2
+#                               links no call.
+#   user_type, type_identifier, constructor_invocation
+#                             - type uses and object creation. Tier 2
+#                               resolves no type.
+#   delegation_specifier      - a supertype or an interface delegation. Tier 2
+#                               emits no inheritance edge, so `class Buffer :
+#                               Sink` is part of `Buffer`'s structure here and
+#                               produces no reference.
+#   annotation, file_annotation
+#                             - `@Throws(IOException::class)` and
+#                               `@file:JvmName("-Okio")` both name something,
+#                               and an annotation reference is a reference.
+#                               Tier 2 emits none.
+#   object_literal            - `object : Runnable { … }` declares no nameable
+#                               type, so nothing it declares is a node. The
+#                               same judgement Java makes for an anonymous
+#                               class body, enforced here by the ancestor
+#                               allow-list rather than by this file.
+id: kotlin-node
+language: kotlin
+rule:
+  any:
+    # The container every declaration in the file lives in.
+    - kind: package_header
+    # Imports — the only reference kind this track emits.
+    - kind: import_header
+    # Classifiers: `class`, `interface`, `fun interface`, `enum class`,
+    # `annotation class`, `data class` and `value class` are all one node
+    # kind; `object` and `companion object` are their own.
+    - kind: class_declaration
+    - kind: object_declaration
+    - kind: companion_object
+    - kind: type_alias
+    # Callables.
+    - kind: function_declaration
+    - kind: property_declaration
+    - kind: primary_constructor
+    - kind: secondary_constructor
+    # A primary-constructor parameter written `val`/`var` declares a property.
+    - kind: class_parameter
+    # An enum entry is a constant of the enum.
+    - kind: enum_entry

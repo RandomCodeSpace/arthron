@@ -32,7 +32,7 @@ use crate::gate::{Counts, GateFailure, GateVerdict};
 use crate::model::{Lang, RefKind, reason_name};
 use crate::query::{Definition, Impact, Match, NodeKind, RefSite};
 use crate::resolution_rate;
-use crate::store::{Report, StoredOutcome};
+use crate::store::{FileError, Report, StoredOutcome};
 
 /// The version of the JSON contract this build emits.
 ///
@@ -50,7 +50,26 @@ pub fn scan(report: &Report, config: &Config) -> Value {
         "config": settings(config),
         "languages": languages(report),
         "fqn_collisions": report.fqn_collisions,
+        "file_errors": file_errors(&report.file_errors),
     })
+}
+
+/// The files a scan reached and could not read.
+///
+/// An array and not a count, because a count nobody can act on is a count
+/// nobody looks at: the whole point of recording these is that the paths are
+/// there. Empty on every clean scan, and always present — a reader never has
+/// to tell "no failures" from "this build did not report them".
+///
+/// One entry per file, so the count is the array's length. Additive, so
+/// [`SCHEMA`] does not move: a reader that ignores unknown keys is unaffected.
+fn file_errors(errors: &[FileError]) -> Value {
+    Value::Array(
+        errors
+            .iter()
+            .map(|e| json!({ "path": e.path, "error": e.message }))
+            .collect(),
+    )
 }
 
 /// Everything one `gate` run decided, as the document needs it.
@@ -109,6 +128,12 @@ pub fn gate(out: &GateOutput<'_>) -> Value {
         "measured": counts(out.measured),
         "languages": languages(out.report),
         "fqn_collisions": out.report.fqn_collisions,
+        // The same array the scan document carries, and for a stronger
+        // reason: a gate's whole job is to say whether a corpus still
+        // measures what it did, and a re-base writes a baseline from this
+        // run. A corpus the scan could not fully read is a fact about the
+        // measurement, so the document CI reads has to carry it too.
+        "file_errors": file_errors(&out.report.file_errors),
     })
 }
 
@@ -257,11 +282,18 @@ pub const HELP: &str = concat!(
     "                        null for a stored language code this build has\n",
     "                        no name for\n",
     "  fqn_collisions   distinct FQNs more than one file declares\n",
+    "  file_errors      [{ path, error }] — files the walk reached and could\n",
+    "                   not read: no permission, not UTF-8, gone mid-walk, or\n",
+    "                   a directory it could not descend into. The scan keeps\n",
+    "                   going and measures the rest, so this is how a smaller\n",
+    "                   file set than the tree holds becomes visible. One\n",
+    "                   entry per file; empty when every file read cleanly.\n",
     "  config           the settings this run read, which decide the file set\n",
     "                   the counts were taken over: { include, exclude, tracks }\n",
     "\n",
     "gate\n",
-    "  schema, command (\"gate\"), languages, fqn_collisions, config  as for scan\n",
+    "  schema, command (\"gate\"), languages, fqn_collisions, file_errors,\n",
+    "  config           as for scan\n",
     "  action           \"compare\" or \"rebase\"\n",
     "  language         the one language this gate measured\n",
     "  baseline_path    the baseline file read or written\n",
@@ -269,7 +301,8 @@ pub const HELP: &str = concat!(
     "  verdict          \"pass\", \"fail\", \"error\" or \"rebased\"\n",
     "  improved         true when a pass beat its baseline\n",
     "  failures         [{ check, message }]; check is one of rate_regressed,\n",
-    "                   local_binding_drift, external_drift\n",
+    "                   denominator_shrank, local_binding_drift,\n",
+    "                   external_drift\n",
     "  error            why the comparison could not be made, else null\n",
     "  baseline         { resolved, external, local_binding, unresolved }\n",
     "  measured         the same four counts, from this run\n",
@@ -498,6 +531,7 @@ mod tests {
                 },
             )]),
             fqn_collisions: 0,
+            file_errors: Vec::new(),
         };
         let reasons = &languages(&report)["go"]["unresolved_reasons"];
         assert_eq!(
@@ -519,6 +553,7 @@ mod tests {
             .check(),
             GateFailure::LocalBindingDrift { was: 0, now: 1 }.check(),
             GateFailure::ExternalDrift { was: 0, now: 1 }.check(),
+            GateFailure::DenominatorShrank { was: 1, now: 0 }.check(),
         ];
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "{names:?}");
