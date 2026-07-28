@@ -4,6 +4,59 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-28 — Tier 2 complete: fourteen tracks, twenty-five gates, every number measured
+
+The last eight tracks landed — batch 3 (Swift, C++), the `.h` amendment, and
+the six best-effort languages. Every registered language now has a live
+track, a measured committed baseline, and a CI gate.
+
+| language | corpus | resolved | external | unresolved | rate |
+|---|---|---|---|---|---|
+| Swift | alamofire 7595cbc | 40 | 130 | 0 | **100.0%** |
+| C++ | fmt 1be298e | 127 | 254 | 18 | **87.6%** |
+| Dart | collection dec28c1 | 75 | 49 | 0 | **100.0%** |
+| Elixir | plug 9fa11c8 | 116 | 55 | 1 | **99.1%** |
+| Haskell | aeson (pinned) | 278 | 796 | 0 | **100.0%** |
+| Lua | busted 56e6d68 | 99 | 0 | 153 | **39.3%** |
+| Bash | bats-core (pinned) | 0 | 0 | 6 | **0.0%** |
+| HCL | terraform-aws-vpc (pinned) | 23 | 1 | 0 | **100.0%** |
+
+**The `.h` amendment, executed as reserved.** The C++ track first landed at
+**3.4%**: fmt is header-dominated and every header is `.h`, the extension
+the tier-2 registration left unclaimed. The track refused to widen the
+claim mid-wave and measured the counterfactual instead; the follow-up
+commit claimed `.h` with the measurement in hand — 33 → 54 readable files,
+3.4% → **87.6%**, the 17 remaining misses all the deliberately-unvendored
+gtest includes. A pure-C repository's headers parsing under the C++
+grammar stays an accepted, documented risk until a C track exists.
+*Rejected:* widening inside the go-live commit (an extension claim is its
+own decision, measured separately).
+
+**A 0.0% baseline is a working gate.** bats-core computes every `source`
+target at runtime (`BATS_ROOT=${BATS_PATH%/*/*}`), so Bash's rate line
+holds 0.0% honestly and the drift checks on the other columns are what
+make it un-gameable; the track's value is its function-definition census.
+Lua's 39.3% carries the same honesty the other direction:
+`ProjectLayoutUnknown 53` is `require 'busted'` matching two real files
+(`?.lua` vs `?/init.lua`, decided by `package.path` order at runtime) —
+recorded as genuinely ambiguous, never guessed.
+
+**The laundering class was caught twice more before merge.** Dart's review
+found `path:` dependencies — packages the tree itself contains — classified
+`External`; fixed by linking through the dependency location, following the
+Rust track's `Dep::Local` precedent. Elixir composed nested `defmodule`
+names from the start (the C# lesson, applied from the trap checklist in
+this log rather than rediscovered).
+
+Merge mechanics for the whole fanout: fourteen tracks landed through
+serial merge trains over two shared append-only files (`sg.rs`,
+`tests/baselines.rs`); every conflict was the same append-append shape,
+every resolution verified by the full suite plus all committed gates
+before push. The frozen core was breached zero times; the one core change
+a track needed (`denominator_shrank`) landed as its own PR.
+
+---
+
 ## 2026-07-27 — Batch 2 tier-2 tracks: C# 100.0%, Kotlin 89.5%, Scala 42.3%; the gate learns to see a dropped reference
 
 | language | corpus | resolved | external | unresolved | rate |

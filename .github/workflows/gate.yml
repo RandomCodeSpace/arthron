@@ -18,9 +18,8 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Twenty-five cold scans of real repositories — one per committed
-    # baseline. Generous, but bounded: a hung scan must not sit on a runner
-    # for the six-hour default.
+    # Twenty-five cold scans of real repositories. Generous, but bounded: a hung
+    # scan must not sit on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -72,13 +71,6 @@ jobs:
       #
       # The rate is per language and never aggregated, so each gate passes the
       # one language its baseline records.
-      #
-      # Every file in `baselines/` needs a step here, and a baseline with a
-      # ratchet but no step is not gated at all: `cargo test` skips every
-      # corpus ratchet whenever `corpus/` is absent, which is every run of
-      # `.github/workflows/ci.yml`. `tests/baselines.rs` parses this file and
-      # fails when the two sets disagree, so adding a baseline without a step
-      # cannot merge.
       - name: Gate go / codeiq
         run: ./target/release/arthron gate corpus/go/codeiq --language go --baseline baselines/go-codeiq.toml
 
@@ -136,10 +128,6 @@ jobs:
       - name: Gate cpp / fmt
         run: ./target/release/arthron gate corpus/cpp/fmt --language cpp --baseline baselines/cpp-fmt.toml
 
-      # Best-effort tier 2. Non-blocking is a statement about how much of the
-      # language the track reads, never about whether its number blocks a
-      # merge: these gate exactly like the rest, and a regression here fails
-      # the job like any other.
       - name: Gate dart / collection
         run: ./target/release/arthron gate corpus/dart/collection --language dart --baseline baselines/dart-collection.toml
 
@@ -152,8 +140,6 @@ jobs:
       - name: Gate lua / busted
         run: ./target/release/arthron gate corpus/lua/busted --language lua --baseline baselines/lua-busted.toml
 
-      # 0.0% over a denominator of six, and a working gate: the drift checks
-      # on `external` and `local_binding` are what make it un-gameable.
       - name: Gate bash / bats-core
         run: ./target/release/arthron gate corpus/bash/bats-core --language bash --baseline baselines/bash-bats-core.toml
 
