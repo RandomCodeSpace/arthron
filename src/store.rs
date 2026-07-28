@@ -11,6 +11,20 @@
 //! make phase 2's replace delete what phase 1 just wrote for the same file,
 //! and the symptom would look like "some definitions randomly missing".
 //!
+//! Ownership carries a second obligation, and it is what makes an
+//! interrupted scan survivable: **a file may be recorded current only once
+//! every one of its facts is committed.** A phase writing half a file's facts
+//! withdraws the store's currency claim in the same transaction, and
+//! [`Store::apply_refs`] — the last half — is the only thing that gives it
+//! back. The same transaction withdraws the claim of every *other* file whose
+//! stored resolution consulted an identity it moved, because the candidate
+//! index says exactly which those are. So a process killed between two
+//! commits leaves a store that knows what it no longer knows: the next scan
+//! re-reads precisely the files whose answers this one falsified, and lands
+//! on the graph a cold scan of the same tree builds. Nothing else recovers
+//! it — a content hash that outlives the facts it vouches for is a file no
+//! later scan has any reason to look at again.
+//!
 //! One write transaction per batch, and a batch is a fixed number of files
 //! rather than the whole event (500 files in one transaction measured 60ms
 //! against 216ms as 500 separate transactions). What the bound buys is this
@@ -27,7 +41,7 @@ use std::path::Path;
 use bincode::{Decode, Encode, config};
 use redb::{
     Database, MultimapTableDefinition, ReadOnlyDatabase, ReadableDatabase, ReadableMultimapTable,
-    ReadableTable, TableDefinition,
+    ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 
 use crate::UnresolvedReason;
@@ -435,6 +449,27 @@ pub struct RefRecord {
     pub lang: u8,
 }
 
+/// What one phase-1 transaction leaves for the event that ran it.
+///
+/// Two answers, because a batch changes two things at once: which identities
+/// exist, and which files' stored answers about them are still worth
+/// anything.
+#[derive(Debug, Clone, Default)]
+pub struct DefOutcome {
+    /// The identities that ended this call with a *definition* declared in
+    /// more than one file — see [`Store::apply_defs`].
+    pub colliding: Vec<NodeId>,
+    /// The files whose currency claim this call withdrew, because an
+    /// identity their stored resolution consulted moved underneath them.
+    ///
+    /// The event has to re-resolve every one of them before it ends: the
+    /// claim is withdrawn *inside* the transaction that invalidates the
+    /// file, so that a scan killed here leaves a store that knows what it no
+    /// longer knows, and [`Store::apply_refs`] is the only thing that puts
+    /// the claim back.
+    pub invalidated: BTreeSet<String>,
+}
+
 /// Everything phase 1 writes, one entry per file, applied in one transaction.
 #[derive(Debug, Clone, Default)]
 pub struct DefBatch {
@@ -769,40 +804,87 @@ impl Store {
     /// second one in, and an identity a later batch takes back is flagged all
     /// the same. A caller spanning batches therefore collects these and asks
     /// [`Store::definition_collisions`] which of them survived the event.
-    pub fn apply_defs(&self, batch: &DefBatch) -> Result<Vec<NodeId>, String> {
+    ///
+    /// # Currency
+    ///
+    /// This writes half of a file's facts, so the same transaction
+    /// **withdraws the store's claim that the file is current**: the other
+    /// half is still the previous event's, and [`Store::apply_refs`] is what
+    /// puts the claim back once it lands. A scan killed between the two
+    /// therefore leaves a file the next scan re-reads, instead of a file
+    /// claiming to be current for work that never finished.
+    ///
+    /// The same transaction withdraws the claim of every *other* file whose
+    /// stored resolution consulted an identity this batch moved. Phase 1 is
+    /// where a definition appears, disappears, or changes meaning, and every
+    /// row that probed it — hit or miss — holds an answer that no longer
+    /// stands. The event widens to those files itself, but the widening lives
+    /// in memory and the commit does not: recording the invalidation in the
+    /// transaction that *causes* it is what makes an interrupted scan
+    /// recoverable rather than silently wrong. They are named back to the
+    /// caller so that the running event re-resolves them and restores their
+    /// claims.
+    pub fn apply_defs(&self, batch: &DefBatch) -> Result<DefOutcome, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
         let mut colliding = Vec::new();
+        let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
             let mut owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
-            let mut touched: BTreeSet<NodeId> = BTreeSet::new();
+            let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
+            let cands = txn
+                .open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
+            // What every identity this transaction touches meant *before* it
+            // ran, captured at the first write to each. Comparing that with
+            // what it means at the end separates an identity whose meaning
+            // moved from one a file merely re-asserted: a woken file rewrites
+            // its own half unchanged, and invalidating its probers for that
+            // would cascade an event across a repository.
+            let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
             for file in &batch.files {
                 let previous: DefOwned = read_owned(&owned, &file.path)?.unwrap_or_default();
                 for id in &previous.nodes {
+                    note_payload(&nodes, &mut before, id)?;
                     drop_site(&mut nodes, id, &file.path)?;
-                    touched.insert(*id);
                 }
                 let mut ids = Vec::with_capacity(file.nodes.len());
                 let mut seen: HashSet<NodeId> = HashSet::with_capacity(file.nodes.len());
                 for (id, record) in &file.nodes {
+                    note_payload(&nodes, &mut before, id)?;
                     upsert_node(&mut nodes, id, record.clone())?;
                     if seen.insert(*id) {
                         ids.push(*id);
                     }
-                    touched.insert(*id);
                 }
                 write_owned(&mut owned, &file.path, &DefOwned { nodes: ids })?;
+                // Half of this file's facts are now this event's and the
+                // other half is still the last one's. The store may not claim
+                // the file is current until `apply_refs` lands the rest.
+                withdraw_claim(&mut files, &file.path)?;
             }
-            for id in &touched {
-                if let Some(record) = read_node(&nodes, id)?
-                    && record.is_definition_collision()
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
+            for (id, was) in &before {
+                let record = read_node(&nodes, id)?;
+                if record
+                    .as_ref()
+                    .is_some_and(NodeRecord::is_definition_collision)
                 {
                     colliding.push(*id);
                 }
+                if record.map(|record| record.payload()).as_ref() != was.as_ref() {
+                    moved.insert(*id);
+                }
             }
+            let rewritten: HashSet<&str> =
+                batch.files.iter().map(|file| file.path.as_str()).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
         }
         txn.commit().map_err(|e| e.to_string())?;
-        Ok(colliding)
+        Ok(DefOutcome {
+            colliding,
+            invalidated,
+        })
     }
 
     /// Which of these identities a *definition* is declared for in more than
@@ -839,26 +921,66 @@ impl Store {
     /// the size of the tree carrying nothing. Removal is also what keeps a
     /// warm store byte-identical to a cold one, which the snapshot oracle
     /// compares.
-    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<(), String> {
+    ///
+    /// Carries the same currency rule [`Store::apply_defs`] does, for the
+    /// same reason: what a type sits under decides every member lookup
+    /// beneath it, so a row that moves invalidates the files that read it,
+    /// and the invalidation is committed with the row rather than after it.
+    /// The files it withdrew are named back to the caller.
+    pub fn apply_supers(&self, batch: &SuperBatch) -> Result<BTreeSet<String>, String> {
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let invalidated;
         {
             let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
+            let cands = txn
+                .open_multimap_table(CANDIDATES)
+                .map_err(|e| e.to_string())?;
+            // The identities whose relation this transaction moves. A file's
+            // row is its own contribution to a merged relation, so a
+            // contribution that changed is an identity whose closure may have
+            // — the over-approximation costs a re-resolve and never an answer.
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
             for file in &batch.files {
-                if file.types.is_empty() {
+                let previous: BTreeMap<NodeId, SuperRecord> =
+                    match supers.get(file.path.as_str()).map_err(|e| e.to_string())? {
+                        Some(guard) => decode::<Vec<(NodeId, SuperRecord)>>(guard.value())?
+                            .into_iter()
+                            .collect(),
+                        None => BTreeMap::new(),
+                    };
+                let mut rows = file.types.clone();
+                rows.sort_by_key(|row| row.0);
+                let stated: BTreeMap<NodeId, &SuperRecord> =
+                    rows.iter().map(|(id, record)| (*id, record)).collect();
+                for id in previous.keys().chain(stated.keys()) {
+                    if previous.get(id) != stated.get(id).copied() {
+                        moved.insert(*id);
+                    }
+                }
+                // This is a third of a file's facts, so the claim goes with
+                // the same rule phase 1 applies: only `apply_refs` restores
+                // it. Every file here has already been through `apply_defs`
+                // in this event, so this is a re-assertion — and it is the
+                // invariant that is worth stating locally, not the saving.
+                withdraw_claim(&mut files, &file.path)?;
+                if rows.is_empty() {
                     supers
                         .remove(file.path.as_str())
                         .map_err(|e| e.to_string())?;
                     continue;
                 }
-                let mut rows = file.types.clone();
-                rows.sort_by_key(|row| row.0);
                 let bytes = encode(&rows)?;
                 supers
                     .insert(file.path.as_str(), bytes.as_slice())
                     .map_err(|e| e.to_string())?;
             }
+            let rewritten: HashSet<&str> =
+                batch.files.iter().map(|file| file.path.as_str()).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
         }
-        txn.commit().map_err(|e| e.to_string())
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(invalidated)
     }
 
     /// The whole supertype relation, merged across the files that state it.
@@ -989,11 +1111,18 @@ impl Store {
     /// A file that stopped being the scan's — a nested manifest appeared
     /// above it — is a deletion by exactly this rule, which is the correct
     /// answer: its facts are no longer this graph's.
-    pub fn forget_files(&self, paths: &[String]) -> Result<(), String> {
+    ///
+    /// A deletion is the sharpest way an identity can move, so this carries
+    /// the same currency rule [`Store::apply_defs`] does: the files whose
+    /// stored resolution consulted an identity these files were the last to
+    /// declare lose their claim in this transaction, and are named back to
+    /// the caller to be re-resolved.
+    pub fn forget_files(&self, paths: &[String]) -> Result<BTreeSet<String>, String> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
         let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
             let mut refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
@@ -1006,6 +1135,14 @@ impl Store {
             let mut def_owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut ref_owned = txn.open_table(REF_OWNED).map_err(|e| e.to_string())?;
             let mut supers = txn.open_table(SUPERS).map_err(|e| e.to_string())?;
+            // What the identities these files declare meant before they went,
+            // and the identities whose supertype relation loses a
+            // contribution. External nodes are deliberately absent: no
+            // resolver can probe one — the `external:` prefix is unreachable
+            // from any candidate — so one appearing or going invalidates
+            // nothing.
+            let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
+            let mut moved: BTreeSet<NodeId> = BTreeSet::new();
             for path in paths {
                 forget_ref_half(
                     &mut nodes, &mut refs, &mut edges, &mut rev, &mut cands, &ref_owned, path,
@@ -1013,15 +1150,33 @@ impl Store {
                 ref_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
                 if let Some(previous) = read_owned::<DefOwned>(&def_owned, path)? {
                     for id in &previous.nodes {
+                        note_payload(&nodes, &mut before, id)?;
                         drop_site(&mut nodes, id, path)?;
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
+                if let Some(guard) = supers.get(path.as_str()).map_err(|e| e.to_string())? {
+                    for (id, _) in decode::<Vec<(NodeId, SuperRecord)>>(guard.value())? {
+                        moved.insert(id);
+                    }
+                }
                 supers.remove(path.as_str()).map_err(|e| e.to_string())?;
                 files.remove(path.as_str()).map_err(|e| e.to_string())?;
             }
+            for (id, was) in &before {
+                if read_node(&nodes, id)?
+                    .map(|record| record.payload())
+                    .as_ref()
+                    != was.as_ref()
+                {
+                    moved.insert(*id);
+                }
+            }
+            let gone: HashSet<&str> = paths.iter().map(String::as_str).collect();
+            invalidated = invalidate_probers(&cands, &mut files, &moved, &gone)?;
         }
-        txn.commit().map_err(|e| e.to_string())
+        txn.commit().map_err(|e| e.to_string())?;
+        Ok(invalidated)
     }
 
     /// Take back the store's claim that these files' facts are current,
@@ -1579,6 +1734,109 @@ fn read_node<T: ReadableTable<&'static [u8; 16], &'static [u8]>>(
     decode(guard.value()).map(Some)
 }
 
+/// What an identity meant before this transaction touched it, recorded once.
+///
+/// Called immediately before the first write to a node, and never again for
+/// that node in the same transaction: the point of comparison is the graph as
+/// the transaction found it, not as it left it halfway through.
+fn note_payload(
+    table: &NodeTable<'_>,
+    before: &mut BTreeMap<NodeId, Option<NodePayload>>,
+    id: &NodeId,
+) -> Result<(), String> {
+    if before.contains_key(id) {
+        return Ok(());
+    }
+    let payload = read_node(table, id)?.map(|record| record.payload());
+    before.insert(*id, payload);
+    Ok(())
+}
+
+/// Withdraw the store's claim that a file's stored facts are current, and
+/// record the file as one the store holds facts for if it does not already.
+///
+/// What a transaction writing *part* of a file's facts owes: the claim is a
+/// statement about the whole file, and until every half is committed there is
+/// no whole to make it about. Minting the row is half the point — a file
+/// whose definitions are stored under no [`FILES`] row is a file no walk can
+/// ever read as deleted, so its nodes would outlive it with nothing left to
+/// name them.
+fn withdraw_claim(files: &mut BytesTable<'_>, path: &str) -> Result<(), String> {
+    let withdrawn = files
+        .get(path)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|guard| guard.value().is_empty());
+    if !withdrawn {
+        files
+            .insert(path, [].as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Withdraw the claim for a file the store already knows, and leave one it
+/// does not alone.
+///
+/// The difference from [`withdraw_claim`] is deliberate: this is called for
+/// *other people's* files, and minting a row for one the store holds nothing
+/// about would make the next walk that does not reach it look like a deletion
+/// of nothing — the same trap [`Store::forget_hashes`] avoids.
+fn withdraw_known(files: &mut BytesTable<'_>, path: &str) -> Result<(), String> {
+    let claimed = files
+        .get(path)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|guard| !guard.value().is_empty());
+    if claimed {
+        files
+            .insert(path, [].as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Withdraw the currency claim of every file whose stored resolution
+/// consulted an identity this transaction moved, and name them.
+///
+/// The candidate index is the record of what each resolver read — hits and
+/// misses alike — so it is exactly the list of rows an identity's meaning
+/// moving invalidates. Writing the withdrawal *here*, inside the transaction
+/// that moved the identity, is what makes a scan killed a moment later
+/// recoverable: the store no longer claims to be current for a file whose
+/// answer it has just falsified, so the next scan re-reads it.
+///
+/// `rewritten` is the transaction's own files, which are being replaced in
+/// full and have had their claims withdrawn already.
+///
+/// The empty-index short circuit is what keeps a cold scan free: phase 1 runs
+/// to completion before the first candidate is written, so on a store nobody
+/// has resolved into yet there is nothing here to invalidate and no lookup
+/// worth making.
+fn invalidate_probers(
+    cands: &CandidateTable<'_>,
+    files: &mut BytesTable<'_>,
+    moved: &BTreeSet<NodeId>,
+    rewritten: &HashSet<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    if moved.is_empty() || cands.is_empty().map_err(|e| e.to_string())? {
+        return Ok(out);
+    }
+    for id in moved {
+        for value in cands.get(id).map_err(|e| e.to_string())? {
+            let guard = value.map_err(|e| e.to_string())?;
+            let (file, _) = guard.value();
+            if rewritten.contains(file) || out.contains(file) {
+                continue;
+            }
+            out.insert(file.to_string());
+        }
+    }
+    for path in &out {
+        withdraw_known(files, path)?;
+    }
+    Ok(out)
+}
+
 fn read_owned<T: Decode<()>>(table: &BytesTable<'_>, path: &str) -> Result<Option<T>, String> {
     let Some(guard) = table.get(path).map_err(|e| e.to_string())? else {
         return Ok(None);
@@ -1852,7 +2110,13 @@ mod tests {
                 )],
             }],
         };
-        assert!(store.apply_defs(&defs).expect("apply defs").is_empty());
+        assert!(
+            store
+                .apply_defs(&defs)
+                .expect("apply defs")
+                .colliding
+                .is_empty()
+        );
 
         let row = key("pkg/b.go", "Foo");
         let refs = RefBatch {
@@ -1877,7 +2141,17 @@ mod tests {
 
         assert_eq!(store.file_hash("pkg/b.go").unwrap(), Some([7u8; 32]));
         assert_eq!(store.file_hash("missing.go").unwrap(), None);
-        assert_eq!(store.known_files().unwrap(), vec!["pkg/b.go".to_string()]);
+        // Both files, and only one of them current. `pkg/a.go` is here on
+        // the strength of its phase-1 half alone, with no hash: the store
+        // holds facts for it, so a walk that stops reaching it has to read
+        // that as a deletion — a definition stored under no file row is a
+        // node nothing can ever take away. Its claim is withdrawn until
+        // `apply_refs` lands the other half.
+        assert_eq!(
+            store.known_files().unwrap(),
+            vec!["pkg/a.go".to_string(), "pkg/b.go".to_string()]
+        );
+        assert_eq!(store.file_hash("pkg/a.go").unwrap(), None);
         assert!(store.symbol_entries().unwrap().contains_key(&def));
         assert_eq!(store.candidate_rows(&def).unwrap(), vec![row]);
         assert!(store.has_edge(&caller, &def, 0).unwrap());
@@ -2001,7 +2275,7 @@ mod tests {
         let batch = DefBatch {
             files: vec![declare("pkg/a_linux.go", 3), declare("pkg/a_darwin.go", 4)],
         };
-        let colliding = store.apply_defs(&batch).expect("apply defs");
+        let colliding = store.apply_defs(&batch).expect("apply defs").colliding;
         assert_eq!(colliding, vec![twin], "only the definition collides");
         assert_eq!(store.report().unwrap().fqn_collisions, 1);
         // Both attributions survive: neither declaration overwrote the other.

@@ -16,6 +16,14 @@
 //! re-resolved in the same event, so the store an incremental scan leaves is
 //! the store a cold scan of the same tree would have built.
 //!
+//! The event's widening lives in this module's memory, and a process can be
+//! killed. So the *store* records it too: every transaction that moves an
+//! identity withdraws, in that same transaction, the currency claim of every
+//! file whose stored resolution consulted it — see [`Store::apply_defs`]. The
+//! files it names come back here and join the waking round, so a scan that
+//! finishes restores every claim it withdrew and a scan that does not leaves
+//! the next one exactly the work it owes.
+//!
 //! Between the two phases sits a third, for the languages that declare one:
 //! the supertype relation. It is the first fact here derived from *two* files
 //! at once — a type's bases live in its own file, and what those bases declare
@@ -305,7 +313,14 @@ pub fn scan<L: Language>(
         store.declared_supers(&event_paths)?
     };
 
-    store.forget_files(&deleted)?;
+    // Every file this event has already invalidated: the store withdrew its
+    // currency claim inside the transaction that falsified its answers, and
+    // only `apply_refs` puts the claim back. So each of these has to be
+    // re-resolved before the scan ends, or the store is left making no claim
+    // about a file a completed scan claims everything about — and the next
+    // scan would re-read it for nothing. Collected across every phase and
+    // folded into the two waking rounds below.
+    let mut invalidated: BTreeSet<String> = store.forget_files(&deleted)?;
 
     // Phase 1: definition and container nodes for the changed set.
     //
@@ -336,8 +351,19 @@ pub fn scan<L: Language>(
             declared_now.insert(*id, record.payload());
         }
         def_batch.files.push(defs);
-        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
+        flush_defs(
+            &store,
+            &mut def_batch,
+            &mut flagged,
+            &mut invalidated,
+            BATCH_FILES,
+        )?;
     }
+    // The changed set's phase-1 half is applied in full *before* the widening
+    // asks what moved. A batch still held here would commit its
+    // invalidations after the wake set was chosen, and the files it named
+    // would end the scan with their claims withdrawn and their rows stale.
+    flush_defs(&store, &mut def_batch, &mut flagged, &mut invalidated, 1)?;
 
     // The identities this event started declaring, stopped declaring, or
     // changed the meaning of. The third case is not the same as the first
@@ -362,7 +388,9 @@ pub fn scan<L: Language>(
     // A woken file that has become unreadable since the walk saw it keeps the
     // halves the last event stored for it — stale, and named here, rather than
     // taking the whole scan down with it.
-    let waking: Vec<ScannedFile<L>> = wake_files(&store, &touched, &covered, &owned)?
+    let mut to_wake = wake_files(&store, &touched, &covered, &owned)?;
+    add_invalidated(&mut to_wake, &invalidated, &covered, &owned);
+    let waking: Vec<ScannedFile<L>> = to_wake
         .into_iter()
         .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
         .collect();
@@ -374,9 +402,15 @@ pub fn scan<L: Language>(
         def_batch
             .files
             .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
-        flush_defs(&store, &mut def_batch, &mut flagged, BATCH_FILES)?;
+        flush_defs(
+            &store,
+            &mut def_batch,
+            &mut flagged,
+            &mut invalidated,
+            BATCH_FILES,
+        )?;
     }
-    flush_defs(&store, &mut def_batch, &mut flagged, 1)?;
+    flush_defs(&store, &mut def_batch, &mut flagged, &mut invalidated, 1)?;
     drop(def_batch);
     // Both halves of the comparison have done their work; `touched` is the
     // whole of what the event kept from them.
@@ -405,7 +439,9 @@ pub fn scan<L: Language>(
     // once `apply_defs` has replaced them — an overlay could add this event's
     // definitions but never take the previous event's away, and resolving a
     // base against one of those is a wrong edge rather than a missing one.
-    let mut roused: Vec<ScannedFile<L>> = Vec::new();
+    let mut covered: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
+    covered.extend(waking.iter().map(|f| f.rel_path.as_str()));
+    let mut to_rouse: BTreeMap<String, PathBuf> = BTreeMap::new();
     if !links.is_empty() {
         // A woken file's bytes did not move and its supertypes still can: the
         // base it names may have become a definition since it was last
@@ -434,9 +470,9 @@ pub fn scan<L: Language>(
                     .or_insert_with(|| record.clone());
             }
             super_batch.files.push(supers);
-            flush_supers(&store, &mut super_batch, BATCH_FILES)?;
+            flush_supers(&store, &mut super_batch, &mut invalidated, BATCH_FILES)?;
         }
-        flush_supers(&store, &mut super_batch, 1)?;
+        flush_supers(&store, &mut super_batch, &mut invalidated, 1)?;
         drop(super_batch);
         drop(fqns);
 
@@ -458,16 +494,21 @@ pub fn scan<L: Language>(
             .collect::<BTreeSet<NodeId>>()
             .into_iter()
             .collect();
-        let mut covered: HashSet<&str> = changed.iter().map(|f| f.rel_path.as_str()).collect();
-        covered.extend(waking.iter().map(|f| f.rel_path.as_str()));
-        roused = wake_files(&store, &moved, &covered, &owned)?
-            .into_iter()
-            .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
-            .collect();
+        to_rouse = wake_files(&store, &moved, &covered, &owned)?;
         // Their phase-1 half is already stored and their bytes did not move,
         // so there is nothing to re-assert: only their references are stale.
         probe.supers = store.supertype_index()?;
     }
+    // Outside the branch, because a language with no supertypes still has an
+    // event that withdrew claims: whatever phase 1 invalidated and neither
+    // round has covered is resolved here, which is the last chance to give
+    // those files their claims back.
+    add_invalidated(&mut to_rouse, &invalidated, &covered, &owned);
+    drop(covered);
+    let roused: Vec<ScannedFile<L>> = to_rouse
+        .into_iter()
+        .filter_map(|(rel, path)| woken(ex, &path, rel, &mut file_errors, &mut stale))
+        .collect();
 
     // Phase 2: resolve every reference in the changed set and in every file
     // this event woke, in either round.
@@ -552,22 +593,30 @@ fn flush_defs(
     store: &Store,
     batch: &mut DefBatch,
     flagged: &mut BTreeSet<NodeId>,
+    invalidated: &mut BTreeSet<String>,
     limit: usize,
 ) -> Result<(), String> {
     if batch.files.is_empty() || batch.files.len() < limit {
         return Ok(());
     }
-    flagged.extend(store.apply_defs(batch)?);
+    let outcome = store.apply_defs(batch)?;
+    flagged.extend(outcome.colliding);
+    invalidated.extend(outcome.invalidated);
     batch.files.clear();
     Ok(())
 }
 
 /// [`flush_defs`], for the supertype phase.
-fn flush_supers(store: &Store, batch: &mut SuperBatch, limit: usize) -> Result<(), String> {
+fn flush_supers(
+    store: &Store,
+    batch: &mut SuperBatch,
+    invalidated: &mut BTreeSet<String>,
+    limit: usize,
+) -> Result<(), String> {
     if batch.files.is_empty() || batch.files.len() < limit {
         return Ok(());
     }
-    store.apply_supers(batch)?;
+    invalidated.extend(store.apply_supers(batch)?);
     batch.files.clear();
     Ok(())
 }
@@ -615,6 +664,33 @@ fn wake_files(
         }
     }
     Ok(out)
+}
+
+/// Fold the files this event has already invalidated into a waking round.
+///
+/// A file whose claim the store withdrew mid-event must be re-resolved before
+/// the event ends: [`Store::apply_refs`] is the only thing that gives the
+/// claim back, and a scan that finished without visiting the file would leave
+/// a store the next scan re-reads for no reason — and one a cold scan of the
+/// same tree would not have written.
+///
+/// The two filters are `wake_files`'s, for the same two reasons: a file this
+/// event already covers is being resolved anyway, and a row whose file the
+/// walk did not reach belongs to a deleted file whose facts are already gone.
+fn add_invalidated(
+    out: &mut BTreeMap<String, PathBuf>,
+    invalidated: &BTreeSet<String>,
+    already: &HashSet<&str>,
+    owned: &BTreeMap<String, PathBuf>,
+) {
+    for file in invalidated {
+        if already.contains(file.as_str()) || out.contains_key(file) {
+            continue;
+        }
+        if let Some(path) = owned.get(file) {
+            out.insert(file.clone(), path.clone());
+        }
+    }
 }
 
 /// Read one file and extract it, as the walk does for a changed file.
