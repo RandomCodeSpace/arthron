@@ -128,8 +128,7 @@ one place: **`ecma` is the single track that owns JavaScript and TypeScript**,
 so `ecma = false` switches off both and neither `javascript` nor `typescript`
 is a key. The full set is `go`, `java`, `ecma`, `python`, `cpp`, `csharp`,
 `kotlin`, `swift`, `ruby`, `php`, `rust`, `scala`, `dart`, `elixir`,
-`haskell`, `lua`, `bash`, `hcl` — eighteen tracks over nineteen languages, and
-a rejected key prints the list.
+`haskell`, `lua`, `bash`, `hcl` — eighteen tracks over nineteen languages.
 
 An unrecognised key is refused **by name** rather than ignored — at the top
 level and under `[tracks]` — because a silent typo means scanning a different
