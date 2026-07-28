@@ -257,6 +257,39 @@ fn a_head_bound_by_a_nested_module_resolves_too() {
 }
 
 #[test]
+fn a_directive_that_writes_the_elixir_root_reaches_the_declaration() {
+    // `Elixir.Plug.Conn` and `Plug.Conn` are one atom, and the declaration
+    // path files it under the short spelling. A reference path that kept the
+    // root would probe a name nothing declares, miss, and file an
+    // in-repository module as somebody else's — laundering by spelling.
+    for source in [
+        "defmodule A do\n  import Elixir.Plug.Conn\nend\n",
+        "defmodule A do\n  alias Elixir.Plug.Conn\nend\n",
+        "defmodule A do\n  require Elixir.Plug.Conn\nend\n",
+        "defmodule A do\n  use Elixir.Plug.Conn\nend\n",
+    ] {
+        let got = only(source, &["A", "Plug.Conn"]);
+        assert!(resolved_to(&got, "Plug.Conn"), "{source:?}: {got:?}");
+        assert!(
+            !matches!(got, Outcome::External(_)),
+            "{source:?}: an in-repository module was filed as external",
+        );
+    }
+}
+
+#[test]
+fn the_elixir_root_binds_under_its_last_segment_like_any_other_alias() {
+    // The root is stripped before the binding is taken, so `alias
+    // Elixir.Plug.Conn` binds `Conn` to `Plug.Conn` exactly as `alias
+    // Plug.Conn` does — and a later `import Conn` resolves.
+    let got = outcomes(
+        "defmodule A do\n  alias Elixir.Plug.Conn\n  import Conn\nend\n",
+        &["A", "Plug.Conn"],
+    );
+    assert!(resolved_to(&got[1], "Plug.Conn"), "{got:?}");
+}
+
+#[test]
 fn a_name_no_binding_reaches_is_still_named_as_written() {
     // The conservative direction, asserted so it stays conservative: a
     // binding written in another module, or later in the file, or inside a

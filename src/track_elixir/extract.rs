@@ -24,7 +24,7 @@
 //! - **A nested `defmodule`.** `defmodule InvalidCSRFTokenError` inside
 //!   `defmodule Plug.CSRFProtection` declares
 //!   `Plug.CSRFProtection.InvalidCSRFTokenError`, and that string appears
-//!   nowhere in the file. 64 of the corpus's 154 modules are written this
+//!   nowhere in the file. 59 of the corpus's 142 modules are written this
 //!   way, and a reference elsewhere names the composed form.
 //! - **The alias environment.** `alias Plug.Conn` binds `Conn`, so a later
 //!   `import Conn` names `Plug.Conn`. Both are file-local facts — no other
@@ -444,14 +444,30 @@ fn module_declaration(pass: &mut Pass, node: &SgNode) {
     if written.kind() != "alias" {
         return; // a computed module name: nothing here can say what it is
     }
-    let (path, aliased) = pass.expand(at, &segments(&written.text()));
+    // A nested `defmodule` does not read its own name through the alias
+    // environment. `Kernel.defmodule/2` concatenates the enclosing module
+    // with the **literal** head segment and discards what the head would
+    // have expanded to, so `alias Bar.Baz` in scope does not make
+    // `defmodule Baz` declare `Bar.Baz` — it declares `<enclosing>.Baz`.
+    // Expanding it would mint a definition for a module the repository never
+    // declares and, worse, hand every `alias Bar.Baz` elsewhere an
+    // in-repository node to resolve against: rate inflation, from the one
+    // construct that looks most like ordinary name composition.
+    //
+    // At the top level there is no enclosing module to concatenate onto, and
+    // there Elixir does expand the head — so that is the one place on this
+    // path where the alias environment belongs.
+    let written_path = segments(&written.text());
+    let (path, aliased) = if ctx.module.is_some() {
+        (written_path, false)
+    } else {
+        pass.expand(at, &written_path)
+    };
     // `Elixir.` is the root every module name already carries, so writing it
     // escapes the enclosing module instead of nesting under it — and so does
-    // a head some `alias` already bound to an absolute name.
-    let (path, absolute) = match path.split_first() {
-        Some((head, rest)) if head == "Elixir" && !rest.is_empty() => (rest.to_vec(), true),
-        _ => (path, aliased),
-    };
+    // a top-level head some `alias` already bound to an absolute name.
+    let (path, root_written) = strip_root(path);
+    let absolute = root_written || aliased;
     let name = path.join(".");
     if name.is_empty() {
         return;
@@ -488,6 +504,28 @@ fn module_declaration(pass: &mut Pass, node: &SgNode) {
         DefFacets::default(),
         span_of(node),
     ));
+}
+
+/// Drop the `Elixir.` root a module atom already carries, reporting whether
+/// it was written.
+///
+/// `Elixir.Plug.Conn` and `Plug.Conn` are two spellings of one atom,
+/// `:"Elixir.Plug.Conn"`. **Both paths that read a module name strip it** —
+/// the declaration path and the reference path alike. Stripping on only one
+/// would leave two spellings that can never meet: an in-repository module
+/// referenced with the explicit root would miss its own declaration and be
+/// filed `External`, which is the laundering direction
+/// [`crate::track_elixir::resolve`]'s second rule cannot survive, and it
+/// would surface as a new name in the pinned external set rather than as a
+/// rate failure.
+///
+/// A module named exactly `Elixir` keeps its name: the root is only a root
+/// when something follows it.
+fn strip_root(path: Vec<String>) -> (Vec<String>, bool) {
+    match path.split_first() {
+        Some((head, rest)) if head == "Elixir" && !rest.is_empty() => (rest.to_vec(), true),
+        _ => (path, false),
+    }
 }
 
 /// `defimpl Protocol, for: Type do … end`.
@@ -720,6 +758,7 @@ fn directive_clause(pass: &mut Pass, node: &SgNode, directive: Directive) {
 
     for (site, path, written) in named {
         let (path, _) = pass.expand(at, &path);
+        let (path, _) = strip_root(path);
         emit(
             pass,
             directive,
@@ -733,10 +772,22 @@ fn directive_clause(pass: &mut Pass, node: &SgNode, directive: Directive) {
             &ctx,
         );
         // A binding reaches forward, and only inside the module body that
-        // wrote it. One written inside a function body binds nothing outside
-        // it, and one inside a `quote` binds in the expansion rather than
-        // here — so neither is recorded, which costs a resolution rather
-        // than inventing one.
+        // wrote it. Neither of these two is recorded, for different reasons
+        // and at different prices.
+        //
+        // A `def`-local `alias` really does not escape its function, so
+        // skipping it is exact: a later `import Bar` at module level really
+        // does name a module called `Bar`.
+        //
+        // A binding inside a `quote` binds in the *expansion*, and nothing
+        // here expands a macro. Skipping it is the honest choice — the
+        // expansion's own alias environment is not this file's — but it is
+        // not free, and the cost is not a miss. `alias Foo.Bar` then
+        // `import Bar` inside one `quote` emits a reference naming `Bar`,
+        // which probes a module called `Bar`, misses, and is filed
+        // `External`: outside *both* terms of the rate, in the laundering
+        // direction, not paid for by it. The alternative is to invent a name
+        // the expansion may never build, so this stands. plug writes none.
         if ctx.quoted || ctx.function.is_some() {
             continue;
         }

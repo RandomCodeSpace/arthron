@@ -107,14 +107,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_corpus_measures_both_claimed_extensions() {
-        // Recorded rather than quietly inherited: the vendored corpus holds
-        // 42 `.ex` files and 34 `.exs` ones — a test tree, `mix.exs` and
-        // `config/config.exs` — so both halves of the extension claim ride on
-        // a measurement of this track reading them, and neither rides on the
-        // registration commit's grammar check alone.
-        assert!(Lang::Elixir.extensions().contains(&"ex"));
-        assert!(Lang::Elixir.extensions().contains(&"exs"));
-    }
+    // Both halves of the extension claim are measured against the corpus in
+    // `tests/elixir_corpus.rs`, where the walk's own file set is split by
+    // extension. A unit test here could only re-assert the static list the
+    // two tests above already pin, and would stay green if the corpus lost
+    // every `.exs` file.
 }

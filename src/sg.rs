@@ -338,8 +338,6 @@ rule:
             .expect("rules compile");
         // `.exs` is the same grammar: a script is Elixir whose top level
         // happens not to be a module.
-        // `.exs` is the same grammar: a script is Elixir whose top level
-        // happens not to be a module.
         for (source, want) in [
             (
                 "defmodule Plug.Conn do\n  def get(conn), do: conn\nend\n",

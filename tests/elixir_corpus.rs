@@ -77,16 +77,42 @@ const BASELINE: &str = "baselines/elixir-plug.toml";
 /// header for why these are exact and not bounds.
 const FILES: usize = 76;
 
+/// Those 76 files split by the two extensions the track claims.
+///
+/// Recorded rather than quietly inherited. `.ex` and `.exs` are one grammar
+/// and one track — a script is Elixir whose top level happens not to be a
+/// module — but they are two entries in the registry's extension list, and a
+/// walk that stopped returning scripts would drop `mix.exs`,
+/// `config/config.exs` and the entire test tree while every rate in this
+/// file stayed perfectly plausible. Asserted against the walk's own output,
+/// so it is a measurement of this track reading them and not a re-reading of
+/// the static list `src/track_elixir.rs` already pins.
+const BY_EXTENSION: &[(&str, usize)] = &[("ex", 42), ("exs", 34)];
+
 /// Directive references, one per module named.
 ///
-/// **172, where a line-oriented reading of the same tree counts 199.** The
-/// 27-site difference is entirely documentation: `lib/plug/error_handler.ex`
-/// writes `use Plug.Router` and `use Plug.ErrorHandler` inside its
-/// `@moduledoc` heredoc and imports nothing at all, and
-/// `test/plug/error_handler_test.exs` writes two more inside a
-/// `Code.eval_string("""…""")`. A parser does not read a string as source,
-/// and that difference is asserted by name below rather than left as a
-/// discrepancy between this file and the corpus provenance.
+/// **172, where a line-oriented reading of the same tree counts 203** — a
+/// line whose first word is `alias`, `import`, `require` or `use`, the same
+/// predicate [`DOCUMENTED_ONLY`] applies below. The 31-line difference spans
+/// 11 files and costs no directive:
+///
+/// - **30 of the 31 sit inside a heredoc.** `lib/plug/error_handler.ex`
+///   writes `use Plug.Router` and `use Plug.ErrorHandler` inside its
+///   `@moduledoc` and imports nothing at all; `lib/plug/telemetry.ex` writes
+///   one more the same way; `test/plug/error_handler_test.exs` writes two
+///   inside a `Code.eval_string("""…""")`. A parser does not read a string
+///   as source. Two of the 30 are not directives in any language:
+///   `lib/plug/conn.ex:63` and `lib/plug/debugger.ex:85` are English
+///   sentences that begin "use that…" and "use it to…".
+/// - **The 31st is a variable.** `lib/plug/builder.ex:383` is
+///   `alias = {:__aliases__, [line: env.line], parts}`, an assignment to a
+///   variable named `alias` in live code — the one line here a
+///   line-oriented reading cannot tell from a directive and a parser never
+///   confuses.
+///
+/// The two files that write directives *only* inside a heredoc are asserted
+/// by name in [`DOCUMENTED_ONLY`], so a parser that started reading strings
+/// as source fails there rather than leaving this count to be argued about.
 const REFERENCES: u64 = 172;
 
 /// Directive references by `(directive, form)`.
@@ -143,11 +169,22 @@ const PACKAGES: u64 = 0;
 
 /// Distinct FQNs a definition in more than one file claims. **Zero.**
 ///
-/// And zero collisions with it: every identity this corpus declares twice is
-/// a multi-clause function in one file, which `Resolver::mergeable` calls one
-/// entity. `Plug.MixProject#plug_crypto_version/0` is the sharpest case —
-/// `mix.exs` writes it once per branch of an `if`, both arms are read, and
-/// both are the same function.
+/// And zero collisions with it — but the credit for that belongs to the
+/// store, not to this track's resolver. `Store::is_definition_collision`
+/// asks whether two *files* declare one identity, so an FQN written twice
+/// inside a single file never becomes a collision, and
+/// `Resolver::mergeable` is only ever handed the ids that did. Every
+/// identity this corpus declares twice is a multi-clause function in one
+/// file — `Plug.MixProject#plug_crypto_version/0` is the sharpest case,
+/// `mix.exs` writing it once per branch of an `if`, both arms read and both
+/// the same function — so all of them are folded by plain FQN dedup on the
+/// way in, which is what the [`STORED`] census above measures.
+///
+/// The consequence, recorded rather than left to be rediscovered: **on plug,
+/// `mergeable` is inert.** Replacing its body with `false` moves no number
+/// in this file. What covers it is the unit tests beside it in
+/// `src/track_elixir/resolve.rs`, and a corpus that declared one module in
+/// two files is what would bring it back into this measurement.
 const COLLISIONS: u64 = 0;
 
 /// Every module the corpus names that this repository does not declare.
@@ -298,6 +335,25 @@ fn the_elixir_track_drops_nothing_and_holds_its_baseline() {
     }
     let walked = source_files::<ElixirLang>(corpus).expect("walking the corpus");
     assert_eq!(walked.len(), FILES, "the walk found a different file set");
+
+    let mut by_extension: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &walked {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        *by_extension.entry(ext).or_default() += 1;
+    }
+    let want_ext: BTreeMap<String, usize> = BY_EXTENSION
+        .iter()
+        .map(|(e, n)| ((*e).to_string(), *n))
+        .collect();
+    assert_eq!(
+        by_extension, want_ext,
+        "the walk read a different mix of `.ex` and `.exs`; both halves of \
+         the extension claim are measured here and nowhere else",
+    );
 
     let scratch = tempfile::tempdir().expect("scratch dir");
     let db = scratch.path().join("graph.redb");

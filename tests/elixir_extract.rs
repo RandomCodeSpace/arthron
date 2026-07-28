@@ -125,6 +125,89 @@ fn nesting_composes_through_a_dotted_inner_name_too() {
 }
 
 #[test]
+fn a_nested_module_head_is_not_read_through_the_alias_environment() {
+    // `Kernel.defmodule/2` concatenates the enclosing module with the
+    // **literal** head segment; it does not expand the head against the
+    // alias environment first. So `alias Bar.Baz` in scope leaves
+    // `defmodule Baz` declaring `Foo.Baz`, not `Bar.Baz`.
+    //
+    // The direction this guards is rate inflation, not a lost node: if the
+    // head expanded, this file would mint a definition for `Bar.Baz` — a
+    // module the repository never declares — and every `alias Bar.Baz` or
+    // `import Bar.Baz` anywhere in the tree would then find an
+    // in-repository node to resolve against and be counted `Resolved`
+    // instead of `External`.
+    let got = defs("defmodule Foo do\n  alias Bar.Baz\n  defmodule Baz do\n  end\nend\n");
+    let modules: Vec<(String, String)> = got
+        .iter()
+        .filter(|d| d.0 == DefKind::Module)
+        .map(|d| (d.1.clone(), d.2.clone()))
+        .collect();
+    assert_eq!(
+        modules,
+        vec![
+            (String::new(), "Foo".to_string()),
+            ("Foo".to_string(), "Baz".to_string()),
+        ],
+        "{got:?}",
+    );
+}
+
+#[test]
+fn a_top_level_module_head_is_read_through_the_alias_environment() {
+    // The boundary of the rule above, pinned so the fix stays scoped to the
+    // nested case. With no enclosing module there is nothing to concatenate
+    // onto, and `defmodule` falls back to the expanded alias — so a
+    // top-level `defmodule Baz` under `alias Bar.Baz` really does declare
+    // `Bar.Baz`.
+    let got = defs("alias Bar.Baz\ndefmodule Baz do\nend\n");
+    let modules: Vec<(String, String)> = got
+        .iter()
+        .filter(|d| d.0 == DefKind::Module)
+        .map(|d| (d.1.clone(), d.2.clone()))
+        .collect();
+    assert_eq!(
+        modules,
+        vec![(String::new(), "Bar.Baz".to_string())],
+        "{got:?}",
+    );
+}
+
+#[test]
+fn a_directive_drops_the_elixir_root_exactly_as_a_declaration_does() {
+    // `Elixir.Foo.Bar` and `Foo.Bar` are two spellings of one atom. The
+    // declaration path strips the root, so the reference path must too —
+    // otherwise an in-repository module written with the explicit root can
+    // never meet its own declaration, and misses into `External`, outside
+    // both terms of the rate.
+    let got = imports("defmodule A do\n  import Elixir.Foo.Bar\nend\n");
+    assert_eq!(
+        got,
+        vec![(
+            Directive::Import,
+            ImportForm::Module(vec!["Foo".to_string(), "Bar".to_string()]),
+            "import Elixir.Foo.Bar".to_string(),
+        )],
+        "{got:?}",
+    );
+}
+
+#[test]
+fn a_module_named_exactly_elixir_keeps_its_name() {
+    // The root is only a root when something follows it.
+    let got = imports("defmodule A do\n  alias Elixir\nend\n");
+    assert_eq!(
+        got,
+        vec![(
+            Directive::Alias,
+            ImportForm::Module(vec!["Elixir".to_string()]),
+            "alias Elixir".to_string(),
+        )],
+        "{got:?}",
+    );
+}
+
+#[test]
 fn an_elixir_prefixed_name_is_absolute() {
     // `Elixir.` is the root every module name already carries, so writing it
     // escapes the enclosing module rather than nesting under it.

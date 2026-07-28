@@ -23,8 +23,8 @@
 //! 1. **A module this repository declares** ⇒ [`crate::Outcome::Resolved`].
 //!    The in-repository module set is every `defmodule`, `defprotocol` and
 //!    `defimpl` in every file the walk read, composed through the modules
-//!    that enclose them — see [`crate::track_elixir::extract`], where 64 of
-//!    the corpus's 154 modules get a name that appears nowhere in their own
+//!    that enclose them — see [`crate::track_elixir::extract`], where 59 of
+//!    the corpus's 142 modules get a name that appears nowhere in their own
 //!    source.
 //! 2. **A module it does not declare is declared somewhere else** ⇒
 //!    [`crate::Outcome::External`], named by the whole module name. In a
@@ -92,9 +92,10 @@
 //!   definition permits.
 //! - **A module a macro generates.** `Module.concat/2` and friends mint
 //!   module names at compile time; nothing here expands a macro, so such a
-//!   module is neither declared nor resolvable. The provenance of the corpus
-//!   records the same limit for the 91 `use` sites whose expansions inject
-//!   `import` and `def` forms.
+//!   module is neither declared nor resolvable. The same limit covers this
+//!   corpus's 71 `use` sites, whose expansions inject `import` and `def`
+//!   forms — the count this track measures, not the count a grep of `use`
+//!   lines returns, which is 94 and includes the documentation.
 
 use std::collections::HashMap;
 use std::path::Path;
