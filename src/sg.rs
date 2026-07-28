@@ -119,6 +119,17 @@ impl SourceTree {
         Self::parse(SupportLang::Kotlin, source)
     }
 
+    /// Parse Bash source — `.sh` and `.bash` alike.
+    ///
+    /// One grammar for both: the extension records what a repository calls a
+    /// script and what it calls a sourced library, not which dialect it is
+    /// written in. `.bats` is **not** parsed here and is not claimed by the
+    /// language: the shell grammar does not reject a `@test "name" { … }`
+    /// block, it misreads one — see [`crate::model::Lang::extensions`].
+    pub fn parse_bash(source: &str) -> Self {
+        Self::parse(SupportLang::Bash, source)
+    }
+
     /// Parse Scala source.
     ///
     /// One grammar for every dialect: Scala 2 and Scala 3 differ in surface
@@ -335,6 +346,28 @@ rule:
                 .expect("the declaration names a type");
             assert_eq!(name.text(), "Greeter");
         }
+    }
+
+    /// Bash, which [`one_match`] cannot check the same way for the second
+    /// form: tree-sitter-bash names the `name` field on a
+    /// `function_definition` written either way, but `function f { … }` and
+    /// `f() { … }` are two spellings the grammar must both reach.
+    #[test]
+    fn parses_bash() {
+        let yaml = "id: t\nlanguage: bash\nrule:\n  kind: function_definition\n";
+        one_match(
+            &SourceTree::parse_bash("hi() {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
+        // The `function` keyword form, with and without parentheses.
+        one_match(
+            &SourceTree::parse_bash("function hi {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
     }
 
     #[test]
