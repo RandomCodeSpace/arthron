@@ -119,6 +119,17 @@ impl SourceTree {
         Self::parse(SupportLang::Kotlin, source)
     }
 
+    /// Parse Bash source — `.sh` and `.bash` alike.
+    ///
+    /// One grammar for both: the extension records what a repository calls a
+    /// script and what it calls a sourced library, not which dialect it is
+    /// written in. `.bats` is **not** parsed here and is not claimed by the
+    /// language: the shell grammar does not reject a `@test "name" { … }`
+    /// block, it misreads one — see [`crate::model::Lang::extensions`].
+    pub fn parse_bash(source: &str) -> Self {
+        Self::parse(SupportLang::Bash, source)
+    }
+
     /// Parse Scala source.
     ///
     /// One grammar for every dialect: Scala 2 and Scala 3 differ in surface
@@ -127,6 +138,26 @@ impl SourceTree {
     /// repository that cross-builds writes both in one tree.
     pub fn parse_scala(source: &str) -> Self {
         Self::parse(SupportLang::Scala, source)
+    }
+
+    /// Parse Swift source.
+    ///
+    /// One grammar for every `.swift` file, a SwiftPM manifest included: a
+    /// `Package.swift` is an ordinary Swift program that the package manager
+    /// runs, not a configuration dialect, and reading it under a second
+    /// parser would be inventing a language the toolchain does not have.
+    pub fn parse_swift(source: &str) -> Self {
+        Self::parse(SupportLang::Swift, source)
+    }
+
+    /// Parse C++ source.
+    ///
+    /// One grammar for every extension [`crate::model::Lang::Cpp`] claims.
+    /// `.c` and `.h` are deliberately not among them — a C translation unit
+    /// read under the C++ grammar is the wrong language — so nothing here
+    /// has to guess which dialect a file is written in.
+    pub fn parse_cpp(source: &str) -> Self {
+        Self::parse(SupportLang::Cpp, source)
     }
 
     /// Parse HCL source.
@@ -328,6 +359,28 @@ rule:
         }
     }
 
+    /// Bash, which [`one_match`] cannot check the same way for the second
+    /// form: tree-sitter-bash names the `name` field on a
+    /// `function_definition` written either way, but `function f { … }` and
+    /// `f() { … }` are two spellings the grammar must both reach.
+    #[test]
+    fn parses_bash() {
+        let yaml = "id: t\nlanguage: bash\nrule:\n  kind: function_definition\n";
+        one_match(
+            &SourceTree::parse_bash("hi() {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
+        // The `function` keyword form, with and without parentheses.
+        one_match(
+            &SourceTree::parse_bash("function hi {\n  echo hi\n}\n"),
+            yaml,
+            "function_definition",
+            "hi",
+        );
+    }
+
     /// HCL, which [`one_match`] cannot check: tree-sitter-hcl names no `name`
     /// field on a block — the block type and its labels are positional
     /// children — so the block type is the first `identifier` and every label
@@ -358,6 +411,26 @@ rule:
             "id: t\nlanguage: scala\nrule:\n  kind: class_definition\n",
             "class_definition",
             "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_swift() {
+        one_match(
+            &SourceTree::parse_swift("class Greeter { func hi() {} }\n"),
+            "id: t\nlanguage: swift\nrule:\n  kind: class_declaration\n",
+            "class_declaration",
+            "Greeter",
+        );
+    }
+
+    #[test]
+    fn parses_cpp() {
+        one_match(
+            &SourceTree::parse_cpp("namespace fmt { }\n"),
+            "id: t\nlanguage: cpp\nrule:\n  kind: namespace_definition\n",
+            "namespace_definition",
+            "fmt",
         );
     }
 }

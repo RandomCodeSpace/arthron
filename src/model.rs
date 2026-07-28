@@ -331,18 +331,23 @@ impl Lang {
             Lang::JavaScript => &["js", "mjs", "cjs"],
             Lang::TypeScript => &["ts"],
             Lang::Python => &["py"],
-            // Deliberately **not** `c`, and for exactly the same reason
-            // not `h`. Measured against the pinned grammar: a K&R-style
-            // definition — valid C, not valid C++ — parses cleanly under
-            // the C grammar and yields an error node under the C++ one, so
-            // the two really are different languages here and a `.c` file
-            // read on this track is read as the wrong one. `.h` is the C
-            // header extension before it is anything else and carries that
-            // same hazard, so this list stops at the spellings only C++
-            // uses. Both ride this track later under C's own decision —
+            // Deliberately **not** `c`. Measured against the pinned
+            // grammar: a K&R-style definition — valid C, not valid C++ —
+            // parses cleanly under the C grammar and yields an error node
+            // under the C++ one, so the two really are different languages
+            // here, a `.c` file read on this track is read as the wrong
+            // one, and `.c` waits for C's own decision. `.h` carried the
+            // same hazard — it is the C header extension before it is
+            // anything else — but the C++ track claims it regardless,
+            // because header-dominated C++ libraries are unmeasurable
+            // without it: fmt keeps 21 of its 55 corpus files in `.h`, and
+            // the track measured 3.4% import resolution refusing them
+            // against 87.6% reading them. The accepted risk is that a
+            // pure-C repository's `.h` files parse under the C++ grammar;
+            // it stands until a C track exists and arbitrates ownership —
             // which is also when [`Domain::Cxx`] starts carrying two
             // languages, and why the domain is named for the family.
-            Lang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
+            Lang::Cpp => &["cpp", "cc", "cxx", "h", "hpp", "hh", "hxx"],
             Lang::CSharp => &["cs"],
             Lang::Kotlin => &["kt", "kts"],
             Lang::Swift => &["swift"],
@@ -1036,14 +1041,17 @@ mod tests {
         assert_eq!(Lang::for_extension("ts"), Some(Lang::TypeScript));
         assert_eq!(Lang::for_extension("py"), Some(Lang::Python));
         assert_eq!(Lang::for_extension("rs"), Some(Lang::Rust));
-        // Unclaimed, and each on purpose. `.c` and `.h` are C, not C++:
-        // read on the `Cpp` track either would be read under the wrong
-        // grammar, so both wait for C's own decision. `.bats` is not shell:
+        // `.h` resolves to `Cpp`: the amendment the tier-2 registration
+        // reserved, made by the commit that first parses it — see
+        // [`Lang::extensions`] for the measurement that forced it.
+        assert_eq!(Lang::for_extension("h"), Some(Lang::Cpp));
+        // Unclaimed, and each on purpose. `.c` is C, not C++: read on the
+        // `Cpp` track it would be read under the wrong grammar, so it
+        // waits for C's own decision. `.bats` is not shell:
         // the shell grammar parses it without complaint and misreads it,
         // which yields wrong records rather than none. `None` says so in
         // every case rather than handing the file to a near-miss claimant.
         assert_eq!(Lang::for_extension("c"), None);
-        assert_eq!(Lang::for_extension("h"), None);
         assert_eq!(Lang::for_extension("bats"), None);
         assert_eq!(Lang::for_extension(""), None);
         // A `.d.ts` file's extension *is* `ts`; the `.d` is part of the stem.
