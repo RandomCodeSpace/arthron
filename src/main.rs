@@ -35,7 +35,7 @@ use arthron::query::{
 };
 use arthron::registry::REGISTRY;
 use arthron::resolution_rate;
-use arthron::store::{ReadStore, StoredOutcome};
+use arthron::store::{NOT_ALL_CURRENT, ReadStore, StoredOutcome};
 
 /// Exit code for a gate regression: the run worked, the numbers are worse.
 const EXIT_GATE_FAILED: u8 = 1;
@@ -903,6 +903,22 @@ fn run_query(verb: &QueryVerb, db_path: &Path, as_json: bool) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    // Said before the answer and on stderr, so that a person reading a
+    // terminal sees the caveat above what it qualifies and a pipe carrying
+    // stdout to `jq` sees one document either way. The store still answers —
+    // it is the best answer there is — but a graph the store itself says it
+    // has stopped vouching for must not answer as though nothing happened.
+    // See `arthron::store::NOT_ALL_CURRENT`.
+    match store.not_current() {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "arthron: {}: {NOT_ALL_CURRENT} ({n} file(s))",
+            db_path.display()
+        ),
+        // A store that will not answer this will not answer the query either,
+        // and the query's own failure is the better sentence to fail on.
+        Err(_) => {}
+    }
     let index = match NameIndex::build(&store) {
         Ok(i) => i,
         Err(e) => {
