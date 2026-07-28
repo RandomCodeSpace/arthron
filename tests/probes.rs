@@ -44,6 +44,8 @@ use arthron::pipeline::{scan_go, source_files};
 use arthron::resolve_go::GoLang;
 use arthron::store::{NodeRecord, Report, Snapshot, Store, StoredOutcome};
 
+mod support;
+
 const CORPUS: &str = "corpus/go/probes";
 const BASELINE: &str = "baselines/go-probes.toml";
 /// The module directive in `corpus/go/probes/go.mod`, which roots every FQN
@@ -55,7 +57,7 @@ fn corpus_present() -> bool {
     if Path::new(CORPUS).join("go.mod").is_file() {
         return true;
     }
-    println!("SKIP: no corpus at {CORPUS} — see README");
+    support::missing(Path::new(CORPUS));
     false
 }
 

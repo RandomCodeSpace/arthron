@@ -77,6 +77,8 @@ use arthron::track_hcl::extract::extract;
 use arthron::track_hcl::lang::HclLang;
 use arthron::track_hcl::resolve::scan_hcl;
 
+mod support;
+
 const CORPUS: &str = "corpus/hcl/terraform-aws-vpc";
 const BASELINE: &str = "baselines/hcl-terraform-aws-vpc.toml";
 
@@ -312,7 +314,7 @@ const EDGES: &[(&str, &[&str])] = &[
 fn the_hcl_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
     let walked = source_files::<HclLang>(corpus).expect("walking the corpus");

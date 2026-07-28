@@ -68,6 +68,8 @@ use arthron::track_scala::extract::extract;
 use arthron::track_scala::lang::ScalaLang;
 use arthron::track_scala::resolve::scan_scala;
 
+mod support;
+
 const CORPUS: &str = "corpus/scala/upickle";
 const BASELINE: &str = "baselines/scala-upickle.toml";
 
@@ -299,7 +301,7 @@ const NESTED_COMPANIONS: &[&str] = &[
 fn the_scala_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
     let walked = source_files::<ScalaLang>(corpus).expect("walking the corpus");

@@ -43,8 +43,17 @@ use arthron::track_ecma::extract::extract;
 use arthron::track_ecma::lang::{Dialect, JsLang, TsLang};
 use arthron::track_ecma::scan_ecma;
 
+mod support;
+
 /// Every EcmaScript corpus: `(root, language, baseline, the manifest whose
-/// presence proves the corpus was cloned in)`.
+/// presence proves the corpus was cloned in, the exact unresolved reasons)`.
+///
+/// The reasons are a column here and not a floor anywhere, for the reason the
+/// tier-2 tracks have always pinned theirs: the four numbers a baseline holds
+/// are identical whichever reason each unresolved reference carries, so a
+/// resolver may relabel every one of them and pass every gate in this file. A
+/// floor — "`NeedsTypeInference` is above zero" — survives any relabelling
+/// that leaves one reference behind.
 ///
 /// The marker is per corpus and not a constant, because a package manifest is
 /// not always at the root: zod is vendored as the `packages/zod/` member of a
@@ -52,30 +61,70 @@ use arthron::track_ecma::scan_ecma;
 /// reaches `.configs/tsconfig.base.json`. Looking for `package.json` at the
 /// root there finds nothing and would skip the whole corpus silently, which is
 /// a vacuous pass wearing a gate's clothes.
-const CORPORA: &[(&str, Lang, &str, &str)] = &[
+#[allow(clippy::type_complexity)]
+const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
     (
         "corpus/javascript/fastify",
         Lang::JavaScript,
         "baselines/javascript-fastify.toml",
         "package.json",
+        &[
+            ("DynamicModuleSpecifier", 1),
+            ("ModuleNotFound", 10),
+            ("NeedsExpressionType", 993),
+            ("NeedsReceiverType", 102),
+            ("NeedsTypeInference", 296),
+            ("NoMatchingDefinition", 238),
+        ],
     ),
     (
         "corpus/javascript/express",
         Lang::JavaScript,
         "baselines/javascript-express.toml",
         "package.json",
+        // No `ModuleNotFound`: express vendors what it imports, and its
+        // misses are expression-level instead.
+        &[
+            ("DynamicModuleSpecifier", 3),
+            ("NeedsExpressionType", 2906),
+            ("NeedsReceiverType", 132),
+            ("NeedsTypeInference", 781),
+            ("NoMatchingDefinition", 1728),
+            ("UnknownPackage", 3),
+        ],
     ),
     (
         "corpus/typescript/vue-core",
         Lang::TypeScript,
         "baselines/typescript-vue-core.toml",
         "package.json",
+        &[
+            ("ModuleNotFound", 108),
+            ("NeedsExpressionType", 11151),
+            ("NeedsReceiverType", 85),
+            ("NeedsTypeInference", 1320),
+            ("NoMatchingDefinition", 15276),
+            ("UnindexedSupertype", 5),
+        ],
     ),
     (
         "corpus/typescript/zod",
         Lang::TypeScript,
         "baselines/typescript-zod.toml",
         "packages/zod/package.json",
+        // The opposite shape to vue-core, and the reason both are gated:
+        // resolution through `exports` conditions rather than a `paths`
+        // mapping puts 7822 misses in `ModuleNotFound` and 8036 in
+        // `UnknownPackage`, buckets vue-core barely fills.
+        &[
+            ("ModuleNotFound", 7822),
+            ("NeedsExpressionType", 8811),
+            ("NeedsReceiverType", 50),
+            ("NeedsTypeInference", 1576),
+            ("NoMatchingDefinition", 524),
+            ("UnindexedSupertype", 2),
+            ("UnknownPackage", 8036),
+        ],
     ),
 ];
 
@@ -86,7 +135,19 @@ fn marker_for(corpus: &Path) -> &'static str {
     CORPORA
         .iter()
         .find(|(root, ..)| *root == name)
-        .map(|(_, _, _, marker)| *marker)
+        .map(|(_, _, _, marker, _)| *marker)
+        .unwrap_or_else(|| panic!("{name} is not one of the corpora CORPORA describes"))
+}
+
+/// The exact unresolved reasons a corpus produces, or a failure naming it: a
+/// root this file does not describe has no tally to compare against, which is
+/// the same absence of a gate as a corpus with no baseline.
+fn reasons_for(corpus: &Path) -> &'static [(&'static str, u64)] {
+    let name = corpus.to_string_lossy().replace('\\', "/");
+    CORPORA
+        .iter()
+        .find(|(root, ..)| *root == name)
+        .map(|(_, _, _, _, reasons)| *reasons)
         .unwrap_or_else(|| panic!("{name} is not one of the corpora CORPORA describes"))
 }
 
@@ -99,10 +160,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.join(marker_for(corpus)).is_file() {
         return true;
     }
-    println!(
-        "SKIP: no corpus at {} — see corpus/README.md",
-        corpus.display()
-    );
+    support::missing(corpus);
     false
 }
 
@@ -150,7 +208,14 @@ fn gate(corpus: &Path, lang: Lang, baseline_path: &str) {
     if !corpus_present(corpus) {
         return;
     }
-    let (_, measured) = measure(corpus, lang);
+    let (report, measured) = measure(corpus, lang);
+    // Exactly, before the baseline is even read: `evaluate` below compares
+    // four integers and every one of them survives a relabelled reason.
+    support::assert_reasons(
+        &corpus.to_string_lossy(),
+        &report.per_lang[&lang.code()].unresolved,
+        reasons_for(corpus),
+    );
     let b = baseline(baseline_path);
     assert_eq!(
         b.language,
@@ -224,12 +289,12 @@ fn every_ecmascript_corpus_has_its_own_baseline() {
     // Four corpora, four baselines, and no two of them the same file: one
     // number covering two repositories would let a collapse in either hide
     // behind the other, exactly as one number covering two languages would.
-    let mut seen: Vec<&str> = CORPORA.iter().map(|(_, _, path, _)| *path).collect();
+    let mut seen: Vec<&str> = CORPORA.iter().map(|(_, _, path, ..)| *path).collect();
     seen.sort_unstable();
     let count = seen.len();
     seen.dedup();
     assert_eq!(seen.len(), count, "two corpora share a baseline file");
-    for (root, lang, path, _) in CORPORA {
+    for (root, lang, path, ..) in CORPORA {
         let b = baseline(path);
         assert_eq!(b.language, lang.name(), "{path} measures another language");
         assert_eq!(b.corpus, *root, "{path} was recorded from another corpus");

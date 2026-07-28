@@ -50,6 +50,8 @@ use arthron::track_lua::extract::{ImportForm, extract};
 use arthron::track_lua::project::layout;
 use arthron::track_lua::resolve::scan_lua;
 
+mod support;
+
 const CORPUS: &str = "corpus/lua/busted";
 const BASELINE: &str = "baselines/lua-busted.toml";
 
@@ -213,7 +215,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 fn the_lua_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

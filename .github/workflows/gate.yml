@@ -145,3 +145,27 @@ jobs:
 
       - name: Gate hcl / terraform-aws-vpc
         run: ./target/release/arthron gate corpus/hcl/terraform-aws-vpc --language hcl --baseline baselines/hcl-terraform-aws-vpc.toml
+
+      # And the suite, in the one job that has a corpus.
+      #
+      # Last, because the resolution rate is the primary gate and a regression
+      # in it must be reported by the step that names the corpus, not by a
+      # `cargo test` line further down.
+      #
+      # Without this step nothing above measures a *definition*. `arthron gate`
+      # compares four integers — resolved, unresolved, external, local_binding
+      # — and the definition censuses, the exact unresolved-reason tallies and
+      # the store-side counts live in `cargo test`, which `.github/workflows/
+      # ci.yml` runs with no corpus and therefore skips every one of. Deleting
+      # a whole `DefKind` moved none of the four integers and was a green pull
+      # request. `tests/baselines.rs` pins this command exactly: a filter here
+      # is how one census would quietly stop running.
+      #
+      # ARTHRON_REQUIRE_CORPUS turns a skip into a failure. Everywhere else an
+      # absent corpus means nobody fetched the private repository; here it
+      # means the checkout above did not land where a test looks, and the
+      # ratchet did not run.
+      - name: Corpus test suite
+        env:
+          ARTHRON_REQUIRE_CORPUS: "1"
+        run: cargo test --release --all-features

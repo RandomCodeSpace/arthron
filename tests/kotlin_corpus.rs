@@ -54,6 +54,8 @@ use arthron::track_kotlin::extract::extract;
 use arthron::track_kotlin::lang::KtLang;
 use arthron::track_kotlin::resolve::scan_kotlin;
 
+mod support;
+
 const CORPUS: &str = "corpus/kotlin/okio";
 const BASELINE: &str = "baselines/kotlin-okio.toml";
 /// The pinned corpus revision, for the baseline's provenance line.
@@ -250,7 +252,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("okio").is_dir() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 

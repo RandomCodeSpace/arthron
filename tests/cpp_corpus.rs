@@ -78,6 +78,8 @@ use arthron::track_cpp::extract::{IncludeForm, extract};
 use arthron::track_cpp::lang::{module_fqn, unit_fqn};
 use arthron::track_cpp::resolve::scan_cpp;
 
+mod support;
+
 const CORPUS: &str = "corpus/cpp/fmt";
 const BASELINE: &str = "baselines/cpp-fmt.toml";
 
@@ -311,7 +313,7 @@ fn directives(source: &str) -> (u64, u64, u64, u64) {
 fn the_cpp_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

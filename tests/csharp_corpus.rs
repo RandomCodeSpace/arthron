@@ -55,6 +55,8 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_csharp::extract::{ImportForm, extract};
 use arthron::track_csharp::resolve::scan_csharp;
 
+mod support;
+
 const CORPUS: &str = "corpus/csharp/serilog";
 const BASELINE: &str = "baselines/csharp-serilog.toml";
 
@@ -320,7 +322,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 fn the_csharp_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 

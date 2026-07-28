@@ -84,6 +84,13 @@ jobs:
       # `tests/baselines.rs` — which reads no corpus, so it runs here — is what
       # makes a baseline missing from that workflow fail.
       #
+      # Skipping here is by design; skipping *everywhere* was not. The
+      # definition censuses and the exact unresolved-reason tallies live in
+      # this command and nowhere else — `arthron gate` compares four integers
+      # and counts no definitions — so until gate.yml ran the suite too, no
+      # census executed in CI at all. It has a `Corpus test suite` step now,
+      # and `tests/baselines.rs` is what makes removing it fail.
+      #
       # `tests/scan_errors.rs` is `#![cfg(unix)]`: its subject is `chmod 000`
       # and non-UTF-8 filenames, and `std::os::unix` does not exist on Windows,
       # so without the gate this step would not fail its assertions on the

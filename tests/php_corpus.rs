@@ -25,6 +25,8 @@ use arthron::track_php::extract::extract;
 use arthron::track_php::lang::PhpLang;
 use arthron::track_php::resolve::scan_php;
 
+mod support;
+
 const CORPUS: &str = "corpus/php/guzzle";
 const BASELINE: &str = "baselines/php-guzzle.toml";
 /// The pinned corpus revision, for the baseline's provenance line.
@@ -35,7 +37,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("composer.json").is_file() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 

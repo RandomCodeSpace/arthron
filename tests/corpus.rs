@@ -12,6 +12,8 @@ use arthron::query::{NodeKind, definition};
 use arthron::resolve_go::GoLang;
 use arthron::store::{NodeRecord, ReadStore, Store};
 
+mod support;
+
 /// Whether the corpus has been cloned in.
 ///
 /// It lives in RandomCodeSpace/arthron-corpus, cloned into ./corpus
@@ -21,7 +23,7 @@ fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("go.mod").is_file() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 
@@ -113,6 +115,11 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
             .any(|(code, n)| reason_name(*code) == "NeedsTypeInference" && *n > 0),
         "no inference floor: it was reclassified, not resolved",
     );
+    // And the whole tally, exactly. The floor above is the weaker half of
+    // this: it survives any relabelling that leaves one reference behind, and
+    // relabelling costs nothing — none of the four gated integers moves when
+    // an unresolved reference changes reason.
+    support::assert_reasons("corpus/go/codeiq", &go.unresolved, CODEIQ_REASONS);
 }
 
 #[test]
@@ -587,6 +594,20 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
 /// raised without anything being linked — fail `cargo test` wherever the
 /// corpus is present.
 ///
+/// Every unresolved reason codeiq produces, exactly.
+///
+/// Go's resolver runs no type checker, so a receiver whose type is not stated
+/// in the file is honestly unresolved — that is `NeedsTypeInference`, and it
+/// is most of this. `NoMatchingDefinition` is the rest: a name this build
+/// indexed a package for and found nothing under.
+const CODEIQ_REASONS: &[(&str, u64)] =
+    &[("NeedsTypeInference", 676), ("NoMatchingDefinition", 123)];
+
+/// caddy's, exactly. Twice the tree and the same two reasons in the same
+/// proportion, which is the point of measuring two corpora.
+const CADDY_REASONS: &[(&str, u64)] =
+    &[("NeedsTypeInference", 1546), ("NoMatchingDefinition", 269)];
+
 /// One baseline per corpus, never one aggregated number. They are written by
 /// the command and by nothing else:
 ///
@@ -596,7 +617,7 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
 /// arthron gate corpus/go/caddy  --language go \
 ///     --baseline baselines/go-caddy.toml  --rebase --commit 853efde
 /// ```
-fn assert_ratchet(corpus: &str, baseline_path: &str) {
+fn assert_ratchet(corpus: &str, baseline_path: &str, reasons: &[(&str, u64)]) {
     let root = Path::new(corpus);
     if !corpus_present(root) {
         return;
@@ -617,6 +638,10 @@ fn assert_ratchet(corpus: &str, baseline_path: &str) {
     for (code, count) in &go.unresolved {
         println!("  {}: {count}", reason_name(*code));
     }
+    // Exactly, not as a floor: the four numbers `evaluate` compares below are
+    // the same whichever reason each unresolved reference carries, so a
+    // relabelled bucket passes this ratchet untouched.
+    support::assert_reasons(corpus, &go.unresolved, reasons);
 
     let text = std::fs::read_to_string(baseline_path)
         .unwrap_or_else(|e| panic!("reading {baseline_path}: {e}"));
@@ -645,7 +670,11 @@ fn assert_ratchet(corpus: &str, baseline_path: &str) {
 
 #[test]
 fn go_holds_its_baseline_on_codeiq() {
-    assert_ratchet("corpus/go/codeiq", "baselines/go-codeiq.toml");
+    assert_ratchet(
+        "corpus/go/codeiq",
+        "baselines/go-codeiq.toml",
+        CODEIQ_REASONS,
+    );
 }
 
 #[test]
@@ -653,5 +682,5 @@ fn go_holds_its_baseline_on_caddy() {
     // The second Go corpus, and not a formality: caddy holds 28 FQNs that two
     // files each declare, and its local-binding column is three times
     // codeiq's. A single corpus locks in a number rather than a capability.
-    assert_ratchet("corpus/go/caddy", "baselines/go-caddy.toml");
+    assert_ratchet("corpus/go/caddy", "baselines/go-caddy.toml", CADDY_REASONS);
 }

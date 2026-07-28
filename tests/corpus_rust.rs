@@ -48,8 +48,19 @@ use arthron::track_rust::extract::extract;
 use arthron::track_rust::lang::RsLang;
 use arthron::track_rust::resolve::scan_rust;
 
+mod support;
+
 const CORPUS: &str = "corpus/rust/ripgrep";
 const BASELINE: &str = "baselines/rust-ripgrep.toml";
+
+/// Every unresolved reason ripgrep produces, exactly.
+///
+/// Thirteen references, which is what makes pinning them cheap and floors
+/// useless: `unresolved > 0` holds while twelve of the thirteen are
+/// relabelled. `AliasCycle` is a `use` chain that re-enters itself and
+/// `NoMatchingDefinition` a path into a module this walk did not index —
+/// different facts, and the baseline records neither.
+const RIPGREP_REASONS: &[(&str, u64)] = &[("AliasCycle", 11), ("NoMatchingDefinition", 2)];
 
 /// The files the scan owns. Exact, because everything below is a count over
 /// this set and a census over a different file set is a different census.
@@ -167,7 +178,7 @@ const PINNED: &[(&str, NodeKind, &str, u32)] = &[
 fn the_extractor_reads_the_rust_corpus_without_losing_its_invariants() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
     let files = source_files::<RsLang>(corpus).expect("walking the corpus");
@@ -263,7 +274,7 @@ fn the_rust_definition_census_is_exact() {
     // them, so they are asserted exactly here or nowhere.
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
     let scratch = tempfile::tempdir().expect("scratch dir");
@@ -335,7 +346,7 @@ fn the_rust_definition_census_is_exact() {
 fn the_rust_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 
@@ -361,6 +372,7 @@ fn the_rust_track_drops_nothing_and_holds_its_baseline() {
     for (code, count) in &tally.unresolved {
         println!("             {} {count}", reason_name(*code));
     }
+    support::assert_reasons(CORPUS, &tally.unresolved, RIPGREP_REASONS);
 
     // -- completeness -----------------------------------------------------
 

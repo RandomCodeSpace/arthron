@@ -591,3 +591,164 @@ fn the_corpus_gate_job_itself_has_no_soft_failure_path() {
         job.triggers[at + 1].1,
     );
 }
+
+/// The one command the gate job may run the suite with.
+///
+/// Exact, and an allow-list for the reason a gate step's flags are: `--test
+/// corpus`, a test-name filter or an `--exclude` would leave this step in the
+/// list, green, running a subset — which is indistinguishable from running all
+/// of it, and is how one census stops executing without anything going red.
+const SUITE_COMMAND: &str = "cargo test --release --all-features";
+
+/// The environment variable that turns a skipped ratchet into a failed one,
+/// spelled as it appears under the step's `env:`.
+const REQUIRE_CORPUS: &str = "ARTHRON_REQUIRE_CORPUS: \"1\"";
+
+/// The corpus checkout, identified by where it puts the tree.
+const CORPUS_CHECKOUT: &str = "path: corpus";
+
+/// The skip line a corpus test may no longer print for itself, spelled in two
+/// halves so this file does not contain the string it forbids — and so the
+/// test below does not report itself as the first offender.
+const OWN_SKIP: &str = concat!("SKIP", ": no corpus");
+
+#[test]
+fn the_corpus_gate_workflow_runs_the_suite_where_the_corpus_exists() {
+    // The hole this closes is the one every other test in this file is one
+    // level below: the gate steps could all be strict, all be measured and
+    // all be required, and the *definition* censuses would still never run.
+    //
+    // `arthron gate` compares four integers — resolved, unresolved, external
+    // and local_binding. It counts no definitions. The censuses that do live
+    // in `cargo test`, and `.github/workflows/ci.yml` runs that with no
+    // corpus on purpose, so every one of them returns before measuring and is
+    // recorded as a pass. Deleting `DefKind::Method` from the Go, Rust or
+    // EcmaScript extractor moved none of the four integers, skipped every
+    // census that would have caught it, and was a green pull request.
+    //
+    // So the suite has to run in the one job that fetches the corpus, and
+    // this is the test that makes forgetting it fail — in a test file that
+    // itself reads no corpus, so it runs everywhere.
+    let job = gate_job();
+    let suites: Vec<usize> = job
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.keys
+                .iter()
+                .any(|(k, v)| k == "run" && v.starts_with("cargo test"))
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        suites.len(),
+        1,
+        "{GATE_WORKFLOW}: {} steps run `cargo test`; the corpus suite is one step and \
+         the job that has a corpus is the only place it means anything",
+        suites.len(),
+    );
+    let at = suites[0];
+    let suite = &job.steps[at];
+
+    let (_, run) = suite
+        .keys
+        .iter()
+        .find(|(k, _)| k == "run")
+        .expect("the step was selected by its run");
+    assert_eq!(
+        run, SUITE_COMMAND,
+        "{GATE_WORKFLOW}: step `{}` runs `{run}`, not `{SUITE_COMMAND}`; a filter here \
+         excludes a census while leaving the step that appears to run it",
+        suite.name,
+    );
+
+    // Without this the step is still only half a gate. Every corpus test
+    // returns early when its corpus is absent — correct on a machine that
+    // never fetched the private repository, and a lie here, where a skip
+    // means the checkout did not land where the test looked. The variable is
+    // what makes `tests/support::missing` fail instead of print.
+    assert!(
+        suite.block.lines().any(|l| l == REQUIRE_CORPUS),
+        "{GATE_WORKFLOW}: step `{}` does not set `{REQUIRE_CORPUS}`, so a corpus that \
+         did not check out is 1500 silent skips and a green job",
+        suite.name,
+    );
+
+    // And it is a gate, so the three ways a gate step is neutralised apply to
+    // it unchanged.
+    for token in SOFT_FAILURE {
+        assert!(
+            !suite.block.contains(token),
+            "{GATE_WORKFLOW}: step `{}` carries `{token}`",
+            suite.name,
+        );
+    }
+    assert!(
+        !suite.keys.iter().any(|(k, _)| k == "if"),
+        "{GATE_WORKFLOW}: step `{}` is conditional",
+        suite.name,
+    );
+
+    // Order is part of the claim: this step measures a corpus, so the corpus
+    // has to be on disk before it runs. After the checkout, and after the
+    // gate steps — the resolution rate is the primary gate and a regression
+    // in it must be named by the step that names the corpus.
+    let checkout = job
+        .steps
+        .iter()
+        .position(|s| s.block.lines().any(|l| l == CORPUS_CHECKOUT))
+        .unwrap_or_else(|| panic!("{GATE_WORKFLOW}: no step checks the corpus out to `corpus/`"));
+    assert!(
+        checkout < at,
+        "{GATE_WORKFLOW}: step `{}` runs before the corpus is checked out",
+        suite.name,
+    );
+}
+
+#[test]
+fn every_corpus_skip_goes_through_the_one_guard() {
+    // `tests/support::missing` is where `ARTHRON_REQUIRE_CORPUS` is read, so
+    // a test file that prints its own skip line and returns is a ratchet the
+    // variable cannot reach: it goes on skipping in the gate job, where a
+    // skip is the ratchet not running. Every one of them went through a
+    // hand-written `println!` until this test existed.
+    //
+    // What it checks is narrow and worth stating: no test file may print the
+    // skip line itself, and a file whose name says it reads a corpus must
+    // call the guard. A new file that invents a different message and is not
+    // named for a corpus is outside both — the residue, named rather than
+    // implied.
+    let mut checked = 0;
+    for entry in std::fs::read_dir("tests").expect("tests/ is committed") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .to_string();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        assert!(
+            !text.contains(OWN_SKIP),
+            "tests/{name} prints its own corpus skip; call `support::missing` instead, \
+             which is what ARTHRON_REQUIRE_CORPUS turns into a failure",
+        );
+        if name.contains("corpus") {
+            assert!(
+                text.contains("support::missing"),
+                "tests/{name} is named for a corpus and never calls `support::missing`, \
+                 so an absent corpus there is a skip even in the job that fetches one",
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 19,
+        "only {checked} corpus test files were found; this test just stopped covering \
+         the ones it used to",
+    );
+}

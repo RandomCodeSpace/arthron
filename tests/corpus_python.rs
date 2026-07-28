@@ -56,8 +56,47 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_python::extract::extract;
 use arthron::track_python::resolve::scan_python;
 
+mod support;
+
 const CORPUS: &str = "corpus/python/django";
 const BASELINE: &str = "baselines/python-django.toml";
+
+/// Every unresolved reason django produces, exactly.
+///
+/// Nine buckets, and the spread is the point: Python's resolver reaches
+/// further than any other tier-1 track and each of these names a different
+/// thing it could not do. `NeedsTypeInference` is the bulk — a receiver whose
+/// type is not stated — and the small ones are the interesting ones, because
+/// a floor cannot see them at all. Moving the MRO miss out of
+/// `NoMatchingDefinition` and into `Generated` relabels 19 references from
+/// "not found" to "the target is generated code" and moves nothing this file
+/// otherwise gates.
+const DJANGO_REASONS: &[(&str, u64)] = &[
+    ("DynamicDispatch", 87),
+    ("Generated", 13),
+    ("NeedsExpressionType", 1609),
+    ("NeedsReceiverType", 136),
+    ("NeedsTypeInference", 10256),
+    ("NoMatchingDefinition", 294),
+    ("ProjectLayoutUnknown", 1),
+    ("UnindexedSupertype", 1209),
+    ("UnknownPackage", 159),
+];
+
+/// flask's, exactly. Ten buckets rather than nine — flask imports modules this
+/// tree does not vendor, so `ModuleNotFound` is real here and empty on django.
+const FLASK_REASONS: &[(&str, u64)] = &[
+    ("DynamicDispatch", 1),
+    ("Generated", 88),
+    ("ModuleNotFound", 12),
+    ("NeedsExpressionType", 143),
+    ("NeedsReceiverType", 5),
+    ("NeedsTypeInference", 2119),
+    ("NoMatchingDefinition", 71),
+    ("ProjectLayoutUnknown", 33),
+    ("UnindexedSupertype", 156),
+    ("UnknownPackage", 219),
+];
 
 const FLASK: &str = "corpus/python/flask";
 const FLASK_BASELINE: &str = "baselines/python-flask.toml";
@@ -219,7 +258,7 @@ const FLASK_CENSUS: Census = Census {
 fn assert_census(corpus: &str, census: &Census) {
     let root = Path::new(corpus);
     if !root.is_dir() {
-        println!("SKIP: no corpus at {corpus} — see README");
+        support::missing(root);
         return;
     }
     let scratch = tempfile::tempdir().expect("scratch dir");
@@ -309,7 +348,7 @@ fn the_flask_definition_census_is_exact() {
 fn the_python_track_drops_nothing_and_holds_its_baseline() {
     let corpus = Path::new(CORPUS);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {CORPUS} — see README");
+        support::missing(corpus);
         return;
     }
 
@@ -335,6 +374,15 @@ fn the_python_track_drops_nothing_and_holds_its_baseline() {
     for (code, count) in &tally.unresolved {
         println!("             {} {count}", reason_name(*code));
     }
+
+    // -- the reasons -------------------------------------------------------
+
+    // Python had no reason assertion at all — not even the `Unknown` and
+    // zero-count pair Go and Java carried — while the tier-2 tracks pinned
+    // theirs exactly. Nothing else in this file can see a reason: the four
+    // numbers the baseline holds are identical whichever one each unresolved
+    // reference carries.
+    support::assert_reasons(CORPUS, &tally.unresolved, DJANGO_REASONS);
 
     // -- completeness -----------------------------------------------------
 
@@ -453,7 +501,7 @@ fn the_python_track_drops_nothing_and_holds_its_baseline() {
 fn the_flask_ratchet_holds() {
     let corpus = Path::new(FLASK);
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {FLASK} — see README");
+        support::missing(corpus);
         return;
     }
 
@@ -477,6 +525,7 @@ fn the_flask_ratchet_holds() {
     for (code, count) in &tally.unresolved {
         println!("             {} {count}", reason_name(*code));
     }
+    support::assert_reasons(FLASK, &tally.unresolved, FLASK_REASONS);
 
     // The four buckets are a partition, so none of them may be the whole of
     // it: a run where everything landed in one bucket accounts for every

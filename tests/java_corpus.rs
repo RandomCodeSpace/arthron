@@ -25,6 +25,8 @@ use arthron::store::{NodeRecord, ReadStore, Store};
 use arthron::track_java::extract::extract;
 use arthron::track_java::{JavaLang, scan_java};
 
+mod support;
+
 const CORPUS: &str = "corpus/java/commons-lang";
 const BASELINE: &str = "baselines/java-commons-lang.toml";
 /// The pinned corpus revision, for the baseline's provenance line.
@@ -43,12 +45,39 @@ const CORPORA: &[(&str, &str, &str)] = &[
     ("corpus/java/gson", "baselines/java-gson.toml", "3ff35d6"),
 ];
 
+/// Every unresolved reason commons-lang produces, exactly.
+///
+/// `AmbiguousOverload` dominates because this corpus is overload sets without
+/// the argument types to discriminate them, and `NeedsExpressionType` is the
+/// honest cost of not running a type checker on `f().m()`. The two are
+/// different facts and the gate cannot tell them apart: moving all 10302 of
+/// the first into `NoMatchingDefinition` leaves every gated integer where it
+/// was.
+const COMMONS_LANG_REASONS: &[(&str, u64)] = &[
+    ("AmbiguousOverload", 10302),
+    ("NeedsExpressionType", 6566),
+    ("NeedsTypeInference", 1969),
+    ("NoMatchingDefinition", 162),
+    ("UnindexedSupertype", 94),
+];
+
+/// gson's, exactly. The same five reasons in a different mixture — generics
+/// threaded through `TypeAdapter<T>` push `NeedsExpressionType` past
+/// `AmbiguousOverload`, which commons-lang never does.
+const GSON_REASONS: &[(&str, u64)] = &[
+    ("AmbiguousOverload", 2234),
+    ("NeedsExpressionType", 4713),
+    ("NeedsTypeInference", 208),
+    ("NoMatchingDefinition", 47),
+    ("UnindexedSupertype", 13),
+];
+
 /// Whether the corpus has been cloned in.
 fn corpus_present(corpus: &Path) -> bool {
     if corpus.join("src/main/java").is_dir() {
         return true;
     }
-    println!("SKIP: no corpus at {} — see README", corpus.display());
+    support::missing(corpus);
     false
 }
 
@@ -153,6 +182,10 @@ fn corpus_rate_is_nonzero_and_every_unresolved_has_a_reason() {
             "no {floor} floor: it was reclassified, not resolved",
         );
     }
+    // And the whole tally, exactly, which is the half the floors above could
+    // not reach: a floor holds while 9056 of these 19093 references are
+    // relabelled, and every number this file otherwise gates stays put.
+    support::assert_reasons(CORPUS, &java.unresolved, COMMONS_LANG_REASONS);
 }
 
 // -- the definition census -------------------------------------------------
@@ -411,19 +444,22 @@ fn the_gson_definition_census_is_exact() {
 /// The ratchet and the recorder share it so that the file one writes is the
 /// number the other compares: two measurement paths would let a baseline be
 /// recorded from a scan the gate never performs.
-fn measure(corpus: &Path) -> Counts {
+fn measure(corpus: &Path) -> (Counts, BTreeMap<u8, u64>) {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let report = scan_java(corpus, &dir.path().join("graph.redb")).expect("scan");
     let java = &report.per_lang[&Lang::Java.code()];
-    Counts {
-        resolved: java.resolved,
-        external: java.external,
-        local_binding: java.local_binding,
-        unresolved: java.unresolved_total(),
-    }
+    (
+        Counts {
+            resolved: java.resolved,
+            external: java.external,
+            local_binding: java.local_binding,
+            unresolved: java.unresolved_total(),
+        },
+        java.unresolved.clone(),
+    )
 }
 
-fn assert_ratchet(corpus: &str, baseline_path: &str) {
+fn assert_ratchet(corpus: &str, baseline_path: &str, reasons: &[(&str, u64)]) {
     let root = Path::new(corpus);
     if !corpus_present(root) {
         return;
@@ -441,11 +477,21 @@ fn assert_ratchet(corpus: &str, baseline_path: &str) {
         "{baseline_path} was recorded from another corpus",
     );
 
-    let measured = measure(root);
+    let (measured, unresolved) = measure(root);
     println!(
         "{corpus}: resolved {} external {} local-binding {} unresolved {}",
         measured.resolved, measured.external, measured.local_binding, measured.unresolved,
     );
+    for (code, count) in &unresolved {
+        println!("  {}: {count}", reason_name(*code));
+    }
+    // Exactly, not as a floor. `evaluate` below compares four integers and
+    // none of them moves when an unresolved reference is relabelled, so this
+    // is the only thing standing between a resolver and 9056 references
+    // reported as "there is no such definition" when the truth is "there are
+    // several and I cannot choose".
+    support::assert_reasons(corpus, &unresolved, reasons);
+
     match evaluate(&baseline, &measured) {
         GateVerdict::Pass { .. } => {}
         other => panic!("{baseline_path}: {other:?}\nmeasured {measured:?}"),
@@ -454,13 +500,13 @@ fn assert_ratchet(corpus: &str, baseline_path: &str) {
 
 #[test]
 fn the_ratchet_holds() {
-    assert_ratchet(CORPUS, BASELINE);
+    assert_ratchet(CORPUS, BASELINE, COMMONS_LANG_REASONS);
 }
 
 #[test]
 fn the_gson_ratchet_holds() {
     let (corpus, baseline, _) = CORPORA[1];
-    assert_ratchet(corpus, baseline);
+    assert_ratchet(corpus, baseline, GSON_REASONS);
 }
 
 /// The baseline is written by `arthron gate --rebase` and by nothing else.

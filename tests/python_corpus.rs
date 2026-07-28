@@ -14,6 +14,8 @@ use arthron::pipeline::source_files;
 use arthron::track_python::extract::extract;
 use arthron::track_python::lang::PyLang;
 
+mod support;
+
 /// The `.py` files under `corpus/python`: django's 899 and flask's 65.
 const FILES: u64 = 964;
 
@@ -42,7 +44,7 @@ const DEFS: &[(DefKind, u64)] = &[
 fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
     let corpus = Path::new("corpus/python");
     if !corpus.is_dir() {
-        println!("SKIP: no corpus at {} — see README", corpus.display());
+        support::missing(corpus);
         return;
     }
     let files = source_files::<PyLang>(corpus).expect("walking the corpus");
