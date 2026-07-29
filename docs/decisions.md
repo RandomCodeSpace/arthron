@@ -4,6 +4,48 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — the first re-pin: probe corpora are pinned, and no target moved
+
+The wave's resolver work landed on a branch that already pinned every resolved
+edge's target, so this is the pin mechanism's first real exercise: absorb main,
+regenerate all of it, and account for every row that moved.
+
+**No pre-existing pinned row changed target — on any corpus.** Across the
+eleven corpora pinned before the merge the verdict was `0 moved, 0 vanished`
+throughout, and the target dictionaries only grew (no corpus dropped a target
+name). All movement was rows that *appeared*: `go-codeiq` 6383 → 7692 keys,
+`go-caddy` 7366 → 7592, `typescript-zod` 8377 → 10289; the other eight were
+byte-identical in their bodies. That is what the Go field-access work and the
+ECMA specifier work should look like — new edges where there were none, and not
+one existing edge re-aimed — and it is the claim only this gate can make, since
+all three corpora also moved the four counted integers (`go-codeiq` resolved
+8016 → 9794) and the counting gate cannot tell a new edge from a re-aimed one.
+
+**Decided: probe corpora carry pin files, on the same rule as any other
+corpus.** The rule is the one already enforced programmatically — every tier-1
+corpus with a baseline has a pin file — so the four probe corpora that landed
+with the wave inherit it rather than being argued about case by case.
+*Rejected:* excluding them as too small to be worth a file. That reads the
+value backwards. A probe corpus exists because each file in it encodes one
+resolver contract that was got wrong once, so its rows are few and every one is
+load-bearing — a higher pin density than any real tree here. They cost
+kilobytes: 10, 6, 5 and 12 rows for java, javascript, python and typescript.
+
+**A defect this re-pin caused and caught.** The per-corpus scan tests indexed
+the pin table by *position* (`check(PINNED[5].0, PINNED[5].1)`), so inserting
+the probe corpora mid-table silently re-aimed every test after the insertion
+point: `javascript_express_edges_are_where_they_were_pinned` began scanning
+`corpus/java/probes`, and the suite stayed green because every corpus still
+agreed with its own pins — each was simply checked under another test's name.
+A test whose name points at the wrong corpus is the pin gate's own defect one
+level up. Each test now looks its corpus up by the pin path it names, and a new
+test refuses a `PINNED` row that no test scans, since the existing coverage test
+only matched committed files against the table and would pass on a pin file
+nothing ever compared. Verified by mutation: dropping one scan test fails the
+new check by name.
+
+---
+
 ## 2026-07-28 — 0.0.1 published
 
 `arthron 0.0.1` is on crates.io, tagged `v0.0.1` (signed). Every ratified

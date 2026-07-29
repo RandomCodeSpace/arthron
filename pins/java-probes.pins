@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/go/probes --pins pins/go-probes.pins --write --commit 48257b7
+#   arthron pin corpus/java/probes --pins pins/java-probes.pins --write --commit 48257b7
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -37,49 +37,27 @@
 # over it, and a file whose header disagrees with its own sections is refused
 # rather than read.
 format = 1
-corpus = "corpus/go/probes"
+corpus = "corpus/java/probes"
 commit = "48257b7"
-targets = 14
-rows = 17
+targets = 4
+rows = 10
 
 [targets]
-def example.com/arthron/probes/clauseheader#Producer
-def example.com/arthron/probes/dotted/p#Foo
-def example.com/arthron/probes/dotted/p.Foo#Bar
-def example.com/arthron/probes/pkgrename/alpha#Name
-def example.com/arthron/probes/pkgrename/beta#Name
-def example.com/arthron/probes/shadowpair#Emit
-def example.com/arthron/probes/testpkg/api#Serve
-def example.com/arthron/probes/testpkg/api_test#Serve
-pkg example.com/arthron/probes/dotted/p
-pkg example.com/arthron/probes/dotted/p.Foo
-pkg example.com/arthron/probes/pkgrename/alpha
-pkg example.com/arthron/probes/pkgrename/beta
-pkg example.com/arthron/probes/testpkg/api
-pkg example.com/arthron/probes/testpkg/api_test
+def probe#Caller.make/0
+def probe#Greeter
+def probe#Greeter.<init>/0
+def probe#Greeter.greet/1
 
 [rows]
-clauseheader/clauseheader.go
-	4612fd55bfb16ae7 0
-	651cdc092cade04d 0
-	a7c4612a45571877 0
-dotted/consumer.go
-	57c575a709706261 8
-	7f6e4044ed519fa9 2
-	d5f363fbb19f7454 9
-	d829058bf4725475 1
-pkgrename/consumer.go
-	20542e40cdd33166 11
-	2d67900e9d473c97 4
-	cb4db02768debd2c 3
-	d8817f6fa32394cd 10
-shadowpair/shadowpair.go
-	dbd37634c65129cc 5
-testpkg/api/api_ext_test.go
-	07e5492977a69c18 12
-	49554994ec07ca79 6
-testpkg/api_test/api_ext_test.go
-	c800f64a2d90b21e 13
-	e51e3c9a27a4733a 7
-testpkg/api_test/api_test.go
-	806f6435a148d28c 7
+src/main/java/probe/Caller.java
+	14340b951d11e1a9 3
+	1f33885ae08efcf0 2
+	4aa07e6b8abcf8ed 1
+	79120b223f771fae 1
+	d215451278fbd2ac 0
+	d575ebe00e916d6e 2
+	eddffe3f551c9bed 1
+	f3803585f625238c 2
+src/main/java/probe/Loud.java
+	898dd8be6f839081 1
+	c91b29fbc8c8cfa6 3

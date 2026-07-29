@@ -50,21 +50,37 @@ mod support;
 /// its resolved set is a handful of module paths that the import ratchet
 /// already states exactly; the wrong-edge surface this file exists for is the
 /// call, type-use and field-access graph, which only the tier-1 tracks build.
+///
+/// **Probe corpora are pinned, on the same rule as any other corpus.** The
+/// rule this table follows is not "pin the big trees": it is the one
+/// [`every_tier_1_corpus_with_a_baseline_has_a_pin_file`] enforces — every
+/// tier-1 corpus carrying a baseline carries a pin file. A probe corpus is
+/// small, so the temptation is to read its handful of rows as not worth a
+/// file. That reads the value backwards. A probe corpus exists because each
+/// of its files encodes one resolver contract that was got wrong once —
+/// a shadowed binding, a renamed package, a test-package split — and those
+/// are exactly the edges that come back wrong under a refactor. Its rows are
+/// few and every one of them is load-bearing, which is a higher pin density
+/// than any real tree here, not a lower one. Pinning them costs kilobytes.
 const PINNED: &[(&str, &str)] = &[
     ("pins/go-codeiq.pins", "corpus/go/codeiq"),
     ("pins/go-caddy.pins", "corpus/go/caddy"),
     ("pins/go-probes.pins", "corpus/go/probes"),
     ("pins/java-commons-lang.pins", "corpus/java/commons-lang"),
     ("pins/java-gson.pins", "corpus/java/gson"),
+    ("pins/java-probes.pins", "corpus/java/probes"),
     ("pins/javascript-express.pins", "corpus/javascript/express"),
     ("pins/javascript-fastify.pins", "corpus/javascript/fastify"),
+    ("pins/javascript-probes.pins", "corpus/javascript/probes"),
     ("pins/python-django.pins", "corpus/python/django"),
     ("pins/python-flask.pins", "corpus/python/flask"),
+    ("pins/python-probes.pins", "corpus/python/probes"),
     (
         "pins/typescript-vue-core.pins",
         "corpus/typescript/vue-core",
     ),
     ("pins/typescript-zod.pins", "corpus/typescript/zod"),
+    ("pins/typescript-probes.pins", "corpus/typescript/probes"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -85,6 +101,29 @@ fn every_committed_pin_file_is_compared_by_this_test() {
         on_disk, listed,
         "a pin file nothing compares against is the absence of a gate, not a passing one",
     );
+}
+
+/// Every row in [`PINNED`] is actually scanned by a test in this file.
+///
+/// [`every_committed_pin_file_is_compared_by_this_test`] only matches the
+/// committed files against the table; it passes on a `PINNED` row that no
+/// test ever scans. That row's pin file would then be parsed, named and
+/// counted, and its corpus never compared — a pin file nothing compares
+/// against, which is the absence of a gate the other test's own message
+/// refuses. The scan tests are one per corpus by hand, so nothing but this
+/// keeps the two in step.
+#[test]
+fn every_pinned_corpus_has_a_test_that_scans_it() {
+    let source = include_str!("edge_pins.rs");
+    for (path, _) in PINNED {
+        let call = format!("check_pinned(\"{path}\")");
+        assert!(
+            source.contains(&call),
+            "{path} is listed in PINNED and no test scans it: this file holds no \
+             `{call}`. A pin file that is parsed but never compared against its \
+             corpus gates nothing — add a `#[test]` that calls it",
+        );
+    }
 }
 
 /// The converse of the test above, which only refuses an orphan pin file.
@@ -666,57 +705,96 @@ fn check(pin_path: &str, corpus: &str) {
     );
 }
 
+/// Look a pin file's corpus up in [`PINNED`] by path, and check that pair.
+///
+/// These tests used to index `PINNED` positionally — `check(PINNED[5].0,
+/// PINNED[5].1)`. That silently couples every test name to a row's *position*,
+/// so inserting one corpus mid-table renames what each test checks while every
+/// one of them keeps passing: the corpora are all still pinned, just each
+/// under another test's name. Adding the four probe corpora did exactly that
+/// before this lookup replaced it. A test that names `javascript_express` and
+/// scans `java/probes` is the same defect the pin gate exists to catch, one
+/// level up, so the corpus is looked up by the path the test names.
+fn check_pinned(pin_path: &str) {
+    let corpus = PINNED
+        .iter()
+        .find(|(path, _)| *path == pin_path)
+        .unwrap_or_else(|| panic!("{pin_path} is not listed in PINNED"))
+        .1;
+    check(pin_path, corpus);
+}
+
 #[test]
 fn go_codeiq_edges_are_where_they_were_pinned() {
-    check(PINNED[0].0, PINNED[0].1);
+    check_pinned("pins/go-codeiq.pins");
 }
 
 #[test]
 fn go_caddy_edges_are_where_they_were_pinned() {
-    check(PINNED[1].0, PINNED[1].1);
+    check_pinned("pins/go-caddy.pins");
 }
 
 #[test]
 fn go_probes_edges_are_where_they_were_pinned() {
-    check(PINNED[2].0, PINNED[2].1);
+    check_pinned("pins/go-probes.pins");
 }
 
 #[test]
 fn java_commons_lang_edges_are_where_they_were_pinned() {
-    check(PINNED[3].0, PINNED[3].1);
+    check_pinned("pins/java-commons-lang.pins");
 }
 
 #[test]
 fn java_gson_edges_are_where_they_were_pinned() {
-    check(PINNED[4].0, PINNED[4].1);
+    check_pinned("pins/java-gson.pins");
+}
+
+#[test]
+fn java_probes_edges_are_where_they_were_pinned() {
+    check_pinned("pins/java-probes.pins");
 }
 
 #[test]
 fn javascript_express_edges_are_where_they_were_pinned() {
-    check(PINNED[5].0, PINNED[5].1);
+    check_pinned("pins/javascript-express.pins");
 }
 
 #[test]
 fn javascript_fastify_edges_are_where_they_were_pinned() {
-    check(PINNED[6].0, PINNED[6].1);
+    check_pinned("pins/javascript-fastify.pins");
+}
+
+#[test]
+fn javascript_probes_edges_are_where_they_were_pinned() {
+    check_pinned("pins/javascript-probes.pins");
 }
 
 #[test]
 fn python_django_edges_are_where_they_were_pinned() {
-    check(PINNED[7].0, PINNED[7].1);
+    check_pinned("pins/python-django.pins");
 }
 
 #[test]
 fn python_flask_edges_are_where_they_were_pinned() {
-    check(PINNED[8].0, PINNED[8].1);
+    check_pinned("pins/python-flask.pins");
+}
+
+#[test]
+fn python_probes_edges_are_where_they_were_pinned() {
+    check_pinned("pins/python-probes.pins");
 }
 
 #[test]
 fn typescript_vue_core_edges_are_where_they_were_pinned() {
-    check(PINNED[9].0, PINNED[9].1);
+    check_pinned("pins/typescript-vue-core.pins");
 }
 
 #[test]
 fn typescript_zod_edges_are_where_they_were_pinned() {
-    check(PINNED[10].0, PINNED[10].1);
+    check_pinned("pins/typescript-zod.pins");
+}
+
+#[test]
+fn typescript_probes_edges_are_where_they_were_pinned() {
+    check_pinned("pins/typescript-probes.pins");
 }

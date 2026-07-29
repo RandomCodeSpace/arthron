@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/javascript/express --pins pins/javascript-express.pins --write --commit 6cf0662
+#   arthron pin corpus/javascript/express --pins pins/javascript-express.pins --write --commit 48257b7
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -38,7 +38,7 @@
 # rather than read.
 format = 1
 corpus = "corpus/javascript/express"
-commit = "6cf0662"
+commit = "48257b7"
 targets = 341
 rows = 496
 
