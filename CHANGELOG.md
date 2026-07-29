@@ -9,7 +9,7 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
-## [Unreleased]
+## [0.0.2] - 2026-07-29
 
 ### Added
 
@@ -822,5 +822,6 @@ and `arthron mcp` answer questions about the result.
 - Name reservation on crates.io. No engine, no commands — the crate existed so
   that the name would be available when there was something to publish under it.
 
-[Unreleased]: https://github.com/RandomCodeSpace/arthron/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/RandomCodeSpace/arthron/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/RandomCodeSpace/arthron/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/RandomCodeSpace/arthron/releases/tag/v0.0.1

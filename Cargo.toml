@@ -1,6 +1,6 @@
 [package]
 name = "arthron"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Local-first code intelligence. One resolver links cross-file references into a verified graph and records every reference it cannot link, with a reason, instead of dropping it."
