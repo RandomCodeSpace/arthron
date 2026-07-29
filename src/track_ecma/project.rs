@@ -144,6 +144,28 @@ pub struct TsProject {
     /// `compilerOptions.paths`, each pattern with its substitutions made
     /// repo-relative, in declaration order.
     pub paths: Vec<(String, Vec<String>)>,
+    /// `compilerOptions.customConditions`: conditions this project adds to
+    /// the set NODE `PACKAGE_TARGET_RESOLVE` is given, on top of the ones the
+    /// module kind and dialect decide.
+    ///
+    /// A monorepo that publishes built artefacts uses one of these to point
+    /// its own compilation at the sources instead — `"@zod/source"` ahead of
+    /// `"types"` in the same `exports` entry. Ignoring it makes every
+    /// intra-repository import take the published branch, which names a file
+    /// no scan of the sources can see, and every name reached through that
+    /// import misses with it.
+    ///
+    /// Order is recorded but does not decide anything: NODE matches
+    /// conditions in the *map's* key order and consults this only for
+    /// membership.
+    pub custom_conditions: Vec<String>,
+    /// `compilerOptions.types`: the ambient type packages this project puts
+    /// in scope without an import.
+    ///
+    /// Read for [`EcmaConfig::declares_ambient`] and nothing else. Distinct
+    /// from [`PackageScope::types`], which is one package's declaration entry
+    /// point.
+    pub ambient_types: Vec<String>,
 }
 
 /// Everything the EcmaScript resolver learned about the project's layout.
@@ -208,6 +230,28 @@ impl EcmaConfig {
             .iter()
             .filter(|s| dir_contains(&s.dir, dir))
             .any(|s| s.dependencies.contains(package))
+    }
+
+    /// Whether an ambient environment's package is present for a file.
+    ///
+    /// Two channels, because a project states the fact in two places and
+    /// either one is the project saying it. `package.json` is the general
+    /// one; `tsconfig.json`'s `compilerOptions.types` is TypeScript's own,
+    /// and it is what a vendored workspace member has when its manifest
+    /// declares no dependencies at all.
+    ///
+    /// Deliberately not a check that the package is *installed*: nothing under
+    /// `node_modules` is indexed, and a manifest that names a dependency is
+    /// the strongest statement about the project this scan can read.
+    pub fn declares_ambient(&self, rel_path: &str, package: &str) -> bool {
+        if self.is_declared_dependency(rel_path, package) {
+            return true;
+        }
+        // TypeScript writes `@types/mocha` into `types` as `mocha`, so the
+        // bare name is compared against both spellings the table can carry.
+        let bare = package.strip_prefix("@types/").unwrap_or(package);
+        self.ts_for(rel_path)
+            .is_some_and(|p| p.ambient_types.iter().any(|t| t == package || t == bare))
     }
 
     /// The workspace package a bare specifier's package name refers to, when
@@ -387,6 +431,8 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
     let dir = parent_dir(rel).to_string();
     let mut base_url: Option<String> = None;
     let mut paths: Vec<(String, Vec<String>)> = Vec::new();
+    let mut custom_conditions: Vec<String> = Vec::new();
+    let mut ambient_types: Vec<String> = Vec::new();
 
     // Nearest config first: a value set by the child wins over the base it
     // extends, which is what `extends` means.
@@ -426,6 +472,19 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
                 }
             }
         }
+        // Nearest-wins, exactly as `paths` above: a child that states either
+        // option replaces the base's rather than adding to it, which is what
+        // `extends` means for a `compilerOptions` key.
+        if custom_conditions.is_empty()
+            && let Some(list) = options.and_then(|o| o.get("customConditions"))
+        {
+            custom_conditions = strings(list);
+        }
+        if ambient_types.is_empty()
+            && let Some(list) = options.and_then(|o| o.get("types"))
+        {
+            ambient_types = strings(list);
+        }
         let Some(extends) = value.get("extends").and_then(Json::as_str) else {
             break;
         };
@@ -457,7 +516,18 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
         dir,
         base_url,
         paths,
+        custom_conditions,
+        ambient_types,
     }
+}
+
+/// A `compilerOptions` array of strings, with anything else in it dropped.
+fn strings(list: &Json) -> Vec<String> {
+    list.items()
+        .iter()
+        .filter_map(Json::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 /// A fingerprint of everything the manifests decide.
@@ -495,11 +565,24 @@ fn digest_of(scopes: &[PackageScope], ts: &[TsProject]) -> Vec<u8> {
     for p in ts {
         field(p.dir.as_bytes());
         field(p.base_url.as_deref().unwrap_or("").as_bytes());
+        field(&(p.paths.len() as u64).to_le_bytes());
         for (pattern, subs) in &p.paths {
             field(pattern.as_bytes());
             for sub in subs {
                 field(sub.as_bytes());
             }
+        }
+        // Both decide resolution, so both belong in the fence: editing a
+        // `customConditions` entry re-points every conditional import in the
+        // project, and a store built before the edit would answer with the
+        // old targets until an unrelated file happened to change.
+        field(&(p.custom_conditions.len() as u64).to_le_bytes());
+        for c in &p.custom_conditions {
+            field(c.as_bytes());
+        }
+        field(&(p.ambient_types.len() as u64).to_le_bytes());
+        for t in &p.ambient_types {
+            field(t.as_bytes());
         }
     }
     hasher.finalize().as_bytes().to_vec()

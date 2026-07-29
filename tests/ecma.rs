@@ -873,3 +873,311 @@ fn a_shadowed_require_stays_in_the_denominator() {
     );
     assert_eq!(row(&table, "b.js", "fs", "b.js"), "external node:fs");
 }
+
+#[test]
+fn a_test_runners_injected_globals_name_the_package_that_injects_them() {
+    // The universe scope was under-modelled: a name a *package* puts in the
+    // global scope reached step 3, found nothing, and reported
+    // `NoMatchingDefinition` — a reason whose contract says the lookup table
+    // was complete and the name absent, which for mocha's `describe` is
+    // false on both halves. `UnknownPackage` is what this resolver already
+    // reports for the same definition when the import is written down
+    // (`import { it } from 'mocha'`), and the injected form must not
+    // disagree with the imported one about where the definition lives.
+    //
+    // Still `Unresolved`, so the reference stays in both terms of the rate:
+    // re-filing it as `External` would raise the gate without linking
+    // anything.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"suite","devDependencies":{"mocha":"^10"}}"#,
+    );
+    write(
+        root,
+        "test/app.test.js",
+        "describe('app', function () {\n  before(function () {});\n  it('works', function () {});\n  after(function () {});\n});\n",
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    for name in ["describe", "it", "before", "after"] {
+        let found = outcomes(&table, "test/app.test.js", name, "test/app.test.js");
+        assert_eq!(
+            found,
+            ["unresolved UnknownPackage"],
+            "{name} is mocha's, not this repository's missing definition",
+        );
+    }
+}
+
+#[test]
+fn an_ambient_environment_is_off_until_its_package_is_declared() {
+    // The model is an *environment*, not a list of common words. A repository
+    // that declares no test runner has nothing injecting `describe`, so the
+    // honest answer there is the one the reason's own contract describes:
+    // the table was complete and the name is absent.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"plain"}"#);
+    write(root, "app.js", "describe('x', function () {});\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "app.js", "describe", "app.js"),
+        "unresolved NoMatchingDefinition",
+    );
+}
+
+#[test]
+fn a_declaration_of_an_injected_name_wins_over_the_ambient_environment() {
+    // The universe scope is consulted last, and the package-injected half of
+    // it is consulted after the host half. A repository that declares its own
+    // `it` gets its own `it`, whatever it happens to depend on.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"own","devDependencies":{"vitest":"^2"}}"#,
+    );
+    write(
+        root,
+        "app.js",
+        "export function expect(x) { return x; }\nexport function use() { return expect(1); }\n",
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "app.js", "expect", "app.js#value:use"),
+        "resolved app.js#value:expect",
+    );
+}
+
+#[test]
+fn a_typescript_project_may_turn_an_environment_on_without_a_dependency() {
+    // A vendored workspace member carries its own `package.json` with no
+    // dependencies at all, and states its ambient packages the way TypeScript
+    // states them: `compilerOptions.types`. That is the same fact through the
+    // other documented channel, so it turns the same environment on.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"member"}"#);
+    write(
+        root,
+        "tsconfig.json",
+        r#"{"compilerOptions":{"types":["vitest"]}}"#,
+    );
+    write(root, "app.test.ts", "test('x', () => { expect(1) })\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    for name in ["test", "expect"] {
+        assert_eq!(
+            row(&table, "app.test.ts", name, "app.test.ts"),
+            "unresolved UnknownPackage",
+            "{name}",
+        );
+    }
+}
+
+#[test]
+fn a_member_of_an_injected_global_names_the_same_package() {
+    // The host half of the universe scope already lets the *head* decide:
+    // `console.log` is `External("web:global")`, not a type question. The
+    // package half sits in the same position and answers the same way — a
+    // member reached through `vi` is in vitest, and calling it
+    // `NeedsTypeInference` would put a package boundary in the type-gap
+    // bucket.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"members","devDependencies":{"vitest":"^2"}}"#,
+    );
+    write(root, "app.test.js", "vi.fn();\nconsole.log(1);\n");
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "app.test.js", "vi.fn", "app.test.js"),
+        "unresolved UnknownPackage",
+    );
+    assert_eq!(
+        row(&table, "app.test.js", "console.log", "app.test.js"),
+        "external web:global",
+    );
+}
+
+#[test]
+fn a_custom_condition_the_tsconfig_states_is_supplied_to_the_exports_walk() {
+    // The largest single driver of zod's rate: a monorepo publishes its
+    // sources under a private condition and points its own `tsconfig` at it,
+    // so every intra-repository import resolves to a `.ts` file that is right
+    // there. Hardcoding the condition list made the same import take the
+    // `"types"` branch instead, which names a built artefact no scan of the
+    // sources can see — one missing module, and every name reached through it
+    // misses with it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"root"}"#);
+    write(
+        root,
+        "packages/lib/package.json",
+        // zod's shape exactly: the source branch first, then the branches
+        // that name built artefacts beside the manifest — files a scan of the
+        // sources will not find, which is why the miss is `ModuleNotFound`
+        // rather than a package boundary.
+        r#"{"name":"lib","exports":{".":{"@lib/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js"}}}"#,
+    );
+    write(
+        root,
+        "packages/lib/src/index.ts",
+        "export function fromSource(): number { return 1 }\n",
+    );
+    write(
+        root,
+        "packages/app/tsconfig.json",
+        r#"{"compilerOptions":{"customConditions":["@lib/source"]}}"#,
+    );
+    write(
+        root,
+        "packages/app/use.ts",
+        "import { fromSource } from 'lib';\nexport function go(): number { return fromSource() }\n",
+    );
+    // The same import, from a directory whose tsconfig says nothing.
+    write(
+        root,
+        "packages/plain/use.ts",
+        "import { fromSource } from 'lib';\nexport function go(): number { return fromSource() }\n",
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "packages/app/use.ts", "lib", "packages/app/use.ts"),
+        "resolved packages/lib/src/index.ts",
+    );
+    assert_eq!(
+        row(
+            &table,
+            "packages/app/use.ts",
+            "fromSource",
+            "packages/app/use.ts#value:go"
+        ),
+        "resolved packages/lib/src/index.ts#value:fromSource",
+    );
+    // Without the option the `"types"` branch still wins, and it names a
+    // built file this scan cannot see. The miss is `ModuleNotFound`, not a
+    // silent fallback to the source.
+    assert_eq!(
+        row(
+            &table,
+            "packages/plain/use.ts",
+            "lib",
+            "packages/plain/use.ts"
+        ),
+        "unresolved ModuleNotFound",
+    );
+}
+
+#[test]
+fn a_custom_condition_reaches_the_imports_map_too() {
+    // `#`-prefixed specifiers go through the same NODE algorithm and the same
+    // condition set. One condition list, both maps.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r##"{"name":"app","imports":{"#dep":{"@app/source":"./src/dep.ts","default":"./dist/dep.js"}}}"##,
+    );
+    write(root, "src/dep.ts", "export const dep = 1;\n");
+    write(
+        root,
+        "tsconfig.json",
+        r#"{"compilerOptions":{"customConditions":["@app/source"]}}"#,
+    );
+    write(
+        root,
+        "src/use.ts",
+        "import { dep } from '#dep';\nexport const used = dep;\n",
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let table = rows(&db);
+
+    assert_eq!(
+        row(&table, "src/use.ts", "#dep", "src/use.ts"),
+        "resolved src/dep.ts",
+    );
+}
+
+#[test]
+fn a_mixed_tree_measures_the_same_on_a_cold_store_and_a_warm_one() {
+    // The two passes share one store and one identity space, and the wake set
+    // each pass computes is filtered to the files that pass owns. So a
+    // JavaScript row that probed an identity the TypeScript pass then
+    // declared was invalidated and could not be re-resolved inside that scan:
+    // its currency claim was left withdrawn, the *next* scan re-read it, and
+    // the JavaScript rate went up with nothing in the tree having changed.
+    //
+    // A rate that depends on how many times it has been measured is not a
+    // measurement. The scan converges before it returns.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"root"}"#);
+    write(
+        root,
+        "packages/lib/package.json",
+        r#"{"name":"lib","main":"./src/index.ts"}"#,
+    );
+    write(
+        root,
+        "packages/lib/src/index.ts",
+        "export function fromTs(): number { return 1 }\n",
+    );
+    write(
+        root,
+        "app/a.js",
+        "const { fromTs } = require('lib');\nfunction useIt() { return fromTs() }\nmodule.exports = { useIt };\n",
+    );
+    let db = root.join("graph.redb");
+    let cold = scan_ecma(root, &db).expect("cold scan");
+    let cold_rows = rows(&db);
+    let warm = scan_ecma(root, &db).expect("warm scan");
+    let warm_rows = rows(&db);
+
+    assert_eq!(
+        cold_rows, warm_rows,
+        "the same tree resolved to two different graphs",
+    );
+    let js = Lang::JavaScript.code();
+    assert_eq!(
+        (
+            cold.per_lang[&js].resolved,
+            cold.per_lang[&js].unresolved_total()
+        ),
+        (
+            warm.per_lang[&js].resolved,
+            warm.per_lang[&js].unresolved_total()
+        ),
+        "the JavaScript rate moved between two scans of one tree",
+    );
+    assert_eq!(
+        row(&cold_rows, "app/a.js", "lib", "app/a.js"),
+        "resolved packages/lib/src/index.ts",
+        "the cold scan is the one that has to be right",
+    );
+}

@@ -13,6 +13,77 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Changed
 
+- **The EcmaScript universe scope has a second half, and it un-pollutes
+  `NoMatchingDefinition`.** That reason's contract says the reference was
+  understood, the lookup table was complete, and the name is absent — "in a
+  corpus that compiles this should mean *our* bug, and should sit near zero."
+  Both halves were false. All 1,728 occurrences on express were five names —
+  `it` 1,111, `describe` 554, `before` 59, `after` 3, `XMLHttpRequest` 1 — and
+  13,833 of vue-core's 15,276 were six more. They are what a test runner puts
+  in the global scope of the files it runs, reaching the file with no import
+  because the runner injects them.
+
+  The universe scope now models both provenances. The *host*'s half is
+  unchanged: a name ECMA-262, Node or the web platform declares is `External`,
+  because the thing on the other end genuinely exists. The new half is a
+  **package**'s: a name a declared dependency injects is
+  `Unresolved(UnknownPackage)`, which is the answer this resolver already gave
+  the same definition whenever the import was written down — zod's
+  `import { expect } from "vitest"` reports `UnknownPackage` today, and the
+  injected form naming the same definition in the same unindexed package must
+  not disagree with it. Six environments are recognised (mocha, jasmine, jest,
+  vitest, cypress, qunit), each by its *documented* global set in full rather
+  than by the subset that looked unlikely to collide: what makes `it` mocha's
+  is not its spelling but the project declaring mocha, checked per file against
+  `package.json` and `tsconfig.json`'s `compilerOptions.types`. A repository
+  that declares no runner still gets `NoMatchingDefinition` for `describe`, and
+  any declaration or import of the name wins, because the universe scope is
+  consulted last.
+
+  **No rate moves and nothing is reclassified into `External`,** which is the
+  point: `UnknownPackage` is `Unresolved`, so every one of these references
+  stays in both terms. express `NoMatchingDefinition` 1,728 → 0 with the rate
+  at 28.99% before and after; vue-core 15,276 → 1,443 with the rate at 48.48%
+  before and after (13,833 from `NoMatchingDefinition` and 785 from
+  `NeedsTypeInference`, the latter being `vi.fn` and `expect.any`, where the
+  head decides exactly as it already does for `console.log`). fastify does not
+  move at all — it injects nothing. The one external that did move is
+  `XMLHttpRequest`, absent from the host list while `WebSocket`,
+  `AbortController` and `fetch` were all in it: express `external` 701 → 702,
+  the same shape of omission as `Error`'s and worth one row.
+
+- **TypeScript's `compilerOptions.customConditions` is read, and it is the
+  largest single miss on zod.** The condition set handed to NODE
+  `PACKAGE_TARGET_RESOLVE` was hardcoded per dialect and module kind, so a
+  monorepo that publishes built artefacts and points its own compilation at the
+  sources instead — `"@zod/source"` written ahead of `"types"` in the same
+  `exports` entry, and named in `packages/zod/tsconfig.json` — took the
+  `"types"` branch. That branch names an `index.d.cts` beside the manifest that
+  no scan of the sources can see, so every self-import missed, and every name
+  reached through one missed with it. The option is now read (flattened through
+  `extends`, folded into the config fence) and added to the set for the nearest
+  TypeScript project, for both `exports` and `imports` maps. It is a *set*, not
+  a priority list: NODE matches conditions in the map's own key order, so a
+  custom condition can only make a branch reachable that was unreachable, and
+  which branch wins stays the package author's decision.
+
+  zod: `ModuleNotFound` 7,822 → 1, `resolved` 10,043 → 17,080, rate 27.24% →
+  **46.33%** (+19.09 points), every one of the 7,037 new edges landing in
+  `packages/zod/src/`. `NoMatchingDefinition` 524 → 1,123 and
+  `NeedsTypeInference` 1,576 → 1,761 in the same movement, and neither is a new
+  miss: a module that could not be found gave every name reached through it one
+  answer, and a module that *is* found gives each of them its own — including,
+  for a namespace re-exported by name, an honest miss this resolver does not
+  yet follow. No other corpus states a `customConditions` and none of the other
+  three moved a row.
+
+  **Every changed row on all four corpora was joined whole-row against the
+  previous scan.** The row-key set is byte-identical — nothing added, nothing
+  removed — and **no reference that already resolved changed its target or its
+  outcome**, on any corpus. The 2,194 rows that changed on zod all came out of
+  `ModuleNotFound`, the 187 on express and 800 on vue-core all out of the
+  ambient class above, and fastify changed nothing.
+
 - **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
   deliberate re-base of seven baselines.** The ratified rule is that a
   reference whose root is a parameter or a local variable names a thing that is
@@ -90,6 +161,28 @@ Decisions and their rationale — including what was rejected — live in
   almost nothing this way: django 0 and flask 7.
 
 ### Fixed
+
+- **A mixed `.js`/`.ts` tree reported a higher JavaScript rate the second time
+  it was scanned.** The track runs two passes over one store, and the wake set
+  each computes is filtered to the files that pass owns. So when the TypeScript
+  pass declared an identity a JavaScript row had already probed and missed — a
+  workspace member whose entry point is a `.ts` file is the shape that does it
+  — applying it withdrew that file's currency claim and no pass in that scan
+  could give it back. The scan ended with the claim outstanding, the *next*
+  scan re-read exactly those files, and they resolved against a store that by
+  then held the TypeScript definitions. On a two-package fixture the JavaScript
+  rate is 0% cold and 100% warm, for a tree nobody touched. A rate that depends
+  on how many times it has been measured is not a measurement, and the cold
+  number is the one every baseline is taken from. The track now runs JavaScript
+  once more to converge; that pass's changed set is exactly the files whose
+  claims are outstanding, which is empty in the ordinary case, and it
+  terminates because a module's identity here is its path. Measured cost, best
+  of three interleaved cold runs: express +0.03 s, fastify +0.01 s, vue-core
+  +0.09 s, zod within noise. The returned report's `file_errors` are now the
+  union of all three passes' rather than the last one's — a tally is
+  whole-store, but a file error belongs to the pass that tried to read the
+  file. None of the four gated corpora is mixed, so no committed number moves;
+  the fixture is the gate.
 
 - **Two Go definition defects the new type-use surface exposed.** `def-type`
   read only `type_spec`, so a package-level `type X = Y` declared no node —
