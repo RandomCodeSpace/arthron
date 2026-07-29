@@ -820,7 +820,7 @@ fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -888,7 +888,11 @@ fn readme_rows() -> Vec<ReadmeRow> {
             unresolved,
             // `**69.5%**`, or `**100.0%** †` where the dagger marks a
             // synthetic corpus and is not part of the number.
-            rate: cells[6].replace("**", "").replace('†', "").trim().to_string(),
+            rate: cells[6]
+                .replace("**", "")
+                .replace('†', "")
+                .trim()
+                .to_string(),
             share: cells[7].to_string(),
         });
     }
