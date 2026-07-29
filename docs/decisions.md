@@ -70,8 +70,8 @@ makes.
 | `shrink_to_fit` the extractor's two vectors | 778,328 kB | 70.57 s | 148.5% |
 | **and stop holding the references** | **286,872 kB** | **109.62 s** | **54.7%** |
 
-The last row is the worst of seven runs of the shipped build, which spanned
-285,124–286,872 kB and 106.56–109.62 s; a single run is not a peak. The first
+The last row is the worst of nine runs of the shipped build, which spanned
+284,612–286,872 kB and 106.47–109.62 s; a single run is not a peak. The first
 row reproduces at 832,468 kB / 69.54 s on a re-measurement of the same commit.
 
 **286,872 kB — 54.7% of the 524,288 kB ceiling, and below the 376,092 kB that
@@ -153,7 +153,7 @@ declarations it keeps and nothing else, and `reread` shrinks the references it
 hands out, because those live until the phase that asked for them is done.
 Neither placement is visible in the total: removing the references' shrink
 entirely measured 278,444–286,660 kB over three runs on the 5.35M-line tree
-against 285,124–286,872 kB over seven with it — overlapping ranges, and the
+against 284,612–286,872 kB over nine with it — overlapping ranges, and the
 widest single-run excursion in either direction (8,216 kB) is larger than the
 difference between them.
 

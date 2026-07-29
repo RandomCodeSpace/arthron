@@ -130,8 +130,8 @@ Decisions and their rationale — including what was rejected — live in
   | `shrink_to_fit` on the extractor's vectors | 778,328 kB | 70.57 s | 148.5% |
   | **and no retained references** | **286,872 kB** | **109.62 s** | **54.7%** |
 
-  The last row is the worst of seven runs of the shipped build, which spanned
-  285,124–286,872 kB and 106.56–109.62 s; the first is reproduced at
+  The last row is the worst of nine runs of the shipped build, which spanned
+  284,612–286,872 kB and 106.47–109.62 s; the first is reproduced at
   832,468 kB / 69.54 s on a re-measurement of the same commit.
 
   Re-extraction cannot change a resolution, and the signature is the

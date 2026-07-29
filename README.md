@@ -410,8 +410,8 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 
 | Budget | Target | Measured |
 |---|---|---|
-| Peak RSS | **< 512 MB (hard)** | 280.2 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling, worst of seven runs spanning 1,748 kB |
-| Cold index throughput | < 60 s / 1M lines | 20.5 s / 1M lines on the same scan, seven runs spanning 19.9–20.5 — but **70.1 s / 1M on TypeScript**, a miss, measured below |
+| Peak RSS | **< 512 MB (hard)** | 280.2 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling, worst of nine runs spanning 2,260 kB |
+| Cold index throughput | < 60 s / 1M lines | 20.5 s / 1M lines on the same scan, worst of nine runs spanning 19.9–20.5 — but **70.1 s / 1M on TypeScript**, a miss, measured below |
 | Warm re-index, unchanged tree | < 1 s | 12.37 s re-scanning that same tree, unchanged — a miss by 12×, recorded as a finding rather than hidden |
 
 The RSS percentage and the ceiling are read in the same binary units: 280.2 of
