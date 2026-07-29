@@ -18,7 +18,7 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Twenty-five cold scans of real repositories. Generous, but bounded: a hung
+    # Twenty-nine cold scans. Generous, but bounded: a hung
     # scan must not sit on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
@@ -86,11 +86,17 @@ jobs:
       - name: Gate java / gson
         run: ./target/release/arthron gate corpus/java/gson --language java --baseline baselines/java-gson.toml
 
+      - name: Gate java / probes
+        run: ./target/release/arthron gate corpus/java/probes --language java --baseline baselines/java-probes.toml
+
       - name: Gate javascript / fastify
         run: ./target/release/arthron gate corpus/javascript/fastify --language javascript --baseline baselines/javascript-fastify.toml
 
       - name: Gate javascript / express
         run: ./target/release/arthron gate corpus/javascript/express --language javascript --baseline baselines/javascript-express.toml
+
+      - name: Gate javascript / probes
+        run: ./target/release/arthron gate corpus/javascript/probes --language javascript --baseline baselines/javascript-probes.toml
 
       - name: Gate typescript / vue-core
         run: ./target/release/arthron gate corpus/typescript/vue-core --language typescript --baseline baselines/typescript-vue-core.toml
@@ -98,11 +104,17 @@ jobs:
       - name: Gate typescript / zod
         run: ./target/release/arthron gate corpus/typescript/zod --language typescript --baseline baselines/typescript-zod.toml
 
+      - name: Gate typescript / probes
+        run: ./target/release/arthron gate corpus/typescript/probes --language typescript --baseline baselines/typescript-probes.toml
+
       - name: Gate python / django
         run: ./target/release/arthron gate corpus/python/django --language python --baseline baselines/python-django.toml
 
       - name: Gate python / flask
         run: ./target/release/arthron gate corpus/python/flask --language python --baseline baselines/python-flask.toml
+
+      - name: Gate python / probes
+        run: ./target/release/arthron gate corpus/python/probes --language python --baseline baselines/python-probes.toml
 
       - name: Gate rust / ripgrep
         run: ./target/release/arthron gate corpus/rust/ripgrep --language rust --baseline baselines/rust-ripgrep.toml

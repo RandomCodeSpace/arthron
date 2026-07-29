@@ -16,11 +16,20 @@ use arthron::track_python::lang::PyLang;
 
 mod support;
 
-/// The `.py` files under `corpus/python`: django's 899 and flask's 65.
-const FILES: u64 = 964;
+/// The `.py` files under `corpus/python`: django's 899, flask's 65 and the
+/// probe corpus's 3.
+///
+/// Moved from 964 when `corpus/python/probes` was added. The delta is
+/// measured, not assumed: extracting that tree alone yields **3 files, 8
+/// references** and the definitions `{Function 3, Method 2, Type 2, Var 1,
+/// Module 3, Alias 1}`, which is every number below minus its former value.
+/// A census that moves without an attribution like this one is a defect, not
+/// a new baseline.
+const FILES: u64 = 967;
 
-/// Every reference the extractor emits over them.
-const REFERENCES: u64 = 53_544;
+/// Every reference the extractor emits over them. Was 53_544; the probe
+/// corpus contributes 8.
+const REFERENCES: u64 = 53_552;
 
 /// Every definition it emits, by kind — django and flask together, because
 /// the extractor is one piece of code reading both.
@@ -29,15 +38,19 @@ const REFERENCES: u64 = 53_544;
 /// pin each tree on its own and pin the store beside it; this pins the
 /// extractor's own answer over the union, which is the number that moves
 /// first when a rule stops matching. `Module` is one per file.
+///
+/// The trailing comment on each row is the probe corpus's contribution, so
+/// the previous value is recoverable by subtraction and the movement stays
+/// attributable to the commit that caused it.
 const DEFS: &[(DefKind, u64)] = &[
-    (DefKind::Function, 1699),
-    (DefKind::Method, 7498),
-    (DefKind::Type, 2020),
-    (DefKind::Var, 2281),
+    (DefKind::Function, 1702), // +3: the three module-level probe functions
+    (DefKind::Method, 7500),   // +2: `Greeter.greet` and `Loud.shout`
+    (DefKind::Type, 2022),     // +2: `Greeter` and `Loud`
+    (DefKind::Var, 2282),      // +1: the module global `SHARED`
     (DefKind::Field, 6186),
     (DefKind::Property, 800),
-    (DefKind::Module, 964),
-    (DefKind::Alias, 6520),
+    (DefKind::Module, 967), // +3: one per probe file
+    (DefKind::Alias, 6521), // +1: the `Greeter` the probe imports
 ];
 
 #[test]
