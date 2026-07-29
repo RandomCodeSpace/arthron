@@ -75,3 +75,45 @@ id: ref-type
 language: go
 rule:
   kind: type_identifier
+---
+# Every selector that is *read* rather than called: `pkg.Name`, `t.field`,
+# `x.y`, `T.Method`. `ref-call` already owns the selector standing in a call's
+# callee position, so this rule matches the same node kind and `extract_go.rs`
+# drops that one — one site, one row, whichever of the two saw it first.
+#
+# Only the *outermost* selector of a chain is a reference: `a.b.c` is one
+# reference to `c` through `a.b`, and matching the inner `a.b` too would report
+# a second reference to a member nobody named on its own. Which node that is
+# needs the parent, so it is decided in Rust.
+#
+# A *type* written `pkg.T` is a `qualified_type` and not a selector, so this
+# rule and `ref-type` cannot see the same site.
+#
+# Go writes a method value (`t.M` passed as a func) exactly as it writes a
+# field read, and the grammar does not separate them, so both are
+# `FieldAccess`. Java can split `MethodRef` out because `::` is its own syntax;
+# here a split would be arthron guessing which of the two a name is.
+id: ref-select
+language: go
+rule:
+  kind: selector_expression
+---
+# A composite literal's keys: the `Field` in `T{Field: v}`.
+#
+# Only a *struct* literal's key names a member. A map literal's key is an
+# expression that is evaluated (`map[K]V{k: v}`), and an array literal's is an
+# index — neither names a field, and this track emits no reference for a bare
+# identifier read, so neither becomes a row. The difference is the literal's
+# stated type, which is on the `composite_literal` above the key and therefore
+# read in Rust.
+#
+# The type may be stated one level out: `[]T{{Field: v}}` and
+# `map[string]T{"k": {Field: v}}` write it on the container and elide it on the
+# element. `extract_go.rs` follows that outwards; an *anonymous* struct type
+# (`[]struct{ n int }{{n: 1}}`) has no canonical name, so it is not a node and
+# neither are its fields — there is nothing for a key to name and no row is
+# emitted.
+id: ref-litkey
+language: go
+rule:
+  kind: keyed_element

@@ -9,7 +9,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::extract_go::GoHeader;
-use crate::lang::{FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe};
+use crate::lang::{
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+};
 use crate::model::{
     DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, Reference, TargetRoot, node_id,
 };
@@ -464,6 +466,107 @@ impl GoResolver {
         }
     }
 
+    /// Classify a field access: `pkg.Name`, `t.field`, `T.Method`, and the
+    /// `Field` in `T{Field: v}`.
+    ///
+    /// A call and a read share every shape but one, so this shares
+    /// [`Self::resolve_call`]'s answers wherever the shape is the same: an
+    /// import qualifier is read from the import table, a receiver root goes to
+    /// [`Self::resolve_receiver`], and a root bound by an enclosing block never
+    /// reaches here at all.
+    ///
+    /// What it adds is the shape a call does not have: a member named on an
+    /// owner that is *written at the site*. `T.Method` is Go's method
+    /// expression, `T{Field: v}` states its own type, and `pkg.T{Field: v}`
+    /// states it through an import — in all three the owner is a type name,
+    /// not a value whose type has to be inferred. So the member is probed
+    /// under that owner, and only a miss needs a reason.
+    ///
+    /// The reason on a miss is decided by *what the owner is*, which the graph
+    /// already knows: an owner that is a type in this repository makes the
+    /// miss [`UnresolvedReason::NeedsReceiverType`] — the declared type is
+    /// known and the member is not indexed, exactly as for a receiver, because
+    /// this track indexes neither Go embedding nor struct fields. An owner
+    /// that is anything else — a package-level `var`, a name this build has
+    /// never seen — leaves the site's type genuinely unstated, which is
+    /// [`UnresolvedReason::NeedsTypeInference`].
+    ///
+    /// Deliberately not applied to a `Call`. `T.Method(x)` is the same shape
+    /// in callee position and would resolve the same way, but every such row
+    /// already exists with an answer, and moving one is a change to a measured
+    /// number that this piece of work is not making. It is its own change,
+    /// with its own attribution.
+    pub fn resolve_field(
+        &self,
+        cfg: &GoModule,
+        r: &Reference,
+        scope: &FileScope,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        let unresolved = |reason| Resolution {
+            outcome: Outcome::Unresolved(reason),
+            candidates: vec![],
+        };
+        if matches!(r.target.root, TargetRoot::This { .. }) {
+            return self.resolve_receiver(scope, r, probe);
+        }
+        if r.target.root != TargetRoot::Name {
+            // `f().x`, `m[k].x`. No name is written, so no lookup was even
+            // attempted — and that is a different fact from a name whose type
+            // is unstated, which is why the taxonomy carries both.
+            return unresolved(UnresolvedReason::NeedsExpressionType);
+        }
+        // Split the path into the package it is rooted in, the owner, and the
+        // member. Only an import can supply a package here: a bare `a.b` is
+        // rooted in this file's own package.
+        let (pkg, owner, member) = match r.target.segments.as_slice() {
+            [owner, member] => (scope.pkg_path.clone(), owner, member),
+            [qualifier, owner, member] => match scope.imports.get(qualifier) {
+                Some(path) if self.is_internal(cfg, path) => (path.clone(), owner, member),
+                Some(path) => {
+                    return Resolution {
+                        outcome: Outcome::External(path.clone()),
+                        candidates: vec![],
+                    };
+                }
+                // `a.b.c` where `a` is a package-level value: its type is not
+                // stated at the site.
+                None => return unresolved(UnresolvedReason::NeedsTypeInference),
+            },
+            // A bare name, or a chain longer than one owner and one member.
+            _ => return unresolved(UnresolvedReason::NeedsTypeInference),
+        };
+        // A two-segment path may still be `pkg.Name` — a package member read
+        // through an import — which is the same lookup a call makes and must
+        // give the same answer.
+        if r.target.segments.len() == 2 && scope.imports.contains_key(owner) {
+            return self.resolve_call(cfg, r, scope, probe);
+        }
+        let id = node_id(Domain::Go, &format!("{pkg}#{owner}.{member}"));
+        let mut candidates = vec![id];
+        if probe.probe(&id).is_some() {
+            return Resolution {
+                outcome: Outcome::Resolved(id),
+                candidates,
+            };
+        }
+        // The member is not indexed under that owner. Whether that is a gap in
+        // this track or a type nobody stated is decided by the owner itself.
+        let owner_id = node_id(Domain::Go, &format!("{pkg}#{owner}"));
+        candidates.push(owner_id);
+        let reason = match probe.probe(&owner_id) {
+            Some(Entry::Definition {
+                kind: DefKind::Type,
+                ..
+            }) => UnresolvedReason::NeedsReceiverType,
+            _ => UnresolvedReason::NeedsTypeInference,
+        };
+        Resolution {
+            outcome: Outcome::Unresolved(reason),
+            candidates,
+        }
+    }
+
     /// Classify a call reference against a file's scope.
     ///
     /// The dispatch is on `(root, segments.len())`. A name root with one
@@ -535,11 +638,28 @@ impl GoResolver {
                 // uses existed and is a separate piece of work — teaching the
                 // resolver which single-argument calls are conversions —
                 // rather than something this list can fix by growing.
-                let universe = match r.kind {
-                    RefKind::TypeUse => GO_UNIVERSE_TYPES,
-                    _ => GO_BUILTINS,
+                //
+                // A call written with exactly one argument is the third case,
+                // and it is why this is a *list* of lists. Go writes the
+                // conversion `string(b)` exactly as it writes the call `f(b)`,
+                // and the grammar files both as `call_expression`, so the site
+                // arrives here as a `Call` naming a predeclared *type*. It
+                // missed `GO_BUILTINS` and was reported
+                // `NoMatchingDefinition` — the bucket whose contract is that
+                // the lookup table was complete and the name absent. The name
+                // is not absent: it is in the universe block, one list over.
+                // That was 123 rows on `codeiq` and 269 on `caddy`, every one
+                // of them a predeclared type name, and they were the whole of
+                // that bucket on both corpora. A type cannot be called, so a
+                // one-argument call naming one is a conversion and nothing
+                // else; arity is what separates it, and no other arity can
+                // reach a type at all.
+                let universe: &[&[&str]] = match r.kind {
+                    RefKind::TypeUse => &[GO_UNIVERSE_TYPES],
+                    _ if r.argc == Some(1) => &[GO_BUILTINS, GO_UNIVERSE_TYPES],
+                    _ => &[GO_BUILTINS],
                 };
-                let outcome = if universe.contains(&name.as_str()) {
+                let outcome = if universe.iter().any(|list| list.contains(&name.as_str())) {
                     Outcome::External("go:builtin".to_string())
                 } else {
                     Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
@@ -763,6 +883,7 @@ impl Resolver<GoLang> for GoResolver {
         }
         match r.kind {
             RefKind::Import => self.resolve_import(cfg, &r.raw_target, probe),
+            RefKind::FieldAccess => self.resolve_field(cfg, r, scope, probe),
             _ => self.resolve_call(cfg, r, scope, probe),
         }
     }

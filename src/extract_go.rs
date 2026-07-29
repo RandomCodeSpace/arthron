@@ -563,6 +563,133 @@ fn type_use_site<'r>(node: &SgNode<'r>) -> (SgNode<'r>, RefTarget) {
     (node.clone(), target)
 }
 
+/// Whether a `selector_expression` is a *read* site of its own.
+///
+/// Two selectors are not: the one standing in a call's callee position, which
+/// `ref-call` already reports as the call it is, and the one standing as
+/// another selector's operand, because `a.b.c` names `c` once through `a.b`
+/// and reporting the inner `a.b` too would invent a reference to a member
+/// nobody named on its own. That is the same rule Java's `field_access` reads
+/// (N-04): the outermost node of a chain carries the whole path.
+fn is_read_site(node: &SgNode) -> bool {
+    match node.parent() {
+        Some(parent) => match &*parent.kind() {
+            "selector_expression" => parent
+                .field("operand")
+                .is_none_or(|operand| operand.range() != node.range()),
+            "call_expression" => parent
+                .field("function")
+                .is_none_or(|function| function.range() != node.range()),
+            _ => true,
+        },
+        None => true,
+    }
+}
+
+/// Apply the root-binding rule to a target read at `site`.
+///
+/// Only the *root* of the chain can be bound: `x.y.z` with `x` a parameter
+/// names a local however long the member path is, which is why the shape
+/// carries a root rather than a `Local` variant. A receiver root is re-rooted
+/// at [`TargetRoot::This`] instead — Go's spelling of `this.m` — and a *bare*
+/// receiver is the one case that stays local, because naming the receiver
+/// value alone names something no more a node than a parameter is.
+///
+/// One function because a call and a read must not disagree about it: they
+/// are the same question asked at two grammar positions, and Go's own rate is
+/// compared against languages that ask it once.
+fn bind_target(site: &SgNode, target: RefTarget) -> (RefTarget, bool) {
+    match (&target.root, target.segments.first()) {
+        (TargetRoot::Name, Some(root)) => match binder_of(site, root) {
+            Binder::None => (target, false),
+            Binder::Local => (target, true),
+            Binder::Receiver => match receiver_target(target) {
+                Ok(this) => (this, false),
+                Err(bare) => (bare, true),
+            },
+        },
+        _ => (target, false),
+    }
+}
+
+/// Strip the wrappers that stand between a written type and its name.
+///
+/// `*T`, `(T)` and `T[A]` all name `T`; a composite literal's element type is
+/// written with any of them. A `generic_type`'s first named child is its own
+/// head, which is the name — its arguments are separate references that
+/// `ref-type` already reports.
+fn peel_type<'r>(node: &SgNode<'r>) -> SgNode<'r> {
+    match &*node.kind() {
+        "pointer_type" | "parenthesized_type" => node
+            .children()
+            .find(SgNode::is_named)
+            .map_or_else(|| node.clone(), |inner| peel_type(&inner)),
+        "generic_type" => node
+            .children()
+            .find(SgNode::is_named)
+            .unwrap_or_else(|| node.clone()),
+        _ => node.clone(),
+    }
+}
+
+/// The type a `literal_value` is a literal *of*, following elided nesting.
+///
+/// A composite literal states its type once: `T{…}` on the literal itself,
+/// `[]T{{…}}` and `map[string]T{"k": {…}}` on the container, with the element
+/// literal writing no type at all. Go allows the elision at any depth, so this
+/// climbs to the enclosing `literal_value` and takes that container's element
+/// type — the `element` of a slice or array, the `value` of a map. A struct
+/// container has no element type: `struct{ inner T }{inner: {…}}` elides
+/// against a *field's* type, which is a lookup this track cannot do, and
+/// answering `None` there leaves the key unreported rather than attributed to
+/// the wrong type.
+fn literal_type<'r>(literal_value: &SgNode<'r>) -> Option<SgNode<'r>> {
+    let parent = literal_value.parent()?;
+    if parent.kind() == "composite_literal" {
+        return parent.field("type").as_ref().map(peel_type);
+    }
+    let outer = literal_value
+        .ancestors()
+        .find(|a| a.kind() == "literal_value")?;
+    let container = literal_type(&outer)?;
+    let element = match &*container.kind() {
+        "slice_type" | "array_type" | "implicit_length_array_type" => container.field("element"),
+        "map_type" => container.field("value"),
+        _ => None,
+    }?;
+    Some(peel_type(&element))
+}
+
+/// The dotted path of a *named* type node, or `None` when it has no name.
+///
+/// `T` is one segment and `pkg.T` is two — the same shape [`type_use_site`]
+/// gives a written type name, because it is the same path. Everything else —
+/// a map, a slice, an anonymous `struct{…}`, an interface — names no node, so
+/// there is nothing for a member of it to be a member of.
+fn named_type_path(node: &SgNode) -> Option<Vec<String>> {
+    match &*node.kind() {
+        "type_identifier" => Some(vec![node.text().to_string()]),
+        "qualified_type" => {
+            let package = node.field("package")?;
+            let name = node.field("name")?;
+            Some(vec![package.text().to_string(), name.text().to_string()])
+        }
+        _ => None,
+    }
+}
+
+/// The identifier a `keyed_element` writes as its key, when it writes one.
+///
+/// A key is a `literal_element` wrapping one expression. Only a bare
+/// identifier can be a field name; a string, an integer or anything compound
+/// is a map key or an array index, which is an expression rather than a member
+/// name.
+fn key_identifier<'r>(keyed: &SgNode<'r>) -> Option<SgNode<'r>> {
+    let key = keyed.field("key")?;
+    let inner = key.children().find(SgNode::is_named)?;
+    (inner.kind() == "identifier").then_some(inner)
+}
+
 /// The number of arguments at a call site.
 ///
 /// A spread (`f(a, b...)`) counts as one argument: Go does not discriminate
@@ -703,31 +830,14 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                 let Some(function) = node.field("function") else {
                     continue;
                 };
-                let target = call_target(&function);
-                // Only the *root* of the chain can be bound: `x.y.z()` with
-                // `x` a parameter names a local however long the member
-                // path is, which is why the shape carries a root rather
-                // than a `Local` variant.
-                let (target, locally_bound) = match (&target.root, target.segments.first()) {
-                    (TargetRoot::Name, Some(root)) => match binder_of(&node, root) {
-                        Binder::None => (target, false),
-                        Binder::Local => (target, true),
-                        // Go's `this`. `t.M()` is the shape every other
-                        // tier-1 language writes `this.M()` and resolves from
-                        // the declared type, so it carries the same root and
-                        // gets the same treatment — in both terms of the
-                        // rate, never on the `local_binding` line.
-                        //
-                        // A *bare* `t()` is different: a func-typed receiver
-                        // called directly names the receiver value itself,
-                        // which is no more a node than a parameter is.
-                        Binder::Receiver => match receiver_target(target) {
-                            Ok(this) => (this, false),
-                            Err(bare) => (bare, true),
-                        },
-                    },
-                    _ => (target, false),
-                };
+                // Go's `this`. `t.M()` is the shape every other tier-1
+                // language writes `this.M()` and resolves from the declared
+                // type, so it carries the same root and gets the same
+                // treatment — in both terms of the rate, never on the
+                // `local_binding` line. A *bare* `t()` is different: a
+                // func-typed receiver called directly names the receiver value
+                // itself, which is no more a node than a parameter is.
+                let (target, locally_bound) = bind_target(&node, call_target(&function));
                 refs.push(Reference {
                     kind: RefKind::Call,
                     space: DeclSpace::Value,
@@ -771,6 +881,64 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     argc,
                     enclosing: enclosing_definition(&site),
                     span: span_of(&site),
+                });
+            }
+            "ref-select" => {
+                if !is_read_site(&node) {
+                    continue; // a call's callee, or an inner link of a chain
+                }
+                let (target, locally_bound) = bind_target(&node, call_target(&node));
+                refs.push(Reference {
+                    kind: RefKind::FieldAccess,
+                    space: DeclSpace::Value,
+                    raw_target: node.text().to_string(),
+                    target,
+                    locally_bound,
+                    // Not a call site: `None` and `Some(0)` are different
+                    // facts, and a read passes no arguments at all.
+                    argc: None,
+                    enclosing: enclosing_definition(&node),
+                    span: span_of(&node),
+                });
+            }
+            "ref-litkey" => {
+                let Some(key) = key_identifier(&node) else {
+                    continue; // a map key or an array index: an expression
+                };
+                let Some(literal_value) = node.parent().filter(|p| p.kind() == "literal_value")
+                else {
+                    continue;
+                };
+                let Some(mut segments) = literal_type(&literal_value)
+                    .as_ref()
+                    .and_then(named_type_path)
+                else {
+                    continue; // the literal's type names no node
+                };
+                segments.push(key.text().to_string());
+                // The site's own text is `Field`, which two literals of two
+                // different types in one function would share — and a
+                // `RefKey` that cannot separate them would give both one row
+                // and one outcome. So the row carries the target as written,
+                // reassembled from the type the literal states and the key:
+                // `T.Field`, `pkg.T.Field`.
+                let raw_target = segments.join(".");
+                // Only the root can be bound, exactly as at a call or a type
+                // use: a literal of a function-local `type`, or of a type
+                // parameter, names a type that is not a node.
+                let locally_bound = is_locally_bound(&key, &segments[0]);
+                refs.push(Reference {
+                    kind: RefKind::FieldAccess,
+                    space: DeclSpace::Value,
+                    raw_target,
+                    target: RefTarget {
+                        root: TargetRoot::Name,
+                        segments,
+                    },
+                    locally_bound,
+                    argc: None,
+                    enclosing: enclosing_definition(&key),
+                    span: span_of(&key),
                 });
             }
             _ => {}
