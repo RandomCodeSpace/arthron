@@ -4,6 +4,29 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — jemalloc is the non-MSVC global allocator
+
+`tikv-jemallocator` **0.7.0** is pinned exactly for non-MSVC targets and
+installed as the process global allocator. The crate's current docs list 0.7.0
+as the latest release, document the `#[global_allocator]` setup used here, and
+license it under MIT or Apache-2.0. Its normal dependency footprint is
+`libc` plus `tikv-jemalloc-sys`; no non-default allocator features are
+enabled (the crate's default background-thread support remains enabled).
+The MSVC cfg follows the crate's documented setup and keeps the dependency and
+allocator declaration out of that target's build path.
+
+The choice is grounded in the previously recorded kubernetes measurement: the
+existing decision log measured jemalloc at 793,548 kB / 63.6 s versus
+832,740 kB / 70.6 s for the then-current allocator, with byte-identical output.
+This stream does not claim to have re-run that heavyweight measurement; the
+review and gate stages must verify it on the reference 2-vCPU environment.
+
+*Rejected: doing nothing.* The measured RSS and wall reductions recover
+headroom and timing margin for a one-line allocator choice, while the target
+cfg limits the portability risk to platforms where the crate is supported.
+
+---
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and

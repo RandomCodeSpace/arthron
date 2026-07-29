@@ -46,6 +46,9 @@ redb = "=4.1.0"
 serde_json = "1"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "=0.7.0"
+
 [lints.rust]
 missing_docs = "deny"
 

@@ -9,6 +9,16 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Changed
+
+- **Non-MSVC builds use the pinned `tikv-jemallocator` 0.7.0 global
+  allocator.** The allocator is excluded from MSVC builds so the Windows CI
+  target keeps its existing toolchain path. The prior kubernetes measurement
+  recorded in the decision log showed lower RSS and wall time with jemalloc;
+  the stream's review and gate stages must re-run that measurement.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added
