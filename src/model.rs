@@ -229,11 +229,21 @@ impl Lang {
 
     /// The capability tier this language's track reports at.
     ///
-    /// Tier 1 resolves the call graph, so its rate is taken over calls, type
-    /// uses and imports together. Tier 2 extracts definitions, structure and
+    /// Tier 1 emits calls, type uses and imports, so its rate is taken over
+    /// all three together. Tier 2 extracts definitions, structure and
     /// imports and emits no call reference at all, so its rate is an
     /// *import*-resolution rate over a strictly smaller denominator — the
     /// shape ratified in `docs/decisions.md`, 2026-07-27.
+    ///
+    /// Tier 1 is not a claim that the call graph is complete. A call whose
+    /// receiver type the signature states resolves; a call on a value whose
+    /// type has to be inferred does not, and the reasons that need a type
+    /// environment — `NeedsExpressionType`, `NeedsReceiverType`,
+    /// `NeedsTypeInference`, `AmbiguousOverload`, `UnindexedSupertype`,
+    /// `DynamicDispatch` — are together most of what tier 1 leaves
+    /// unresolved. Which of them leads differs by language and by corpus, so
+    /// no single one stands for the gap. The tier says which reference kinds
+    /// are in the denominator, not that every one of them links.
     ///
     /// Both are per-language and neither is ever aggregated, but two rates
     /// printed in one column are read as one measurement unless something
@@ -252,7 +262,7 @@ impl Lang {
     /// the phrase cannot disagree.
     pub fn rate_scope(self) -> &'static str {
         match self.tier() {
-            1 => "call-graph resolution",
+            1 => "call, import and type-use resolution",
             _ => "import resolution",
         }
     }
@@ -953,8 +963,8 @@ mod tests {
     fn the_tier_one_set_is_the_ratified_five_and_every_other_language_is_tier_two() {
         // The tier decides what a rate is a rate *of*, so this list is a
         // capability claim and not a convenience: adding a name here says
-        // that language's track resolves a call graph, and a report reader
-        // will read its number against Go's.
+        // that language's track emits calls and type uses as well as
+        // imports, and a report reader will read its number against Go's.
         let tier_one = [
             Lang::Go,
             Lang::Java,
@@ -968,7 +978,10 @@ mod tests {
         }
         // The phrase a report prints is derived from the number, so a
         // language cannot be labelled one tier and described as the other.
-        assert_eq!(Lang::Go.rate_scope(), "call-graph resolution");
+        assert_eq!(
+            Lang::Go.rate_scope(),
+            "call, import and type-use resolution"
+        );
         assert_eq!(Lang::Ruby.rate_scope(), "import resolution");
     }
 

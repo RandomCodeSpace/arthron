@@ -12,9 +12,14 @@
 //! - **0** the command ran and this is the answer.
 //! - **1** the command ran and the answer is no: a gate regression, a query
 //!   that matched nothing or matched several. Never an error.
-//! - **2** nothing was measured: usage, I/O, or the environment — a store
-//!   somebody else holds, a root that is not there, a directory that cannot be
-//!   created, a config file that will not parse.
+//! - **2** there is no verdict. Usually nothing was measured: usage, I/O, or
+//!   the environment — a store somebody else holds, a root that is not there,
+//!   a directory that cannot be created, a config file that will not parse —
+//!   and those are the ones worth retrying. `gate` also answers 2 when the
+//!   comparison could not be made at all: a baseline's or a run's `resolved +
+//!   unresolved` of zero leaves no rate on that side, which is neither a pass
+//!   nor a regression. That one is measured and deterministic, so a retry
+//!   answers 2 again.
 //!
 //! `scan` therefore never returns 1: it has no verdict to fail. Every failure
 //! it can have is one of the environmental ones.
@@ -235,4 +240,78 @@ fn one_is_the_verdict_and_nothing_else() {
             .expect("a utf-8 temp path"),
     ]);
     assert_eq!(code(&out), Some(2));
+}
+
+#[test]
+fn a_comparison_that_could_not_be_made_is_a_two_in_both_output_modes() {
+    // The half of exit code 2 that is not environmental, and the one the
+    // documentation used to leave out. A baseline whose `resolved +
+    // unresolved` is zero has no rate to compare against, so the run is
+    // neither a pass (0) nor a regression (1) — and unlike a held store or a
+    // missing root it is measured and deterministic, so retrying it cannot
+    // help. Both output modes answer through the same mapping and so answer
+    // the same number.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fixture(root);
+    let baseline = root.join("go.toml");
+    // `external = 7` so the file is not all zeros: the emptiness under test
+    // is the rate's denominator, not the baseline.
+    fs::write(
+        &baseline,
+        concat!(
+            "format = 1\n",
+            "corpus = \"fixture\"\n",
+            "commit = \"unknown\"\n",
+            "language = \"go\"\n",
+            "resolved = 0\n",
+            "external = 7\n",
+            "local_binding = 0\n",
+            "unresolved = 0\n",
+        ),
+    )
+    .expect("baseline");
+
+    let args = [
+        "gate",
+        root.to_str().expect("a utf-8 temp path"),
+        "--language",
+        "go",
+        "--baseline",
+        baseline.to_str().expect("a utf-8 temp path"),
+    ];
+
+    let out = arthron(&args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        code(&out),
+        Some(2),
+        "a comparison with no rate on one side is not a verdict: {stderr}",
+    );
+    assert!(
+        stderr.contains("gate: error"),
+        "the reason is named, not just the code: {stderr}",
+    );
+
+    // Deterministic, unlike every other 2: retrying answers 2 again.
+    let again = arthron(&args);
+    assert_eq!(
+        code(&again),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&again.stderr),
+    );
+
+    // …and `--json` agrees, on the code and in the document.
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let out = arthron(&json_args);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        code(&out),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(stdout.contains("\"verdict\": \"error\""), "{stdout}");
 }

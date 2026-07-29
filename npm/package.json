@@ -14,7 +14,7 @@
   },
   "keywords": [
     "code-analysis",
-    "call-graph",
+    "code-graph",
     "static-analysis",
     "ast",
     "codebase",
