@@ -31,7 +31,22 @@
 //! `super.greet` against `this.greet` is the same asymmetry
 //! `tests/javascript_probes.rs` records, and it belongs to the shared
 //! ECMAScript track rather than to either language — which is why both probes
-//! assert it, in both dialects.
+//! assert it, in both dialects. So is its mislabel: `src/lib.rs` reserves
+//! `UnindexedSupertype` for a supertype that is external or unindexed, and
+//! `Greeter` is neither — the same scan resolves `super.greet` straight
+//! through it. That module doc reads the contradiction out in full and names
+//! the missing branch; this file pins the TypeScript half of the identical
+//! row, so the eventual fix has to move both.
+//!
+//! `this.inner.greet` is a *different* miss and keeps a different reason on
+//! purpose. `src/lib.rs` defines `NoMatchingDefinition` as the bucket that,
+//! in a corpus which compiles, means arthron's own bug — and this corpus
+//! compiles (`tsc --noEmit`, `strict`, clean). The engine looked
+//! `Holder.prototype.inner.greet` up lexically, that path genuinely has no
+//! definition, and the reason blames the right party for the right thing. The
+//! bug it names is the one the table above states: the annotation is read and
+//! not consulted. It is the same fix as the row above and belongs in the same
+//! decision, but it is not the same defect and does not get the same reason.
 //!
 //! `baselines/typescript-probes.toml` is compared here too, and like the Go
 //! probe pin it is a **pin, not a ratchet**: the corpus is hand-written, so
@@ -300,6 +315,12 @@ fn every_written_annotation_resolves_and_types_no_receiver() {
     // names they type land in three *different* unresolved buckets. Pinning
     // the annotation beside the call is what makes the pair readable: the type
     // is not missing, it is not consulted.
+    //
+    // `NoMatchingDefinition` on the field call is the honest reason and not
+    // the mislabel `this.greet` carries: `src/lib.rs` says that bucket means
+    // arthron's own bug in a corpus that compiles, this corpus compiles, and
+    // the lexical path `Holder.prototype.inner.greet` really has no
+    // definition. It blames this engine, which is who is at fault.
     if !corpus_present() {
         return;
     }
@@ -352,7 +373,8 @@ fn every_written_annotation_resolves_and_types_no_receiver() {
 fn this_does_not_make_the_walk_super_makes_and_says_so() {
     // The asymmetry, pinned as what is rather than what should be — the same
     // one `tests/javascript_probes.rs` records, because it belongs to the
-    // shared track and not to either dialect.
+    // shared track and not to either dialect. The reason is the same mislabel
+    // there too, and the module doc says which of its conjuncts fail here.
     if !corpus_present() {
         return;
     }

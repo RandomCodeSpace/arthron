@@ -18,8 +18,8 @@ jobs:
     # required check on main.
     name: corpus gates
     runs-on: ubuntu-latest
-    # Twenty-nine cold scans. Generous, but bounded: a hung
-    # scan must not sit on a runner for the six-hour default.
+    # Twenty-nine cold scans. Generous, but bounded: a hung scan must not sit
+    # on a runner for the six-hour default.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5

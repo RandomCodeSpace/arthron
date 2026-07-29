@@ -16,20 +16,29 @@ use arthron::track_python::lang::PyLang;
 
 mod support;
 
-/// The `.py` files under `corpus/python`: django's 899, flask's 65 and the
-/// probe corpus's 3.
+/// The trees this census walks, named one at a time.
 ///
-/// Moved from 964 when `corpus/python/probes` was added. The delta is
-/// measured, not assumed: extracting that tree alone yields **3 files, 8
-/// references** and the definitions `{Function 3, Method 2, Type 2, Var 1,
-/// Module 3, Alias 1}`, which is every number below minus its former value.
-/// A census that moves without an attribution like this one is a defect, not
-/// a new baseline.
-const FILES: u64 = 967;
+/// It used to walk `corpus/python` whole, and that was the one whole-language
+/// walk in `tests/` — every other corpus test names its tree (`corpus.rs`
+/// walks `corpus/go/codeiq` and `corpus/go/caddy`, never `corpus/go`, which
+/// is why `corpus/go/probes` moved no census when it landed). A whole-tree
+/// walk makes this file's constants a function of the *corpus repository's*
+/// contents rather than of this repository's extractor: any commit adding a
+/// `.py` file anywhere under `corpus/python` turns this test red without
+/// this repository changing, and `.github/workflows/gate.yml` checks the
+/// corpus out at `ref: main`, unpinned. Naming the trees restores the
+/// property that a census moves only when the extractor does.
+///
+/// `corpus/python/probes` is deliberately absent: a probe corpus is pinned
+/// row by row, by name, in `tests/python_probes.rs`, which is a stronger
+/// check than a total it would otherwise blur.
+const CORPORA: &[&str] = &["corpus/python/django", "corpus/python/flask"];
 
-/// Every reference the extractor emits over them. Was 53_544; the probe
-/// corpus contributes 8.
-const REFERENCES: u64 = 53_552;
+/// The `.py` files under them: django's 899 and flask's 65.
+const FILES: u64 = 964;
+
+/// Every reference the extractor emits over them.
+const REFERENCES: u64 = 53_544;
 
 /// Every definition it emits, by kind — django and flask together, because
 /// the extractor is one piece of code reading both.
@@ -38,30 +47,33 @@ const REFERENCES: u64 = 53_552;
 /// pin each tree on its own and pin the store beside it; this pins the
 /// extractor's own answer over the union, which is the number that moves
 /// first when a rule stops matching. `Module` is one per file.
-///
-/// The trailing comment on each row is the probe corpus's contribution, so
-/// the previous value is recoverable by subtraction and the movement stays
-/// attributable to the commit that caused it.
 const DEFS: &[(DefKind, u64)] = &[
-    (DefKind::Function, 1702), // +3: the three module-level probe functions
-    (DefKind::Method, 7500),   // +2: `Greeter.greet` and `Loud.shout`
-    (DefKind::Type, 2022),     // +2: `Greeter` and `Loud`
-    (DefKind::Var, 2282),      // +1: the module global `SHARED`
+    (DefKind::Function, 1699),
+    (DefKind::Method, 7498),
+    (DefKind::Type, 2020),
+    (DefKind::Var, 2281),
     (DefKind::Field, 6186),
     (DefKind::Property, 800),
-    (DefKind::Module, 967), // +3: one per probe file
-    (DefKind::Alias, 6521), // +1: the `Greeter` the probe imports
+    (DefKind::Module, 964),
+    (DefKind::Alias, 6520),
 ];
 
 #[test]
 fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
-    let corpus = Path::new("corpus/python");
-    if !corpus.is_dir() {
-        support::missing(corpus);
-        return;
+    // Paths stay relative to `corpus/python`, not to each tree, so `rel` —
+    // and therefore every module name the extractor derives from it — is
+    // byte-identical to what the whole-tree walk produced.
+    let root = Path::new("corpus/python");
+    let mut files = Vec::new();
+    for tree in CORPORA {
+        let tree = Path::new(tree);
+        if !tree.is_dir() {
+            support::missing(tree);
+            return;
+        }
+        files.extend(source_files::<PyLang>(tree).expect("walking the corpus"));
     }
-    let files = source_files::<PyLang>(corpus).expect("walking the corpus");
-    assert!(!files.is_empty(), "the corpus has no .py files");
+    assert!(!files.is_empty(), "the corpora have no .py files");
 
     let mut files_read = 0u64;
     let mut defs = 0u64;
@@ -72,7 +84,7 @@ fn the_extractor_reads_the_python_corpus_without_losing_its_invariants() {
 
     for path in &files {
         let rel = path
-            .strip_prefix(corpus)
+            .strip_prefix(root)
             .expect("a walked path is under the corpus")
             .to_string_lossy()
             .replace('\\', "/");

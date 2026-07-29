@@ -25,10 +25,36 @@
 //! `super.greet` against `this.greet` is the row worth reading twice: **the
 //! same call, one keyword apart, with different answers.** `super.` walks the
 //! written `extends` into the other module; `this.` does not make that walk
-//! today and reports `UnindexedSupertype` for a supertype this very scan
-//! indexed. A probe is a truth table, so that is asserted as what *is*, not as
-//! what should be. If it is fixed, one named row moves and this test is where
-//! the fix is proved rather than assumed.
+//! today.
+//!
+//! It also files the failure under the wrong reason, and that is pinned
+//! deliberately rather than quietly. `src/lib.rs` defines
+//! `UnresolvedReason::UnindexedSupertype` as "the receiver type is known and
+//! in-repository, the member is in no indexed supertype, and at least one
+//! supertype is external or unindexed". On this row **all three conjuncts are
+//! false**: `Loud` is in-repository, the member *is* in an indexed supertype,
+//! and `Greeter` is neither external nor unindexed — provably, because the
+//! same scan resolves `super.greet` to
+//! `greeter.js#value:Greeter.prototype.greet`. One missing branch causes it:
+//! `walk_members` (`src/track_ecma/resolve.rs`) probes the base under a
+//! module-local id, so an imported base always misses, and only
+//! `resolve_super` carries the import-following fallback that recovers from
+//! it.
+//!
+//! So the row is wrong twice over — a resolution this engine already holds
+//! the facts to make, filed under a reason the taxonomy excludes. A probe is
+//! a truth table, so both halves are asserted as what *is*, not as what
+//! should be; recording the mislabel is what stops it being discovered later
+//! as an unattributable movement.
+//!
+//! The fix's blast radius is measured, not guessed. Giving `resolve_this` the
+//! fallback `resolve_super` already has moves exactly two baselines —
+//! javascript/probes 75.0% to 87.5% (resolved 6 to 7, unresolved 2 to 1) and
+//! typescript/probes 80.0% to 86.7% (resolved 12 to 13, unresolved 3 to 2) —
+//! and moves **nothing** on express, fastify, vue-core or zod: all four hold
+//! their four gated integers and their exact reason tallies. So it is a
+//! deliberate re-base of two pins plus a `docs/decisions.md` entry for the
+//! reason reported in the interval, and no ratchet is touched.
 //!
 //! `baselines/javascript-probes.toml` is compared here too, and like the Go
 //! probe pin it is a **pin, not a ratchet**: the corpus is hand-written, so
@@ -278,10 +304,12 @@ fn this_does_not_make_the_walk_super_makes_and_says_so() {
     //
     // `Loud` extends the same imported `Greeter` in both cases and the scan
     // has `greeter.js` in hand — the row two tests above proves it. `this.`
-    // still reports `UnindexedSupertype`. Recording it here is what makes
-    // fixing it a movement of one named row instead of a number nobody can
-    // attribute, and what stops it regressing further into a bucket outside
-    // the rate.
+    // still reports `UnindexedSupertype`, a reason whose definition in
+    // `src/lib.rs` excludes this case on all three of its conjuncts; the
+    // module doc reads it out in full. Both halves are recorded, the miss and
+    // the mislabel, because that is what makes fixing them a movement of one
+    // named row instead of a number nobody can attribute, and what stops the
+    // row regressing further into a bucket outside the rate.
     if !corpus_present() {
         return;
     }
