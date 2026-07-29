@@ -6,30 +6,44 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ## 2026-07-29 — Java overload narrowing stops at file-local argument types
 
-**Decision:** when a Java call or creation site reaches a shared arity key, the
-resolver may probe the overloads' full-signature identities using argument
-types the same file states directly. The extractor records literals, declared
-names, casts and class creations in the Java header; it still emits the same
-core `Reference`, and only the resolver links.
+**Decision:** a Java call or creation stores its complete file-locally-evident
+argument vector on `Reference.arg_types`; non-call references and an invocation
+with any unknown argument store `None`. Literals, declared names, casts, class
+creations, and unary `+`, `-`, or `~` over a numeric literal are included.
+Calls, `null`, lambdas, member expressions, array access, and general operators
+remain unknown. The resolver reads only the reference field; the temporary
+byte-offset side table is gone.
 
-JLS §15.12.2's phase order is preserved: strict invocation is tried before
-loose invocation. The implemented conversion surface is deliberately smaller
-than Java's: identity, `int` to `long`, `Integer` to `Object`, and `int` to
-`Integer`. Each is target-asserted by a fixture, including overloaded
-constructors. An expression call used as an argument remains
-`AmbiguousOverload`.
+JLS §15.12.2's phase order is preserved: strict fixed arity, loose fixed
+arity, then variable arity. Applicability is collected across the receiver and
+its indexed supertypes before selection, so an inapplicable declaration on the
+receiver cannot hide an inherited or varargs candidate. The first phase with
+applicable declarations wins. Conversion-depth dominance selects among that
+phase's candidates, then class-over-interface and subtype-owner specificity
+break owner ties; incomparable survivors remain `AmbiguousOverload`.
 
-This stage only narrows an arity-key alias. A call that never reached
-`AmbiguousOverload` keeps its existing path, so the expected row movement is
-`AmbiguousOverload` to a named full-signature `Resolved` target or no movement.
-Corpus attribution, baseline re-base and pin regeneration wait for the
-independent whole-row review.
+The conversion surface is deliberately finite and fixture-proven: identity;
+primitive widening; boxing; unboxing followed by primitive widening; numeric
+wrapper to `Number` to `Object`; and `Character`/`Boolean` to `Object`.
+No user-defined subtype relation is guessed. Unique callables keep their
+existing arity node as the edge target and gain a Java-owned full-signature
+alias that forwards to it; overloaded callables retain their full-signature
+nodes and set-valued arity marker.
 
-*Rejected:* implementing all invocation conversions from a hand-written type
-table. Generic inference, arrays, poly expressions, user-defined subtype
-relations, further primitive widenings, boxing followed by widening, and
-multiple non-exact applicable signatures stay ambiguous until a fixture proves
-the next cut.
+The original Stream C card said no core change was needed because overload
+types were already in the node keyspace. That was true for definitions and
+false for reference rows: same-arity calls with different argument vectors
+collapsed. The plan amendment and C0 corrected the discrepancy by adding
+`Reference.arg_types` and `RefKey.arg_types` in a dedicated core landing;
+Stream C merged that landing and changes no core file itself.
+
+*Rejected:* putting argument types in `JavaHeader` keyed by byte offset, which
+would again let stored row identity disagree with the facts resolution reads.
+Also rejected: arbitrary class-subtype guesses, return-type inference,
+member/field typing, array element typing, and other written-type-environment
+work reserved for Streams H and I. Those shapes stay honestly ambiguous.
+
+---
 
 ## 2026-07-29 — reference-row identity carries file-local argument types
 

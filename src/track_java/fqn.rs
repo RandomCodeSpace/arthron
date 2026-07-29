@@ -63,10 +63,11 @@
 //! it: both fall back to the **signature form** `name(T1,T2)` spelled with the
 //! parameter types *as written*, and the shared key becomes a separate
 //! [`crate::model::DefKind::Alias`] node standing for the overload set. A
-//! probe that lands on the alias has found an ambiguity it must report
-//! (`AmbiguousOverload`); a probe that lands on a method has found the only
-//! member of that name and arity. M-01's requirement — two overloads are two
-//! nodes — holds either way.
+//! unique callable keeps the arity identity as its node and also emits a
+//! signature alias forwarding to that node. Typed applicability can therefore
+//! probe one signature grammar for both shapes without re-aiming existing
+//! unique-callable edges. M-01's requirement — two overloads are two nodes —
+//! holds either way.
 //!
 //! The signature form is injective within a type because §8.4.8.3 forbids two
 //! methods of one class whose erasures are override-equivalent: two members
@@ -131,7 +132,7 @@ pub fn varargs_key(name: &str, min: u32) -> String {
     format!("{name}/*{min}")
 }
 
-/// The signature form, used only when a key is shared by two declarations.
+/// The signature form used by overload definitions and unique-callable aliases.
 pub fn signature_key(name: &str, types: &[String]) -> String {
     format!("{name}({})", types.join(","))
 }

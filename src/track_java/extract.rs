@@ -162,16 +162,6 @@ pub struct Binding {
     pub end: u32,
 }
 
-/// Argument types stated directly at one invocation site.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallArguments {
-    /// Byte offset of the call or creation reference.
-    pub start: u32,
-    /// One source-level type per argument, or `None` when any argument needs
-    /// expression typing rather than a file-local read.
-    pub types: Option<Vec<String>>,
-}
-
 /// One type declared in this file, with the supertypes it names.
 ///
 /// H-01: member lookup cannot start until `extends`/`implements` have been
@@ -266,8 +256,6 @@ pub struct JavaHeader {
     pub imports: Vec<Import>,
     /// Every name this file binds, with extents and declared types (X-02).
     pub bindings: Vec<Binding>,
-    /// Argument types readable without inference, keyed by invocation start.
-    pub call_arguments: Vec<CallArguments>,
     /// Every type this file declares, in declaration order.
     pub types: Vec<TypeDecl>,
     /// Every anonymous class body, enum-constant body and local class, in
@@ -511,9 +499,10 @@ fn argument_count(node: &SgNode) -> Option<u32> {
 ///
 /// This is deliberately a cut line, not a miniature type checker: literals,
 /// declared names, casts and class creation are readable in one file.
-/// Calls, operators, conditionals, lambdas, method references, arrays,
+/// Calls, general operators, conditionals, lambdas, method references, arrays,
 /// `null`, and anything else stay unknown and therefore cannot narrow an
-/// overload set.
+/// overload set. Unary `+`, `-`, and `~` over a numeric literal are included:
+/// unary numeric promotion preserves the literal's `int`/`long` type here.
 fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String> {
     match &*node.kind() {
         "string_literal" => Some("String".to_string()),
@@ -556,20 +545,30 @@ fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String
             .children()
             .find(|child| child.is_named())
             .and_then(|child| argument_type(&child, header, site)),
+        "unary_expression" if node.text().trim_start().starts_with(['+', '-', '~']) => {
+            let promoted = node
+                .children()
+                .find(|child| child.is_named())
+                .and_then(|child| argument_type(&child, header, site))?;
+            matches!(
+                promoted.as_str(),
+                "byte" | "short" | "char" | "int" | "long" | "float" | "double"
+            )
+            .then_some(promoted)
+        }
         _ => None,
     }
 }
 
 /// The complete argument-type vector when every argument is file-local.
-fn call_arguments(node: &SgNode, header: &JavaHeader) -> CallArguments {
-    let start = node.range().start as u32;
-    let types = node.field("arguments").and_then(|list| {
+fn argument_types(node: &SgNode, header: &JavaHeader) -> Option<Vec<String>> {
+    let site = node.range().start as u32;
+    node.field("arguments").and_then(|list| {
         list.children()
             .filter(|child| child.is_named() && child.kind() != "comment")
-            .map(|child| argument_type(&child, header, start))
+            .map(|child| argument_type(&child, header, site))
             .collect::<Option<Vec<_>>>()
-    });
-    CallArguments { start, types }
+    })
 }
 
 /// The literal text of a call site's callee, minus explicit type arguments.
@@ -2009,7 +2008,9 @@ fn reference(
         locally_bound: is_locally_bound(header, kind, &target, site),
         target,
         argc,
-        arg_types: None,
+        arg_types: matches!(kind, RefKind::Call | RefKind::New)
+            .then(|| argument_types(node, header))
+            .flatten(),
         enclosing: enclosing_definition(node),
         span: span_of(node),
     }
@@ -2064,7 +2065,6 @@ fn collect_references(
     header: &JavaHeader,
     inherit_heads: &HashSet<(usize, usize)>,
     refs: &mut Vec<Reference>,
-    call_args: &mut Vec<CallArguments>,
 ) {
     if in_error_region(node) {
         return;
@@ -2075,7 +2075,6 @@ fn collect_references(
                 return;
             };
             let target = call_target(node);
-            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2101,7 +2100,6 @@ fn collect_references(
             if segments.is_empty() {
                 return;
             }
-            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2132,7 +2130,6 @@ fn collect_references(
                 "super" => TargetRoot::Super { qualifier },
                 _ => return,
             };
-            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2161,7 +2158,6 @@ fn collect_references(
                 return;
             };
             let name = owner.text().to_string();
-            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2295,8 +2291,8 @@ fn collect_references(
     }
 }
 
-/// Split every callable this file declares into overload groups, name the
-/// groups that are shared, and give each one a node.
+/// Split every callable this file declares into overload groups, name shared
+/// groups, and give unique callables a forwarding signature alias.
 ///
 /// M-01: two overloads are two definitions and must be two nodes. M-04: a
 /// call site knows only the callee's name and argument count, so the identity
@@ -2311,7 +2307,7 @@ fn collect_references(
 /// compete for one of its own types' keys.
 ///
 /// Returns the shared keys, which [`crate::lang::Resolver::def_fqn`] reads to
-/// decide which form a definition's FQN takes.
+/// decide which form a callable definition's FQN takes.
 fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for def in defs.iter() {
@@ -2328,12 +2324,28 @@ fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     for def in defs.iter() {
         let Some(key) = group_key(def) else { continue };
-        if !shared.contains(&key) || !seen.insert(key) {
+        let callable = fqn::callable_of(def);
+        if !shared.contains(&key) {
+            // The arity identity remains the callable's node. A forwarding
+            // signature identity exposes its parameter shape to typed
+            // applicability without re-aiming existing edges.
+            aliases.push(java_def(
+                DefKind::Alias,
+                callable.signature(),
+                def.owner.clone(),
+                DeclSpace::Value,
+                DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
+                None,
+                def.span,
+            ));
+            continue;
+        }
+        if !seen.insert(key) {
             continue;
         }
         aliases.push(java_def(
             DefKind::Alias,
-            fqn::callable_of(def).key(),
+            callable.key(),
             def.owner.clone(),
             DeclSpace::Value,
             DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
@@ -2397,18 +2409,9 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<JavaLang> {
     }
     header.types = types;
     header.overloaded = mark_overload_sets(&mut defs);
-    let mut call_arguments = Vec::new();
     for (_, node) in &matched {
-        collect_references(
-            source,
-            node,
-            &header,
-            &inherit_heads,
-            &mut refs,
-            &mut call_arguments,
-        );
+        collect_references(source, node, &header, &inherit_heads, &mut refs);
     }
-    header.call_arguments = call_arguments;
 
     // The file's container definition, emitted whether or not a package
     // clause parsed: a file that lost its clause still belongs somewhere, and
@@ -3081,7 +3084,12 @@ class A {
         assert!(defs_named(&f, "inner").is_empty());
         assert!(defs_named(&f, "run").is_empty());
         // What *is* declared: `A`, its default constructor, and `f`.
-        let names: Vec<&str> = f.defs.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = f
+            .defs
+            .iter()
+            .filter(|d| d.kind != DefKind::Alias)
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(names, ["p", "A", "A", "f"]);
     }
 
@@ -3288,7 +3296,7 @@ record Point(int x, int y) {}
         let synth: Vec<(&str, DefKind, u32)> = f
             .defs
             .iter()
-            .filter(|d| d.facets.contains(DefFacets::SYNTHETIC))
+            .filter(|d| d.kind != DefKind::Alias && d.facets.contains(DefFacets::SYNTHETIC))
             .map(|d| {
                 (
                     d.name.as_str(),

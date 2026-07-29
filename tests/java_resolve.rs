@@ -461,6 +461,174 @@ public class Arguments {
     );
 }
 
+/// §15.12.2.1-.5: every declaration at the invocation's arity participates
+/// in applicability before phase order and specificity select a target.
+#[test]
+fn applicability_collects_direct_inherited_and_varargs_candidates() {
+    let scan = scan(&[(
+        "com/acme/Applicability.java",
+        r#"package com.acme;
+public class Applicability {
+    static class Base {
+        void inherited(int value) {}
+        void inherited(long value) {}
+    }
+
+    static class Child extends Base {
+        void inherited(String value) {}
+
+        void callInherited() {
+            inherited(1);
+        }
+    }
+
+    static void flexible(String value) {}
+    static void flexible(boolean value) {}
+    static void flexible(int... value) {}
+    static void flexible(long... value) {}
+
+    static void phased(int value) {}
+    static void phased(long value) {}
+    static void phased(Integer... value) {}
+    static void phased(Object... value) {}
+
+    static void calls() {
+        flexible(1);
+        phased(1);
+    }
+}
+"#,
+    )]);
+
+    assert_eq!(
+        scan.one("inherited", RefKind::Call),
+        "RESOLVED com.acme#Applicability$Base.inherited(int)",
+        "an inapplicable direct declaration must not hide an inherited applicable overload",
+    );
+    assert_eq!(
+        scan.one("flexible", RefKind::Call),
+        "RESOLVED com.acme#Applicability.flexible(int...)",
+        "an inapplicable fixed-arity set must not hide an applicable varargs set",
+    );
+    assert_eq!(
+        scan.one("phased", RefKind::Call),
+        "RESOLVED com.acme#Applicability.phased(int)",
+        "an applicable fixed-arity method must beat every varargs candidate",
+    );
+}
+
+/// JLS §5.1.2, §5.1.5, §5.1.7-.8 and §15.12.2.5: conversion depth is part
+/// of most-specific selection; a supported but less-specific target cannot
+/// win merely because it was the first signature probed.
+#[test]
+fn conversion_depths_choose_most_specific_primitive_and_wrapper_targets() {
+    let scan = scan(&[(
+        "com/acme/Conversions.java",
+        r#"package com.acme;
+public class Conversions {
+    static void number(Number value) {}
+    static void number(Object value) {}
+    static void boxedReference(Number value) {}
+    static void boxedReference(Object value) {}
+    static void primitive(float value) {}
+    static void primitive(double value) {}
+    static void unboxed(long value) {}
+    static void unboxed(double value) {}
+    static void characterObject(Object value) {}
+    static void characterObject(String value) {}
+    static void incomparable(int left, long right) {}
+    static void incomparable(long left, int right) {}
+    static void unknownNull(Number value) {}
+    static void unknownNull(Object value) {}
+    static void unknownCall(Number value) {}
+    static void unknownCall(Object value) {}
+    static void unknownPoly(java.util.function.Consumer<String> value) {}
+    static void unknownPoly(java.util.function.Function<String, String> value) {}
+    static Integer value() { return null; }
+
+    static void calls() {
+        Integer integer = 1;
+        Character character = 'x';
+        unknownNull(null);
+        unknownCall(value());
+        unknownPoly(value -> value.trim());
+        number(integer);
+        boxedReference(1);
+        primitive(1);
+        unboxed(integer);
+        characterObject(character);
+        incomparable(1, 1);
+    }
+}
+"#,
+    )]);
+
+    for raw in ["unknownNull", "unknownCall", "unknownPoly"] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            "AmbiguousOverload",
+            "`{raw}` has no file-local standalone argument type and must stay honest",
+        );
+    }
+    assert_eq!(
+        scan.one("incomparable", RefKind::Call),
+        "AmbiguousOverload",
+        "incomparable conversion vectors must not be resolved by probe order",
+    );
+    for (raw, target) in [
+        ("number", "com.acme#Conversions.number(Number)"),
+        (
+            "boxedReference",
+            "com.acme#Conversions.boxedReference(Number)",
+        ),
+        ("primitive", "com.acme#Conversions.primitive(float)"),
+        ("unboxed", "com.acme#Conversions.unboxed(long)"),
+        (
+            "characterObject",
+            "com.acme#Conversions.characterObject(Object)",
+        ),
+    ] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED {target}"),
+            "`{raw}` selected the wrong full-signature target",
+        );
+    }
+}
+
+/// §15.15.3-.5: unary numeric operators apply unary numeric promotion, so a
+/// literal operand still states a primitive argument type without inference.
+#[test]
+fn unary_numeric_literal_arguments_select_promoted_primitive_overloads() {
+    let scan = scan(&[(
+        "com/acme/UnaryArguments.java",
+        r#"package com.acme;
+public class UnaryArguments {
+    static void minus(long value) {}
+    static void minus(String value) {}
+    static void plus(long value) {}
+    static void plus(String value) {}
+    static void complement(long value) {}
+    static void complement(String value) {}
+
+    static void calls() {
+        minus(-1L);
+        plus(+1L);
+        complement(~1L);
+    }
+}
+"#,
+    )]);
+
+    for raw in ["minus", "plus", "complement"] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED com.acme#UnaryArguments.{raw}(long)"),
+            "`{raw}` did not preserve the promoted literal type",
+        );
+    }
+}
+
 /// N-04 / B-02: a fully qualified name is attributed to its package in value
 /// position exactly as it is in type position.
 #[test]

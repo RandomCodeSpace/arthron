@@ -13,11 +13,14 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Changed
 
-- Java calls and constructor invocations now narrow a same-arity overload set
-  to its full-signature target when every argument type is stated locally by a
-  literal, declared name, cast or class creation. Unknown expressions remain
-  `AmbiguousOverload`; the conversion cut is identity, `int` to `long`,
-  `Integer` to `Object`, and `int` to `Integer`.
+- Java calls and constructor invocations now store complete file-local
+  argument vectors on `Reference.arg_types` and select applicable declarations
+  across the receiver and indexed supertypes in strict, loose, then varargs
+  phases. Fixture-proven conversions cover primitive widening, boxing,
+  unboxing plus widening, and built-in wrapper-to-`Number`/`Object` chains;
+  incomparable or expression-typed candidates remain `AmbiguousOverload`.
+  Unique callables retain their arity target through forwarding signature
+  aliases, and unary numeric literals preserve their promoted primitive type.
 - Reference rows now carry file-locally evident call argument types in their
   canonical key. Schema generation 11 forces older stores to rescan. Current
   extractors initialize the field to `None`, freezing graph behavior until a

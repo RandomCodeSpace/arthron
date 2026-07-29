@@ -18,10 +18,11 @@
 //!   declared but never called by the driver, so the `OVERLOAD`/`VARARGS`
 //!   multimap cannot be built. The arity key is therefore the definition's
 //!   *identity* whenever it is unique, and an ambiguous set is represented by
-//!   a [`DefKind::Alias`] node the extractor emits at the shared key. A probe
-//!   that lands on the alias reports `AmbiguousOverload`; one that misses has
-//!   found "not declared on this type" and may walk on. See
-//!   [`crate::track_java::fqn`].
+//!   a [`DefKind::Alias`] node the extractor emits at the shared key. Unique
+//!   callables keep that arity identity and expose their written parameter
+//!   shape through a forwarding signature alias. Typed applicability probes
+//!   signatures uniformly; an untyped probe that lands on the shared marker
+//!   still reports `AmbiguousOverload`. See [`crate::track_java::fqn`].
 //! * **The supertype closure is two facts, not one (H-01).** For a type the
 //!   file being resolved declares, `extends`/`implements` are a single-file
 //!   fact ([`TypeDecl`]) and the walk reads them straight off the scope. For
@@ -48,9 +49,7 @@ use crate::model::{
     DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
 };
 use crate::track_java::JavaLang;
-use crate::track_java::extract::{
-    Binding, BindingKind, CallArguments, ErasedType, JavaHeader, TypeDecl,
-};
+use crate::track_java::extract::{Binding, BindingKind, ErasedType, JavaHeader, TypeDecl};
 use crate::track_java::fqn;
 use crate::{Outcome, UnresolvedReason};
 
@@ -271,8 +270,6 @@ pub struct JavaScope {
     supers: HashMap<String, TypeDecl>,
     /// X-02's declared-type environment, with the extents §6.3 scopes it by.
     bindings: Vec<Binding>,
-    /// File-local argument types, keyed by the invocation's byte start.
-    call_arguments: Vec<CallArguments>,
     /// T-03..T-05's type frames that are not nodes, with the extents that say
     /// which sites are inside them.
     erased: Vec<ErasedType>,
@@ -358,14 +355,6 @@ impl JavaScope {
         frames.sort_by_key(|f| std::cmp::Reverse(f.start));
         frames
     }
-
-    /// Every argument type at this invocation, when all are stated locally.
-    fn argument_types_at(&self, site: u32) -> Option<&[String]> {
-        self.call_arguments
-            .iter()
-            .find(|arguments| arguments.start == site)
-            .and_then(|arguments| arguments.types.as_deref())
-    }
 }
 
 /// A type a reference named, once it has been placed.
@@ -418,6 +407,35 @@ struct Invocation<'a> {
     argc: Option<u32>,
     /// Written argument types, when every one is file-local.
     arguments: Option<&'a [String]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationPhase {
+    Strict,
+    Loose,
+    Varargs,
+}
+
+#[derive(Debug, Clone)]
+struct Applicable {
+    owner: String,
+    target: NodeId,
+    depths: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct TypedSite<'a> {
+    owner: &'a str,
+    local: Option<Vec<String>>,
+    name: &'a str,
+    arguments: &'a [String],
+}
+
+#[derive(Debug, Default)]
+struct Applicability {
+    candidates: Vec<Applicable>,
+    saw_member: bool,
+    unindexed: bool,
 }
 
 /// Every declaration one *member name* reaches on a type (I-04, C-08).
@@ -1093,6 +1111,20 @@ impl JavaResolver {
                 return Member::Missing { unindexed: true };
             }
         };
+        if let Some(arguments) = arguments {
+            let name = keys[0].split('/').next().unwrap_or(&keys[0]);
+            return self.typed_lookup(
+                cfg,
+                scope,
+                TypedSite {
+                    owner: &fqn_start,
+                    local: local_start,
+                    name,
+                    arguments,
+                },
+                p,
+            );
+        }
         let mut unindexed = false;
         let mut seen: HashSet<String> = HashSet::new();
         let mut inherited: Vec<(String, NodeId)> = Vec::new();
@@ -1106,11 +1138,7 @@ impl JavaResolver {
                     Some(Entry::Definition {
                         kind: DefKind::Alias,
                         ..
-                    }) => {
-                        return arguments.map_or(Member::Ambiguous, |arguments| {
-                            self.typed_overload(&type_fqn, &keys[0], arguments, p)
-                        });
-                    }
+                    }) => return Member::Ambiguous,
                     // §8.2: a private member is not inherited, so a
                     // supertype's is not a candidate here at all. Skipped and
                     // not returned — the walk carries on to whatever the
@@ -1168,104 +1196,368 @@ impl JavaResolver {
         }
     }
 
-    /// Narrow one shared arity key with types stated at the invocation.
-    ///
-    /// JLS §15.12.2 runs strict invocation before loose invocation. This
-    /// implementation proves only the file-local subset exercised here:
-    /// identity, `int -> long`, `Integer -> Object`, and `int -> Integer`.
-    /// It does not infer generic arguments, return types, arrays, other
-    /// widening steps, boxing followed by widening, user-defined subtype
-    /// relations, poly expressions, or choose between multiple non-exact
-    /// applicable signatures. Those shapes stay `AmbiguousOverload`; a short
-    /// answer is safer than a wrong edge.
-    fn typed_overload(
+    /// Apply JLS §15.12.2's strict, loose, then variable-arity phases to all
+    /// visible declarations on the receiver and its indexed supertypes.
+    fn typed_lookup(
         &self,
-        owner_fqn: &str,
-        arity_key: &str,
-        arguments: &[String],
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        site: TypedSite<'_>,
         p: &mut Probes<'_>,
     ) -> Member {
-        let name = arity_key.split('/').next().unwrap_or(arity_key);
-        for loose in [false, true] {
-            let Some(signatures) = Self::applicable_signatures(arguments, loose) else {
-                return Member::Ambiguous;
-            };
-            let mut found = Vec::new();
-            for types in signatures {
-                let key = fqn::signature_key(name, &types);
-                let member_fqn = fqn::member_fqn(owner_fqn, &key);
-                if matches!(p.get(&member_fqn), Some(Entry::Definition { .. })) {
-                    let id = node_id(JavaLang::DOMAIN, &member_fqn);
-                    if !found.contains(&id) {
-                        found.push(id);
-                    }
-                    // An identity match is more specific than every widening
-                    // candidate in the same phase.
-                    if types == arguments {
-                        return Member::Found(id);
-                    }
-                }
-            }
-            match found.as_slice() {
-                [only] => return Member::Found(*only),
-                [] => {}
-                _ => return Member::Ambiguous,
+        let mut saw_member = false;
+        let mut unindexed = false;
+        for phase in [
+            InvocationPhase::Strict,
+            InvocationPhase::Loose,
+            InvocationPhase::Varargs,
+        ] {
+            let found = self.collect_applicable(cfg, scope, &site, phase, p);
+            saw_member |= found.saw_member;
+            unindexed |= found.unindexed;
+            if !found.candidates.is_empty() {
+                return self.select_applicable(found.candidates, p);
             }
         }
-        Member::Ambiguous
+        if saw_member {
+            Member::Ambiguous
+        } else {
+            Member::Missing { unindexed }
+        }
     }
 
-    /// Full parameter lists reachable in one invocation phase.
-    ///
-    /// The Cartesian product is capped: wide calls with many conversion
-    /// alternatives are exactly where this intentionally refuses to guess.
-    fn applicable_signatures(arguments: &[String], loose: bool) -> Option<Vec<Vec<String>>> {
-        const MAX_SIGNATURE_PROBES: usize = 64;
-        let alternatives: Vec<Vec<String>> = arguments
-            .iter()
-            .map(|argument| Self::conversion_targets(argument, loose))
-            .collect();
-        if alternatives.iter().any(Vec::is_empty) {
-            return Some(Vec::new());
+    fn collect_applicable(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        site: &TypedSite<'_>,
+        phase: InvocationPhase,
+        p: &mut Probes<'_>,
+    ) -> Applicability {
+        let mut out = Applicability::default();
+        let mut seen = HashSet::new();
+        let mut queue = vec![(site.owner.to_string(), site.local.clone())];
+        while let Some((type_fqn, local)) = queue.pop() {
+            if !seen.insert(type_fqn.clone()) {
+                continue;
+            }
+            let shapes = match phase {
+                InvocationPhase::Strict | InvocationPhase::Loose => {
+                    let key = fqn::arity_key(site.name, site.arguments.len() as u32);
+                    let declaration = fqn::member_fqn(&type_fqn, &key);
+                    let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
+                    out.saw_member |= visible;
+                    if visible {
+                        Self::fixed_signatures(site.arguments, phase)
+                            .into_iter()
+                            .map(|(types, depths)| (types, depths, declaration.clone()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                InvocationPhase::Varargs => {
+                    let mut shapes = Vec::new();
+                    for min in (0..=site.arguments.len() as u32).rev() {
+                        let key = fqn::varargs_key(site.name, min);
+                        let declaration = fqn::member_fqn(&type_fqn, &key);
+                        let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
+                        out.saw_member |= visible;
+                        if visible {
+                            shapes.extend(
+                                Self::varargs_signatures(site.arguments, min as usize)
+                                    .into_iter()
+                                    .map(|(types, depths)| (types, depths, declaration.clone())),
+                            );
+                        }
+                    }
+                    shapes
+                }
+            };
+            for (types, depths, declaration) in shapes {
+                let signature = fqn::signature_key(site.name, &types);
+                let signature_fqn = fqn::member_fqn(&type_fqn, &signature);
+                let Some(entry) = p.get(&signature_fqn) else {
+                    continue;
+                };
+                let target = match entry {
+                    Entry::Alias { target } => target,
+                    Entry::Definition {
+                        facets,
+                        kind: DefKind::Method | DefKind::Constructor,
+                    } if type_fqn == site.owner || !facets.contains(DefFacets::PRIVATE) => {
+                        node_id(JavaLang::DOMAIN, &signature_fqn)
+                    }
+                    _ => continue,
+                };
+                // A forwarding signature for a unique callable must point at
+                // the declaration key this phase discovered.
+                if matches!(entry, Entry::Alias { .. })
+                    && !matches!(p.get(&declaration), Some(Entry::Definition { .. }))
+                {
+                    continue;
+                }
+                out.candidates.push(Applicable {
+                    owner: type_fqn.clone(),
+                    target,
+                    depths,
+                });
+            }
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                out.unindexed = true;
+                break;
+            }
+            let Some(path) = local else {
+                out.unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
+                continue;
+            };
+            let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
+                out.unindexed = true;
+                continue;
+            };
+            if decl.superclass.is_none() {
+                out.unindexed = true;
+            }
+            let supers = decl.interfaces.iter().chain(decl.superclass.iter());
+            for segments in supers {
+                match self.canonical_type(cfg, scope, segments, p) {
+                    Owner::InRepo { fqn, local } => queue.push((fqn, local)),
+                    _ => out.unindexed = true,
+                }
+            }
         }
-        let mut signatures = vec![Vec::new()];
+        out
+    }
+
+    fn visible_member(
+        declaration: &str,
+        declaration_owner: &str,
+        start_owner: &str,
+        p: &mut Probes<'_>,
+    ) -> bool {
+        match p.get(declaration) {
+            Some(Entry::Definition { facets, .. })
+                if declaration_owner != start_owner && facets.contains(DefFacets::PRIVATE) =>
+            {
+                false
+            }
+            Some(Entry::Definition { .. }) => true,
+            _ => false,
+        }
+    }
+
+    fn fixed_signatures(
+        arguments: &[String],
+        phase: InvocationPhase,
+    ) -> Vec<(Vec<String>, Vec<u8>)> {
+        let alternatives = arguments
+            .iter()
+            .map(|argument| Self::conversion_targets(argument, phase))
+            .collect::<Vec<_>>();
+        Self::signature_product(&alternatives)
+    }
+
+    fn varargs_signatures(arguments: &[String], min: usize) -> Vec<(Vec<String>, Vec<u8>)> {
+        if min > arguments.len() || min == arguments.len() {
+            // With no repeated argument the component type is not present at
+            // the site, so this key is known but its applicability is not.
+            return Vec::new();
+        }
+        let options = arguments
+            .iter()
+            .map(|argument| Self::conversion_targets(argument, InvocationPhase::Loose))
+            .collect::<Vec<_>>();
+        let prefixes = Self::signature_product(&options[..min]);
+        let mut common: HashMap<String, Vec<u8>> = HashMap::new();
+        for (ty, depth) in &options[min] {
+            common.insert(ty.clone(), vec![*depth]);
+        }
+        for choices in &options[min + 1..] {
+            common.retain(|ty, depths| {
+                let Some((_, depth)) = choices.iter().find(|(candidate, _)| candidate == ty) else {
+                    return false;
+                };
+                depths.push(*depth);
+                true
+            });
+        }
+        let mut out = Vec::new();
+        for (prefix_types, prefix_depths) in prefixes {
+            for (component, tail_depths) in &common {
+                if out.len() >= 64 {
+                    return Vec::new();
+                }
+                let mut types = prefix_types.clone();
+                types.push(format!("{component}..."));
+                let mut depths = prefix_depths.clone();
+                depths.extend(tail_depths);
+                out.push((types, depths));
+            }
+        }
+        out
+    }
+
+    fn signature_product(alternatives: &[Vec<(String, u8)>]) -> Vec<(Vec<String>, Vec<u8>)> {
+        let mut signatures = vec![(Vec::new(), Vec::new())];
         for choices in alternatives {
             let mut next = Vec::new();
-            for prefix in &signatures {
-                for choice in &choices {
-                    if next.len() >= MAX_SIGNATURE_PROBES {
-                        return None;
+            for (prefix, depths) in &signatures {
+                for (choice, depth) in choices {
+                    if next.len() >= 64 {
+                        return Vec::new();
                     }
                     let mut signature = prefix.clone();
                     signature.push(choice.clone());
-                    next.push(signature);
+                    let mut ranks = depths.clone();
+                    ranks.push(*depth);
+                    next.push((signature, ranks));
                 }
             }
             signatures = next;
         }
-        Some(signatures)
+        signatures
     }
 
-    /// Parameter types reachable from one known argument in one proven phase.
-    fn conversion_targets(argument: &str, loose: bool) -> Vec<String> {
-        if loose {
-            return match argument {
-                // Fixture-proven boxing. Boxing followed by widening
-                // reference conversion deliberately waits for a fixture.
-                "int" => vec!["Integer".to_string()],
-                _ => Vec::new(),
-            };
-        }
-        let mut targets = vec![argument.to_string()];
-        match argument {
-            // Fixture-proven first widening step only. `int -> float` and
-            // `int -> double` are legal but stay ambiguous until exercised.
-            "int" => targets.push("long".to_string()),
-            // Fixture-proven widening reference conversion.
-            "Integer" => targets.push("Object".to_string()),
-            _ => {}
+    /// The fixture-proven conversion surface. No user-defined subtype is
+    /// guessed: only primitive widening, boxing, unboxing plus widening, and
+    /// the built-in wrapper-to-`Number`/`Object` chains are represented.
+    fn conversion_targets(argument: &str, phase: InvocationPhase) -> Vec<(String, u8)> {
+        let mut targets = vec![(argument.to_string(), 0)];
+        Self::push_strict_widening(argument, &mut targets);
+        if phase != InvocationPhase::Strict {
+            Self::push_loose_conversions(argument, &mut targets);
         }
         targets
+    }
+
+    fn push_strict_widening(argument: &str, targets: &mut Vec<(String, u8)>) {
+        let primitive: &[&str] = match argument {
+            "byte" => &["short", "int", "long", "float", "double"],
+            "short" | "char" => &["int", "long", "float", "double"],
+            "int" => &["long", "float", "double"],
+            "long" => &["float", "double"],
+            "float" => &["double"],
+            _ => &[],
+        };
+        targets.extend(
+            primitive
+                .iter()
+                .enumerate()
+                .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 1)),
+        );
+        let references: &[&str] = match argument {
+            "Byte" | "Short" | "Integer" | "Long" | "Float" | "Double" => &["Number", "Object"],
+            "Number" | "Character" | "Boolean" => &["Object"],
+            _ => &[],
+        };
+        targets.extend(
+            references
+                .iter()
+                .enumerate()
+                .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 1)),
+        );
+    }
+
+    fn push_loose_conversions(argument: &str, targets: &mut Vec<(String, u8)>) {
+        let boxed = match argument {
+            "byte" => Some("Byte"),
+            "short" => Some("Short"),
+            "char" => Some("Character"),
+            "int" => Some("Integer"),
+            "long" => Some("Long"),
+            "float" => Some("Float"),
+            "double" => Some("Double"),
+            "boolean" => Some("Boolean"),
+            _ => None,
+        };
+        if let Some(wrapper) = boxed {
+            targets.push((wrapper.to_string(), 1));
+            let chain: &[&str] = match wrapper {
+                "Byte" | "Short" | "Integer" | "Long" | "Float" | "Double" => &["Number", "Object"],
+                _ => &["Object"],
+            };
+            targets.extend(
+                chain
+                    .iter()
+                    .enumerate()
+                    .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 2)),
+            );
+        }
+        let unboxed = match argument {
+            "Byte" => Some("byte"),
+            "Short" => Some("short"),
+            "Character" => Some("char"),
+            "Integer" => Some("int"),
+            "Long" => Some("long"),
+            "Float" => Some("float"),
+            "Double" => Some("double"),
+            "Boolean" => Some("boolean"),
+            _ => None,
+        };
+        if let Some(primitive) = unboxed {
+            targets.push((primitive.to_string(), 1));
+            let mut widening = Vec::new();
+            Self::push_strict_widening(primitive, &mut widening);
+            targets.extend(
+                widening
+                    .into_iter()
+                    .filter(|(ty, _)| ty != primitive)
+                    .map(|(ty, depth)| (ty, depth + 1)),
+            );
+        }
+    }
+
+    fn select_applicable(&self, candidates: Vec<Applicable>, p: &mut Probes<'_>) -> Member {
+        let mut unique: Vec<Applicable> = Vec::new();
+        for candidate in candidates {
+            if let Some(held) = unique
+                .iter_mut()
+                .find(|held| held.target == candidate.target)
+            {
+                if Self::depths_dominate(&candidate.depths, &held.depths) {
+                    *held = candidate;
+                }
+            } else {
+                unique.push(candidate);
+            }
+        }
+        let survivors = unique
+            .iter()
+            .filter(|candidate| {
+                !unique.iter().any(|other| {
+                    other.target != candidate.target
+                        && Self::depths_dominate(&other.depths, &candidate.depths)
+                })
+            })
+            .collect::<Vec<_>>();
+        let concrete = survivors
+            .iter()
+            .copied()
+            .filter(|candidate| !Self::declares_interface(&candidate.owner, p))
+            .collect::<Vec<_>>();
+        let ranked = if concrete.is_empty() {
+            survivors
+        } else {
+            concrete
+        };
+        if let [only] = ranked.as_slice() {
+            return Member::Found(only.target);
+        }
+        let owner_winner = ranked.iter().find(|candidate| {
+            ranked.iter().all(|other| {
+                candidate.target == other.target
+                    || (candidate.owner != other.owner
+                        && Self::reaches_supertype(&candidate.owner, &other.owner, p))
+            })
+        });
+        owner_winner.map_or(Member::Ambiguous, |winner| Member::Found(winner.target))
+    }
+
+    fn depths_dominate(left: &[u8], right: &[u8]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| left <= right)
+            && left.iter().zip(right).any(|(left, right)| left < right)
     }
 
     /// The one interface declaration a class actually inherits (§9.4.1).
@@ -1499,7 +1791,7 @@ impl JavaResolver {
             types: &enclosing,
             at: r.span.byte_start,
         };
-        let arguments = scope.argument_types_at(site.at);
+        let arguments = r.arg_types.as_deref();
         let invocation = Invocation {
             argc: r.argc,
             arguments,
@@ -1827,7 +2119,7 @@ impl JavaResolver {
             fqn::INIT,
             Invocation {
                 argc: r.argc,
-                arguments: scope.argument_types_at(r.span.byte_start),
+                arguments: r.arg_types.as_deref(),
             },
             p,
         );
@@ -1942,7 +2234,6 @@ fn build_scope(cfg: &JavaConfig, file: &FileFacts<JavaLang>) -> JavaScope {
             header.module.as_deref(),
         ),
         bindings: header.bindings.clone(),
-        call_arguments: header.call_arguments.clone(),
         erased: header.erased.clone(),
         ..JavaScope::default()
     };
@@ -2083,6 +2374,30 @@ impl Resolver<JavaLang> for JavaResolver {
                 &def.name,
             ))),
         }
+    }
+
+    /// A synthetic full-signature identity for a unique callable forwards to
+    /// its established arity identity. Overload-set aliases carry an arity
+    /// name and intentionally forward nowhere.
+    fn def_alias_targets(
+        &self,
+        _cfg: &JavaConfig,
+        header: &JavaHeader,
+        def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        if def.kind != DefKind::Alias || !def.name.contains('(') {
+            return Vec::new();
+        }
+        let callable = fqn::callable_of(def);
+        let owner = fqn::type_fqn(
+            &fqn::container(
+                header.package.as_deref().unwrap_or(""),
+                header.module.as_deref(),
+            ),
+            &def.owner,
+        );
+        vec![Fqn::new(fqn::member_fqn(&owner, &callable.key()))]
     }
 
     /// Empty: the driver never calls this, and Java's arity key is part of
