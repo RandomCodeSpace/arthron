@@ -9,6 +9,15 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Changed
+
+- Reference rows now carry file-locally evident call argument types in their
+  canonical key. Schema generation 10 forces older stores to rescan. Current
+  extractors initialize the field to `None`, freezing graph behavior until a
+  language track deliberately starts recording types.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added

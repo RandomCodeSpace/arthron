@@ -1720,6 +1720,7 @@ mod tests {
             },
             locally_bound: true,
             argc: Some(0),
+            arg_types: None,
             enclosing: None,
             span: Span {
                 byte_start: 0,

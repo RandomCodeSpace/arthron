@@ -4,6 +4,40 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — reference-row identity carries file-local argument types
+
+Two same-arity calls with the same literal target and enclosing definition can
+legitimately resolve to different overloads when their argument types differ.
+The reference row previously keyed those sites by arity but not argument
+types. Because a row carries one outcome, that collapsed distinct answers:
+the first occurrence supplied the stored outcome while later occurrences only
+increased its count, even though their edges could name different targets.
+
+**Decided: `Reference` and `RefKey` carry
+`arg_types: Option<Vec<String>>`.** `Some(types)` means every argument type is
+file-locally evident; `None` means at least one needs inference or the
+extractor does not record types. The canonical redb key and edge-pin row hash
+include the field. Schema generation 10 wipes older stores so no generation-9
+key is decoded under the new grammar.
+
+Every current extractor writes `None`, including Java. This core change is
+therefore representation only: no language begins type-directed resolution
+here. Java's language-owned follow-up can populate the field and resolve from
+the reference itself, so everything its resolver reads is in the row key or
+derived from it.
+
+*Rejected: folding types into `raw_target`.* That field is the literal text at
+the site; changing its meaning would corrupt source-facing output.
+
+*Rejected: adding the span to the key.* It would distinguish every occurrence
+and destroy intentional row deduplication.
+
+*Rejected: demoting a row when collapsed occurrences disagree.* That would
+under-report genuinely resolved sites and leave occurrence edges disagreeing
+with the stored row rather than fixing the identity defect.
+
+---
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and

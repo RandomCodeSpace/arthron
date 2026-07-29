@@ -1087,6 +1087,7 @@ fn phase_two<L: Language>(
             enclosing: enclosing_name.to_string(),
             raw_target: r.raw_target.clone(),
             argc: r.argc,
+            arg_types: r.arg_types.clone(),
             locally_bound: r.locally_bound,
         };
         record::<L>(key, r, src, res, &mut acc);

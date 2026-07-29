@@ -470,6 +470,7 @@ fn directive(facts: &mut FileFacts<DartLang>, node: &SgNode) {
             // name a local: `LocalBinding` does not apply to this track.
             locally_bound: false,
             argc: None,
+            arg_types: None,
             // A Dart directive sits at the top of its library and inside no
             // declaration at all, so the driver sources its edge at the
             // library node — which is exactly what imports it.

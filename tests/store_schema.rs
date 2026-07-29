@@ -103,6 +103,7 @@ fn key(file: &str, enclosing: &str, raw: &str) -> RefKey {
         enclosing: enclosing.to_string(),
         raw_target: raw.to_string(),
         argc: None,
+        arg_types: None,
         locally_bound: false,
     }
 }
@@ -114,6 +115,22 @@ fn record(outcome: StoredOutcome) -> RefRecord {
         first_line: 7,
         lang: Lang::Go.code(),
     }
+}
+
+#[test]
+fn schema_ten_round_trips_argument_types_in_reference_keys() {
+    assert_eq!(SCHEMA_VERSION, 10);
+
+    let mut typed = key("pkg/a.java", "pkg#Caller.m()", "pick");
+    typed.argc = Some(1);
+    typed.arg_types = Some(vec!["int".to_string()]);
+
+    let (file, encoded) = typed.split();
+    assert_eq!(RefKey::join(file, &encoded).expect("join"), typed);
+
+    let mut other = typed.clone();
+    other.arg_types = Some(vec!["java.lang.String".to_string()]);
+    assert_ne!(typed.split().1, other.split().1);
 }
 
 /// One file's phase-2 half: one row, one edge, one candidate entry.

@@ -784,6 +784,10 @@ pub struct Reference {
     /// Argument count at a call or creation site. `None` when the language
     /// does not discriminate by arity.
     pub argc: Option<u32>,
+    /// File-locally evident argument types at a call or creation site.
+    /// `None` when any argument needs inference or the extractor does not
+    /// record argument types.
+    pub arg_types: Option<Vec<String>>,
     /// The nearest nameable enclosing definition, or `None` when there is
     /// none — package level, a Go `init` body, a Java static initializer.
     pub enclosing: Option<Encloser>,

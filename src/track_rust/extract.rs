@@ -396,6 +396,7 @@ fn module_item(node: &SgNode, defs: &mut Vec<Definition>, refs: &mut Vec<Referen
         },
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: enclosing_definition(node),
         span: span_of(node),
     });
@@ -431,6 +432,7 @@ fn extern_crate(
         target,
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: enclosing_definition(node),
         span,
     });
@@ -466,6 +468,7 @@ fn use_declaration(
             target,
             locally_bound: false,
             argc: None,
+            arg_types: None,
             enclosing: enclosing.clone(),
             span: Span {
                 byte_start: leaf.byte_start,

@@ -812,6 +812,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     },
                     locally_bound: false,
                     argc: None,
+                    arg_types: None,
                     enclosing: None,
                     span,
                 });
@@ -892,6 +893,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     target,
                     locally_bound,
                     argc: argument_count(&node),
+                    arg_types: None,
                     enclosing: enclosing_definition(&node),
                     span: span_of(&node),
                 });
@@ -926,6 +928,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     target,
                     locally_bound,
                     argc,
+                    arg_types: None,
                     enclosing: enclosing_definition(&site),
                     span: span_of(&site),
                 });
@@ -944,6 +947,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     // Not a call site: `None` and `Some(0)` are different
                     // facts, and a read passes no arguments at all.
                     argc: None,
+                    arg_types: None,
                     enclosing: enclosing_definition(&node),
                     span: span_of(&node),
                 });
@@ -988,6 +992,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     },
                     locally_bound,
                     argc: None,
+                    arg_types: None,
                     enclosing: enclosing_definition(&key),
                     span,
                 });
