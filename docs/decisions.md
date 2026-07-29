@@ -4,6 +4,49 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — collision disposition belongs to the stored definition set
+
+Two files declaring C# `N#Shared` as a partial type exposed a split answer:
+the cold C# scan reported **0 FQN collisions**, while an unchanged warm scan
+and a later full-registry report reported **1**. The node was correct — both
+declaration paths survived — and the count was not. The pipeline subtracted
+mergeable identities using only definitions extracted in the current event;
+an unchanged event had none, while `Store::report` counted the durable
+multi-file node mechanically.
+
+**Decided: the store persists each definition site's merge-relevant facts and
+a collision disposition for the complete current declaration set.** For every
+touched multi-file identity, declarations are read in deterministic
+`(file, line)` order and every unordered pair is handed to the language's
+`Resolver::mergeable`. The disposition is committed after phase 1 and before
+phase 2 restores any file's currency claim, so a completed report is a
+function of the stored graph rather than of the last event. A deletion first
+withdraws the surviving co-declarers' claims, then reclassifies and restores
+them through the ordinary waking path; an interruption therefore cannot
+publish the old disposition as current.
+
+The discriminating tests name the identities and sites: partial `N#Shared`
+keeps `a.cs` and `z.cs` and reports zero cold, warm, direct-store and
+full-registry; field-versus-property `N#Shared::Value` keeps both paths and
+reports one cold and warm. A three-site `field, property, field` fixture
+reports one because the non-adjacent field pair is incompatible, then reports
+zero after that declaration is deleted. This is the reason adjacent-window
+comparison is insufficient even when its order is deterministic.
+
+Schema generation moves **9 → 10** and old stores wipe and rebuild. The graph
+is a cache; migrating encoded declaration sites and inventing a disposition
+for data whose language definitions were not stored would be a guess.
+
+*Rejected: keeping the event-local subtraction.* It is definitionally unable
+to answer an unchanged warm event or a later registry track. *Rejected:
+checking adjacent windows.* Mergeability need not be transitive. *Rejected:
+dropping duplicate declarations or counting only one partial.* Both violate
+the never-drop rule and erase queryable source sites. *Rejected: teaching the
+store language semantics.* The resolver remains the only authority; the store
+owns persistence and tallying of the verdict.
+
+---
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and

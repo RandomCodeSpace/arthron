@@ -45,8 +45,9 @@ use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, node_id
 use crate::registry::REGISTRY;
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
-    DeclSite, DefBatch, FileDefs, FileError, FileRefs, FileSupers, NodePayload, NodeRecord,
-    RefBatch, RefKey, RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
+    CollisionDisposition, DeclSite, DefBatch, FileDefs, FileError, FileRefs, FileSupers,
+    NodePayload, NodeRecord, RefBatch, RefKey, RefRecord, Report, Store, StoredDefinition,
+    StoredOutcome, SuperBatch, SuperRecord,
 };
 
 /// Files a phase writes in one transaction.
@@ -387,6 +388,7 @@ pub fn scan<L: Language>(
     let mut event_paths: Vec<String> = changed.iter().map(|f| f.rel_path.clone()).collect();
     event_paths.extend(deleted.iter().cloned());
     let declared_before = store.declared_nodes(&event_paths)?;
+    let deleted_before = store.declared_nodes(&deleted)?;
     // The other half of what an identity means, read at the same moment and
     // for the same reason: a type whose supertypes move changes what every
     // member lookup below it reaches, while the type's own id and payload sit
@@ -405,7 +407,14 @@ pub fn scan<L: Language>(
     // about a file a completed scan claims everything about — and the next
     // scan would re-read it for nothing. Collected across every phase and
     // folded into the two waking rounds below.
-    let mut invalidated: BTreeSet<String> = store.forget_files(&deleted)?;
+    let deleted_ids: BTreeSet<NodeId> = deleted_before.keys().copied().collect();
+    let deleted_paths: BTreeSet<String> = deleted.iter().cloned().collect();
+    let mut invalidated = store.declaration_files(&deleted_ids, &deleted_paths)?;
+    // A deletion can change a collision disposition without applying a
+    // definition half for any survivor. Withdraw those survivors first, so
+    // an interruption cannot present the old disposition as current.
+    store.forget_hashes(&invalidated.iter().cloned().collect::<Vec<_>>())?;
+    invalidated.extend(store.forget_files(&deleted)?);
 
     // Phase 1: definition and container nodes for the changed set.
     //
@@ -415,9 +424,6 @@ pub fn scan<L: Language>(
     // batch a file lands in decides nothing, and the graph a batched phase
     // leaves is the graph a single transaction left.
     let probe = store.symbol_entries()?;
-    // The definitions this event declared, by identity. Two of them under
-    // one identity is the only case the language can be asked about.
-    let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
     let mut def_batch = DefBatch {
         files: Vec::with_capacity(BATCH_FILES),
     };
@@ -431,7 +437,7 @@ pub fn scan<L: Language>(
     // read from.
     let mut declared_now: BTreeMap<NodeId, NodePayload> = BTreeMap::new();
     for file in &changed {
-        let defs = phase_one(rs, &cfg, file, &probe, &mut event_defs);
+        let defs = phase_one(rs, &cfg, file, &probe);
         for (id, record) in &defs.nodes {
             declared_now.insert(*id, record.payload());
         }
@@ -484,9 +490,7 @@ pub fn scan<L: Language>(
     // and keeps every file this event writes phase-2 facts for covered by a
     // phase-1 half.
     for file in &waking {
-        def_batch
-            .files
-            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        def_batch.files.push(phase_one(rs, &cfg, file, &probe));
         flush_defs(
             &store,
             &mut def_batch,
@@ -497,14 +501,40 @@ pub fn scan<L: Language>(
     }
     flush_defs(&store, &mut def_batch, &mut flagged, &mut invalidated, 1)?;
     drop(def_batch);
+
+    // Collision semantics belong to the complete current declaration set,
+    // never to this event's definitions alone. The store returns sites in
+    // deterministic `(file, line)` order; every unordered pair is asked,
+    // because adjacent windows accept `field, property, field` while the two
+    // fields are incompatible.
+    let mut disposition_ids: BTreeSet<NodeId> = declared_before
+        .keys()
+        .chain(declared_now.keys())
+        .copied()
+        .collect();
+    disposition_ids.extend(flagged);
+    let mut dispositions = BTreeMap::new();
+    for (id, defs) in store.collision_definitions(&disposition_ids)? {
+        let mergeable = (0..defs.len()).all(|left| {
+            ((left + 1)..defs.len()).all(|right| rs.mergeable(&defs[left], &defs[right]))
+        });
+        dispositions.insert(
+            id,
+            if mergeable {
+                CollisionDisposition::Mergeable
+            } else {
+                CollisionDisposition::Collision
+            },
+        );
+    }
+    // Files written by phase 1 still have no currency claim. Persist the
+    // verdict before phase 2 can restore any of them.
+    store.set_collision_dispositions(&disposition_ids, &dispositions)?;
+
     // Both halves of the comparison have done their work; `touched` is the
     // whole of what the event kept from them.
     drop(declared_before);
     drop(declared_now);
-
-    let colliding = store.definition_collisions(&flagged)?;
-    let merged = mergeable_count(rs, &colliding, &event_defs);
-    drop(event_defs);
 
     // The phase-1 probe goes before the phase-2 one is read: holding two
     // whole symbol tables at once buys nothing, and phase 1 is over.
@@ -640,7 +670,6 @@ pub fn scan<L: Language>(
     flush_stale(&store, &mut stale)?;
 
     let mut report = store.report()?;
-    report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
     report.file_errors = named(file_errors);
     Ok(report)
 }
@@ -913,7 +942,6 @@ fn phase_one<L: Language>(
     cfg: &L::Config,
     file: &ScannedFile<L>,
     probe: &dyn SymbolProbe,
-    event_defs: &mut HashMap<NodeId, Vec<Definition>>,
 ) -> FileDefs {
     let mut nodes = Vec::with_capacity(file.defs.len());
     for def in &file.defs {
@@ -942,6 +970,8 @@ fn phase_one<L: Language>(
             file: file.rel_path.clone(),
             line: def.span.line,
             payload: payload.clone(),
+            merge_definition: (!rs.stores_as_package(def))
+                .then(|| StoredDefinition::from_definition(def)),
         }];
         let record = match payload {
             NodePayload::Package(name) => NodeRecord::Package {
@@ -958,7 +988,6 @@ fn phase_one<L: Language>(
             },
         };
         nodes.push((id, record));
-        event_defs.entry(id).or_default().push(def.clone());
     }
     FileDefs {
         path: file.rel_path.clone(),
@@ -1275,6 +1304,7 @@ fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
                         file: path.to_string(),
                         line,
                         payload: NodePayload::External(package),
+                        merge_definition: None,
                     }],
                 },
             )
@@ -1288,33 +1318,6 @@ fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
         edges: acc.edges.into_iter().collect(),
         candidates: acc.candidates.into_iter().collect(),
     }
-}
-
-/// How many of the identities the store flagged the language itself calls
-/// one entity rather than two.
-///
-/// Only a pair this event holds in full can be asked: a declaration stored
-/// by an earlier event kept its FQN, kind and sites, not its [`Definition`],
-/// so there is nothing to hand [`Resolver::mergeable`]. Those count as
-/// collisions, which is right for every language that answers `false`
-/// unconditionally and wrong for the first that does not — and the fix at
-/// that point is to store enough of the definition to ask, not to soften the
-/// count.
-fn mergeable_count<L: Language>(
-    rs: &dyn Resolver<L>,
-    colliding: &[NodeId],
-    event_defs: &HashMap<NodeId, Vec<Definition>>,
-) -> u64 {
-    let mut merged = 0;
-    for id in colliding {
-        let Some(defs) = event_defs.get(id) else {
-            continue;
-        };
-        if defs.len() >= 2 && defs.windows(2).all(|pair| rs.mergeable(&pair[0], &pair[1])) {
-            merged += 1;
-        }
-    }
-    merged
 }
 
 /// The container a file's definitions live in, when it names one.
