@@ -55,6 +55,7 @@ fn site_of(file: &str, line: u32, payload: NodePayload) -> DeclSite {
         file: file.to_string(),
         line,
         payload,
+        merge_definition: None,
     }
 }
 
@@ -131,6 +132,56 @@ fn refs_of(file: &str, raw: &str, target: NodeId) -> FileRefs {
 
 fn open(path: &Path) -> Store {
     Store::open(path).expect("open")
+}
+
+#[test]
+fn a_schema_nine_store_is_wiped_and_rebuilt_at_schema_ten() {
+    assert_eq!(
+        SCHEMA_VERSION, 10,
+        "persisting collision disposition is the schema 9 -> 10 break",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.redb");
+    {
+        let store = open(&path);
+        store
+            .apply_defs(&DefBatch {
+                files: vec![FileDefs {
+                    path: "pkg/a.go".into(),
+                    nodes: vec![definition("m/pkg#Old", "pkg/a.go", 3)],
+                }],
+            })
+            .expect("apply schema-nine definition");
+        assert!(
+            store.node(&go("m/pkg#Old")).unwrap().is_some(),
+            "the old store contains a graph to wipe",
+        );
+    }
+
+    let db = Database::create(&path).expect("raw schema-nine open");
+    let txn = db.begin_write().expect("write schema-nine stamp");
+    {
+        let mut meta = txn.open_table(META).expect("meta");
+        meta.insert("schema_version", &9u32.to_le_bytes()[..])
+            .expect("stamp schema nine");
+    }
+    txn.commit().expect("commit schema nine");
+    drop(db);
+
+    let rebuilt = open(&path);
+    assert!(
+        rebuilt.known_files().unwrap().is_empty(),
+        "schema-nine ownership was wiped",
+    );
+    assert!(
+        rebuilt
+            .snapshot()
+            .expect("rebuilt snapshot")
+            .nodes
+            .is_empty(),
+        "schema-nine nodes were wiped before schema ten was created",
+    );
+    assert_eq!(rebuilt.report().unwrap().fqn_collisions, 0);
 }
 
 #[test]
