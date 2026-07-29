@@ -1,0 +1,80 @@
+# arthron edge pins — the target-stability gate.
+#
+# Regenerate this file with ONE command, from the repository root:
+#
+#   arthron pin corpus/go/probes --pins pins/go-probes.pins --write --commit 6cf0662
+#
+# Nothing else writes this file and nothing hand-edits it. A pin file edited
+# by hand is a claim about a scan that never ran.
+#
+# What it is. One line per resolved reference row, grouped under the file the
+# reference sits in: the row's 64-bit key hash, and an index into the [targets]
+# dictionary above it. The key hashed is the store's own canonical row key —
+# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
+# so a row's identity here is the row's identity there.
+#
+# What it is for. `arthron gate` compares four integers, and a reference that
+# resolves to the *wrong* definition moves none of them: it is still one
+# resolved row and still one edge, and only the far end changed. This file is
+# the only thing in the build that reads the far end.
+#
+# How it fails. A pinned row whose target changed fails by name —
+# `target_moved` — printing the file, the line, the site text, the old target
+# and the new one. A row that appeared is coverage growth and passes. A row
+# that vanished is flagged, not failed: the counting gate owns that half, and a
+# re-pin that drops rows shows the drop as deleted lines in this file's diff.
+#
+# Re-pinning is a deliberate act. Every changed target is a claim that the old
+# edge was wrong, and belongs in docs/decisions.md with the reason.
+#
+# `corpus` and `commit` are provenance: printed, never verified.
+# `targets` and `rows` are not a second copy of the body — they are a checksum
+# over it, and a file whose header disagrees with its own sections is refused
+# rather than read.
+format = 1
+corpus = "corpus/go/probes"
+commit = "6cf0662"
+targets = 14
+rows = 17
+
+[targets]
+def example.com/arthron/probes/clauseheader#Producer
+def example.com/arthron/probes/dotted/p#Foo
+def example.com/arthron/probes/dotted/p.Foo#Bar
+def example.com/arthron/probes/pkgrename/alpha#Name
+def example.com/arthron/probes/pkgrename/beta#Name
+def example.com/arthron/probes/shadowpair#Emit
+def example.com/arthron/probes/testpkg/api#Serve
+def example.com/arthron/probes/testpkg/api_test#Serve
+pkg example.com/arthron/probes/dotted/p
+pkg example.com/arthron/probes/dotted/p.Foo
+pkg example.com/arthron/probes/pkgrename/alpha
+pkg example.com/arthron/probes/pkgrename/beta
+pkg example.com/arthron/probes/testpkg/api
+pkg example.com/arthron/probes/testpkg/api_test
+
+[rows]
+clauseheader/clauseheader.go
+	4612fd55bfb16ae7 0
+	651cdc092cade04d 0
+	a7c4612a45571877 0
+dotted/consumer.go
+	57c575a709706261 8
+	7f6e4044ed519fa9 2
+	d5f363fbb19f7454 9
+	d829058bf4725475 1
+pkgrename/consumer.go
+	20542e40cdd33166 11
+	2d67900e9d473c97 4
+	cb4db02768debd2c 3
+	d8817f6fa32394cd 10
+shadowpair/shadowpair.go
+	dbd37634c65129cc 5
+testpkg/api/api_ext_test.go
+	07e5492977a69c18 12
+	49554994ec07ca79 6
+testpkg/api_test/api_ext_test.go
+	c800f64a2d90b21e 13
+	e51e3c9a27a4733a 7
+testpkg/api_test/api_test.go
+	806f6435a148d28c 7
