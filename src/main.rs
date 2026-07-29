@@ -896,15 +896,21 @@ fn run_pin(
     // taken over joins on nothing: every pinned row reads as vanished, every
     // scanned row as appeared, and a typo in a CI line or a renamed corpus is
     // a green run that checked no edge at all.
+    //
+    // Both sides are compared and shown `/`-separated, because that is the
+    // only form the header can hold: the writer below normalises, so a pin
+    // taken on Windows names `C:/x` while the same run scans `C:\x`. Leaving
+    // the separator in let the platform decide whether a tree matched itself,
+    // and made the refusal read as if the separator were the difference.
+    let scanned = path.display().to_string().replace('\\', "/");
     if !write
         && let Some(pinned) = &existing
-        && Path::new(&pinned.corpus) != path
+        && pinned.corpus != scanned
     {
         noteln!(
-            "arthron: {shown} pins {}, and this run scanned {}; a pin file compared \
+            "arthron: {shown} pins {}, and this run scanned {scanned}; a pin file compared \
              against another tree checks no edge at all",
             pinned.corpus,
-            path.display(),
         );
         return ExitCode::from(EXIT_USAGE);
     }

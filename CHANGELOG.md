@@ -467,6 +467,15 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Fixed
 
+- `arthron pin` compared the tree a pin file names against the tree it scanned
+  with the platform's own path semantics, while the header can only ever hold a
+  `/`-separated path. On Windows the two forms differ, so whether a pin file
+  matched its own tree was decided by the separator rather than by the tree,
+  and the refusal printed one path each way — reading as if the separator were
+  the difference. Both sides are now normalised before the comparison and in
+  the message. Found by the Windows CI job, which had never reached the
+  positive half of the check.
+
 - **Every number the README published was stale, and nothing could have caught
   it.** Three re-bases moved the tier-1 counts — the locals unification, Go's
   field-access surface, and the ECMAScript config and globals work — and four

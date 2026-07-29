@@ -634,9 +634,13 @@ fn a_pin_file_compared_against_another_tree_is_refused() {
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // `/`-separated on both sides: the header can hold no other form, so the
+    // refusal renders the scanned tree the way the pinned one was written.
+    // Asserting the raw `Display` form passed on Unix and failed on Windows
+    // for a message that was correct.
     for needle in [
-        mine.display().to_string(),
-        theirs.display().to_string(),
+        mine.display().to_string().replace('\\', "/"),
+        theirs.display().to_string().replace('\\', "/"),
         "checks no edge at all".to_string(),
     ] {
         assert!(
