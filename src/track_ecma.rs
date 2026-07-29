@@ -66,7 +66,9 @@
 //!    runs and why, and prove it with a cold-versus-incremental comparison.
 //! 7. **An entry point** with the shape of [`crate::registry::TrackScan`].
 //!    *Landed* as [`scan_ecma`], driving both impls through
-//!    [`crate::pipeline::scan`] and returning the later report.
+//!    [`crate::pipeline::scan`] — JavaScript, TypeScript, JavaScript again to
+//!    converge — and returning the last report, with every pass's file errors
+//!    folded into it.
 //! 8. **The switch, here.** *Landed*: `scan: None` became `scan: Some(scan_ecma)`.
 //! 9. **Two baselines, never one.** *Landed.* `arthron gate --language`
 //!    compares per language; a baseline file names the language it measures
@@ -115,10 +117,12 @@ use crate::track_ecma::resolve::{JS_RESOLVER, TS_RESOLVER};
 /// importing a `.ts` file still links to the right module node whichever ran
 /// first.
 ///
-/// The returned [`Report`] is the TypeScript pass's, which is the whole
-/// report: [`crate::store::Store::report`] tallies every row in the store and
-/// keys the tallies by language, so JavaScript's line is already in it and no
-/// combined EcmaScript number exists to return.
+/// The returned [`Report`] is the last pass's, which is the whole report:
+/// [`crate::store::Store::report`] tallies every row in the store and keys the
+/// tallies by language, so both languages' lines are already in it and no
+/// combined EcmaScript number exists to return. Its `file_errors` are the
+/// union of all three passes': a tally is whole-store, but a file error
+/// belongs to the pass that tried to read the file.
 pub fn scan_ecma(root: &Path, db_path: &Path) -> Result<Report, String> {
     scan_ecma_with(root, db_path, &crate::config::FileFilter::none())
 }
@@ -135,8 +139,44 @@ pub fn scan_ecma_with(
     db_path: &Path,
     filter: &crate::config::FileFilter,
 ) -> Result<Report, String> {
-    scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER, filter)?;
-    scan::<TsLang>(root, db_path, &TsExtractor, &TS_RESOLVER, filter)
+    let js = scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER, filter)?;
+    let ts = scan::<TsLang>(root, db_path, &TsExtractor, &TS_RESOLVER, filter)?;
+    // The convergence pass. The TypeScript pass declares identities the
+    // JavaScript pass had already probed and missed — a workspace member
+    // whose entry point is a `.ts` file is the shape that does it — and
+    // applying them withdraws the currency claim of every JavaScript file
+    // that probed one. The wake set that would give those claims back is
+    // filtered to the files the *running* language owns, so the TypeScript
+    // pass cannot re-resolve a `.js` file and the scan used to end with the
+    // claims still withdrawn. The next scan then re-read exactly those files,
+    // re-resolved them against a store that by then held the TypeScript
+    // definitions, and reported a higher JavaScript rate for a tree nobody
+    // had touched.
+    //
+    // A rate that depends on how many times it has been measured is not a
+    // measurement, and the cold number is the one every baseline is taken
+    // from. So run JavaScript once more: its changed set is exactly the files
+    // whose claims are outstanding, which is empty in the ordinary case, and
+    // it terminates because a module's identity here is its path — re-reading
+    // an unchanged `.js` file re-asserts the definitions it already had, so
+    // this pass declares nothing new and wakes nobody.
+    let mut report = scan::<JsLang>(root, db_path, &JsExtractor, &JS_RESOLVER, filter)?;
+    // Every pass walks its own half of the tree, so each has file errors the
+    // others never saw. Returning the last pass's alone would drop the
+    // TypeScript pass's — keyed by path, so a file that fails in two passes
+    // is one entry, which is the rule the driver already applies within one.
+    let mut errors: std::collections::BTreeMap<String, String> = js
+        .file_errors
+        .into_iter()
+        .chain(ts.file_errors)
+        .chain(std::mem::take(&mut report.file_errors))
+        .map(|e| (e.path, e.message))
+        .collect();
+    report.file_errors = std::mem::take(&mut errors)
+        .into_iter()
+        .map(|(path, message)| crate::store::FileError { path, message })
+        .collect();
+    Ok(report)
 }
 
 /// The EcmaScript family's registration.

@@ -84,13 +84,20 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         "package.json",
         // No `ModuleNotFound`: express vendors what it imports, and its
         // misses are expression-level instead.
+        //
+        // And **no `NoMatchingDefinition` at all**, which is the whole point
+        // of the entry above it. Every one of the 1,728 this corpus used to
+        // report was mocha putting a name in the universe scope — `it` 1,111,
+        // `describe` 554, `before` 59, `after` 3 — plus one `XMLHttpRequest`
+        // the host global list had left out. A reason whose contract says
+        // "our bug, and near zero" now reads zero here, so the next
+        // occurrence of it is a real one.
         &[
             ("DynamicModuleSpecifier", 3),
             ("NeedsExpressionType", 2906),
             ("NeedsReceiverType", 132),
             ("NeedsTypeInference", 781),
-            ("NoMatchingDefinition", 1728),
-            ("UnknownPackage", 3),
+            ("UnknownPackage", 1730),
         ],
     ),
     (
@@ -98,13 +105,21 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         Lang::TypeScript,
         "baselines/typescript-vue-core.toml",
         "package.json",
+        // 14,618 `UnknownPackage` where 15,276 `NoMatchingDefinition` used to
+        // be: vitest's injected globals, 13,833 of them under the reason that
+        // claimed the lookup table was complete, and 785 more — `vi.fn`,
+        // `expect.any` — under the one that claimed a type was missing. What
+        // is left in `NoMatchingDefinition` is 1,443, and it is real: DOM
+        // interface names this build deliberately does not claim as host
+        // globals, and members the resolver genuinely did not reach.
         &[
             ("ModuleNotFound", 108),
             ("NeedsExpressionType", 11151),
             ("NeedsReceiverType", 85),
-            ("NeedsTypeInference", 1320),
-            ("NoMatchingDefinition", 15276),
+            ("NeedsTypeInference", 535),
+            ("NoMatchingDefinition", 1443),
             ("UnindexedSupertype", 5),
+            ("UnknownPackage", 14618),
         ],
     ),
     (
@@ -114,14 +129,29 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         "packages/zod/package.json",
         // The opposite shape to vue-core, and the reason both are gated:
         // resolution through `exports` conditions rather than a `paths`
-        // mapping puts 7822 misses in `ModuleNotFound` and 8036 in
-        // `UnknownPackage`, buckets vue-core barely fills.
+        // mapping.
+        //
+        // `ModuleNotFound` was 7,822 and is 1. Every one of them was this
+        // repository importing itself — `import * as z from "zod/v4"` — down
+        // the `"types"` branch of its own `exports` map, which names a built
+        // `.d.cts` beside the manifest that no scan of the sources can see.
+        // The map's *first* branch is `"@zod/source"`, and
+        // `packages/zod/tsconfig.json` states exactly that in
+        // `compilerOptions.customConditions`. Reading it links 7,037 more
+        // references into `packages/zod/src/`.
+        //
+        // `NoMatchingDefinition` rose 524 → 1,123 and `NeedsTypeInference`
+        // 1,576 → 1,761 in the same movement, and neither is a new miss: a
+        // module that could not be found gave every name reached through it
+        // one answer, and a module that *is* found gives each of them its own
+        // — including, for a namespace re-exported by name, an honest one
+        // this resolver does not yet follow.
         &[
-            ("ModuleNotFound", 7822),
+            ("ModuleNotFound", 1),
             ("NeedsExpressionType", 8811),
             ("NeedsReceiverType", 50),
-            ("NeedsTypeInference", 1576),
-            ("NoMatchingDefinition", 524),
+            ("NeedsTypeInference", 1761),
+            ("NoMatchingDefinition", 1123),
             ("UnindexedSupertype", 2),
             ("UnknownPackage", 8036),
         ],
@@ -757,6 +787,100 @@ fn assert_census(census: &Census) {
             "{fqn} is not declared at {file}:{line} — {} site(s) in that file, at {here:?}",
             here.len(),
         );
+    }
+}
+
+/// One reference row, named exactly: `(file, raw_target, enclosing)` → what
+/// the resolver concluded, rendered the way this file's `outcome` renders it.
+///
+/// A tally cannot tell a corpus which rows moved, and the three changes this
+/// commit makes are each visible as a *reason on a named site*. Pinning the
+/// sites is what makes a regression fail by name rather than by an integer
+/// that has to be re-derived.
+const PINNED_ROWS: &[(&str, &str, &str, &str)] = &[
+    // mocha puts `it` in express's universe scope. Not this repository's
+    // missing definition, and not `External` either — still `Unresolved`, so
+    // the reference stays in both terms of the rate.
+    (
+        "corpus/javascript/express",
+        "test/Route.js",
+        "it",
+        "unresolved UnknownPackage",
+    ),
+    // The host global list had left this one out, so a name no repository
+    // ever declares reported `NoMatchingDefinition` — the reason that says
+    // the table was complete.
+    (
+        "corpus/javascript/express",
+        "examples/search/public/client.js",
+        "XMLHttpRequest",
+        "external web:global",
+    ),
+    // vitest's, through `globals: true`, and the same answer this resolver
+    // already gives zod for `import { expect } from "vitest"`.
+    (
+        "corpus/typescript/vue-core",
+        "packages/compiler-core/__tests__/codegen.spec.ts",
+        "expect",
+        "unresolved UnknownPackage",
+    ),
+    // `customConditions`. Without `"@zod/source"` in the set this took the
+    // `"types"` branch of zod's own `exports` map and missed on a built
+    // artefact; with it, the import lands on the source file in this tree.
+    (
+        "corpus/typescript/zod",
+        "packages/zod/src/v4/classic/tests/anyunknown.test.ts",
+        "zod/v4",
+        "resolved packages/zod/src/v4/index.ts",
+    ),
+];
+
+/// Every row in [`PINNED_ROWS`] says what it is supposed to say.
+#[test]
+fn the_three_reclassifications_are_pinned_to_named_sites() {
+    let mut by_corpus: BTreeMap<&str, Vec<&(&str, &str, &str, &str)>> = BTreeMap::new();
+    for pin in PINNED_ROWS {
+        by_corpus.entry(pin.0).or_default().push(pin);
+    }
+    for (root, pins) in by_corpus {
+        let corpus = Path::new(root);
+        if !corpus_present(corpus) {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.redb");
+        scan_ecma(corpus, &db).expect("scan");
+        let store = Store::open(&db).expect("store opens");
+        let snapshot = store.snapshot().expect("snapshot");
+        for (_, file, target, want) in pins {
+            let found: Vec<String> = snapshot
+                .rows
+                .iter()
+                .filter(|(key, _)| key.file == *file && key.raw_target == *target)
+                .map(|(_, record)| match &record.outcome {
+                    arthron::store::StoredOutcome::Resolved(id) => {
+                        match store.node(id).expect("node read") {
+                            Some(NodeRecord::Definition { fqn, .. }) => format!("resolved {fqn}"),
+                            Some(NodeRecord::Package { import_path, .. }) => {
+                                format!("resolved {import_path}")
+                            }
+                            _ => "resolved <dangling>".to_string(),
+                        }
+                    }
+                    arthron::store::StoredOutcome::External(p) => format!("external {p}"),
+                    arthron::store::StoredOutcome::Unresolved(c) => {
+                        format!("unresolved {}", reason_name(*c))
+                    }
+                })
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "{root}: no row for ({file}, {target}) — a pinned site vanished",
+            );
+            for outcome in &found {
+                assert_eq!(outcome, want, "{root}: ({file}, {target})");
+            }
+        }
     }
 }
 
