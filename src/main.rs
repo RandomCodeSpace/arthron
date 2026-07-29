@@ -36,6 +36,7 @@ use arthron::gate::{
 use arthron::json;
 use arthron::mcp;
 use arthron::model::{Lang, reason_name};
+use arthron::pins;
 use arthron::pipeline::scan_repo_with;
 use arthron::query::{
     DEFAULT_IMPACT_DEPTH, Impact, Match, NameIndex, NodeKind, RefSite, definition, impact,
@@ -237,6 +238,55 @@ enum Command {
         #[arg(long, long_help = json::HELP)]
         json: bool,
     },
+    /// Scan a corpus and check that every resolved reference still points
+    /// where its pin file says it does.
+    ///
+    /// The complement of `gate`, not a variant of it. `gate` compares four
+    /// integers — resolved, external, local_binding, unresolved — and a
+    /// reference that resolves to the *wrong* definition moves none of them:
+    /// it is still one resolved row and still one edge, and only the far end
+    /// changed. This is the only command that reads the far end.
+    ///
+    /// A pinned row whose target changed fails, by name, printing the file,
+    /// the line, the site text, the old target and the new one. A row that
+    /// appeared is coverage growth and passes. A row that vanished with
+    /// nothing in its place is flagged and does not fail: the counting gate
+    /// owns that half. A row that vanished while another appeared is a row
+    /// whose key changed — `rows_rekeyed` — and that fails, because re-keying
+    /// preserves every integer the counting gate reads.
+    ///
+    /// `--write` records what this run measured instead of comparing against
+    /// it. That is the one command a deliberate capability landing runs per
+    /// corpus, and every pin file carries it in its own header.
+    ///
+    /// `arthron.toml` at the corpus root is read for its globs and its
+    /// `[tracks]` table, exactly as `gate` reads it, so both measure the same
+    /// file set. Its `db` key is ignored for the same reason: pins are only
+    /// meaningful against a cold store.
+    ///
+    /// Exit codes: 0 pass (or a successful --write), 1 a target moved, and 2
+    /// for usage, I/O or the environment, where nothing was measured at all.
+    #[command(after_long_help = json::CONFIG_HELP)]
+    Pin {
+        /// Corpus root.
+        path: PathBuf,
+        /// Pin file to compare against, or to write with --write.
+        #[arg(long)]
+        pins: PathBuf,
+        /// Overwrite the pin file with what this run measured instead of
+        /// comparing against it. Every changed target is a claim that the old
+        /// edge was wrong and belongs in docs/decisions.md with the reason.
+        #[arg(long)]
+        write: bool,
+        /// Commit to record as provenance when writing. Never verified.
+        /// Defaults to the value already in the pin file, or "unknown".
+        #[arg(long)]
+        commit: Option<String>,
+        /// Database file. Default: a fresh temporary store, deleted after the
+        /// run — pins are only meaningful against a cold store.
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Ask the stored graph about a name.
     ///
     /// The store is opened read-only: a query never creates it, never
@@ -333,6 +383,13 @@ fn main() -> ExitCode {
             commit.as_deref(),
             json,
         ),
+        Command::Pin {
+            path,
+            pins,
+            write,
+            commit,
+            db,
+        } => run_pin(&path, &pins, write, commit.as_deref(), db.as_deref()),
         Command::Query { verb, db, json } => match working_db(db) {
             Ok(db_path) => run_query(&verb, &db_path, json),
             Err(e) => {
@@ -796,6 +853,187 @@ fn write_baseline(
     std::fs::write(baseline_path, render_baseline(&baseline))
         .map_err(|e| format!("writing {}: {e}", baseline_path.display()))?;
     Ok(baseline)
+}
+
+/// Scan a corpus cold and either check its resolved edges against a pin file
+/// or write one.
+///
+/// Reads the pin file *before* scanning. A malformed one is a usage error, and
+/// finding that out after a multi-minute scan helps nobody — the same order
+/// `gate` reads its baseline in, for the same reason.
+fn run_pin(
+    path: &Path,
+    pins_path: &Path,
+    write: bool,
+    commit: Option<&str>,
+    db: Option<&Path>,
+) -> ExitCode {
+    let shown = pins_path.display().to_string().replace('\\', "/");
+    let existing = match std::fs::read_to_string(pins_path) {
+        Ok(text) => match pins::parse(&text) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                noteln!(
+                    "arthron: {shown}: {e}\n\
+                     arthron: a pin file this build cannot read is not overwritten; \
+                     delete it if it is being replaced deliberately",
+                );
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            noteln!("arthron: reading {shown}: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    if !write && existing.is_none() {
+        noteln!("arthron: {shown} does not exist; record it with --write");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // Provenance the parser deliberately does not check, checked here — where
+    // it decides something. A pin file compared against a tree it was not
+    // taken over joins on nothing: every pinned row reads as vanished, every
+    // scanned row as appeared, and a typo in a CI line or a renamed corpus is
+    // a green run that checked no edge at all.
+    if !write
+        && let Some(pinned) = &existing
+        && Path::new(&pinned.corpus) != path
+    {
+        noteln!(
+            "arthron: {shown} pins {}, and this run scanned {}; a pin file compared \
+             against another tree checks no edge at all",
+            pinned.corpus,
+            path.display(),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let config = match Config::load(path) {
+        Ok(c) => c,
+        Err(e) => {
+            noteln!("arthron: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    // `_scratch` is bound, not discarded: its `Drop` removes the temporary
+    // store, and it must outlive the scan.
+    let (db_path, _scratch) = match db {
+        Some(p) => (p.to_path_buf(), None),
+        None => match scratch_dir() {
+            Ok(d) => (d.0.join("pin.redb"), Some(d)),
+            Err(e) => {
+                noteln!("arthron: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+    };
+    if let Some(parent) = db_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        noteln!("arthron: creating {}: {e}", parent.display());
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Err(e) = scan_repo_with(path, &db_path, &config) {
+        noteln!("arthron: {e}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let rows = match ReadStore::open(&db_path).and_then(|store| pins::collect(&store)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            noteln!("arthron: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    // A scan that resolved nothing is not a measurement either way round. A
+    // pin file written from it looks exactly as authoritative as a correct one
+    // and would bless every later run; a comparison against it reads every
+    // pinned row as vanished with nothing appearing in its place — flagged,
+    // not failed — which is a green run over an empty tree. Refuse both, the
+    // way a baseline of all zeros is refused.
+    if rows.is_empty() {
+        noteln!(
+            "arthron: {}: this scan resolved no reference at all, so it pins nothing \
+             and agrees with nothing",
+            path.display(),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    if write {
+        // `/`-separated on every platform, like the repo-relative keys a scan
+        // builds: the pin format has no escapes, so a Windows `\` would write
+        // a header no later run could read back.
+        let corpus = path.display().to_string().replace('\\', "/");
+        let commit = commit
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().map(|p| p.commit.clone()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let text = match pins::render(&corpus, &commit, &shown, &rows) {
+            Ok(t) => t,
+            Err(e) => {
+                noteln!("arthron: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        // What changed against what was there, so a re-pin is never a silent
+        // overwrite: the numbers a reviewer needs are on stdout before the
+        // diff is read. Computed before the write, so a comparison that cannot
+        // be made does not leave a replaced file and no account of it.
+        let mut out = String::new();
+        if let Some(before) = &existing {
+            match pins::compare(before, &rows) {
+                Ok(verdict) => out.push_str(&verdict.report()),
+                Err(e) => {
+                    noteln!("arthron: {shown}: {e}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            }
+        }
+        if let Some(parent) = pins_path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            noteln!("arthron: creating {}: {e}", parent.display());
+            return ExitCode::from(EXIT_USAGE);
+        }
+        if let Err(e) = std::fs::write(pins_path, &text) {
+            noteln!("arthron: writing {shown}: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        outln!(
+            out,
+            "pins: wrote {shown} at {commit} ({corpus}) — {} rows",
+            rows.len(),
+        );
+        return emit(&out, ExitCode::SUCCESS);
+    }
+
+    let pinned = existing.expect("checked above: a comparison without a pin file is a usage error");
+    let verdict = match pins::compare(&pinned, &rows) {
+        Ok(v) => v,
+        Err(e) => {
+            noteln!("arthron: {shown}: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let mut out = format!("pins: {shown} ({})\n", pinned.corpus);
+    out.push_str(&verdict.report());
+    if verdict.failed() {
+        outln!(
+            out,
+            "pins: FAIL — a pinned edge is not where it was pinned: a target moved, a \
+             pinned row was re-keyed out of the comparison, or two rows share one key. \
+             None of those moves the four integers `arthron gate` compares, which is \
+             why this check exists. Re-pin only with every change attributed in \
+             docs/decisions.md.",
+        );
+        emit(&out, ExitCode::from(EXIT_GATE_FAILED))
+    } else {
+        outln!(out, "pins: pass");
+        emit(&out, ExitCode::SUCCESS)
+    }
 }
 
 fn report_verdict(

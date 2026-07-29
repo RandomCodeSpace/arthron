@@ -1,0 +1,55 @@
+# arthron edge pins — the target-stability gate.
+#
+# Regenerate this file with ONE command, from the repository root:
+#
+#   arthron pin corpus/python/probes --pins pins/python-probes.pins --write --commit 6a2275c
+#
+# Nothing else writes this file and nothing hand-edits it. A pin file edited
+# by hand is a claim about a scan that never ran.
+#
+# What it is. One line per resolved reference row, grouped under the file the
+# reference sits in: the row's 64-bit key hash, and an index into the [targets]
+# dictionary above it. The key hashed is the store's own canonical row key —
+# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
+# so a row's identity here is the row's identity there.
+#
+# What it is for. `arthron gate` compares four integers, and a reference that
+# resolves to the *wrong* definition moves none of them: it is still one
+# resolved row and still one edge, and only the far end changed. This file is
+# the only thing in the build that reads the far end.
+#
+# How it fails. A pinned row whose target changed fails by name —
+# `target_moved` — printing the file, the line, the site text, the old target
+# and the new one. A row that appeared is coverage growth and passes. A row
+# that vanished with nothing in its place is flagged, not failed: the counting
+# gate owns that half, and a re-pin that drops rows shows the drop as deleted
+# lines in this file's diff. A row that vanished *while another appeared* is a
+# row whose key changed, and that fails by name too — `rows_rekeyed` — because
+# re-keying preserves all four of the integers `arthron gate` compares by
+# construction, so nothing else in the build would ever say the row stopped
+# being checked.
+#
+# Re-pinning is a deliberate act. Every changed target is a claim that the old
+# edge was wrong, and belongs in docs/decisions.md with the reason.
+#
+# `corpus` and `commit` are provenance: printed, never verified.
+# `targets` and `rows` are not a second copy of the body — they are a checksum
+# over it, and a file whose header disagrees with its own sections is refused
+# rather than read.
+format = 1
+corpus = "corpus/python/probes"
+commit = "6a2275c"
+targets = 2
+rows = 5
+
+[targets]
+def probe.greeter#Greeter
+def probe.greeter#Greeter.greet
+
+[rows]
+probe/caller.py
+	3e6ddc8d68096a0a 0
+	47a35ac5c9f78e66 0
+	c18857cc35842c00 0
+	c735daa37cfb5bac 1
+	fb3675291f000686 0

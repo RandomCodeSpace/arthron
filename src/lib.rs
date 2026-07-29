@@ -265,6 +265,7 @@ pub mod json;
 pub mod lang;
 pub mod mcp;
 pub mod model;
+pub mod pins;
 pub mod pipeline;
 pub mod query;
 pub mod registry;

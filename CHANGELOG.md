@@ -11,6 +11,63 @@ Decisions and their rationale — including what was rejected — live in
 
 ## [Unreleased]
 
+### Added
+
+- **`arthron pin`, and a committed target pin per tier-1 corpus: the gate can
+  now see a wrong edge.** `arthron gate` compares four integers — `resolved`,
+  `external`, `local_binding`, `unresolved` — and a reference that resolves to
+  the *wrong* definition moves none of them. It is still one `Resolved` row and
+  still one edge; only the far end changed. The rate cannot see it, the
+  `denominator_shrank` check cannot see it, and neither drift check can, because
+  not one of them reads a target. That blind spot is the whole of the standing
+  verdict that *a wrong edge is worse than a miss, because a miss is counted and
+  a wrong edge is not*.
+
+  `pins/<corpus>.pins` records the target of every resolved reference row, per
+  corpus, for the fifteen tier-1 corpora — 80,272 rows over 18,687 distinct
+  targets. `tests/edge_pins.rs` scans each corpus cold and compares. The rule:
+
+  - a pinned row whose target **changed** fails, by name — `target_moved` —
+    printing the file, the line, the reference kind, the enclosing FQN, the
+    site text, the arity, the old target and the new one;
+  - a row that **appeared** is coverage growth and passes;
+  - a row that **vanished** is flagged in the output and does not fail: the
+    counting gate owns that half, and a re-pin that drops rows shows the drop
+    as deleted lines in the pin file's own diff.
+
+  **The format, and why.** Written out in full those rows are 14.5 MB of
+  committed text (measured). Stored as a 64-bit hash of the store's own
+  canonical row key plus an index into a plaintext, deduplicated dictionary of
+  target names, the fifteen files are 3.1 MB. The target names stay in
+  plaintext deliberately: a check whose failure printed
+  `0x8f3a… became 0x1c07…` would tell a reviewer that something moved and
+  nothing about what, so the old target is recoverable by name from the file
+  and the new one — with the file, line and site text — is re-derived by
+  joining the failing hash against the scan already in hand. Rows are grouped
+  under their file so a re-pin's diff says which files' edges moved.
+
+  **Regeneration is one command per corpus, and every pin file carries it in
+  its own header:**
+
+  ```
+  arthron pin corpus/go/codeiq --pins pins/go-codeiq.pins --write --commit <sha>
+  ```
+
+  Verified by mutation, not by assertion. Making the Java member walk prefer a
+  superclass's declaration over the receiver's own override left
+  `java-commons-lang` at `resolved 34217 / unresolved 16279 / external 63385 /
+  local_binding 15162` and `java-gson` at `12885 / 6105 / 16737 / 6706` —
+  byte-identical to their baselines, both gates green — while the pin check
+  failed both, naming 275 and 266 moved edges with 0 appeared and 0 vanished
+  (`ImmutableTriple.of` resolving to `Triple.of`, `new JsonTreeReader`
+  resolving to `JsonReader.<init>`). Reverting made all 21 pin tests green
+  again.
+
+  No workflow change: `.github/workflows/gate.yml` already ends by running the
+  whole suite with `ARTHRON_REQUIRE_CORPUS=1` in the one job that fetches the
+  corpus, so the fifteen comparisons run and block a merge there. Fifteen cold
+  scans, 7.4 s wall.
+
 ### Changed
 
 - **The EcmaScript universe scope has a second half, and it un-pollutes

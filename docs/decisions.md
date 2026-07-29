@@ -4,6 +4,94 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — the second re-pin: a docs-only merge moves no edge, and the pins say so in bytes
+
+Main's docs-truth work — retracting the call-graph claim, publishing the rate's
+denominator, correcting documented numbers — is prose, README tables and one
+display string (`Lang::rate_scope`, "call-graph resolution" → "call, import and
+type-use resolution"). Nothing in it touches resolution. That is a claim, and
+the pin gate is the only thing here that can settle it, so it was checked before
+it was believed: all fifteen corpora were compared against their committed pins
+*before* anything was regenerated.
+
+**Every corpus: `0 appeared, 0 vanished, 0 moved`** — 80,272 held rows over
+fifteen pin files. Regenerating then left every one of the fifteen files
+differing from its committed version in exactly two lines, both of them the
+provenance header: `commit =` and the `arthron pin …` command inside the
+comment. Not one body byte moved. The first re-pin could only say that no
+*pre-existing* row was re-aimed while thousands appeared; this one says the
+stronger thing, that the resolver's answer over 80,272 edges is byte-identical
+across the merge. A null result is the result a targeted gate should produce
+for a change that targets nothing, and it is worth writing down precisely
+because the counting gate would have produced the same silence for a merge that
+re-aimed every edge in the tree.
+
+**Decided: a re-pin whose body does not move is still written, at the new
+commit.** The header records the tree the pins were last verified against, and
+after absorbing main that is the merge commit, not its parent.
+*Rejected:* skipping the write to keep the diff empty. That buys a clean diff
+by letting the header name a tree the file was not checked against. `corpus`
+and `commit` are provenance — printed, never verified — which is only safe
+while the regeneration command shown in the header is the one that was actually
+run; a header left behind is the first step to a pin file nobody can date.
+
+**A number this branch had already got wrong, found by re-measuring instead of
+re-reading.** The `Unreleased` entry introducing `arthron pin` still said
+*eleven tier-1 corpora — 76,792 rows over 18,325 distinct targets*, the count
+from before the four probe corpora were pinned one commit earlier. It ships
+fifteen files: 80,272 rows over 18,687 targets, 3.1 MB, and the CI comparison
+is fifteen cold scans at 7.4 s wall. Corrected in `CHANGELOG.md` against
+measured values — the method was validated by re-deriving `76,792` and `18,325`
+exactly from the pin set as it stood at that commit. The mutation-proof
+paragraph in the same entry is deliberately left alone: *275 and 266 moved
+edges, all 21 pin tests green on revert* is the record of a run that happened
+when there were 21 such tests, and re-numbering it to today's 35 would be
+claiming an experiment nobody re-ran.
+
+---
+
+## 2026-07-29 — the first re-pin: probe corpora are pinned, and no target moved
+
+The wave's resolver work landed on a branch that already pinned every resolved
+edge's target, so this is the pin mechanism's first real exercise: absorb main,
+regenerate all of it, and account for every row that moved.
+
+**No pre-existing pinned row changed target — on any corpus.** Across the
+eleven corpora pinned before the merge the verdict was `0 moved, 0 vanished`
+throughout, and the target dictionaries only grew (no corpus dropped a target
+name). All movement was rows that *appeared*: `go-codeiq` 6383 → 7692 keys,
+`go-caddy` 7366 → 7592, `typescript-zod` 8377 → 10289; the other eight were
+byte-identical in their bodies. That is what the Go field-access work and the
+ECMA specifier work should look like — new edges where there were none, and not
+one existing edge re-aimed — and it is the claim only this gate can make, since
+all three corpora also moved the four counted integers (`go-codeiq` resolved
+8016 → 9794) and the counting gate cannot tell a new edge from a re-aimed one.
+
+**Decided: probe corpora carry pin files, on the same rule as any other
+corpus.** The rule is the one already enforced programmatically — every tier-1
+corpus with a baseline has a pin file — so the four probe corpora that landed
+with the wave inherit it rather than being argued about case by case.
+*Rejected:* excluding them as too small to be worth a file. That reads the
+value backwards. A probe corpus exists because each file in it encodes one
+resolver contract that was got wrong once, so its rows are few and every one is
+load-bearing — a higher pin density than any real tree here. They cost
+kilobytes: 10, 6, 5 and 12 rows for java, javascript, python and typescript.
+
+**A defect this re-pin caused and caught.** The per-corpus scan tests indexed
+the pin table by *position* (`check(PINNED[5].0, PINNED[5].1)`), so inserting
+the probe corpora mid-table silently re-aimed every test after the insertion
+point: `javascript_express_edges_are_where_they_were_pinned` began scanning
+`corpus/java/probes`, and the suite stayed green because every corpus still
+agreed with its own pins — each was simply checked under another test's name.
+A test whose name points at the wrong corpus is the pin gate's own defect one
+level up. Each test now looks its corpus up by the pin path it names, and a new
+test refuses a `PINNED` row that no test scans, since the existing coverage test
+only matched committed files against the table and would pass on a pin file
+nothing ever compared. Verified by mutation: dropping one scan test fails the
+new check by name.
+
+---
+
 ## 2026-07-28 — 0.0.1 published
 
 `arthron 0.0.1` is on crates.io, tagged `v0.0.1` (signed). Every ratified
