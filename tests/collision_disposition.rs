@@ -1,7 +1,7 @@
 //! Collision disposition is durable graph state, not an event-local tally
 //! correction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use arthron::Outcome;
@@ -470,5 +470,64 @@ fn replacing_one_declaration_withdraws_the_old_disposition_until_phase_two_finis
     assert_eq!(
         resumed.fqn_collisions, 1,
         "the resolver, not Store::apply_defs, classifies the changed field/field pair",
+    );
+}
+
+#[test]
+fn removing_a_set_to_zero_does_not_suppress_a_later_fresh_direct_collision() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let store = Store::open(&scratch.path().join("graph.redb")).expect("store opens");
+    let id = node_id(Domain::CSharp, "N#Shared::Value");
+    let apply = |paths: &[&str]| {
+        store
+            .apply_defs(&DefBatch {
+                files: paths
+                    .iter()
+                    .map(|path| FileDefs {
+                        path: (*path).to_string(),
+                        nodes: vec![pairwise_node(path, "field")],
+                    })
+                    .collect(),
+            })
+            .expect("apply definitions");
+    };
+
+    apply(&["a.collision", "b.collision"]);
+    store
+        .set_collision_dispositions(
+            &BTreeSet::from([id]),
+            &BTreeMap::from([(id, CollisionDisposition::Mergeable)]),
+        )
+        .expect("settle initial pair");
+    store
+        .forget_files(&["b.collision".to_string()])
+        .expect("leave one declaration");
+    apply(&["replacement-b.collision"]);
+    assert_eq!(
+        store
+            .report()
+            .expect("one-to-two direct report")
+            .fqn_collisions,
+        1,
+        "a marker cannot survive when only one declaration was left",
+    );
+    store
+        .set_collision_dispositions(
+            &BTreeSet::from([id]),
+            &BTreeMap::from([(id, CollisionDisposition::Mergeable)]),
+        )
+        .expect("settle replacement pair");
+    store
+        .forget_files(&[
+            "replacement-b.collision".to_string(),
+            "a.collision".to_string(),
+        ])
+        .expect("leave zero declarations");
+
+    apply(&["fresh-a.collision", "fresh-b.collision"]);
+    assert_eq!(
+        store.report().expect("fresh direct report").fqn_collisions,
+        1,
+        "an invalidated verdict cannot outlive the declaration set it described",
     );
 }

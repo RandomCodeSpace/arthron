@@ -1086,6 +1086,18 @@ impl Store {
                     .remove(&id)
                     .map_err(|e| e.to_string())?
                     .is_some();
+                let Some(record) = now else {
+                    invalidated_verdicts
+                        .remove(&id)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                };
+                if !record.is_multi_file_definition() {
+                    invalidated_verdicts
+                        .remove(&id)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 if had_verdict
                     || invalidated_verdicts
                         .get(&id)
@@ -1095,12 +1107,6 @@ impl Store {
                     invalidated_verdicts
                         .insert(&id, 1)
                         .map_err(|e| e.to_string())?;
-                }
-                let Some(record) = now else {
-                    continue;
-                };
-                if !record.is_multi_file_definition() {
-                    continue;
                 }
                 // The unchanged declarations contribute to the new set too.
                 // Their old answers and the old disposition are one fact, so
@@ -1528,6 +1534,18 @@ impl Store {
                     .remove(&id)
                     .map_err(|e| e.to_string())?
                     .is_some();
+                let Some(record) = read_node(&nodes, &id)? else {
+                    invalidated_verdicts
+                        .remove(&id)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                };
+                if !record.is_multi_file_definition() {
+                    invalidated_verdicts
+                        .remove(&id)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 if had_verdict
                     || invalidated_verdicts
                         .get(&id)
@@ -1537,12 +1555,6 @@ impl Store {
                     invalidated_verdicts
                         .insert(&id, 1)
                         .map_err(|e| e.to_string())?;
-                }
-                let Some(record) = read_node(&nodes, &id)? else {
-                    continue;
-                };
-                if !record.is_multi_file_definition() {
-                    continue;
                 }
                 for site in record.declarations() {
                     if gone.contains(site.file.as_str()) {
