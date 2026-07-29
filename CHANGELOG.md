@@ -225,6 +225,76 @@ Decisions and their rationale — including what was rejected — live in
   kind on both corpora, because a rule that stops deduplicating moves one and
   not the other.
 
+- **A probe corpus for each of the other four tier-1 languages, and the four
+  gates that pin them.** Go had a synthetic corpus that states a resolver
+  outcome per named site; Java, JavaScript, TypeScript and Python did not, so
+  every method-call outcome in four of the five languages was observable only
+  as its contribution to a real corpus's totals — where a fix and a regression
+  of the same size cancel. `corpus/java/probes`, `corpus/javascript/probes`,
+  `corpus/typescript/probes` and `corpus/python/probes` are hand-written truth
+  tables: every call site is asserted by name, hit or miss, with the reason a
+  miss carries. Baselines, `tests/baselines.rs` `GATED` rows and steps in
+  `.github/workflows/gate.yml` land with them — twenty-five gates become
+  twenty-nine.
+
+  | baseline | resolved | external | local_binding | unresolved | rate |
+  |---|---:|---:|---:|---:|---:|
+  | `java-probes` | 13 | 7 | 1 | 1 | 92.9% |
+  | `javascript-probes` | 6 | 0 | 1 | 2 | 75.0% |
+  | `typescript-probes` | 12 | 0 | 1 | 3 | 80.0% |
+  | `python-probes` | 5 | 0 | 2 | 1 | 83.3% |
+
+  These four and `go-probes` are **pins, not ratchets**. The corpora are
+  hand-written, so their rates are properties of the fixtures and are not
+  evidence of a capability; re-basing one to claim a better number would be
+  claiming something nobody measured. They are in the README's tier-1 table
+  because they are gated exactly like the others, marked `†` so no reader takes
+  them for a sample of real code.
+
+  **The misses are pinned as exactly as the hits, including two that are filed
+  under the wrong reason.** `super.greet` and `this.greet` are the same call one
+  keyword apart and get different answers: `super.` walks the written `extends`
+  into the other module, `this.` does not. The failure is then reported as
+  `UnindexedSupertype`, whose definition in `src/lib.rs` requires the receiver
+  type to be in-repository, the member to be in no indexed supertype, and some
+  supertype to be external or unindexed — and on this row **all three conjuncts
+  are false**, provably, because the same scan resolves `super.greet` through
+  that supertype. One missing branch causes it: `walk_members`
+  (`src/track_ecma/resolve.rs`) probes the base under a module-local id, so an
+  imported base always misses, and only `resolve_super` carries the
+  import-following fallback. Both ECMAScript dialects assert it, because the
+  defect belongs to the shared track rather than to either language. A probe is
+  a truth table, so this is recorded as what *is* rather than what should be —
+  recording the mislabel is what stops it surfacing later as an unattributable
+  movement. Its fix is measured, not guessed: giving `resolve_this` the
+  fallback moves `javascript-probes` to 87.5% (resolved 6 → 7) and
+  `typescript-probes` to 86.7% (resolved 12 → 13) and moves **nothing** on
+  express, fastify, vue-core or zod, so it is a deliberate re-base of two pins
+  plus a `docs/decisions.md` entry, and no ratchet is touched.
+
+  TypeScript's probe adds a third row that keeps a *different* reason on
+  purpose: `this.inner.greet` is `NoMatchingDefinition`, the bucket that in a
+  corpus which compiles means arthron's own bug — and this corpus compiles
+  (`tsc --noEmit`, `strict`, clean). Three annotations naming a class two lines
+  of import away land in three different buckets while every one of them
+  resolves as a `TypeUse`: the type is read and simply not used to type a
+  receiver.
+
+- **The Python census walks named trees instead of a whole language
+  directory.** `tests/python_corpus.rs` walked `corpus/python` entire — the one
+  whole-language walk in `tests/`, where every other corpus test names its tree
+  — which made its constants a function of the *corpus repository's* contents
+  rather than of this repository's extractor. `gate.yml` checks the corpus out
+  at `ref: main`, unpinned, so any commit adding a `.py` file anywhere under
+  `corpus/python` would have turned the test red with nothing here changed;
+  adding `corpus/python/probes` would have done it immediately. It now names
+  `corpus/python/django` and `corpus/python/flask`, restoring the property that
+  a census moves only when the extractor does. Paths stay relative to
+  `corpus/python`, so every module name derived from one is byte-identical and
+  no constant moves. `corpus/python/probes` is deliberately outside it: a probe
+  is pinned row by row in `tests/python_probes.rs`, which is a stronger check
+  than a total that would blur it.
+
 - **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
   deliberate re-base of seven baselines.** The ratified rule is that a
   reference whose root is a parameter or a local variable names a thing that is
@@ -302,29 +372,79 @@ Decisions and their rationale — including what was rejected — live in
   almost nothing this way: django 0 and flask 7.
 
 - **`arthron scan` prints the rate's denominator under every language line.**
-  `rate denominator 8900 of 25223 references (35.3%)`: `(resolved +
+  `rate denominator 14089 of 36557 references (38.5%)`: `(resolved +
   unresolved)` over every reference the language emitted. Excluding `external`
   and `local_binding` from both of the rate's terms is correct and it also
-  makes the denominator a fraction of the surface — codeiq's Go rate of 90.1%
-  covers 35.3% of Go's references, fastify's 63.0% covers 14.2% of
+  makes the denominator a fraction of the surface — codeiq's Go rate of 69.5%
+  covers 38.5% of Go's references, fastify's 63.0% covers 14.2% of
   JavaScript's — and a rate published without its share reads as a claim about
-  the whole. Text report only, on `scan` and on `gate`. **`--json` is
+  the whole. The codeiq figures quoted here are the ones this release ships,
+  not the ones the feature was written against: the Go field-access entry above
+  moved them inside this same unreleased section. Text report only, on `scan` and on `gate`. **`--json` is
   unchanged and its `schema` does not move**: the document already carries all
   four counts, so a consumer derives the share exactly, and a field for
   arithmetic is not a field.
 
 - **The tier-1 claim is retracted to what is measured.** The README, the
   changelog and the report line called tier 1 "call-graph resolution". It is
-  not: method dispatch mostly does not resolve, and `NeedsTypeInference` — 758
-  of codeiq's 884 unresolved rows — is most of what tier 1 leaves unlinked in
-  all five languages. A call through a receiver whose type its own signature
-  states does resolve, in all five, since the locals re-base above. Tier 1 now
+  not: method dispatch mostly does not resolve, and the buckets that need a
+  type environment — `NeedsExpressionType`, `NeedsReceiverType`,
+  `NeedsTypeInference`, `AmbiguousOverload`, `UnindexedSupertype`,
+  `DynamicDispatch` — are the majority of what tier 1 leaves unlinked on nine
+  of the ten real corpora, 51.9% on flask to 100.0% on both Go corpora, the
+  tenth being vue-core at 42.1%. This entry first said the single reason
+  `NeedsTypeInference` was "most of what tier 1 leaves unlinked in all five
+  languages", citing 758 of codeiq's 884 unresolved rows. That was an
+  over-attribution and is corrected here: it holds for no language once the
+  reasons are counted — commons-lang is led by `AmbiguousOverload` (9,218 of
+  16,279) and gson by `NeedsExpressionType` (4,713 of 6,105), where
+  `NeedsTypeInference` is 342 and 72 rows — and codeiq's own leading bucket is
+  now `NeedsReceiverType`, 3,116 of 4,295. What the leading buckets share is
+  the type environment, which is the work; no one of them stands for it. A call
+  through a receiver whose type its own signature states does resolve, in all
+  five, since the locals re-base above. Tier 1 now
   reads "definitions, references, and cross-file import and function-call
   resolution", and the scan line prints `tier 1: call, import and type-use
   resolution` — which is what the denominator holds. Nothing measured changed;
   no baseline moved.
 
 ### Fixed
+
+- **Every number the README published was stale, and nothing could have caught
+  it.** Three re-bases moved the tier-1 counts — the locals unification, Go's
+  field-access surface, and the ECMAScript config and globals work — and four
+  probe baselines landed, while the tables, the `arthron scan` sample and the
+  prose around them still stated the pre-wave figures. A gate compares a scan
+  against a baseline and has no opinion about prose, so all twenty-nine gates
+  were green over a README that was wrong in every tier-1 row. Both tables are
+  now re-rendered from `baselines/*.toml`: fifteen tier-1 rows including the
+  five probe pins, fourteen tier-2 rows unchanged, and both derived columns
+  recomputed rather than carried forward.
+
+  `every_readme_table_row_matches_its_baseline` and
+  `every_published_rate_carries_its_denominator_share` in `tests/baselines.rs`
+  are what make the next drift fail instead of ship. The first re-derives all
+  eight cells of every row — the four gated counts, the commit pin, the rate
+  and the denominator share — and asserts one row per committed baseline, so a
+  baseline with no row and a row with no baseline both fail. The second checks
+  the commitment the README makes in prose, that no rate is published without
+  its share, as a shape rather than a sentence. Both read `README.md` and
+  `baselines/` only, so they run in CI where the corpus is absent and every
+  ratchet skips.
+
+- **The retraction over-attributed the gap to one reason.** The README, this
+  changelog and `Lang::tier`'s doc comment all said `NeedsTypeInference` was
+  most of what tier 1 leaves unresolved, citing 758 of codeiq's 884 unresolved
+  rows. Counted per reason on all ten real corpora it holds for none of them —
+  commons-lang is led by `AmbiguousOverload` (9,218 of 16,279), gson by
+  `NeedsExpressionType` (4,713 of 6,105) where `NeedsTypeInference` is 72, and
+  codeiq's own leading bucket is now `NeedsReceiverType` at 3,116 of 4,295.
+  What is true, and is what the three now say, is that the reasons *needing a
+  type environment* are together the majority on nine of the ten, 51.9% on
+  flask to 100.0% on both Go corpora, with vue-core the tenth at 42.1% because
+  the injected test-runner globals outnumber them there. Replacing one reason
+  with the family it belongs to is the same retraction the tier-1 claim already
+  made, one level down.
 
 - **A mixed `.js`/`.ts` tree reported a higher JavaScript rate the second time
   it was scanned.** The track runs two passes over one store, and the wake set

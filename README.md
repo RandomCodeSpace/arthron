@@ -53,16 +53,16 @@ every unresolved reason:
 
 ```console
 $ arthron scan corpus/go/codeiq
-go           resolved 8016     external 12210    local-binding 4113     unresolved 884      rate 90.1% (tier 1: call, import and type-use resolution)
-             rate denominator 8900 of 25223 references (35.3%)
-             NoMatchingDefinition 123
-             NeedsTypeInference 758
-             NeedsReceiverType 3
+go           resolved 9794     external 12595    local-binding 9873     unresolved 4295     rate 69.5% (tier 1: call, import and type-use resolution)
+             rate denominator 14089 of 36557 references (38.5%)
+             NeedsTypeInference 770
+             NeedsReceiverType 3116
+             NeedsExpressionType 409
 ```
 
 The second line is the one to read next to the rate. `external` and
 `local_binding` sit outside both of the rate's terms by design, and on a real
-corpus they are most of the rows — so 90.1% here is a rate over 35.3% of the
+corpus they are most of the rows — so 69.5% here is a rate over 38.5% of the
 references Go emitted, not over all of them. Both numbers are true and neither
 stands in for the other.
 
@@ -197,67 +197,103 @@ sites, imports and type uses — the reference kinds these tracks emit.
 That is not a complete call graph, and this section used to say it was. Method
 dispatch mostly does not resolve yet. A call through a receiver whose type the
 enclosing signature states does resolve — Go joined the other four in doing so
-— but a call on a value whose type has to be inferred is `NeedsTypeInference`,
-which is 758 of `codeiq`'s 884 unresolved rows and the great majority of what
-tier 1 leaves unlinked in every one of the five. Closing it is the
-type-environment work, and it has not been done. What tier 1 delivers today is
-definitions, references, and cross-file import and function-call resolution
-with the accounting to show which is which.
+— but a call on a value whose type has to be inferred does not, and the stored
+reasons are where that shows. The buckets that need a type environment —
+`NeedsExpressionType`, `NeedsReceiverType`, `NeedsTypeInference`,
+`AmbiguousOverload`, `UnindexedSupertype`, `DynamicDispatch` — are the majority
+of what tier 1 leaves unlinked on nine of the ten real corpora, from 51.9% on
+`flask` to 100.0% on both Go corpora. The tenth is `vue-core` at 42.1%, where
+the largest single bucket is instead the 14,618 names a declared test runner
+injects into the global scope.
+
+No one reason stands for that gap, and an earlier draft of this section said
+one did — that `NeedsTypeInference` was "the great majority" in all five
+languages. It is not, and was not: which bucket leads differs by language and
+by corpus — `NeedsReceiverType` on both Go corpora (72.5% and 64.9%),
+`AmbiguousOverload` on commons-lang (56.6%), `NeedsExpressionType` on gson,
+express, fastify and zod, `NeedsTypeInference` on django (43.3%) — and on
+`gson` `NeedsTypeInference` is 72 rows of 6,105. What the leading buckets share
+is the type environment none of them has, and that is the work that has not
+been done. What tier 1 delivers today is definitions, references, and
+cross-file import and function-call resolution with the accounting to show
+which is which.
 
 The last column is the rate's denominator as a share of every reference the
 language emitted: `(resolved + unresolved) / (resolved + external +
 local_binding + unresolved)`. `external` and `local_binding` are legitimately
 outside both of the rate's terms, and they are also most of the rows on a real
-corpus — Go's 90.1% is a rate over 35.3% of what Go emitted. Publishing the
+corpus — Go's 69.5% is a rate over 38.5% of what Go emitted. Publishing the
 rate without the share invites reading the first number as the second.
 
 <!-- tier-1 table: every column is read straight out of baselines/<file>.toml.
      rate  = resolved / (resolved + unresolved)
      denom = (resolved + unresolved) / (resolved + external + local_binding + unresolved)
      Refresh = re-read the baselines and re-render these rows; nothing here is
-     derived from anything else, and no row may be edited by hand. -->
+     derived from anything else, and no row may be edited by hand.
+     `every_readme_table_row_matches_its_baseline` in tests/baselines.rs
+     re-derives all eight cells and fails on any drift, corpus or not. -->
 | language | corpus | resolved | external | local-binding | unresolved | rate | rate denom. |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Go | `codeiq` `853efde` | 8,016 | 12,210 | 4,113 | 884 | **90.1%** | 35.3% |
-| Go | `caddy` `853efde` | 10,208 | 19,201 | 8,252 | 2,700 | **79.1%** | 32.0% |
+| Go | `codeiq` `853efde` | 9,794 | 12,595 | 9,873 | 4,295 | **69.5%** | 38.5% |
+| Go | `caddy` `853efde` | 10,585 | 21,304 | 13,181 | 9,014 | **54.0%** | 36.2% |
 | Go | `probes` `synthetic` | 17 | 26 | 1 | 0 | **100.0%** † | 38.6% |
 | Java | `commons-lang` `598dfc1` | 34,217 | 63,385 | 15,162 | 16,279 | **67.8%** | 39.1% |
 | Java | `gson` `3ff35d6` | 12,885 | 16,737 | 6,706 | 6,105 | **67.9%** | 44.8% |
+| Java | `probes` `e4dc880` | 13 | 7 | 1 | 1 | **92.9%** † | 63.6% |
 | JavaScript | `fastify` `94bcbcc` | 2,795 | 5,159 | 21,542 | 1,640 | **63.0%** | 14.2% |
-| JavaScript | `express` `dbac741` | 2,267 | 701 | 3,039 | 5,553 | **29.0%** | 67.6% |
+| JavaScript | `express` `dbac741` | 2,267 | 702 | 3,039 | 5,552 | **29.0%** | 67.6% |
+| JavaScript | `probes` `e4dc880` | 6 | 0 | 1 | 2 | **75.0%** † | 88.9% |
 | TypeScript | `vue-core` `fa2885d` | 26,297 | 3,694 | 9,564 | 27,945 | **48.5%** | 80.4% |
-| TypeScript | `zod` `1fb56a5` | 10,043 | 1,952 | 8,143 | 26,821 | **27.2%** | 78.5% |
+| TypeScript | `zod` `1fb56a5` | 17,080 | 1,952 | 8,143 | 19,784 | **46.3%** | 78.5% |
+| TypeScript | `probes` `e4dc880` | 12 | 0 | 1 | 3 | **80.0%** † | 93.8% |
 | Python | `django` `af67523` | 19,103 | 13,326 | 8,405 | 6,185 | **75.5%** | 53.8% |
 | Python | `flask` `22d9247` | 1,185 | 2,317 | 2,146 | 877 | **57.5%** | 31.6% |
+| Python | `probes` `e4dc880` | 5 | 0 | 2 | 1 | **83.3%** † | 75.0% |
 
-Six of these eleven rates moved in one deliberate re-base — Go's two real
-corpora, both Java corpora, both Python corpora. `probes` held every column
-but `external`, which went from 0 to 26 when the Go track began emitting type
-uses. Three changes landed together, and they do not move a rate for the same
-reason:
+Ten real corpora and five synthetic probe pins. Since the last published table
+four rows are new, three rates moved, one row changed without its rate moving,
+and every other cell is byte-identical. A rate moves for more than one reason
+and only one of those reasons is "it got better", so each movement below is
+attributed per row in [`CHANGELOG.md`](CHANGELOG.md) — by a whole-row join
+against a binary built from the previous commit — rather than inferred from
+these totals.
 
-1. **One `LocalBinding` rule.** A reference whose *root* is a parameter or a
-   local is reported beside `external`, outside **both** terms of the rate,
-   however long the member path after it. This takes references *out* of both
-   terms, so it can raise a rate without linking anything: Python's rose 17 and
-   28 points that way, and 7,579 django references moved from
-   `NeedsTypeInference` to `local_binding` without one of them being resolved.
-2. **A receiver is not a local, in any of the five.** Go alone read its own
-   receiver as one, so `t.helper()` sat outside both of Go's rate terms while
-   the identical `this.helper()` and `self.helper()` were resolved and counted
-   everywhere else — the commonest shape in object-oriented code, excluded in
-   one language and not the other four. Go now resolves it against the type its
-   own signature states, exactly as Java and Python do. That costs `caddy` 5.1
-   points and `codeiq` 0.7, and gains them 470 and 110 real edges.
-3. **The Go track now emits type uses**, which the other four already did, so
-   "call sites, imports and type uses" is now true of all five. This is the
-   opposite of the first: `caddy`'s rate rose because 6,732 references that had
-   no row at all now resolve — coverage, not reclassification.
+1. **Both Go rates fell, and that is coverage.** The extractor now emits the
+   two member sites it never had: a selector *read* (`pkg.Name`, `t.field`)
+   and a struct literal's field keys. That is 11,334 new occurrences on
+   `codeiq` and 13,723 on `caddy`, of which 1,778 and 377 resolve; most of the
+   rest are `NeedsReceiverType`, because a Go struct field is not a node in
+   this build. The rate's denominator grew 8,900 → 14,089 and 12,908 → 19,599,
+   the rate fell 90.1% → 69.5% and 79.1% → 54.0%, and **nothing that resolved
+   before stopped resolving**. Two rates taken over different reference sets
+   are not two measurements of the same thing.
+2. **`zod` rose 19.1 points because one config key is now read.**
+   `compilerOptions.customConditions` points zod's self-imports at its own
+   sources instead of at a built `.d.cts` that no scan of the sources can see:
+   `ModuleNotFound` 7,822 → 1, resolved 10,043 → 17,080, and every one of the
+   7,037 new edges lands in `packages/zod/src/`. That is linking that was
+   previously missed, not reclassification.
+3. **A rate can rise with nothing linked at all, and one did.** A reference
+   whose *root* is a parameter or a local is reported beside `external`,
+   outside **both** terms of the rate, however long the member path after it —
+   so unifying that rule across the five raised Python's two rates by 17 and 28
+   points while 7,579 django references moved from `NeedsTypeInference` to
+   `local_binding` without one of them being resolved. Read the rate next to
+   the `local_binding` column in [`baselines/`](baselines), which is gated for
+   drift exactly so this cannot be done quietly.
 
-Read the rate next to the `local_binding` column in [`baselines/`](baselines),
-which is gated for drift exactly so the first kind cannot be done quietly.
+`express` is the row that changed without its rate moving: `XMLHttpRequest` was
+missing from the host global list while `WebSocket`, `AbortController` and
+`fetch` were all in it, so `external` went 701 → 702 and the rate reads 28.99%
+on both sides. The same change reclassified the 1,728 express and 13,833
+vue-core references that a declared test runner injects — `it`, `describe`,
+`expect` — out of `NoMatchingDefinition`, a bucket whose contract is that it
+means *arthron's* bug. They became `Unresolved(UnknownPackage)` rather than
+`External` deliberately: `Unresolved` keeps them inside both of the rate's
+terms, where `External` would take them out of both and raise the rate without
+linking anything. No gated number moved.
 
-What the first change costs is *edges*, and the counts are in
+What the third change costs is *edges*, and the counts are in
 [`CHANGELOG.md`](CHANGELOG.md): 5,374 commons-lang and 3,189 gson occurrences
 that `arthron query` and the MCP server used to answer with a definition are
 reported on the `local_binding` line instead — 13.6% and 19.8% of those
@@ -277,7 +313,9 @@ track that emits no expression-level reference has no local to bind.
      rate  = resolved / (resolved + unresolved)
      denom = (resolved + unresolved) / (resolved + external + local_binding + unresolved)
      Refresh = re-read the baselines and re-render these rows; nothing here is
-     derived from anything else, and no row may be edited by hand. -->
+     derived from anything else, and no row may be edited by hand.
+     `every_readme_table_row_matches_its_baseline` in tests/baselines.rs
+     re-derives all eight cells and fails on any drift, corpus or not. -->
 | language | corpus | resolved | external | local-binding | unresolved | rate | rate denom. |
 |---|---|---:|---:|---:|---:|---:|---:|
 | Rust | `ripgrep` `e89fff8` | 649 | 411 | 0 | 13 | **98.0%** | 61.7% |
@@ -303,11 +341,20 @@ reads a deliberately narrow slice of that language's reference surface, so the
 denominator is small by design and the definition census beside it carries most
 of the weight. Best effort constrains how much of a language is read; it does
 not make the number optional. All six are gated in CI on the same terms as the
-other nineteen baselines, and a regression in any of them fails the build.
+other twenty-three baselines, and a regression in any of them fails the build.
 
-† `probes` is a synthetic corpus, written to pin resolver behaviour rather than
-sampled from a real project. It is listed because it is gated like the others,
-not as evidence about real Go.
+† `probes` is a synthetic corpus — one per tier-1 language, hand-written to pin
+resolver behaviour name by name rather than sampled from a real project. The
+five are listed because they are gated like the others, not as evidence about
+real Go, Java, JavaScript, TypeScript or Python: a hand-written rate is a
+property of the fixture, so these five are **pins, not ratchets**, and must
+never be re-based to claim a capability. They pin the misses as exactly as the
+hits, including two known *mislabels* — `this.greet` across a module boundary
+reports `UnindexedSupertype` when no conjunct of that reason holds, in both
+ECMAScript dialects — so that the day either is fixed, the named rows move and
+the probe says which. `arthron` holds the facts to resolve that row today; the
+fix is a re-base of two pins and a `docs/decisions.md` entry, and it moves
+nothing on express, fastify, vue-core or zod.
 
 ## How to read these numbers
 
@@ -315,7 +362,7 @@ not as evidence about real Go.
 figure, and there will not be one. Rates are reported per language, per corpus,
 because averaging Go's tier-1 rate with Bash's import rate produces a number
 that means nothing and hides every regression underneath it. Nineteen languages,
-twenty-five committed baselines, twenty-five separate numbers.
+twenty-nine committed baselines, twenty-nine separate numbers.
 
 **`Unresolved` is data, not failure.** Every unresolved reference is stored with
 a reason — `NeedsTypeInference`, `NoMatchingDefinition`, `ModuleNotFound`,

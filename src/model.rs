@@ -237,9 +237,13 @@ impl Lang {
     ///
     /// Tier 1 is not a claim that the call graph is complete. A call whose
     /// receiver type the signature states resolves; a call on a value whose
-    /// type has to be inferred is `NeedsTypeInference`, and that is still
-    /// most of what tier 1 leaves unresolved. The tier says which reference
-    /// kinds are in the denominator, not that every one of them links.
+    /// type has to be inferred does not, and the reasons that need a type
+    /// environment — `NeedsExpressionType`, `NeedsReceiverType`,
+    /// `NeedsTypeInference`, `AmbiguousOverload`, `UnindexedSupertype`,
+    /// `DynamicDispatch` — are together most of what tier 1 leaves
+    /// unresolved. Which of them leads differs by language and by corpus, so
+    /// no single one stands for the gap. The tier says which reference kinds
+    /// are in the denominator, not that every one of them links.
     ///
     /// Both are per-language and neither is ever aggregated, but two rates
     /// printed in one column are read as one measurement unless something

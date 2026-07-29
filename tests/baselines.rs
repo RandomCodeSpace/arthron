@@ -763,3 +763,246 @@ fn every_corpus_skip_goes_through_the_one_guard() {
          the ones it used to",
     );
 }
+
+/// The README's per-language tables, read as text.
+///
+/// Those tables state the same four counts the baselines hold, plus two
+/// columns derived from them. Nothing enforced the equality, so the published
+/// numbers went stale behind three separate re-bases while every gate stayed
+/// green — a gate compares a scan against a baseline and has no opinion about
+/// prose. This is that opinion, and like the rest of this file it reads no
+/// corpus, so it runs in the job where every ratchet skips.
+const README: &str = "README.md";
+
+/// One rendered table row: the corpus it names and the cells it states.
+struct ReadmeRow {
+    lang: String,
+    corpus: String,
+    commit: String,
+    resolved: u64,
+    external: u64,
+    local_binding: u64,
+    unresolved: u64,
+    rate: String,
+    share: String,
+}
+
+/// The display name the tables use for a baseline's `language`, which is not
+/// always the baseline's own spelling — `cpp` and `csharp` are the two that
+/// differ, and they are the reason this is a table rather than a capitalise.
+fn display_name(language: &str) -> &'static str {
+    match language {
+        "go" => "Go",
+        "java" => "Java",
+        "javascript" => "JavaScript",
+        "typescript" => "TypeScript",
+        "python" => "Python",
+        "cpp" => "C++",
+        "csharp" => "C#",
+        "kotlin" => "Kotlin",
+        "swift" => "Swift",
+        "ruby" => "Ruby",
+        "php" => "PHP",
+        "rust" => "Rust",
+        "scala" => "Scala",
+        "dart" => "Dart",
+        "elixir" => "Elixir",
+        "haskell" => "Haskell",
+        "lua" => "Lua",
+        "bash" => "Bash",
+        "hcl" => "HCL",
+        other => panic!("no README display name for language `{other}`"),
+    }
+}
+
+/// `12,345` — the tables group thousands and the baselines do not.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One percentage to a single decimal place, as the tables render it.
+///
+/// `None` for a zero denominator rather than a printed `0.0%`: `bats-core`
+/// resolves nothing and its rate is a real `0.0%` over six references, but a
+/// baseline with no references *at all* has no rate, and printing one for it
+/// would be the class of claim this file exists to refuse.
+fn percent(numerator: u64, denominator: u64) -> Option<String> {
+    if denominator == 0 {
+        return None;
+    }
+    let tenths = ((numerator as f64) * 1000.0 / (denominator as f64)).round() / 10.0;
+    Some(format!("{tenths:.1}%"))
+}
+
+/// Every table row in [`README`], parsed from the eight-cell shape both
+/// tables share.
+///
+/// A row this parser does not recognise is invisible here, so the caller
+/// asserts the count against the number of committed baselines — that is what
+/// stops a reformatted table from silently emptying the comparison.
+fn readme_rows() -> Vec<ReadmeRow> {
+    let text = std::fs::read_to_string(README).expect("README.md is committed");
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('|') || !line.ends_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = line
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim())
+            .collect();
+        if cells.len() != 8 {
+            continue;
+        }
+        // The provenance cell is `` `corpus` `commit` ``.
+        let provenance: Vec<&str> = cells[1].split_whitespace().collect();
+        if provenance.len() != 2 {
+            continue;
+        }
+        let count = |c: &str| c.replace(',', "").parse::<u64>();
+        let (Ok(resolved), Ok(external), Ok(local_binding), Ok(unresolved)) = (
+            count(cells[2]),
+            count(cells[3]),
+            count(cells[4]),
+            count(cells[5]),
+        ) else {
+            continue;
+        };
+        rows.push(ReadmeRow {
+            lang: cells[0].to_string(),
+            corpus: provenance[0].trim_matches('`').to_string(),
+            commit: provenance[1].trim_matches('`').to_string(),
+            resolved,
+            external,
+            local_binding,
+            unresolved,
+            // `**69.5%**`, or `**100.0%** †` where the dagger marks a
+            // synthetic corpus and is not part of the number.
+            rate: cells[6].replace("**", "").replace('†', "").trim().to_string(),
+            share: cells[7].to_string(),
+        });
+    }
+    rows
+}
+
+#[test]
+fn every_readme_table_row_matches_its_baseline() {
+    let rows = readme_rows();
+    assert_eq!(
+        rows.len(),
+        GATED.len(),
+        "the README states {} table rows and {} baselines are committed; every baseline \
+         gets a row and no row may name anything else",
+        rows.len(),
+        GATED.len(),
+    );
+
+    for (path, _) in GATED {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let baseline = parse_baseline(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let corpus = baseline
+            .corpus
+            .rsplit('/')
+            .next()
+            .expect("a corpus path has a last component");
+        let lang = display_name(&baseline.language);
+
+        let row = rows
+            .iter()
+            .find(|r| r.lang == lang && r.corpus == corpus)
+            .unwrap_or_else(|| {
+                panic!("{path} has no README row: no table states `{corpus}` under {lang}")
+            });
+
+        for (column, stated, held) in [
+            ("resolved", row.resolved, baseline.counts.resolved),
+            ("external", row.external, baseline.counts.external),
+            (
+                "local-binding",
+                row.local_binding,
+                baseline.counts.local_binding,
+            ),
+            ("unresolved", row.unresolved, baseline.counts.unresolved),
+        ] {
+            assert_eq!(
+                stated,
+                held,
+                "README row `{corpus}` states {column} {}, {path} holds {}; re-render the \
+                 row from the baseline rather than editing it",
+                grouped(stated),
+                grouped(held),
+            );
+        }
+
+        assert_eq!(
+            row.commit, baseline.commit,
+            "README row `{corpus}` pins commit {} and {path} records {}",
+            row.commit, baseline.commit,
+        );
+
+        // The two derived columns are recomputed here, not trusted.
+        let denominator = baseline.counts.resolved + baseline.counts.unresolved;
+        let emitted = denominator + baseline.counts.external + baseline.counts.local_binding;
+        let rate = percent(baseline.counts.resolved, denominator)
+            .unwrap_or_else(|| panic!("{path} has no rate: resolved + unresolved is zero"));
+        let share = percent(denominator, emitted)
+            .unwrap_or_else(|| panic!("{path} has no share: it emitted no references"));
+        assert_eq!(
+            row.rate, rate,
+            "README row `{corpus}` states rate {} and {path} derives {rate}",
+            row.rate,
+        );
+        assert_eq!(
+            row.share, share,
+            "README row `{corpus}` states a rate denominator share of {} and {path} derives \
+             {share}",
+            row.share,
+        );
+    }
+}
+
+#[test]
+fn every_published_rate_carries_its_denominator_share() {
+    // The README commits in prose to "every table here carries it as a
+    // column". That is checked as a shape rather than trusted as a sentence:
+    // a rate published without its share is exactly the misreading the
+    // accounting exists to prevent, so a table that grows a rate column and
+    // not a share column fails here.
+    let text = std::fs::read_to_string(README).expect("README.md is committed");
+    let mut headers = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("| language | corpus |") {
+            continue;
+        }
+        headers += 1;
+        assert!(
+            line.contains("| rate |") && line.contains("| rate denom. |"),
+            "a per-language table states a rate without a `rate denom.` column: {line}",
+        );
+    }
+    assert_eq!(
+        headers, 2,
+        "expected the tier-1 and tier-2 tables; found {headers} per-language table headers",
+    );
+
+    for row in &readme_rows() {
+        assert!(
+            row.rate.ends_with('%') && row.share.ends_with('%'),
+            "row `{}` does not state both a rate and its share: {} / {}",
+            row.corpus,
+            row.rate,
+            row.share,
+        );
+    }
+}
