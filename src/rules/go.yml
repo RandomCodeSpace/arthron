@@ -86,8 +86,13 @@ rule:
 # a second reference to a member nobody named on its own. Which node that is
 # needs the parent, so it is decided in Rust.
 #
-# A *type* written `pkg.T` is a `qualified_type` and not a selector, so this
-# rule and `ref-type` cannot see the same site.
+# A *type* written `pkg.T` is a `qualified_type` and not a selector, so in a
+# type position this rule and `ref-type` cannot see the same site. In an
+# *expression* position the grammar has no `qualified_type` to offer, so they
+# can: `(*util.Thing)(nil)` writes a type and the parser hands it over as a
+# `selector_expression`, and the row is a `field-access` naming the right node
+# under the wrong kind. One occurrence on `codeiq`, none on `caddy`; the
+# `field-access` occurrence census in `tests/corpus.rs` pins the count.
 #
 # Go writes a method value (`t.M` passed as a func) exactly as it writes a
 # field read, and the grammar does not separate them, so both are
@@ -113,6 +118,17 @@ rule:
 # (`[]struct{ n int }{{n: 1}}`) has no canonical name, so it is not a node and
 # neither are its fields — there is nothing for a key to name and no row is
 # emitted.
+#
+# The type separating the two is the type *as written*, not as declared, and
+# that is a known limit rather than the whole rule. `map[K]V{k: v}` is
+# rejected because the site says `map`; `type Registry map[K]V` followed by
+# `Registry{k: v}` is not, because the site says a name and the declaration is
+# usually in another file of the package, which no file-local extractor reads.
+# Such a key is reported as `Registry.k` — measured at 9 rows / 90 occurrences
+# on `codeiq`, 0 on `caddy` — and lands in `NeedsReceiverType`, inside the
+# denominator. `named_type_path` in `extract_go.rs` carries the measurement
+# and why neither layer can close it alone; `GoResolver::resolve_field`
+# carries the guarantee that it can never become a wrong *edge*.
 id: ref-litkey
 language: go
 rule:

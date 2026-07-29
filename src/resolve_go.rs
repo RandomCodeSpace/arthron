@@ -5,7 +5,7 @@
 //! into exactly one [`Outcome`]. Every candidate probed — hit or miss — is
 //! returned for the invalidation index.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::extract_go::GoHeader;
@@ -184,6 +184,10 @@ pub struct FileScope {
     pub imports: HashMap<String, String>,
     /// Paths dot-imported into this file's scope.
     pub dot_imports: Vec<String>,
+    /// Byte offsets of this file's composite-literal keys, carried through
+    /// from [`GoHeader::literal_keys`] — the one thing about a
+    /// [`RefKind::FieldAccess`] that only the syntax could say.
+    pub literal_keys: HashSet<u32>,
 }
 
 /// Whether a path segment is a Go major-version marker (`v2`, `v3`, …).
@@ -323,6 +327,7 @@ pub fn file_scope(
         pkg_path,
         imports,
         dot_imports,
+        literal_keys: header.literal_keys.iter().copied().collect(),
     }
 }
 
@@ -469,11 +474,24 @@ impl GoResolver {
     /// Classify a field access: `pkg.Name`, `t.field`, `T.Method`, and the
     /// `Field` in `T{Field: v}`.
     ///
-    /// A call and a read share every shape but one, so this shares
-    /// [`Self::resolve_call`]'s answers wherever the shape is the same: an
-    /// import qualifier is read from the import table, a receiver root goes to
-    /// [`Self::resolve_receiver`], and a root bound by an enclosing block never
-    /// reaches here at all.
+    /// A call and a read share most shapes, and this shares
+    /// [`Self::resolve_call`]'s answers on those: a two-segment `pkg.Name` is
+    /// handed straight to it, a receiver root goes to
+    /// [`Self::resolve_receiver`], and a root bound by an enclosing block
+    /// never reaches here at all.
+    ///
+    /// One shape they answer differently, and the doc says so rather than
+    /// claiming a symmetry that is not there. A *three*-segment path rooted
+    /// in an import — `pkg.T.Member`, which is what `pkg.T{Member: v}` and
+    /// `pkg.Var.Field` both reduce to — is [`Outcome::External`] here and
+    /// [`UnresolvedReason::NeedsTypeInference`] in [`Self::resolve_call`],
+    /// which files every path longer than a `QualifiedIdent` under one
+    /// answer. Reading it as `External` is what a literal key on a
+    /// dependency's type is — a reference *into* that dependency, filed the
+    /// way every other reference into one is — and a selector read of the
+    /// same shape rides along. Making the two agree moves a measured number
+    /// in one direction or the other and is its own change, with its own
+    /// attribution.
     ///
     /// What it adds is the shape a call does not have: a member named on an
     /// owner that is *written at the site*. `T.Method` is Go's method
@@ -496,6 +514,19 @@ impl GoResolver {
     /// already exists with an answer, and moving one is a change to a measured
     /// number that this piece of work is not making. It is its own change,
     /// with its own attribution.
+    ///
+    /// # A composite-literal key never links
+    ///
+    /// A site [`FileScope::literal_keys`] marks is the `Field` in
+    /// `T{Field: v}`, and the member probe is skipped for it entirely: it can
+    /// only ever find the wrong node. A Go struct field is not a node in this
+    /// build, and Go forbids a type from declaring a method and a field of one
+    /// name, so `T.Field` existing in the table proves `T` is *not* a struct —
+    /// a named map, slice or array type, whose literal key is an index
+    /// expression rather than a member name and whose same-named method the
+    /// key does not name. Linking it would emit a wrong edge, which is
+    /// strictly worse than an unresolved reference. Skipping the probe costs
+    /// nothing a compiling corpus could have earned.
     pub fn resolve_field(
         &self,
         cfg: &GoModule,
@@ -542,13 +573,19 @@ impl GoResolver {
         if r.target.segments.len() == 2 && scope.imports.contains_key(owner) {
             return self.resolve_call(cfg, r, scope, probe);
         }
-        let id = node_id(Domain::Go, &format!("{pkg}#{owner}.{member}"));
-        let mut candidates = vec![id];
-        if probe.probe(&id).is_some() {
-            return Resolution {
-                outcome: Outcome::Resolved(id),
-                candidates,
-            };
+        let mut candidates = Vec::new();
+        // A composite-literal key is the one shape that must not be probed:
+        // see the type-level note above. Every other site asks the member
+        // question the shape states.
+        if !scope.literal_keys.contains(&r.span.byte_start) {
+            let id = node_id(Domain::Go, &format!("{pkg}#{owner}.{member}"));
+            candidates.push(id);
+            if probe.probe(&id).is_some() {
+                return Resolution {
+                    outcome: Outcome::Resolved(id),
+                    candidates,
+                };
+            }
         }
         // The member is not indexed under that owner. Whether that is a gap in
         // this track or a type nobody stated is decided by the owner itself.
@@ -654,9 +691,20 @@ impl GoResolver {
                 // one-argument call naming one is a conversion and nothing
                 // else; arity is what separates it, and no other arity can
                 // reach a type at all.
+                //
+                // Two names in the type list are excluded from that widening,
+                // because the argument for it does not reach them. `nil` and
+                // `comparable` are in [`GO_UNIVERSE_TYPES`] for the two
+                // positions that write them — a `case nil:` arm and a type
+                // constraint — and neither is a type a conversion can name, so
+                // `nil(x)` and `comparable(x)` are not Go. Admitting them
+                // would have the list claim something wider than "a type
+                // cannot be called"; no compiling corpus can reach either.
                 let universe: &[&[&str]] = match r.kind {
                     RefKind::TypeUse => &[GO_UNIVERSE_TYPES],
-                    _ if r.argc == Some(1) => &[GO_BUILTINS, GO_UNIVERSE_TYPES],
+                    _ if r.argc == Some(1) && !matches!(name.as_str(), "nil" | "comparable") => {
+                        &[GO_BUILTINS, GO_UNIVERSE_TYPES]
+                    }
                     _ => &[GO_BUILTINS],
                 };
                 let outcome = if universe.iter().any(|list| list.contains(&name.as_str())) {
@@ -894,7 +942,6 @@ mod tests {
     use super::*;
     use crate::extract_go::Import;
     use crate::model::{DeclSpace, DefFacets, Encloser, RefTarget, Span};
-    use std::collections::HashSet;
 
     const NOWHERE: Span = Span {
         byte_start: 0,
@@ -928,6 +975,7 @@ mod tests {
             rel_path: rel_path.to_string(),
             package: Some(package.to_string()),
             imports,
+            literal_keys: Vec::new(),
         }
     }
 
@@ -967,6 +1015,7 @@ mod tests {
             pkg_path: "example.com/app/server".into(),
             imports,
             dot_imports: vec![],
+            literal_keys: HashSet::new(),
         }
     }
 

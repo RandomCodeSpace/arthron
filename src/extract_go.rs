@@ -48,6 +48,22 @@ pub struct GoHeader {
     /// `refs`: the reference is the extractor's, the binding effect it has
     /// on the file's scope is the resolver's.
     pub imports: Vec<Import>,
+    /// Byte offsets of the composite-literal keys reported in `refs`.
+    ///
+    /// A literal key and a selector become the same reference: both are a
+    /// [`RefKind::FieldAccess`] carrying `[Owner, Member]`, and nothing in
+    /// the reference says which syntax produced it. They are not the same
+    /// question. `T.M` written as a selector is Go's method expression and
+    /// names the method; a literal key never can, because Go forbids a type
+    /// from declaring a method and a field of one name, so a literal key that
+    /// *did* find `T.M` would have found the wrong node. Only the extractor
+    /// saw the syntax, so it says so here — the one file-local fact the
+    /// resolver cannot re-derive.
+    ///
+    /// A byte offset identifies the site: a key is one identifier, and no
+    /// selector can begin at a key identifier's first byte, because a key is
+    /// followed by `:`.
+    pub literal_keys: Vec<u32>,
 }
 
 /// The Go extractor. Stateless.
@@ -639,9 +655,13 @@ fn peel_type<'r>(node: &SgNode<'r>) -> SgNode<'r> {
 /// literal writing no type at all. Go allows the elision at any depth, so this
 /// climbs to the enclosing `literal_value` and takes that container's element
 /// type — the `element` of a slice or array, the `value` of a map. A struct
-/// container has no element type: `struct{ inner T }{inner: {…}}` elides
-/// against a *field's* type, which is a lookup this track cannot do, and
-/// answering `None` there leaves the key unreported rather than attributed to
+/// container has no element type and no elision to follow: the spec allows a
+/// nested literal to omit its type only "within a composite literal of array,
+/// slice, or map type T", so a struct field's value always writes its own and
+/// a struct container is never what an elided literal elided against. The
+/// arm answers `None` because there is nothing to answer, not because a
+/// lookup is missing; it is unreachable in Go that compiles, and in a tree
+/// that does not, `None` leaves the key unreported rather than attributed to
 /// the wrong type.
 fn literal_type<'r>(literal_value: &SgNode<'r>) -> Option<SgNode<'r>> {
     let parent = literal_value.parent()?;
@@ -666,6 +686,32 @@ fn literal_type<'r>(literal_value: &SgNode<'r>) -> Option<SgNode<'r>> {
 /// gives a written type name, because it is the same path. Everything else —
 /// a map, a slice, an anonymous `struct{…}`, an interface — names no node, so
 /// there is nothing for a member of it to be a member of.
+///
+/// It answers what the name *is*, never what it was declared as, and a
+/// file-local extractor has no second question to ask: `type Registry
+/// map[Key]int` is usually written in another file of the same package. So a
+/// *named* map, slice or array type reaches [`key_identifier`] exactly as a
+/// named struct does, and its key — an index expression, not a member name —
+/// is reported as `T.Key`. That is a wrong [`RefKind`], a wrong `raw_target`
+/// and a row in `NeedsReceiverType` that should not exist: 9 rows / 90
+/// occurrences on `codeiq` (`CapabilityMatrix`, declared in `plan.go` and
+/// built in `capabilities.go`) and 0 on `caddy`, all of it inside the
+/// denominator, so it understates the rate rather than flattering it —
+/// 69.5% as measured against 70.0% without those rows.
+///
+/// Restricting emission to what one file can prove is not the fix. The file
+/// declares the literal's type at only 249 of `codeiq`'s 643 unqualified
+/// literal-key sites and 519 of `caddy`'s 2,482, so the restriction would
+/// take 55% of `codeiq`'s and 79% of `caddy`'s legitimate struct keys with
+/// it, and every `pkg.T{…}` besides — a denominator that depends on which
+/// file a type was written in is a worse defect than the one it fixes. The
+/// resolver does see the whole package, but no outcome it can return means
+/// "this site is not a reference", and inventing one is not a thing this
+/// track does. Closing it needs the extractor/resolver contract to change,
+/// which is a design decision and not this function's.
+///
+/// What *is* closed here is the harm: `GoResolver::resolve_field` never
+/// probes a literal key's member, so no such site can link.
 fn named_type_path(node: &SgNode) -> Option<Vec<String>> {
     match &*node.kind() {
         "type_identifier" => Some(vec![node.text().to_string()]),
@@ -725,6 +771,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
         rel_path: rel_path.to_string(),
         package: None,
         imports: Vec::new(),
+        literal_keys: Vec::new(),
     };
     let mut defs: Vec<Definition> = Vec::new();
     let mut refs: Vec<Reference> = Vec::new();
@@ -927,6 +974,10 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                 // use: a literal of a function-local `type`, or of a type
                 // parameter, names a type that is not a node.
                 let locally_bound = is_locally_bound(&key, &segments[0]);
+                let span = span_of(&key);
+                // Which syntax this row came from, for the resolver: see
+                // `GoHeader::literal_keys`.
+                header.literal_keys.push(span.byte_start);
                 refs.push(Reference {
                     kind: RefKind::FieldAccess,
                     space: DeclSpace::Value,
@@ -938,7 +989,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<GoLang> {
                     locally_bound,
                     argc: None,
                     enclosing: enclosing_definition(&key),
-                    span: span_of(&key),
+                    span,
                 });
             }
             _ => {}

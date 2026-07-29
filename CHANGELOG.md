@@ -37,6 +37,27 @@ Decisions and their rationale — including what was rejected — live in
   anonymous `struct{…}` has no canonical name, so neither it nor its fields are
   nodes and its keys name nothing.
 
+  Both of those read the type *as written*, which is the whole of what one
+  file says. `map[K]V{k: v}` is rejected because the site writes `map`;
+  `type Registry map[K]V` used as `Registry{k: v}` is not, because the site
+  writes a name and the declaration is usually in a sibling file. So a named
+  map, slice or array type keyed by an identifier is reported as a member of
+  it — 9 rows / 90 occurrences on `codeiq` (`CapabilityMatrix` in
+  `internal/intelligence/query`), 0 on `caddy` — and lands in
+  `NeedsReceiverType`, inside the denominator, understating the rate rather
+  than flattering it: 69.5% as measured against 70.0% without those rows.
+  Closing it needs a fact no single file holds, so it is stated where it is
+  made (`named_type_path` in `extract_go.rs`, and `ref-litkey` in
+  `rules/go.yml`) rather than fixed by guessing. What is closed is the harm:
+  a literal key's member is never probed, so no such site can *link*. A named
+  non-struct type may carry a method, and a method name and a map-key
+  constant do not collide the way a method name and a field name do, so the
+  probe could only ever have found the wrong node — and a wrong edge is
+  strictly worse than an unresolved reference. Nothing a compiling corpus had
+  earned is lost by skipping it: a Go struct field is not a node in this
+  build, so every literal key on both corpora was already unresolved, and all
+  three Go gates hold their counts to the row.
+
   Separately, **`NoMatchingDefinition` is now empty on both Go corpora**, from
   123 rows on `codeiq` and 269 on `caddy`. Every one of them was a predeclared
   type name at a conversion — `string(b)`, `int64(n)`, `byte(c)` — which Go

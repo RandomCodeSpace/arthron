@@ -51,7 +51,8 @@ fn write(root: &Path, rel: &str, content: &str) {
 
 /// Every reference row of one scan, rendered as the *name* it points at.
 struct Scan {
-    rows: Vec<(String, u8, String)>,
+    /// `(raw_target, kind code, enclosing FQN, outcome)`.
+    rows: Vec<(String, u8, String, String)>,
 }
 
 fn render(files: &[(&str, &str)]) -> Scan {
@@ -84,7 +85,12 @@ fn render(files: &[(&str, &str)]) -> Scan {
                 StoredOutcome::External(package) => format!("external {package}"),
                 StoredOutcome::Unresolved(code) => reason_name(*code).to_string(),
             };
-            (key.raw_target.clone(), key.kind, outcome)
+            (
+                key.raw_target.clone(),
+                key.kind,
+                key.enclosing.clone(),
+                outcome,
+            )
         })
         .collect();
     Scan { rows }
@@ -105,17 +111,35 @@ impl Scan {
 
     #[track_caller]
     fn one(&self, raw_target: &str, kind: RefKind) -> &str {
+        self.only(raw_target, kind, None)
+    }
+
+    /// The outcome of the one row with this site text *inside* one encloser.
+    ///
+    /// Two sites can write one site text and be two rows: the encloser is
+    /// part of the store's key, so `T{K: v}` in one function and `T.K` in
+    /// another are separate rows with separate answers.
+    #[track_caller]
+    fn one_in(&self, raw_target: &str, kind: RefKind, enclosing: &str) -> &str {
+        self.only(raw_target, kind, Some(enclosing))
+    }
+
+    #[track_caller]
+    fn only(&self, raw_target: &str, kind: RefKind, enclosing: Option<&str>) -> &str {
         let code = kind.code();
         let hits: Vec<&str> = self
             .rows
             .iter()
-            .filter(|(raw, k, _)| raw == raw_target && *k == code)
-            .map(|(_, _, outcome)| outcome.as_str())
+            .filter(|(raw, k, enc, _)| {
+                raw == raw_target && *k == code && enclosing.is_none_or(|want| enc == want)
+            })
+            .map(|(_, _, _, outcome)| outcome.as_str())
             .collect();
         assert_eq!(
             hits.len(),
             1,
-            "expected exactly one `{raw_target}` {kind:?} row, found {}\n{}",
+            "expected exactly one `{raw_target}` {kind:?} row{}, found {}\n{}",
+            enclosing.map_or(String::new(), |e| format!(" in `{e}`")),
             hits.len(),
             self.dump(),
         );
@@ -127,7 +151,7 @@ impl Scan {
         let code = kind.code();
         self.rows
             .iter()
-            .filter(|(raw, k, _)| raw == raw_target && *k == code)
+            .filter(|(raw, k, _, _)| raw == raw_target && *k == code)
             .count()
     }
 
@@ -137,8 +161,8 @@ impl Scan {
         let mut out: Vec<&str> = self
             .rows
             .iter()
-            .filter(|(_, k, _)| *k == code)
-            .map(|(raw, _, _)| raw.as_str())
+            .filter(|(_, k, _, _)| *k == code)
+            .map(|(raw, _, _, _)| raw.as_str())
             .collect();
         out.sort_unstable();
         out
@@ -146,8 +170,10 @@ impl Scan {
 
     fn dump(&self) -> String {
         let mut out = String::from("rows:\n");
-        for (raw, kind, outcome) in &self.rows {
-            out.push_str(&format!("  kind={kind} {raw:?} -> {outcome}\n"));
+        for (raw, kind, enclosing, outcome) in &self.rows {
+            out.push_str(&format!(
+                "  kind={kind} {raw:?} in {enclosing} -> {outcome}\n"
+            ));
         }
         out
     }
@@ -441,6 +467,139 @@ fn go_a_map_literal_key_is_an_expression_and_not_a_reference() {
         scan.field_targets().is_empty(),
         "a map or array key is an expression: {}",
         scan.dump(),
+    );
+}
+
+/// A *named* map, slice or array type is where the anonymous rule above stops
+/// being able to help, and the identifier gate is what still holds.
+///
+/// `named_type_path` reads the literal's type as written and cannot ask what
+/// it was declared as — `type Row []int` is usually in another file of the
+/// package, and a file-local extractor never reads one. So the type half of
+/// the map/array rule does not fire here, and the *key* half is the only
+/// thing between an index expression and a field-access row. `Row{0: 1}` is
+/// legal Go, its key is an integer index, and no row may come out of it.
+#[test]
+fn go_a_named_slice_literal_index_key_is_still_an_expression() {
+    let scan = render(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "app.go",
+            concat!(
+                "package app\n\n",
+                "type Row []int\n",
+                "type Grid [2]int\n",
+                "type Table map[string]int\n\n",
+                "func Build() {\n",
+                "\t_ = Row{0: 1}\n",
+                "\t_ = Grid{1: 2}\n",
+                "\t_ = Table{\"k\": 3}\n",
+                "}\n",
+            ),
+        ),
+    ]);
+
+    assert!(
+        scan.field_targets().is_empty(),
+        "an index or string key names no member, whatever the literal's type is called: {}",
+        scan.dump(),
+    );
+}
+
+/// The literal key that *does* get through, and the guarantee that it cannot
+/// become a wrong edge.
+///
+/// `type Registry map[Key]int` keyed by an identifier reaches the same code a
+/// struct literal does, because only the declaration says which it is and the
+/// declaration is out of a file-local extractor's reach. So the row exists,
+/// written `Registry.Alpha` — measured at 9 rows / 90 occurrences on `codeiq`
+/// and 0 on `caddy`, and stated as a limit in `rules/go.yml`. What must never
+/// happen is the row *linking*: a named non-struct type may carry a method,
+/// and a method name and a map-key constant do not collide the way a method
+/// name and a field name do, so probing `Registry.Alpha` finds the method and
+/// links a reference the program never wrote. `resolve_field` does not probe
+/// a literal key's member at all, which is why this stays unresolved.
+#[test]
+fn go_a_named_map_literal_key_never_links_to_a_method() {
+    let scan = render(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "app.go",
+            concat!(
+                "package app\n\n",
+                "type Key string\n",
+                "type Registry map[Key]int\n\n",
+                "func (r Registry) Alpha() int { return r[\"a\"] }\n\n",
+                "const Alpha Key = \"a\"\n\n",
+                "func Build() {\n",
+                "\t_ = Registry{Alpha: 1}\n",
+                "}\n",
+            ),
+        ),
+    ]);
+
+    assert_eq!(
+        scan.field("Registry.Alpha"),
+        "NeedsReceiverType",
+        "a literal key must not link to the method that happens to share its name",
+    );
+}
+
+/// The other half of the same question: a member *written as a selector* is
+/// Go's method expression and still links.
+///
+/// The two sites reduce to one reference — a `FieldAccess` carrying
+/// `[Registry, Alpha]` — and only the syntax tells them apart, which is why
+/// the extractor records where its literal keys were. Nothing about the
+/// literal-key rule may cost a method expression its edge, on a named
+/// non-struct receiver or a struct one.
+#[test]
+fn go_a_method_expression_still_links_beside_a_literal_key() {
+    let scan = render(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "app.go",
+            concat!(
+                "package app\n\n",
+                "type Key string\n",
+                "type Registry map[Key]int\n\n",
+                "func (r Registry) Alpha() int { return r[\"a\"] }\n\n",
+                "type Conn struct{ n int }\n\n",
+                "func (c Conn) Ping() int { return c.n }\n\n",
+                "const Alpha Key = \"a\"\n\n",
+                "func Build() {\n",
+                "\t_ = Registry{Alpha: 1}\n",
+                "}\n\n",
+                "func Expr() {\n",
+                "\t_ = Registry.Alpha\n",
+                "\t_ = Conn.Ping\n",
+                "}\n",
+            ),
+        ),
+    ]);
+
+    assert_eq!(
+        scan.one_in(
+            "Registry.Alpha",
+            RefKind::FieldAccess,
+            "example.com/app#Expr"
+        ),
+        "resolved example.com/app#Registry.Alpha",
+        "a method expression is a link, whatever the receiver type is declared as",
+    );
+    assert_eq!(
+        scan.one_in(
+            "Registry.Alpha",
+            RefKind::FieldAccess,
+            "example.com/app#Build"
+        ),
+        "NeedsReceiverType",
+        "the literal key in the other function keeps its own row and its own answer",
+    );
+    assert_eq!(
+        scan.field("Conn.Ping"),
+        "resolved example.com/app#Conn.Ping",
+        "a method expression on a struct type is unaffected",
     );
 }
 
