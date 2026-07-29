@@ -410,32 +410,57 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 
 | Budget | Target | Measured |
 |---|---|---|
-| Peak RSS | **< 512 MB (hard)** | 337.1 MiB cold-scanning kubernetes v1.36.3, 1,789,247 lines — 66% of the ceiling, six runs spanning 0.2% |
-| Cold index throughput | < 60 s / 1M lines | ~17 s / 1M lines on the same scan |
-| Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes **on the pre-Wave-3 build** — a miss, recorded as a finding rather than hidden, and not yet re-measured |
+| Peak RSS | **< 512 MB (hard)** | 280.2 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling, worst of nine runs spanning 2,260 kB |
+| Cold index throughput | < 60 s / 1M lines | 20.5 s / 1M lines on the same scan, worst of nine runs spanning 19.9–20.5 — but **70.1 s / 1M on TypeScript**, a miss, measured below |
+| Warm re-index, unchanged tree | < 1 s | 12.37 s re-scanning that same tree, unchanged — a miss by 12×, recorded as a finding rather than hidden |
 
-The RSS percentage and the ceiling are read in the same binary units: 337.1 of
-512 is 66%. That is the basis every RSS verdict on this project was recorded
-on — the 729.1 MiB that failed this gate was recorded as **1.42× the ceiling**,
-which is 729.1/512 — so it is said here rather than left to be inferred. Read
-`512 MB` as decimal MB instead and the same measurement is 353.5 MB, 69% of it:
-under the ceiling on either reading, but only one of the two matches the
-record.
+The RSS percentage and the ceiling are read in the same binary units: 280.2 of
+512 is 54.7%. That is the basis every RSS verdict on this project was recorded
+on — the 729.1 MiB that failed this gate once was recorded as **1.42× the
+ceiling**, which is 729.1/512 — so it is said here rather than left to be
+inferred. Read `512 MB` as decimal MB instead and the same measurement is
+293.8 MB, 57% of it: under the ceiling on either reading, but only one of the
+two matches the record.
 
-The first two rows are the shipped build. The third is not, and the column
-says so rather than letting three numbers read as one benchmark run: warm
-timing was last measured on the binary whose cold RSS was 729.1 MiB, and the
-memory work that replaced it was explicitly not aimed at the warm path (warm
-cost is per-file re-read and re-hash). Warm RSS improved 13% on the same
-change; warm wall time has not been re-run on the reference hardware, so the
-number here is the last one that was actually executed and it is labelled
-rather than refreshed by inference.
+All three rows are now the shipped build on one tree, cold-scanned and then
+re-scanned unchanged: 5,353,211 lines, where the first two rows used to name
+1,789,247 and the third a build two waves older. The earlier 337.1 MiB is
+therefore not restated beside them — it was a real measurement, of a smaller
+tree, by a build that no longer exists here, and setting it next to a number
+from neither would invite the two to be read as a before-and-after of the same
+scan.
 
-The RSS number is the interesting one: it was **729.1 MiB** and failed the hard
-gate. Bounding it — per-500-file commits on every phase, a capped redb page
-cache, phase 2 consuming facts per file — brought it to 337.1 MiB, and
-byte-identity of the resulting graph was proven at the level of full blake3
-snapshot digests across five corpora, not at the level of matching tallies.
+Warm is the miss, and it is not this build's doing: 11.73 s and 12.37 s over
+two runs here, against 12.35 s and 12.63 s for the same pair on the commit
+before the memory change, with warm peak RSS identical to within 0.2%
+(125,872–126,012 kB against 125,880–126,008 kB). Warm cost is per-file re-read
+and re-hash of every file in the tree, so it tracks the tree's size rather than
+the changed set: a target set against a 1.8M-line tree is missed by 13× against
+a 5.35M-line one. It is stated as measured rather than normalised away.
+
+Cold throughput is a per-language number, and one language misses the target.
+Median of three runs each on the shipped build, per 1M lines: Go `caddy` 32.6 s,
+Java `commons-lang` 44.4 s, Java `gson` 48.7 s, JavaScript `fastify` 37.1 s,
+JavaScript `express` 42.9 s, Python `django` 42.7 s, Python `flask` 43.5 s, and
+the 5.35M-line Go tree 20.2 s — every one inside the 60 s target — against
+TypeScript `vue-core` at **70.1 s** and TypeScript `zod` at **82.5 s**, both
+outside it. The extra parse per file that bought the memory ceiling roughly
+doubled all of them, and TypeScript was the language with the least room:
+36.7 s and 45.3 s before it. Timing is a target and the ceiling is hard, so
+this ships — but a target that is now missed is recorded here rather than left
+to be inferred from the Go row.
+
+The RSS number is the interesting one, and it has failed this gate twice. It
+was **729.1 MiB**; per-500-file commits on every phase, a capped redb page cache
+and phase 2 consuming facts per file brought it to 337.1 MiB. Then Go learned to
+emit type uses, non-call selector reads and composite-literal keys, references
+per tree went up 2.82×, and a cold scan reached **158.4% of the ceiling** —
+because the walk's references were held until phase 2 consumed them, 89.8% of
+the peak. The walk now keeps a file's declarations and forgets its references,
+and each later phase reads the file again. Both times byte-identity of the
+resulting graph was proven before the change shipped: today that is all 29
+corpus gates and all 15 target-pin comparisons producing byte-identical output,
+not merely matching tallies. See [`docs/decisions.md`](docs/decisions.md).
 
 ## No network calls, ever
 

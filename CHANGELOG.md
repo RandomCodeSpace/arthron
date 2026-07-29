@@ -13,6 +13,35 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Added
 
+- **`tests/rss_ceiling.rs`: a guard on the memory non-negotiable, honest about
+  what it cannot check.** It does not run the 512 MiB measurement — the tree
+  that ceiling is stated against is not in the corpus repository, so CI never
+  executes it, and the file's own comment says so rather than implying
+  otherwise. Nor does any Go corpus stand in for it: three runs of each build on
+  `go/caddy` measure 55,752–55,952 kB before the change and 55,808–56,320 kB
+  after, and on `go/codeiq` 46,184–46,208 kB against 46,168–46,296 kB — one
+  build's own spread covers the difference, so no threshold on a Go tree could
+  separate them.
+
+  Three non-Go corpora *can*, which is recorded rather than glossed: the change
+  moves `python/django` from 68,908–69,020 kB to 59,160–59,288 kB,
+  `javascript/fastify` from 26,112–26,368 kB to 19,688–20,080 kB and
+  `javascript/express` from 16,172–16,336 kB to 14,592 kB flat — gaps of
+  9,620 kB, 6,032 kB and 1,580 kB, where no build's own spread on any of them
+  exceeded 512 kB. What they cannot do is stand in for the ceiling — they
+  separate the two builds by ~10,000 kB where the tree the ceiling is stated
+  against separates them by 545,596 kB — and an RSS threshold is a number
+  about the hardware and the allocator, which is why it is not asserted on CI
+  runners that are not the reference hardware.
+
+  So it pins the mechanism, which is what a future change would break: counting
+  extractor invocations through the public `scan` entry, a Go file is extracted
+  exactly twice and a Java file exactly three times. A count of one is the
+  regression. It fails with one on the parent commit, verified by running it
+  there, and takes 0.01 s with no corpus. What it does *not* catch is named in
+  its own comment: re-adding the references to the retained record while keeping
+  the re-read leaves both counts where they are.
+
 - **`arthron pin`, and a committed target pin per tier-1 corpus: the gate can
   now see a wrong edge.** `arthron gate` compares four integers — `resolved`,
   `external`, `local_binding`, `unresolved` — and a reference that resolves to
@@ -69,6 +98,67 @@ Decisions and their rationale — including what was rejected — live in
   scans, 7.4 s wall.
 
 ### Changed
+
+- **A cold scan no longer holds the whole tree's references, and peak RSS drops
+  from 158.4% of the 512 MiB ceiling to 54.7% of it.** Teaching Go to emit type
+  uses, non-call selector reads and composite-literal keys took a 5,353,211-line
+  Go tree from 595,892 references to 1,678,021, and peak RSS with it: 830,612 kB
+  against a hard 524,288 kB ceiling on the 2 vCPU reference hardware.
+
+  Live-byte accounting that closed to 97.7% of measured VmRSS put **89.8% of the
+  813.2 MiB peak — 729.9 MiB — in one place**: the changed set's references,
+  extracted by the walk and kept alive until phase 2 consumed them. RSS climbed
+  monotonically to 729.9 MiB with the database still untouched, and minor faults
+  stopped at t≈38 s, so phase 2 never asked the kernel for another page. The
+  peak was the whole parsed tree, held.
+
+  The driver now keeps a file's path, hash, header and **declarations**, and not
+  its references. Declarations are 72,362 against 1,678,021 references and cost
+  13.3 MiB in total; phase 1 needs every changed file's before it names
+  anything, and nothing needs every file's references at once. Each later phase
+  reads the file again — twice per file for a language with no link kinds, three
+  times for one that declares them and so runs a supertype phase. What the walk
+  ends up holding is larger than those 13.3 MiB — 110,896 kB, measured, against
+  a 10,240 kB fixed cost — because a path, a hash and a language header ride
+  beside every file's declarations; the rest of that retained set has not been
+  decomposed, and `docs/decisions.md` says so rather than leaving the
+  declaration figure to be read as the whole of it.
+
+  | | peak RSS | wall | of ceiling |
+  |---|---|---|---|
+  | before | 830,612 kB | 70.59 s | 158.4% |
+  | `shrink_to_fit` on the extractor's vectors | 778,328 kB | 70.57 s | 148.5% |
+  | **and no retained references** | **286,872 kB** | **109.62 s** | **54.7%** |
+
+  The last row is the worst of nine runs of the shipped build, which spanned
+  284,612–286,872 kB and 106.47–109.62 s; the first is reproduced at
+  832,468 kB / 69.54 s on a re-measurement of the same commit.
+
+  Re-extraction cannot change a resolution, and the signature is the
+  enforcement: `Extractor::extract` takes a path and a string — no probe, no
+  config, no other file — so the same bytes give the same facts. The bytes are
+  re-hashed on the second read, and a file that moved under the scan goes to the
+  existing `stale` path rather than being resolved against declarations its
+  source no longer makes.
+
+  **Nothing about the graph moved.** All 29 corpus gates and all 15 pin
+  comparisons exit 0 against the committed baselines and pin files, and the
+  complete stdout of all 44 runs — every rate, every reason tally, every
+  `held/appeared/vanished/moved` count — is byte-identical to the same 44 runs
+  on the parent commit.
+
+  The cost is one extra parse per file: 39.0 s more wall clock on that tree,
+  **20.5 s per 1M lines against a 60 s target** — and it is not the same margin
+  in every language. Median of three runs each, per 1M lines: `go/caddy` 19.4 →
+  32.6, `java/commons-lang` 24.5 → 44.4, `javascript/fastify` 19.2 → 37.1,
+  `python/django` 18.4 → 42.7, all still inside the target, against
+  `typescript/vue-core` 36.7 → **70.1** and `typescript/zod` 45.3 → **82.5**,
+  both now outside it. **TypeScript cold indexing misses the timing target on
+  this build.** Timing is a target and the ceiling is hard, so the trade stands;
+  the miss is recorded here and in `README.md` rather than inferred from the Go
+  number. Warm scans are not affected: 11.73 s and 12.37 s on the unchanged
+  5.35M-line tree against 12.35 s and 12.63 s before the change, with warm peak
+  RSS equal to within 0.2%.
 
 - **The EcmaScript universe scope has a second half, and it un-pollutes
   `NoMatchingDefinition`.** That reason's contract says the reference was
