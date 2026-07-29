@@ -24,7 +24,7 @@ Decisions and their rationale — including what was rejected — live in
   a wrong edge is not*.
 
   `pins/<corpus>.pins` records the target of every resolved reference row, per
-  corpus, for the eleven tier-1 corpora — 76,792 rows over 18,325 distinct
+  corpus, for the fifteen tier-1 corpora — 80,272 rows over 18,687 distinct
   targets. `tests/edge_pins.rs` scans each corpus cold and compares. The rule:
 
   - a pinned row whose target **changed** fails, by name — `target_moved` —
@@ -38,7 +38,7 @@ Decisions and their rationale — including what was rejected — live in
   **The format, and why.** Written out in full those rows are 14.5 MB of
   committed text (measured). Stored as a 64-bit hash of the store's own
   canonical row key plus an index into a plaintext, deduplicated dictionary of
-  target names, the eleven files are 3.0 MB. The target names stay in
+  target names, the fifteen files are 3.1 MB. The target names stay in
   plaintext deliberately: a check whose failure printed
   `0x8f3a… became 0x1c07…` would tell a reviewer that something moved and
   nothing about what, so the old target is recoverable by name from the file
@@ -65,8 +65,8 @@ Decisions and their rationale — including what was rejected — live in
 
   No workflow change: `.github/workflows/gate.yml` already ends by running the
   whole suite with `ARTHRON_REQUIRE_CORPUS=1` in the one job that fetches the
-  corpus, so the eleven comparisons run and block a merge there. Eleven cold
-  scans, 9.9 s wall.
+  corpus, so the fifteen comparisons run and block a merge there. Fifteen cold
+  scans, 7.4 s wall.
 
 ### Changed
 
