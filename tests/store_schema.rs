@@ -55,6 +55,7 @@ fn site_of(file: &str, line: u32, payload: NodePayload) -> DeclSite {
         file: file.to_string(),
         line,
         payload,
+        merge_definition: None,
     }
 }
 
@@ -118,8 +119,8 @@ fn record(outcome: StoredOutcome) -> RefRecord {
 }
 
 #[test]
-fn schema_ten_round_trips_argument_types_in_reference_keys() {
-    assert_eq!(SCHEMA_VERSION, 10);
+fn schema_eleven_round_trips_argument_types_in_reference_keys() {
+    assert_eq!(SCHEMA_VERSION, 11);
 
     let mut typed = key("pkg/a.java", "pkg#Caller.m()", "pick");
     typed.argc = Some(1);
@@ -148,6 +149,56 @@ fn refs_of(file: &str, raw: &str, target: NodeId) -> FileRefs {
 
 fn open(path: &Path) -> Store {
     Store::open(path).expect("open")
+}
+
+#[test]
+fn a_schema_ten_store_is_wiped_and_rebuilt_at_schema_eleven() {
+    assert_eq!(
+        SCHEMA_VERSION, 11,
+        "adding argument types to reference keys is the schema 10 -> 11 break",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.redb");
+    {
+        let store = open(&path);
+        store
+            .apply_defs(&DefBatch {
+                files: vec![FileDefs {
+                    path: "pkg/a.go".into(),
+                    nodes: vec![definition("m/pkg#Old", "pkg/a.go", 3)],
+                }],
+            })
+            .expect("apply schema-ten definition");
+        assert!(
+            store.node(&go("m/pkg#Old")).unwrap().is_some(),
+            "the old store contains a graph to wipe",
+        );
+    }
+
+    let db = Database::create(&path).expect("raw schema-ten open");
+    let txn = db.begin_write().expect("write schema-ten stamp");
+    {
+        let mut meta = txn.open_table(META).expect("meta");
+        meta.insert("schema_version", &10u32.to_le_bytes()[..])
+            .expect("stamp schema ten");
+    }
+    txn.commit().expect("commit schema ten");
+    drop(db);
+
+    let rebuilt = open(&path);
+    assert!(
+        rebuilt.known_files().unwrap().is_empty(),
+        "schema-ten ownership was wiped",
+    );
+    assert!(
+        rebuilt
+            .snapshot()
+            .expect("rebuilt snapshot")
+            .nodes
+            .is_empty(),
+        "schema-ten nodes were wiped before schema eleven was created",
+    );
+    assert_eq!(rebuilt.report().unwrap().fqn_collisions, 0);
 }
 
 #[test]

@@ -33,6 +33,21 @@ There is no fourth outcome and no way to express "dropped".
 
 ## Install
 
+Download the archive for your platform from
+[GitHub Releases](https://github.com/RandomCodeSpace/arthron/releases), verify
+it with the adjacent `.sha256` file, extract it, and put `arthron` (or
+`arthron.exe`) on your `PATH`:
+
+| Platform | Archive | Checksum |
+|---|---|---|
+| Linux x86_64 (GNU) | `arthron-x86_64-unknown-linux-gnu.tar.xz` | `arthron-x86_64-unknown-linux-gnu.tar.xz.sha256` |
+| Linux aarch64 (GNU) | `arthron-aarch64-unknown-linux-gnu.tar.xz` | `arthron-aarch64-unknown-linux-gnu.tar.xz.sha256` |
+| macOS x86_64 | `arthron-x86_64-apple-darwin.tar.xz` | `arthron-x86_64-apple-darwin.tar.xz.sha256` |
+| macOS aarch64 | `arthron-aarch64-apple-darwin.tar.xz` | `arthron-aarch64-apple-darwin.tar.xz.sha256` |
+| Windows x86_64 (MSVC) | `arthron-x86_64-pc-windows-msvc.zip` | `arthron-x86_64-pc-windows-msvc.zip.sha256` |
+
+Or install from crates.io:
+
 ```bash
 cargo install arthron
 ```
