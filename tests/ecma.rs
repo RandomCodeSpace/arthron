@@ -593,6 +593,71 @@ fn ecma_member_reads_are_emitted_once_and_keep_their_honest_root_outcomes() {
 }
 
 #[test]
+fn parenthesized_member_callees_keep_their_call_or_new_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"parenthesized-member-callees","type":"module"}"#,
+    );
+    for extension in ["js", "ts"] {
+        write(
+            root,
+            &format!("values.{extension}"),
+            "export const named = 1;\nexport function called() {}\nexport class Constructed {}\n",
+        );
+        write(
+            root,
+            &format!("read.{extension}"),
+            &format!(
+                "import * as imported from './values.{extension}';\n\
+                 export function read() {{\n\
+                   const ordinaryRead = (imported.named);\n\
+                   (imported.called)();\n\
+                   new (imported.Constructed)();\n\
+                   return ordinaryRead;\n\
+                 }}\n"
+            ),
+        );
+    }
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let fields = rows_of_kind(&db, RefKind::FieldAccess);
+    let calls = rows_of_kind(&db, RefKind::Call);
+    let news = rows_of_kind(&db, RefKind::New);
+    for extension in ["js", "ts"] {
+        let read = format!("read.{extension}");
+        let values = format!("values.{extension}");
+        let enclosing = format!("{read}#value:read");
+
+        assert_eq!(
+            row(&fields, &read, "imported.named", &enclosing),
+            format!("resolved {values}#value:named"),
+            "an ordinary parenthesized member expression remains a field read",
+        );
+        assert_eq!(
+            row(&calls, &read, "(imported.called)", &enclosing),
+            format!("resolved {values}#value:called"),
+            "a parenthesized member callee keeps its call outcome",
+        );
+        assert_eq!(
+            row(&news, &read, "(imported.Constructed)", &enclosing),
+            format!("resolved {values}#value:Constructed"),
+            "a parenthesized member constructor keeps its new outcome",
+        );
+        for raw in ["imported.called", "imported.Constructed"] {
+            assert!(
+                !fields
+                    .keys()
+                    .any(|(file, field, _)| file == &read && field == raw),
+                "{read}: {raw} is already represented by its call or construction site",
+            );
+        }
+    }
+}
+
+#[test]
 fn a_javascript_esm_file_does_not_probe_extensions() {
     // A5, and it is non-negotiable: NODE `ESM_RESOLVE` performs URL
     // resolution only, so `./util` resolves to `./util` exactly or fails.

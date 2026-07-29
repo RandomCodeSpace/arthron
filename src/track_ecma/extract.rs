@@ -1988,20 +1988,29 @@ fn member_read(ctx: &mut Ctx, node: &SgNode) {
     if in_type_position(node) {
         return;
     }
-    let Some(parent) = node.parent() else {
-        return;
-    };
-    let is_field = |name: &str| {
-        parent
-            .field(name)
-            .is_some_and(|field| field.range() == node.range())
-    };
-    if (parent.kind() == "member_expression" && is_field("object"))
-        || (parent.kind() == "call_expression" && is_field("function"))
-        || (parent.kind() == "new_expression" && is_field("constructor"))
-        || (parent.kind() == "assignment_expression" && is_field("left"))
-    {
-        return;
+    let mut current = node.clone();
+    while let Some(parent) = current.parent() {
+        let is_field = |name: &str| {
+            parent
+                .field(name)
+                .is_some_and(|field| field.range() == current.range())
+        };
+        if (parent.kind() == "member_expression" && is_field("object"))
+            || (parent.kind() == "call_expression" && is_field("function"))
+            || (parent.kind() == "new_expression" && is_field("constructor"))
+            || (parent.kind() == "assignment_expression" && is_field("left"))
+        {
+            return;
+        }
+        if parent.kind() == "parenthesized_expression"
+            && parent
+                .children()
+                .any(|child| child.is_named() && child.range() == current.range())
+        {
+            current = parent;
+            continue;
+        }
+        break;
     }
     ctx.push_ref(
         RefKind::FieldAccess,
