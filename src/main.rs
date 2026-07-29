@@ -27,13 +27,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 use clap::{Parser, Subcommand};
 
 use arthron::config::Config;
