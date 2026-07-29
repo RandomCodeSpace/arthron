@@ -67,15 +67,30 @@ use crate::store::{
 /// any batch size — only the memory and the transaction count do.
 const BATCH_FILES: usize = 500;
 
-/// One file this event re-reads, extracted.
+/// One file this event re-reads: its identity, and the half of its facts
+/// small enough to keep.
 ///
 /// Either its bytes moved, or an identity it referenced did — both mean the
 /// same thing to the store: replace this file's halves with what this event
 /// says they are.
+///
+/// The **references are deliberately absent**. Held from the walk until
+/// phase 2 consumed them they were, measured over a 5.35M-line Go tree,
+/// 89.8% of a cold scan's peak RSS — 729.9 MiB of 813.2 MiB. The
+/// declarations are three orders of magnitude cheaper (13.3 MiB for 72,362
+/// of them) and phase 1 needs them before any file's references are read, so
+/// they stay; the references are read again, per file, by whichever later
+/// phase wants them, and dropped as soon as it is done. See [`reread`].
 struct ScannedFile<L: Language> {
     rel_path: String,
+    /// Where to read the file again. Phases 1.5 and 2 re-extract from it.
+    path: PathBuf,
     hash: [u8; 32],
-    facts: FileFacts<L>,
+    /// Language-private facts about the file. Small, and phase 1 needs every
+    /// changed file's before it names a single definition.
+    header: L::Header,
+    /// The declarations phase 1 turns into nodes.
+    defs: Vec<Definition>,
 }
 
 /// The store's symbol table, as a resolver probes it.
@@ -145,16 +160,25 @@ struct RefAcc {
 ///
 /// # Memory
 ///
-/// Peak RSS is linear in the tree, not in the batch. What a cold scan holds
-/// at once is the changed set — every owned file, parsed — from the walk
-/// until phase 2 consumes it, and beside it, one phase at a time, the symbol
-/// table each phase probes, the FQN index the supertype phase reads, and the
-/// two definition maps the widening compares. Each of those is dropped where
-/// the phase that reads it ends, which is why they are dropped by name below
-/// rather than at the end of the function; the changed set spans them all,
-/// and it is the tree. The 512 MB ceiling is therefore an envelope measured
-/// against the reference corpus, not a property of this code — see
-/// [`BATCH_FILES`].
+/// A cold scan holds, of the changed set, one file's *references* at a time
+/// and every file's declarations. That asymmetry is the whole memory design.
+/// References outnumber declarations 23 to 1 on a large Go tree — 1,678,021
+/// against 72,362 — and cost 136 bytes plus 5.7 heap allocations each, so
+/// holding them all from the walk until phase 2 consumed them was 89.8% of
+/// a measured 813.2 MiB peak. They are not held: [`ScannedFile`] keeps the
+/// path and the hash, and each later phase reads the file again. See
+/// [`reread`].
+///
+/// Beside that, one phase at a time: the symbol table each phase probes, the
+/// FQN index the supertype phase reads, and the two definition maps the
+/// widening compares. Each is dropped where the phase that reads it ends,
+/// which is why they are dropped by name below rather than at the end of the
+/// function.
+///
+/// Peak RSS is therefore linear in the *declaration* count and in the single
+/// largest file, not in the tree's references. The 512 MB ceiling is checked
+/// by `tests/rss_ceiling.rs`, which states exactly what it can and cannot
+/// prove — see [`BATCH_FILES`].
 pub fn scan<L: Language>(
     root: &Path,
     db_path: &Path,
@@ -292,11 +316,16 @@ pub fn scan<L: Language>(
         if store.file_hash(&rel)? == Some(hash) {
             continue; // unchanged: not in this event's changed set
         }
-        let facts = ex.extract(&rel, &source);
+        // `facts.refs` is not moved out, so it is dropped with `facts` at
+        // the end of this statement — the walk keeps a file's declarations
+        // and forgets its references. That is the whole of the memory fix.
+        let facts = extract_facts(ex, &rel, &source);
         changed.push(ScannedFile {
             rel_path: rel,
+            path: path.clone(),
             hash,
-            facts,
+            header: facts.header,
+            defs: facts.defs,
         });
     }
 
@@ -331,7 +360,7 @@ pub fn scan<L: Language>(
     // identities from names phase 2 then disagrees with.
     let mut event_names: HashMap<String, String> = HashMap::new();
     for file in &changed {
-        if let Some((path, name)) = rs.declared_container(&cfg, &file.facts.header) {
+        if let Some((path, name)) = rs.declared_container(&cfg, &file.header) {
             event_names.insert(path, name);
         }
     }
@@ -505,7 +534,14 @@ pub fn scan<L: Language>(
         };
         let mut supers_now: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
         for file in changed.iter().chain(waking.iter()) {
-            let supers = phase_supers(rs, &cfg, file, &probe, &fqns, links);
+            // Re-read rather than held: see [`reread`]. A file whose bytes
+            // moved under the scan is skipped here and again in phase 2, and
+            // both times it lands in `stale`.
+            let Some(facts) = reread(ex, file, &mut file_errors, &mut stale) else {
+                continue;
+            };
+            let supers = phase_supers(rs, &cfg, &file.rel_path, &facts, &probe, &fqns, links);
+            drop(facts);
             for (id, record) in &supers.types {
                 supers_now
                     .entry(*id)
@@ -556,16 +592,21 @@ pub fn scan<L: Language>(
     // Phase 2: resolve every reference in the changed set and in every file
     // this event woke, in either round.
     //
-    // The files are *consumed* here, not borrowed. Phase 2 is the last thing
-    // that reads a file's extracted facts, and on a cold scan those facts are
-    // the largest thing the process holds — the whole tree, parsed. Dropping
-    // each file's as its half is built is what lets the batches be allocated
-    // out of the memory the facts are giving back, rather than beside it.
+    // A file's references are read here and nowhere else, one file at a
+    // time, and dropped before the next is read. Holding the whole changed
+    // set's references from the walk to this loop was 89.8% of a cold scan's
+    // peak; re-reading the bytes costs one extra parse per file and holds
+    // one file's worth. See [`reread`] for why the second parse cannot say
+    // anything different from the first.
     let mut ref_batch = RefBatch {
         files: Vec::with_capacity(BATCH_FILES),
     };
     for file in changed.into_iter().chain(waking).chain(roused) {
-        let refs = phase_two(rs, &cfg, &file, &probe);
+        let Some(facts) = reread(ex, &file, &mut file_errors, &mut stale) else {
+            continue;
+        };
+        let refs = phase_two(rs, &cfg, &file, &facts, &probe);
+        drop(facts);
         drop(file);
         ref_batch.files.push(refs);
         flush_refs(&store, &mut ref_batch, BATCH_FILES)?;
@@ -736,6 +777,22 @@ fn add_invalidated(
     }
 }
 
+/// Extract one file and hand back the slack.
+///
+/// A `Vec` doubles, so a file's references land in a buffer holding up to
+/// twice what the extractor emitted. Measured over a large Go tree that
+/// overshoot was 99.7 MiB of live capacity holding nothing at all.
+///
+/// Capacity is not an observable of the facts: the records, their order and
+/// their count are untouched, and no resolver can ask a `Vec` how much room
+/// it has. This makes the process smaller, never the graph different.
+fn extract_facts<L: Language>(ex: &dyn Extractor<L>, rel_path: &str, source: &str) -> FileFacts<L> {
+    let mut facts = ex.extract(rel_path, source);
+    facts.defs.shrink_to_fit();
+    facts.refs.shrink_to_fit();
+    facts
+}
+
 /// Read one file and extract it, as the walk does for a changed file.
 fn scan_file<L: Language>(
     ex: &dyn Extractor<L>,
@@ -744,12 +801,59 @@ fn scan_file<L: Language>(
 ) -> Result<ScannedFile<L>, String> {
     let source = read_source(path, &rel_path)?;
     let hash = *blake3::hash(source.as_bytes()).as_bytes();
-    let facts = ex.extract(&rel_path, &source);
+    let facts = extract_facts(ex, &rel_path, &source);
     Ok(ScannedFile {
         rel_path,
+        path: path.to_path_buf(),
         hash,
-        facts,
+        header: facts.header,
+        defs: facts.defs,
     })
+}
+
+/// Read one file again and re-extract it, for a phase that does not hold the
+/// walk's references.
+///
+/// Re-extraction cannot change an outcome, and the enforcement is structural
+/// rather than argued: [`Extractor::extract`] takes a path and a string — no
+/// probe, no config, no other file — so the same bytes give the same facts.
+/// [`scan_file`] already re-reads every woken file on exactly this
+/// assumption, so this generalises a path the graph already rests on.
+///
+/// The bytes are what must be checked, and they are. A file whose hash has
+/// moved since the walk is no longer the file this event's phase-1 half
+/// describes, and resolving it would place its references against
+/// declarations its source no longer makes. It goes to `stale` instead —
+/// exactly where an unreadable file goes — so the store withdraws its
+/// currency claim and the next scan reads the file whole.
+fn reread<L: Language>(
+    ex: &dyn Extractor<L>,
+    file: &ScannedFile<L>,
+    file_errors: &mut BTreeMap<String, String>,
+    stale: &mut BTreeSet<String>,
+) -> Option<FileFacts<L>> {
+    let source = match read_source(&file.path, &file.rel_path) {
+        Ok(source) => source,
+        Err(e) => {
+            stale.insert(file.rel_path.clone());
+            file_errors.insert(file.rel_path.clone(), e);
+            return None;
+        }
+    };
+    if *blake3::hash(source.as_bytes()).as_bytes() != file.hash {
+        stale.insert(file.rel_path.clone());
+        file_errors.insert(
+            file.rel_path.clone(),
+            format!(
+                "{}: the bytes changed while this scan was reading the tree, so this \
+                 file's references are left unresolved and its store rows stale until \
+                 the next scan",
+                file.rel_path,
+            ),
+        );
+        return None;
+    }
+    Some(extract_facts(ex, &file.rel_path, &source))
 }
 
 fn read_source(path: &Path, rel_path: &str) -> Result<String, String> {
@@ -766,16 +870,16 @@ fn phase_one<L: Language>(
     probe: &dyn SymbolProbe,
     event_defs: &mut HashMap<NodeId, Vec<Definition>>,
 ) -> FileDefs {
-    let mut nodes = Vec::with_capacity(file.facts.defs.len());
-    for def in &file.facts.defs {
-        let Some(fqn) = rs.def_fqn(cfg, &file.facts.header, &def.owner, def, probe) else {
+    let mut nodes = Vec::with_capacity(file.defs.len());
+    for def in &file.defs {
+        let Some(fqn) = rs.def_fqn(cfg, &file.header, &def.owner, def, probe) else {
             continue; // not nameable, so not a node
         };
         let id = node_id(L::DOMAIN, fqn.as_str());
         // An empty name means "this file does not say", which is not the
         // same as naming the empty string.
         let targets: Vec<NodeId> = rs
-            .def_alias_targets(cfg, &file.facts.header, def, probe)
+            .def_alias_targets(cfg, &file.header, def, probe)
             .iter()
             .map(|t| node_id(L::DOMAIN, t.as_str()))
             // A self-referential alias is not a forward, and storing it would
@@ -833,7 +937,8 @@ fn phase_one<L: Language>(
 fn phase_supers<L: Language>(
     rs: &dyn Resolver<L>,
     cfg: &L::Config,
-    file: &ScannedFile<L>,
+    rel_path: &str,
+    facts: &FileFacts<L>,
     probe: &dyn SymbolProbe,
     fqns: &HashMap<NodeId, String>,
     kinds: &[RefKind],
@@ -843,35 +948,34 @@ fn phase_supers<L: Language>(
         supers: Vec::new(),
         complete: true,
     };
-    for def in &file.facts.defs {
+    for def in &facts.defs {
         if def.kind != DefKind::Type {
             continue;
         }
-        if let Some(fqn) = rs.def_fqn(cfg, &file.facts.header, &def.owner, def, probe) {
+        if let Some(fqn) = rs.def_fqn(cfg, &facts.header, &def.owner, def, probe) {
             rows.entry(node_id(L::DOMAIN, fqn.as_str()))
                 .or_insert_with(complete);
         }
     }
-    let linking: Vec<&Reference> = file
-        .facts
+    let linking: Vec<&Reference> = facts
         .refs
         .iter()
         .filter(|r| kinds.contains(&r.kind))
         .collect();
     if linking.is_empty() {
         return FileSupers {
-            path: file.rel_path.clone(),
+            path: rel_path.to_string(),
             types: rows.into_iter().collect(),
         };
     }
-    let scope = rs.scope(cfg, &file.facts, probe);
+    let scope = rs.scope(cfg, facts, probe);
     for r in linking {
         let Some(encloser) = r.enclosing.as_ref().filter(|e| e.kind == DefKind::Type) else {
             continue; // not a fact about a type, so no type's closure moves
         };
         let Some(src) = encloser
             .as_definition()
-            .and_then(|d| rs.def_fqn(cfg, &file.facts.header, &d.owner, &d, probe))
+            .and_then(|d| rs.def_fqn(cfg, &facts.header, &d.owner, &d, probe))
             .map(|fqn| node_id(L::DOMAIN, fqn.as_str()))
         else {
             continue; // the subtype is not nameable, so nothing can consult it
@@ -892,7 +996,7 @@ fn phase_supers<L: Language>(
         }
     }
     FileSupers {
-        path: file.rel_path.clone(),
+        path: rel_path.to_string(),
         types: rows.into_iter().collect(),
     }
 }
@@ -904,19 +1008,20 @@ fn phase_two<L: Language>(
     rs: &dyn Resolver<L>,
     cfg: &L::Config,
     file: &ScannedFile<L>,
+    facts: &FileFacts<L>,
     probe: &dyn SymbolProbe,
 ) -> FileRefs {
-    let scope = rs.scope(cfg, &file.facts, probe);
+    let scope = rs.scope(cfg, facts, probe);
     // The file's container stands in wherever a reference has no nameable
     // encloser, which is where a package-level initialiser's calls belong.
-    let container = container_fqn::<L>(rs, cfg, &file.facts, probe);
+    let container = container_fqn::<L>(rs, cfg, facts, probe);
     let container_id = container
         .as_ref()
         .map(|fqn| node_id(L::DOMAIN, fqn.as_str()));
     let container_name = container.as_ref().map_or("", Fqn::as_str);
     let mut acc = RefAcc::default();
 
-    for r in &file.facts.refs {
+    for r in &facts.refs {
         let res = rs.resolve(cfg, &scope, r, probe);
         // The source of an edge is the reference's nearest nameable
         // encloser, named by the same function that names definitions — so
@@ -925,7 +1030,7 @@ fn phase_two<L: Language>(
             .enclosing
             .as_ref()
             .and_then(|e| e.as_definition())
-            .and_then(|d| rs.def_fqn(cfg, &file.facts.header, &d.owner, &d, probe));
+            .and_then(|d| rs.def_fqn(cfg, &facts.header, &d.owner, &d, probe));
         let (src, enclosing_name) = match &enclosing {
             Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
             None => (container_id, container_name),

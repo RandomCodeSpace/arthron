@@ -4,6 +4,117 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — the walk keeps a file's declarations and forgets its references
+
+Wave 2 taught Go to emit type uses, non-call selector reads and
+composite-literal keys. Against a 17,873-file / 5,353,211-line Go tree that
+took Go references from 595,892 to **1,678,021 (2.82x)** — and peak RSS from
+376,092 kB to **830,612 kB, 158.4% of the hard 512 MiB ceiling**. Wall clock
+was never the problem: 70.6 s is 13.2 s per 1M lines against a 60 s target.
+
+Measured, not guessed. `perf` is unavailable on the reference box
+(`perf_event_paranoid=4`) and no massif/heaptrack is installed, so the peak was
+decomposed by a 100 ms `/proc/<pid>/status` sampler plus exact live-byte
+accounting that summed every `String::capacity` and `Vec` capacity per field
+through glibc's chunk-size rule. That accounting closed to **97.7% of measured
+VmRSS**, which is what makes the attribution evidence rather than a model:
+
+| term | of the 813.2 MiB peak |
+|---|---|
+| the changed set's references, live from the walk until phase 2 | **729.9 MiB — 89.8%** |
+| redb page cache and dirty pages | 83 MiB — 10.2% |
+| the resolver's own indices | 7.6 MiB — 0.9% |
+
+The shape mattered more than the total: RSS climbed monotonically to 729.9 MiB
+**with the database still untouched**, and minor faults stopped at t≈38 s. Phase
+2 never asked the kernel for another page — it ran inside memory the walk had
+already committed. The peak was not a spike to smooth; it was the whole parsed
+tree, held.
+
+**Decided: `ScannedFile` keeps a file's path, hash, header and declarations, and
+not its references. Each later phase reads the file again.** References
+outnumber declarations 23 to 1 (1,678,021 against 72,362) and cost 136 bytes
+plus 5.7 heap allocations each; declarations cost 13.3 MiB for all of them.
+Phase 1 needs every changed file's declarations before it names anything, so
+those stay. Nothing needs every file's references at once, so nothing holds
+them.
+
+Re-extraction cannot change an outcome, and the enforcement is structural
+rather than argued: `Extractor::extract(&self, rel_path, source)` takes no
+probe, no config and no other file, so the same bytes give the same facts.
+`scan_file` already re-read every woken file on exactly that assumption, so
+this generalises a path the graph already rested on. The bytes are re-hashed
+on the second read — a file that moved under the scan is routed to the existing
+`stale` path rather than resolved against declarations its source no longer
+makes.
+
+| change | peak RSS | wall | of ceiling |
+|---|---|---|---|
+| the wave, as measured | 830,612 kB | 70.59 s | 158.4% |
+| `shrink_to_fit` the extractor's two vectors | 778,328 kB | 70.57 s | 148.5% |
+| **and stop holding the references** | **286,544 kB** | **108.92 s** | **54.7%** |
+
+**286,544 kB — 54.7% of the 524,288 kB ceiling, and below the 376,092 kB that
+v0.0.1 needed for a third of the references.** The cost is 38.3 s of wall clock,
+one extra parse per file: **20.4 s per 1M lines against a 60 s target**, so the
+tree could grow 2.9x before timing became the binding constraint. That is the
+trade taken deliberately — the ceiling is hard and the timing is a target.
+
+Every resolution number is unchanged, checked rather than asserted: all 29
+corpus gates and all 15 pin comparisons were re-run against the committed
+baselines and pin files, `44/44` exit 0, and the **complete stdout of all 44 —
+every rate, every reason tally, every `held/appeared/vanished/moved` count — is
+byte-identical to the same 44 runs on the parent commit**. `git status
+--porcelain baselines/ pins/` is empty. This was a change of representation; it
+was required to be invisible to the graph, and it is.
+
+*Rejected: capping, sampling or summarising references to fit.* This is the
+predecessor's exact failure and the resolver-never-drops non-negotiable exists
+because of it. A reduction that lowers RSS by losing data is worse than
+shipping over the ceiling.
+
+*Rejected: inline small strings (`CompactString` or equivalent), worth a
+projected 161.5 MiB.* 5,291,802 of 6,655,300 string allocations are ≤24 bytes
+and cost 161.5 MiB chunked. Real, and unnecessary: the change above already
+lands at 54.7% of the ceiling. It buys a dependency and a mechanical type
+change across every track for headroom that is not needed, which fails the
+"check whether a simpler local change is enough" test.
+
+*Rejected: jemalloc, worth a **measured** 38.3 MiB and 9.9% less wall clock.*
+793,548 kB / 63.6 s against 832,740 kB / 70.6 s, report byte-identical. The
+cheapest line in the whole investigation and still declined for the same
+reason: a global allocator is a dependency and a platform-portability question
+for a saving the structural fix has made irrelevant. Recorded here because it
+was measured and would be the first thing to reach for if the ceiling ever
+binds again.
+
+*Rejected: spilling the extracted facts to a temporary file instead of
+re-parsing.* One extraction instead of two, but it needs a serialisable
+`L::Header` on every track, a temp file to create, fsync, find and delete, and
+a new failure mode when it cannot be written. Re-extraction reaches the same
+peak with no new state and no new file.
+
+*Rejected: `shrink_to_fit` alone.* Kept — it is five lines and costs one
+realloc per file — but it is not a fix. Measured at **52,284 kB**, half the
+102.5 MiB the live-byte accounting projected, because glibc returns a shrunk
+allocation to its own arenas rather than to the kernel. That gap is the
+standing reminder that live bytes and RSS are different measurements.
+
+**The regression guard is a mechanism test, and `tests/rss_ceiling.rs` says so
+in its own comment rather than implying CI covers the ceiling.** CI cannot run
+this measurement: the tree it is stated against is not in the corpus
+repository. Nor is an in-corpus proxy a substitute, which is measured rather
+than assumed — on the largest Go corpus this change moved peak RSS from
+55,840 kB to 56,140 kB, 300 kB *worse*, because at that size the peak is fixed
+cost and the retained references were never the peak at all. **A threshold set
+on any corpus tree would have passed on the code this guard exists to reject.**
+So the test pins the mechanism instead: a Go file is extracted exactly twice
+and a Java file exactly three times, counted through the public `scan` entry
+with a wrapped extractor. It fails with `1` on the parent commit, which was
+verified by running it there.
+
+---
+
 ## 2026-07-29 — the second re-pin: a docs-only merge moves no edge, and the pins say so in bytes
 
 Main's docs-truth work — retracting the call-graph claim, publishing the rate's

@@ -13,6 +13,22 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Added
 
+- **`tests/rss_ceiling.rs`: a guard on the memory non-negotiable, honest about
+  what it cannot check.** It does not run the 512 MiB measurement — the tree
+  that ceiling is stated against is not in the corpus repository, so CI never
+  executes it, and the file's own comment says so rather than implying
+  otherwise. An in-corpus proxy would not help either, which is measured rather
+  than assumed: on the largest Go corpus the change above moved peak RSS from
+  55,840 kB to 56,140 kB, 300 kB *worse*, because at that size the peak is fixed
+  cost. A threshold set on any corpus tree would have passed on the code the
+  guard exists to reject.
+
+  So it pins the mechanism, which is what a future change would break: counting
+  extractor invocations through the public `scan` entry, a Go file is extracted
+  exactly twice and a Java file exactly three times. A count of one is the
+  regression. It fails with one on the parent commit, verified by running it
+  there, and takes 0.01 s with no corpus.
+
 - **`arthron pin`, and a committed target pin per tier-1 corpus: the gate can
   now see a wrong edge.** `arthron gate` compares four integers — `resolved`,
   `external`, `local_binding`, `unresolved` — and a reference that resolves to
@@ -69,6 +85,49 @@ Decisions and their rationale — including what was rejected — live in
   scans, 7.4 s wall.
 
 ### Changed
+
+- **A cold scan no longer holds the whole tree's references, and peak RSS drops
+  from 158.4% of the 512 MiB ceiling to 54.7% of it.** Teaching Go to emit type
+  uses, non-call selector reads and composite-literal keys took a 5,353,211-line
+  Go tree from 595,892 references to 1,678,021, and peak RSS with it: 830,612 kB
+  against a hard 524,288 kB ceiling on the 2 vCPU reference hardware.
+
+  Live-byte accounting that closed to 97.7% of measured VmRSS put **89.8% of the
+  813.2 MiB peak — 729.9 MiB — in one place**: the changed set's references,
+  extracted by the walk and kept alive until phase 2 consumed them. RSS climbed
+  monotonically to 729.9 MiB with the database still untouched, and minor faults
+  stopped at t≈38 s, so phase 2 never asked the kernel for another page. The
+  peak was the whole parsed tree, held.
+
+  The driver now keeps a file's path, hash, header and **declarations**, and not
+  its references. Declarations are 72,362 against 1,678,021 references and cost
+  13.3 MiB in total; phase 1 needs every changed file's before it names
+  anything, and nothing needs every file's references at once. Each later phase
+  reads the file again — twice per file for a language with no link kinds, three
+  times for one that declares them and so runs a supertype phase.
+
+  | | peak RSS | wall | of ceiling |
+  |---|---|---|---|
+  | before | 830,612 kB | 70.59 s | 158.4% |
+  | `shrink_to_fit` on the extractor's vectors | 778,328 kB | 70.57 s | 148.5% |
+  | **and no retained references** | **286,544 kB** | **108.92 s** | **54.7%** |
+
+  Re-extraction cannot change a resolution, and the signature is the
+  enforcement: `Extractor::extract` takes a path and a string — no probe, no
+  config, no other file — so the same bytes give the same facts. The bytes are
+  re-hashed on the second read, and a file that moved under the scan goes to the
+  existing `stale` path rather than being resolved against declarations its
+  source no longer makes.
+
+  **Nothing about the graph moved.** All 29 corpus gates and all 15 pin
+  comparisons exit 0 against the committed baselines and pin files, and the
+  complete stdout of all 44 runs — every rate, every reason tally, every
+  `held/appeared/vanished/moved` count — is byte-identical to the same 44 runs
+  on the parent commit.
+
+  The cost is one extra parse per file: 38.3 s more wall clock on that tree,
+  **20.4 s per 1M lines against a 60 s target**. Warm scans are unaffected,
+  because the changed set is already small.
 
 - **The EcmaScript universe scope has a second half, and it un-pollutes
   `NoMatchingDefinition`.** That reason's contract says the reference was

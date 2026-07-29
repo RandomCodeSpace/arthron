@@ -410,17 +410,23 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 
 | Budget | Target | Measured |
 |---|---|---|
-| Peak RSS | **< 512 MB (hard)** | 337.1 MiB cold-scanning kubernetes v1.36.3, 1,789,247 lines — 66% of the ceiling, six runs spanning 0.2% |
-| Cold index throughput | < 60 s / 1M lines | ~17 s / 1M lines on the same scan |
+| Peak RSS | **< 512 MB (hard)** | 279.8 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling |
+| Cold index throughput | < 60 s / 1M lines | 20.4 s / 1M lines on the same scan |
 | Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes **on the pre-Wave-3 build** — a miss, recorded as a finding rather than hidden, and not yet re-measured |
 
-The RSS percentage and the ceiling are read in the same binary units: 337.1 of
-512 is 66%. That is the basis every RSS verdict on this project was recorded
-on — the 729.1 MiB that failed this gate was recorded as **1.42× the ceiling**,
-which is 729.1/512 — so it is said here rather than left to be inferred. Read
-`512 MB` as decimal MB instead and the same measurement is 353.5 MB, 69% of it:
-under the ceiling on either reading, but only one of the two matches the
-record.
+The RSS percentage and the ceiling are read in the same binary units: 279.8 of
+512 is 54.7%. That is the basis every RSS verdict on this project was recorded
+on — the 729.1 MiB that failed this gate once was recorded as **1.42× the
+ceiling**, which is 729.1/512 — so it is said here rather than left to be
+inferred. Read `512 MB` as decimal MB instead and the same measurement is
+293.4 MB, 57% of it: under the ceiling on either reading, but only one of the
+two matches the record.
+
+The first two rows were re-measured on a larger tree than the one they used to
+name: 5,353,211 lines against 1,789,247. The earlier 337.1 MiB is therefore not
+restated beside them — it was a real measurement, of a smaller tree, by a build
+that no longer exists here, and setting it next to a number from neither would
+invite the two to be read as a before-and-after of the same scan.
 
 The first two rows are the shipped build. The third is not, and the column
 says so rather than letting three numbers read as one benchmark run: warm
@@ -431,11 +437,17 @@ change; warm wall time has not been re-run on the reference hardware, so the
 number here is the last one that was actually executed and it is labelled
 rather than refreshed by inference.
 
-The RSS number is the interesting one: it was **729.1 MiB** and failed the hard
-gate. Bounding it — per-500-file commits on every phase, a capped redb page
-cache, phase 2 consuming facts per file — brought it to 337.1 MiB, and
-byte-identity of the resulting graph was proven at the level of full blake3
-snapshot digests across five corpora, not at the level of matching tallies.
+The RSS number is the interesting one, and it has failed this gate twice. It
+was **729.1 MiB**; per-500-file commits on every phase, a capped redb page cache
+and phase 2 consuming facts per file brought it to 337.1 MiB. Then Go learned to
+emit type uses, non-call selector reads and composite-literal keys, references
+per tree went up 2.82×, and a cold scan reached **158.4% of the ceiling** —
+because the walk's references were held until phase 2 consumed them, 89.8% of
+the peak. The walk now keeps a file's declarations and forgets its references,
+and each later phase reads the file again. Both times byte-identity of the
+resulting graph was proven before the change shipped: today that is all 29
+corpus gates and all 15 target-pin comparisons producing byte-identical output,
+not merely matching tallies. See [`docs/decisions.md`](docs/decisions.md).
 
 ## No network calls, ever
 
