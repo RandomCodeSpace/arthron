@@ -4,6 +4,62 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — static ECMA member reads enter the graph once
+
+The JavaScript and TypeScript extractors emitted calls, imports, type uses and
+heritage, but omitted a dotted property when the property was read as a value.
+That was an invisible denominator, not an honest miss: `imported.member` could
+name an exported repository definition and there was no row to resolve.
+
+Measured with the pinned ast-grep 0.44.1 parser and the product's own file
+walker over all four ECMA corpora, the syntax cut is **33,731** outermost
+non-call/non-construction member reads after excluding plain assignment
+targets:
+
+| corpus | import binding | `this` / `super` | name root | complex expression | total |
+|---|---:|---:|---:|---:|---:|
+| fastify | 171 | 221 | 5,631 | 542 | 6,565 |
+| express | 0 | 253 | 716 | 43 | 1,012 |
+| vue-core | 3,045 | 741 | 11,918 | 1,498 | 17,202 |
+| zod | 570 | 212 | 6,766 | 1,404 | 8,952 |
+| **total** | **3,786** | **1,427** | **25,031** | **3,487** | **33,731** |
+
+`name root` is syntactic, not a claim that every such name is local:
+23,359 are bound by a lexical environment that is not a node, 544 are module
+bindings that are nodes, and 1,128 are unbound or global names. Keeping those
+classes separate is what prevents the large local term from hiding module
+edges.
+
+The syntax count is not the new-row count. **106 TypeScript sites already have
+the more precise `TypeUse` kind** (13 in vue-core, 93 in zod). Emitting them
+again as `FieldAccess` produced a second, false `NeedsExpressionType` beside a
+resolved import-type row in the fixture suite. They are excluded, not lost.
+The resulting extraction delta is **33,625 `FieldAccess` occurrences**:
+6,565 fastify, 1,012 express, 17,189 vue-core and 8,859 zod. Store
+deduplication means these occurrence counts are not predictions of committed
+row movement; the corpus join and re-base own that measurement.
+
+**Decided: emit the outermost static `member_expression` once as
+`FieldAccess`.** It reuses the same target roots, binding verdict and resolver
+paths as call position: an imported namespace member can resolve, a lexical
+name remains `LocalBinding`, `this` / `super` retain receiver lookup, and an
+expression root remains `NeedsExpressionType`. No unresolved reason changes.
+
+**A plain assignment target (`a.b = x`) is a write without a read and is not
+emitted by this read rule.** An augmented assignment (`a.b += x`) reads the
+old value and is emitted. A member used as the callee of a call or constructor
+keeps its `Call` / `New` row and is not duplicated as a field access.
+
+*Rejected: emitting nested selectors separately.* `a.b.c` is one read target;
+an extra `a.b` row double-counts syntax that exists only as the outer
+expression's operand.
+
+*Rejected: emitting computed `a[b]` access.* The key is a runtime value. Using
+its source text as a member name would invent a target.
+
+*Rejected: emitting type-position members again.* Their existing `TypeUse` row
+is both more precise and already in the measurement.
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and

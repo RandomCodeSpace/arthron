@@ -9,6 +9,20 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Changed
+
+- **JavaScript and TypeScript now emit dotted member reads as
+  `FieldAccess`.** The outermost static selector is emitted once: namespace
+  imports can reach exported definitions, lexical locals remain
+  `LocalBinding`, and expression/receiver roots retain the existing honest
+  `NeedsExpressionType` / `NeedsReceiverType` reasons. Call and construction
+  targets keep their more precise kinds, plain assignment targets are writes
+  rather than reads, and computed `a[b]` access still emits no invented name.
+  Type-position members also keep their existing `TypeUse` rows instead of
+  gaining a duplicate field-access row.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added
