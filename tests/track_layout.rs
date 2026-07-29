@@ -17,8 +17,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use arthron::config::Config;
 use arthron::model::Lang;
-use arthron::pipeline::scan_repo;
+use arthron::pipeline::{scan_repo, scan_repo_with};
 use arthron::store::Report;
 
 fn write(root: &Path, rel: &str, content: &str) {
@@ -205,6 +206,37 @@ fn a_layout_that_broke_since_the_last_scan_reports_no_tally_from_it() {
         first.per_lang.get(&Lang::Go.code()),
         "the rows were forgotten rather than left for the next readable scan",
     );
+}
+
+#[test]
+fn a_track_switched_off_after_a_warm_scan_marks_its_stale_tally_unmeasured() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = root.join("kept.redb");
+    fixture(root);
+    write(root, "go.mod", "module example.com/app\n\ngo 1.22\n");
+
+    let first = scan_repo(root, &db).expect("the first scan answers");
+    assert!(
+        tallied(&first).contains(&"go"),
+        "the warm store needs a Go tally to expose it: {:?}",
+        tallied(&first),
+    );
+
+    let config = Config::parse("[tracks]\ngo = false\n").expect("config");
+    let second = scan_repo_with(root, &db, &config).expect("the configured scan answers");
+    assert!(
+        !tallied(&second).contains(&"go"),
+        "a disabled track re-emitted a stale tally: {:?}",
+        tallied(&second),
+    );
+    let said = errored(&second, Lang::Go.name()).unwrap_or_else(|| {
+        panic!(
+            "nothing marked Go as switched off: {:?}",
+            second.file_errors
+        )
+    });
+    assert!(said.contains("switched off"), "marker: {said}");
 }
 
 #[test]

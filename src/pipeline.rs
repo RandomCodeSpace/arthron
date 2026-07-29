@@ -1189,10 +1189,23 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
             continue; // not live: owns no file, contributes nothing
         };
         if !config.track_enabled(track.name) {
-            // Not asked, so it says nothing either way: a switched-off track
-            // leaves the store's rows and their tally exactly as the last
-            // scan left them.
+            // Not asked, so its stored rows stay exactly as the last scan
+            // left them. They are not this run's measurement, though: a
+            // later live track's full-store report must not re-emit them as
+            // one. Name that fact beside omitting the stale tally.
             switched_off = true;
+            for lang in track.langs {
+                unmeasured.push(lang.code());
+                file_errors.insert(
+                    lang.name().to_string(),
+                    format!(
+                        "track `{}` is switched off by {CONFIG_FILE}; this run measured nothing \
+                         for {} and retained rows are omitted",
+                        track.name,
+                        lang.name(),
+                    ),
+                );
+            }
             continue;
         }
         let measured = scan(root, db_path, &filter)?;
