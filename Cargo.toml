@@ -8,7 +8,10 @@ repository = "https://github.com/RandomCodeSpace/arthron"
 homepage = "https://github.com/RandomCodeSpace/arthron"
 readme = "README.md"
 license = "MIT"
-keywords = ["code-intelligence", "call-graph", "static-analysis", "ast", "cross-reference"]
+# A keyword is read as a capability claim on the crate page, so "call-graph"
+# is not one of them: tier 1 resolves calls, imports and type uses into a
+# graph and says what it could not link, which is not a complete call graph.
+keywords = ["code-intelligence", "code-graph", "static-analysis", "ast", "cross-reference"]
 categories = ["development-tools", "command-line-utilities"]
 # An allowlist, not a denylist: what a published crate carries is everything
 # that compiles it and nothing else. `src/**/*` is deliberately broad because

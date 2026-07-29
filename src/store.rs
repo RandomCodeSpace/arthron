@@ -1334,8 +1334,11 @@ impl Store {
 
     /// Whether the graph holds this exact edge.
     ///
-    /// An edge is a resolved reference, so `src` is the node the reference
-    /// sat in — which is the assertion worth making about it.
+    /// An edge is a reference that *linked*: `Resolved` to a definition in
+    /// this repository, or `External` to the dependency node naming the
+    /// package it reached. An `Unresolved` reference produces none, and
+    /// nothing else produces one. `src` is the node the reference sat in
+    /// either way — which is the assertion worth making about it.
     pub fn has_edge(&self, src: &NodeId, dst: &NodeId, kind: u8) -> Result<bool, String> {
         let txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = txn.open_table(EDGES).map_err(|e| e.to_string())?;

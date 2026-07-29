@@ -47,7 +47,11 @@ a `.ts` import can name a `.js` definition.
 _Avoid_: language (as an identity input)
 
 **Edge**:
-A reference that resolved. Nothing else creates an edge.
+A reference that linked — `Resolved` to a definition in this repository, or
+`External` to the dependency node that names the package it reached. Both are
+real edges: a call into a dependency is a fact about this repository, not a
+dead end. An `Unresolved` reference creates no edge; nothing else creates one
+either.
 _Avoid_: contains, defines (as edge kinds)
 
 **Candidate**:

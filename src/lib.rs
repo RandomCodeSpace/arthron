@@ -289,8 +289,11 @@ pub mod track_go;
 pub mod track_java;
 pub mod track_python;
 
-// The ratified tier-2 tracks. All disabled: each carries `scan: None`, owns
-// no file, and reads nothing.
+// The ratified tier-2 tracks. All live: each carries `scan: Some(...)`, owns
+// its extensions, and is gated against a committed baseline like the tier-1
+// four. Tier is a capability claim, not a switch — tier 2 emits definitions,
+// structure and imports and no call reference, so its rate is an
+// import-resolution rate.
 pub mod track_bash;
 pub mod track_cpp;
 pub mod track_csharp;
