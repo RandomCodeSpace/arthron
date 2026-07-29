@@ -77,10 +77,15 @@ const BATCH_FILES: usize = 500;
 /// The **references are deliberately absent**. Held from the walk until
 /// phase 2 consumed them they were, measured over a 5.35M-line Go tree,
 /// 89.8% of a cold scan's peak RSS — 729.9 MiB of 813.2 MiB. The
-/// declarations are three orders of magnitude cheaper (13.3 MiB for 72,362
-/// of them) and phase 1 needs them before any file's references are read, so
-/// they stay; the references are read again, per file, by whichever later
-/// phase wants them, and dropped as soon as it is done. See [`reread`].
+/// declarations are a fifty-fifth of that (13.3 MiB for 72,362 of them) and
+/// phase 1 needs them before any file's references are read, so they stay;
+/// the references are read again, per file, by whichever later phase wants
+/// them, and dropped as soon as it is done. See [`reread`].
+///
+/// What this record costs is more than those 13.3 MiB, because the path, the
+/// hash and the header are per file rather than per declaration — [`scan`]'s
+/// `# Memory` section carries the measurement of what the walk ends up
+/// holding, which is the number to start from when tuning this.
 struct ScannedFile<L: Language> {
     rel_path: String,
     /// Where to read the file again. Phases 1.5 and 2 re-extract from it.

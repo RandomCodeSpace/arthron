@@ -40,8 +40,9 @@ those stay. Nothing needs every file's references at once, so nothing holds
 them.
 
 **That 13.3 MiB is one term of the retained set and not the whole of it, which
-this entry originally left to be inferred.** Sampled at 200 ms, the fixed build's
-walk ends at **110,896 kB with the store still at 1.1 MB** — nothing written yet
+this entry originally left to be inferred.** Sampled at 200 ms, the shipped
+build's walk ends at **110,896 kB with the store still at 1.1 MB** — nothing
+written yet
 — against a **10,240 kB** fixed cost measured on a two-file tree. So the walk
 retains ~100 MB, not 13 MB: a `String`, a `PathBuf`, a 32-byte hash and a
 language header ride beside every changed file's declarations, and the walk
