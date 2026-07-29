@@ -19,19 +19,18 @@ Decisions and their rationale — including what was rejected — live in
   corpus that compiles this should mean *our* bug, and should sit near zero."
   Both halves were false. All 1,728 occurrences on express were five names —
   `it` 1,111, `describe` 554, `before` 59, `after` 3, `XMLHttpRequest` 1 — and
-  13,833 of vue-core's 15,276 were six more. They are what a test runner puts
-  in the global scope of the files it runs, reaching the file with no import
-  because the runner injects them.
+  13,833 of vue-core's 15,276 were eight more: `expect` 9,930, `test` 2,860,
+  `it` 609, `describe` 373, `beforeEach` 37, `afterEach` 21, `afterAll` 2,
+  `beforeAll` 1. They are what a test runner puts in the global scope of the
+  files it runs, reaching the file with no import because the runner injects
+  them.
 
   The universe scope now models both provenances. The *host*'s half is
   unchanged: a name ECMA-262, Node or the web platform declares is `External`,
   because the thing on the other end genuinely exists. The new half is a
   **package**'s: a name a declared dependency injects is
-  `Unresolved(UnknownPackage)`, which is the answer this resolver already gave
-  the same definition whenever the import was written down — zod's
-  `import { expect } from "vitest"` reports `UnknownPackage` today, and the
-  injected form naming the same definition in the same unindexed package must
-  not disagree with it. Six environments are recognised (mocha, jasmine, jest,
+  `Unresolved(UnknownPackage)`, filed against the package the definition is
+  actually in. Six environments are recognised (mocha, jasmine, jest,
   vitest, cypress, qunit), each by its *documented* global set in full rather
   than by the subset that looked unlikely to collide: what makes `it` mocha's
   is not its spelling but the project declaring mocha, checked per file against
@@ -51,6 +50,24 @@ Decisions and their rationale — including what was rejected — live in
   `XMLHttpRequest`, absent from the host list while `WebSocket`,
   `AbortController` and `fetch` were all in it: express `external` 701 → 702,
   the same shape of omission as `Error`'s and worth one row.
+
+  **The written-out import of the same name does not always agree, and the two
+  channels differ.** An environment turns on through either `package.json` or
+  `tsconfig.json`'s `compilerOptions.types`. Through `types` the two spellings
+  match exactly: zod states `"types": ["vitest"]` and declares no dependencies
+  at all, so its 168 `from "vitest"` specifiers, the names bound by them and
+  the injected spellings all report `UnknownPackage`. Through `package.json`
+  they do not: a declared dependency is the dependency boundary, so the import
+  and every name reached through it answer `External("npm:<pkg>")`. vue-core
+  declares vitest in its root `devDependencies` and carries both — 95
+  occurrences of vitest's names under `External`, written as imports, against
+  14,618 injected under `Unresolved(UnknownPackage)`. The injected half is not
+  the one that may move: `Unresolved` keeps it in both terms of the rate, where
+  `External` would take it out of both and raise the gate without linking
+  anything. Closing the asymmetry means moving the *imported* side, which is a
+  change to what `External` means at the dependency boundary for every package
+  and is not made here. Both halves are pinned by a test so neither drifts in
+  silence.
 
 - **TypeScript's `compilerOptions.customConditions` is read, and it is the
   largest single miss on zod.** The condition set handed to NODE
@@ -76,6 +93,15 @@ Decisions and their rationale — including what was rejected — live in
   for a namespace re-exported by name, an honest miss this resolver does not
   yet follow. No other corpus states a `customConditions` and none of the other
   three moved a row.
+
+  `extends` is nearest-wins on *stated*, not on non-empty. `"types": []` is the
+  documented way to say "no ambient type packages" and `"customConditions": []`
+  says the same about conditions; both were read as "unstated" and silently
+  given the base's value back, turning an ambient environment on under a config
+  that turned it off and sending an import down a branch `tsc` would not take.
+  Presence of the key now decides. No corpus states either as an empty list, so
+  no gated number moves — verified by a whole-row join against the previous
+  scan on all four, which changed nothing.
 
   **Every changed row on all four corpora was joined whole-row against the
   previous scan.** The row-key set is byte-identical — nothing added, nothing

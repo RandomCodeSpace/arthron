@@ -431,8 +431,8 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
     let dir = parent_dir(rel).to_string();
     let mut base_url: Option<String> = None;
     let mut paths: Vec<(String, Vec<String>)> = Vec::new();
-    let mut custom_conditions: Vec<String> = Vec::new();
-    let mut ambient_types: Vec<String> = Vec::new();
+    let mut custom_conditions: Option<Vec<String>> = None;
+    let mut ambient_types: Option<Vec<String>> = None;
 
     // Nearest config first: a value set by the child wins over the base it
     // extends, which is what `extends` means.
@@ -475,15 +475,26 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
         // Nearest-wins, exactly as `paths` above: a child that states either
         // option replaces the base's rather than adding to it, which is what
         // `extends` means for a `compilerOptions` key.
-        if custom_conditions.is_empty()
+        //
+        // *Stated*, not *non-empty*, and that is why these two are `Option`
+        // where `paths` above is a `Vec`. `"types": []` is the documented way
+        // to say "no ambient type packages at all" and `"customConditions":
+        // []` says the same about conditions; reading an empty list as
+        // "unstated" would hand the child back the base's value it had just
+        // switched off. `paths` can use emptiness as the proxy because an
+        // empty map substitutes nothing either way, and these two decide a
+        // lookup: an inherited `"types": ["jest"]` turns an ambient
+        // environment on under a child that turned it off, and an inherited
+        // condition sends an import down a branch tsc would not take.
+        if custom_conditions.is_none()
             && let Some(list) = options.and_then(|o| o.get("customConditions"))
         {
-            custom_conditions = strings(list);
+            custom_conditions = Some(strings(list));
         }
-        if ambient_types.is_empty()
+        if ambient_types.is_none()
             && let Some(list) = options.and_then(|o| o.get("types"))
         {
-            ambient_types = strings(list);
+            ambient_types = Some(strings(list));
         }
         let Some(extends) = value.get("extends").and_then(Json::as_str) else {
             break;
@@ -516,8 +527,8 @@ fn ts_project(rel: &str, sources: &BTreeMap<String, Json>, root: &Path) -> TsPro
         dir,
         base_url,
         paths,
-        custom_conditions,
-        ambient_types,
+        custom_conditions: custom_conditions.unwrap_or_default(),
+        ambient_types: ambient_types.unwrap_or_default(),
     }
 }
 

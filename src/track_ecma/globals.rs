@@ -178,19 +178,43 @@ pub const TS_LIB_TYPES: &[&str] = &[
 /// missing. A test runner's `describe`, `it` and `expect` are declared by a
 /// package under `node_modules` — a package this scan does not index — and
 /// reach the file without an import because the runner puts them there. The
-/// honest reason is [`crate::UnresolvedReason::UnknownPackage`], and the proof
-/// that it is honest is that this resolver already gives that exact answer for
-/// the same definition whenever the import is written down: `import { expect }
-/// from 'vitest'` in a package that does not vendor vitest reports
-/// `UnknownPackage` today. The injected form names the same definition in the
-/// same unindexed package, so it must not report something else — and what it
-/// did report, [`crate::UnresolvedReason::NoMatchingDefinition`], claims the
-/// lookup table was complete and the name absent, which is false on both
-/// halves.
+/// name is filed against that package, so the reason is
+/// [`crate::UnresolvedReason::UnknownPackage`]. What it reported before,
+/// [`crate::UnresolvedReason::NoMatchingDefinition`], claims the lookup table
+/// was complete and the name absent, and that is false on both halves.
 ///
-/// It is emphatically **not** `External`. That would move the reference out of
-/// *both* terms of the resolution rate and raise the gate without linking
-/// anything, which is the one way this gate can be cheated.
+/// # What the written-out import of the same name answers
+///
+/// Stated exactly, because the two channels
+/// [`crate::track_ecma::project::EcmaConfig::declares_ambient`] reads do not
+/// give the same answer and only one of them is a clean precedent.
+///
+/// Through `tsconfig.json`'s `compilerOptions.types` they agree, and that is
+/// the case this reason was chosen from. zod states `"types": ["vitest"]` in
+/// `packages/zod/tsconfig.json` and its manifest declares no dependencies at
+/// all, so vitest is not a *declared dependency* there: its 168
+/// `from "vitest"` specifiers, the names bound by them, and the injected
+/// spellings of those same names all report `UnknownPackage`, together with
+/// the rest of that corpus's 8,036.
+///
+/// Through `package.json` they do not agree. A declared dependency **is** the
+/// dependency boundary, so the specifier rules answer `External("npm:<pkg>")`
+/// for the import and for every name reached through it. vue-core declares
+/// vitest in its root `devDependencies` and carries both: 95 occurrences of
+/// vitest's names, written as imports, are `External("npm:vitest")`, and
+/// 14,618, injected, are `Unresolved(UnknownPackage)`. One definition, one
+/// repository, two outcome classes.
+///
+/// This half is not the one that may move. `Unresolved` keeps the reference in
+/// *both* terms of the resolution rate; `External` would take it out of both
+/// and raise the gate without linking anything, which is the one way this gate
+/// can be cheated — and an injected name is inferred from a manifest, where an
+/// import is written down, so it is the weaker evidence of the two. Closing
+/// the asymmetry means moving the *imported* side instead, and that is a
+/// change to what `External` means at the dependency boundary for every
+/// package rather than anything about ambient globals. Until it is made,
+/// `the_two_channels_that_turn_an_environment_on_do_not_agree_about_the_imported_form`
+/// pins both halves so neither drifts in silence.
 ///
 /// # Why the names are not gated on being rare
 ///
@@ -219,11 +243,13 @@ pub struct Injected {
 
 /// The ambient environments this build recognises.
 ///
-/// Test runners only, so far, because that is the whole of the measured
-/// class: every one of express's 1,728 `NoMatchingDefinition` occurrences and
-/// 13,830 of vue-core's 15,276 are a runner's injected globals. A browser or
-/// Node global belongs in [`WEB_GLOBALS`] or [`NODE_GLOBALS`] instead — the
-/// host declares those, and `External` is what that means.
+/// Test runners only, so far, because that is nearly the whole of the measured
+/// class: 1,727 of express's 1,728 `NoMatchingDefinition` occurrences and
+/// 13,833 of vue-core's 15,276 are a runner's injected globals. The one
+/// express occurrence left over is `XMLHttpRequest`, and it is exactly the
+/// distinction this table draws: a browser or Node global belongs in
+/// [`WEB_GLOBALS`] or [`NODE_GLOBALS`] instead — the host declares those, and
+/// `External` is what that means.
 pub const INJECTED: &[Injected] = &[
     Injected {
         env: "mocha",
