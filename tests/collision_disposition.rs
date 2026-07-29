@@ -13,7 +13,10 @@ use arthron::model::{
     node_id,
 };
 use arthron::pipeline::{scan, scan_repo};
-use arthron::store::{NodeRecord, Store};
+use arthron::store::{
+    CollisionDisposition, DeclSite, DefBatch, FileDefs, NodePayload, NodeRecord, Store,
+    StoredDefinition,
+};
 use arthron::track_csharp::resolve::scan_csharp;
 
 fn write(root: &Path, rel: &str, body: &str) {
@@ -38,6 +41,16 @@ fn declaration_paths(store: &Store, domain: Domain, fqn: &str) -> Vec<String> {
     };
     assert_eq!(stored, fqn);
     declarations.into_iter().map(|site| site.file).collect()
+}
+
+fn withdrawn_claims(store: &Store) -> usize {
+    store
+        .snapshot()
+        .expect("snapshot")
+        .files
+        .values()
+        .filter(|hash| hash.is_none())
+        .count()
 }
 
 fn partial_type_tree(root: &Path, reverse_creation: bool) {
@@ -246,6 +259,27 @@ impl Resolver<PairwiseLang> for PairwiseResolver {
     }
 }
 
+fn pairwise_node(file: &str, shape: &str) -> (NodeId, NodeRecord) {
+    let facts = PairwiseExtractor.extract(file, shape);
+    let definition = &facts.defs[0];
+    let id = node_id(Domain::CSharp, "N#Shared::Value");
+    (
+        id,
+        NodeRecord::Definition {
+            fqn: "N#Shared::Value".to_string(),
+            kind: definition.kind.code(),
+            facets: definition.facets.bits(),
+            targets: Vec::new(),
+            declarations: vec![DeclSite {
+                file: file.to_string(),
+                line: definition.span.line,
+                payload: NodePayload::Definition(definition.kind.code(), definition.facets.bits()),
+                merge_definition: Some(StoredDefinition::from_definition(definition)),
+            }],
+        },
+    )
+}
+
 #[test]
 fn three_declarations_check_every_pair_not_only_adjacent_windows() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -305,5 +339,136 @@ fn three_declarations_check_every_pair_not_only_adjacent_windows() {
     assert_eq!(
         store.report().expect("post-delete report").fqn_collisions,
         0
+    );
+}
+
+#[test]
+fn deleting_the_middle_declaration_withdraws_the_old_disposition_until_the_survivors_recompute() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let root = scratch.path();
+    write(root, "a.collision", "field");
+    write(root, "b.collision", "property");
+    write(root, "c.collision", "field");
+    let db = root.join("graph.redb");
+
+    let cold = scan::<PairwiseLang>(
+        root,
+        &db,
+        &PairwiseExtractor,
+        &PairwiseResolver,
+        &arthron::config::FileFilter::none(),
+    )
+    .expect("cold pairwise scan");
+    assert_eq!(cold.fqn_collisions, 1, "the field pair is incompatible");
+
+    std::fs::remove_file(root.join("b.collision")).expect("remove middle property");
+    let id = node_id(Domain::CSharp, "N#Shared::Value");
+    let store = Store::open(&db).expect("store opens");
+    store
+        .forget_files(&["b.collision".to_string()])
+        .expect("forget deleted declaration");
+
+    assert_eq!(
+        store.report().expect("interrupted report").fqn_collisions,
+        0,
+        "an interrupted deletion must not publish the prior collision verdict",
+    );
+    assert_eq!(
+        withdrawn_claims(&store),
+        2,
+        "both surviving declaration files must be re-scanned before a verdict is published",
+    );
+    assert!(
+        !store
+            .snapshot()
+            .expect("interrupted snapshot")
+            .collision_dispositions
+            .contains_key(&id),
+        "the old verdict describes a declaration set that no longer exists",
+    );
+    drop(store);
+
+    let resumed = scan::<PairwiseLang>(
+        root,
+        &db,
+        &PairwiseExtractor,
+        &PairwiseResolver,
+        &arthron::config::FileFilter::none(),
+    )
+    .expect("resumed pairwise scan");
+    assert_eq!(
+        resumed.fqn_collisions, 1,
+        "the recomputed field/field pair remains a collision; no Mergeable verdict is invented",
+    );
+    let settled = Store::open(&db).expect("settled store opens");
+    assert_eq!(withdrawn_claims(&settled), 0);
+    assert_eq!(
+        settled
+            .snapshot()
+            .expect("settled snapshot")
+            .collision_dispositions
+            .get(&id),
+        Some(&CollisionDisposition::Collision),
+        "only the resolver may restore the collision verdict for the surviving set",
+    );
+}
+
+#[test]
+fn replacing_one_declaration_withdraws_the_old_disposition_until_phase_two_finishes() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let root = scratch.path();
+    write(root, "a.collision", "field");
+    write(root, "b.collision", "property");
+    let db = root.join("graph.redb");
+
+    let cold = scan::<PairwiseLang>(
+        root,
+        &db,
+        &PairwiseExtractor,
+        &PairwiseResolver,
+        &arthron::config::FileFilter::none(),
+    )
+    .expect("cold pairwise scan");
+    assert_eq!(cold.fqn_collisions, 0, "field/property is mergeable");
+
+    write(root, "b.collision", "field");
+    let id = node_id(Domain::CSharp, "N#Shared::Value");
+    let store = Store::open(&db).expect("store opens");
+    store
+        .apply_defs(&DefBatch {
+            files: vec![FileDefs {
+                path: "b.collision".to_string(),
+                nodes: vec![pairwise_node("b.collision", "field")],
+            }],
+        })
+        .expect("replace the definition half");
+
+    assert_eq!(
+        store.report().expect("interrupted report").fqn_collisions,
+        0,
+        "the old Mergeable verdict must not stand in for the changed pair",
+    );
+    assert_eq!(withdrawn_claims(&store), 2);
+    assert!(
+        !store
+            .snapshot()
+            .expect("interrupted snapshot")
+            .collision_dispositions
+            .contains_key(&id),
+        "the old Mergeable verdict described the pre-replacement set",
+    );
+    drop(store);
+
+    let resumed = scan::<PairwiseLang>(
+        root,
+        &db,
+        &PairwiseExtractor,
+        &PairwiseResolver,
+        &arthron::config::FileFilter::none(),
+    )
+    .expect("resumed pairwise scan");
+    assert_eq!(
+        resumed.fqn_collisions, 1,
+        "the resolver, not Store::apply_defs, classifies the changed field/field pair",
     );
 }

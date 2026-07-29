@@ -167,6 +167,11 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
 const COLLISION_DISPOSITIONS: TableDefinition<&[u8; 16], u8> =
     TableDefinition::new("collision_dispositions");
+// A missing disposition still has the direct-Store mechanical meaning of
+// Collision. This table distinguishes that fresh, unclassified state from a
+// verdict that a declaration-set change explicitly invalidated.
+const COLLISION_VERDICTS_INVALIDATED: TableDefinition<&[u8; 16], u8> =
+    TableDefinition::new("collision_verdicts_invalidated");
 const REFS: TableDefinition<(&str, &[u8]), &[u8]> = TableDefinition::new("refs");
 /// One edge, as the tables key it: `(src, dst, `[`crate::model::RefKind`]` code)`.
 type EdgeKey<'a> = (&'a [u8; 16], &'a [u8; 16], u8);
@@ -1010,6 +1015,9 @@ impl Store {
             let mut dispositions = txn
                 .open_table(COLLISION_DISPOSITIONS)
                 .map_err(|e| e.to_string())?;
+            let mut invalidated_verdicts = txn
+                .open_table(COLLISION_VERDICTS_INVALIDATED)
+                .map_err(|e| e.to_string())?;
             let mut owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
             let cands = txn
@@ -1022,21 +1030,23 @@ impl Store {
             // its own half unchanged, and invalidating its probers for that
             // would cascade an event across a repository.
             let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
+            // A collision disposition describes the whole declaration set,
+            // not merely the payload the resolver probes. Keep that whole
+            // record too: changing one file's site can leave the payload
+            // alone while changing which declaration pairs need a verdict.
+            let mut declarations_before: BTreeMap<NodeId, Option<NodeRecord>> = BTreeMap::new();
             for file in &batch.files {
                 let previous: DefOwned = read_owned(&owned, &file.path)?.unwrap_or_default();
                 for id in &previous.nodes {
                     note_payload(&nodes, &mut before, id)?;
+                    note_node(&nodes, &mut declarations_before, id)?;
                     drop_site(&mut nodes, id, &file.path)?;
-                    if !read_node(&nodes, id)?
-                        .is_some_and(|record| record.is_multi_file_definition())
-                    {
-                        dispositions.remove(id).map_err(|e| e.to_string())?;
-                    }
                 }
                 let mut ids = Vec::with_capacity(file.nodes.len());
                 let mut seen: HashSet<NodeId> = HashSet::with_capacity(file.nodes.len());
                 for (id, record) in &file.nodes {
                     note_payload(&nodes, &mut before, id)?;
+                    note_node(&nodes, &mut declarations_before, id)?;
                     upsert_node(&mut nodes, id, record.clone())?;
                     if seen.insert(*id) {
                         ids.push(*id);
@@ -1063,7 +1073,47 @@ impl Store {
             }
             let rewritten: HashSet<&str> =
                 batch.files.iter().map(|file| file.path.as_str()).collect();
-            invalidated = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
+            let mut changed = invalidate_probers(&cands, &mut files, &moved, &rewritten)?;
+            for (id, was) in declarations_before {
+                let now = read_node(&nodes, &id)?;
+                if now == was {
+                    continue;
+                }
+                // No resolver verdict survives a declaration-set change.
+                // Removing it is not calling the set Mergeable: it is making
+                // the store say no verdict until the resolver writes one.
+                let had_verdict = dispositions
+                    .remove(&id)
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if had_verdict
+                    || invalidated_verdicts
+                        .get(&id)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                {
+                    invalidated_verdicts
+                        .insert(&id, 1)
+                        .map_err(|e| e.to_string())?;
+                }
+                let Some(record) = now else {
+                    continue;
+                };
+                if !record.is_multi_file_definition() {
+                    continue;
+                }
+                // The unchanged declarations contribute to the new set too.
+                // Their old answers and the old disposition are one fact, so
+                // they lose currency in the same commit that changes it.
+                for site in record.declarations() {
+                    if rewritten.contains(site.file.as_str()) {
+                        continue;
+                    }
+                    withdraw_known(&mut files, &site.file)?;
+                    changed.insert(site.file.clone());
+                }
+            }
+            invalidated = changed;
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(DefOutcome {
@@ -1149,6 +1199,9 @@ impl Store {
             let mut table = txn
                 .open_table(COLLISION_DISPOSITIONS)
                 .map_err(|e| e.to_string())?;
+            let mut invalidated_verdicts = txn
+                .open_table(COLLISION_VERDICTS_INVALIDATED)
+                .map_err(|e| e.to_string())?;
             for id in touched {
                 match dispositions.get(id) {
                     Some(disposition) => {
@@ -1160,6 +1213,7 @@ impl Store {
                         table.remove(id).map_err(|e| e.to_string())?;
                     }
                 }
+                invalidated_verdicts.remove(id).map_err(|e| e.to_string())?;
             }
         }
         txn.commit().map_err(|e| e.to_string())
@@ -1413,6 +1467,9 @@ impl Store {
             let mut dispositions = txn
                 .open_table(COLLISION_DISPOSITIONS)
                 .map_err(|e| e.to_string())?;
+            let mut invalidated_verdicts = txn
+                .open_table(COLLISION_VERDICTS_INVALIDATED)
+                .map_err(|e| e.to_string())?;
             let mut refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
             let mut edges = txn.open_table(EDGES).map_err(|e| e.to_string())?;
             let mut rev = txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
@@ -1431,6 +1488,7 @@ impl Store {
             // nothing.
             let mut before: BTreeMap<NodeId, Option<NodePayload>> = BTreeMap::new();
             let mut moved: BTreeSet<NodeId> = BTreeSet::new();
+            let mut dropped_definitions: BTreeSet<NodeId> = BTreeSet::new();
             for path in paths {
                 forget_ref_half(
                     &mut nodes, &mut refs, &mut edges, &mut rev, &mut cands, &ref_owned, path,
@@ -1440,11 +1498,7 @@ impl Store {
                     for id in &previous.nodes {
                         note_payload(&nodes, &mut before, id)?;
                         drop_site(&mut nodes, id, path)?;
-                        if !read_node(&nodes, id)?
-                            .is_some_and(|record| record.is_multi_file_definition())
-                        {
-                            dispositions.remove(id).map_err(|e| e.to_string())?;
-                        }
+                        dropped_definitions.insert(*id);
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
@@ -1466,7 +1520,39 @@ impl Store {
                 }
             }
             let gone: HashSet<&str> = paths.iter().map(String::as_str).collect();
-            invalidated = invalidate_probers(&cands, &mut files, &moved, &gone)?;
+            let mut changed = invalidate_probers(&cands, &mut files, &moved, &gone)?;
+            for id in dropped_definitions {
+                // The persisted value answered for the set before this file
+                // left. It cannot remain publishable for its survivors.
+                let had_verdict = dispositions
+                    .remove(&id)
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if had_verdict
+                    || invalidated_verdicts
+                        .get(&id)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                {
+                    invalidated_verdicts
+                        .insert(&id, 1)
+                        .map_err(|e| e.to_string())?;
+                }
+                let Some(record) = read_node(&nodes, &id)? else {
+                    continue;
+                };
+                if !record.is_multi_file_definition() {
+                    continue;
+                }
+                for site in record.declarations() {
+                    if gone.contains(site.file.as_str()) {
+                        continue;
+                    }
+                    withdraw_known(&mut files, &site.file)?;
+                    changed.insert(site.file.clone());
+                }
+            }
+            invalidated = changed;
         }
         txn.commit().map_err(|e| e.to_string())?;
         Ok(invalidated)
@@ -1822,19 +1908,32 @@ impl Store {
         let dispositions = txn
             .open_table(COLLISION_DISPOSITIONS)
             .map_err(|e| e.to_string())?;
+        let invalidated_verdicts = txn
+            .open_table(COLLISION_VERDICTS_INVALIDATED)
+            .map_err(|e| e.to_string())?;
         for entry in nodes.iter().map_err(|e| e.to_string())? {
             let (id, value) = entry.map_err(|e| e.to_string())?;
             let record: NodeRecord = decode(value.value())?;
+            if !record.is_multi_file_definition() {
+                continue;
+            }
+            if invalidated_verdicts
+                .get(id.value())
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                continue;
+            }
             let disposition = dispositions
                 .get(id.value())
                 .map_err(|e| e.to_string())?
                 .map(|guard| CollisionDisposition::from_code(guard.value()))
                 .transpose()?
-                // Direct store API callers do not have a resolver to provide
-                // a language verdict. Preserve the mechanical collision
-                // answer unless the pipeline explicitly persisted mergeable.
+                // Direct Store callers have no language resolver. A fresh
+                // multi-file definition remains the mechanical Collision
+                // answer until a resolver supplies Mergeable.
                 .unwrap_or(CollisionDisposition::Collision);
-            if record.is_multi_file_definition() && disposition == CollisionDisposition::Collision {
+            if disposition == CollisionDisposition::Collision {
                 report.fqn_collisions += 1;
             }
         }
@@ -2189,6 +2288,8 @@ fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.delete_table(NODES).map_err(|e| e.to_string())?;
     txn.delete_table(COLLISION_DISPOSITIONS)
         .map_err(|e| e.to_string())?;
+    txn.delete_table(COLLISION_VERDICTS_INVALIDATED)
+        .map_err(|e| e.to_string())?;
     txn.delete_table(REFS).map_err(|e| e.to_string())?;
     txn.delete_table(EDGES).map_err(|e| e.to_string())?;
     txn.delete_table(REV_EDGES).map_err(|e| e.to_string())?;
@@ -2205,6 +2306,8 @@ fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
 fn create_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.open_table(NODES).map_err(|e| e.to_string())?;
     txn.open_table(COLLISION_DISPOSITIONS)
+        .map_err(|e| e.to_string())?;
+    txn.open_table(COLLISION_VERDICTS_INVALIDATED)
         .map_err(|e| e.to_string())?;
     txn.open_table(REFS).map_err(|e| e.to_string())?;
     txn.open_table(EDGES).map_err(|e| e.to_string())?;
@@ -2262,6 +2365,24 @@ fn note_payload(
     }
     let payload = read_node(table, id)?.map(|record| record.payload());
     before.insert(*id, payload);
+    Ok(())
+}
+
+/// What an identity's complete declaration set was before this transaction.
+///
+/// Payload equality is enough for resolver invalidation, but not for a
+/// collision disposition: adding, removing or replacing a declaration site
+/// can leave the representative payload unchanged while changing the pairs a
+/// language must classify.
+fn note_node(
+    table: &NodeTable<'_>,
+    before: &mut BTreeMap<NodeId, Option<NodeRecord>>,
+    id: &NodeId,
+) -> Result<(), String> {
+    if before.contains_key(id) {
+        return Ok(());
+    }
+    before.insert(*id, read_node(table, id)?);
     Ok(())
 }
 
