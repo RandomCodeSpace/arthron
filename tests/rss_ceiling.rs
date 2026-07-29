@@ -9,21 +9,45 @@
 //! a scratch clone that is deliberately not vendored, so **CI never executes
 //! that measurement**, neither here nor in `.github/workflows/gate.yml`.
 //!
-//! Nor is an in-corpus proxy a substitute, and that is measured rather than
-//! assumed. On the largest Go corpus the fix this file guards moved peak RSS
-//! from 55,840 kB to 56,140 kB — it got 300 kB *worse*, because on a tree
-//! that small the peak is fixed cost (the binary, the ast-grep rule set, the
-//! store's page cache) and the retained references were never the peak at
-//! all. A threshold set on any corpus tree would therefore have passed on the
-//! very code this file exists to reject. There is no in-corpus proxy for this
-//! ceiling, and pretending otherwise would be a green check for a test that
-//! measures nothing.
+//! Nor does a corpus tree stand in for it — though not for the reason this
+//! comment first gave, which was a single-run 300 kB delta stated as a
+//! regression. Three runs of each build: on Go the two are indistinguishable,
+//! `caddy` 55,752–55,952 kB before the fix against 55,808–56,320 kB after and
+//! `codeiq` 46,184–46,208 kB against 46,168–46,296 kB, because on a tree that
+//! small the peak is fixed cost (the binary, the ast-grep rule set, the
+//! store's page cache) and the retained references never cleared it.
+//!
+//! Three non-Go corpora *do* separate the builds, and saying otherwise would
+//! be the same error in the other direction: `python/django` 68,908–69,020 kB
+//! against 59,160–59,288 kB, `javascript/fastify` 26,112–26,368 kB against
+//! 19,688–20,080 kB, `javascript/express` 16,172–16,336 kB against a flat
+//! 14,592 kB — gaps of 9,620 kB, 6,032 kB and 1,580 kB, where no build's own
+//! spread on any of them exceeded 512 kB. What that buys is ~10,000 kB of
+//! signal for a ceiling the tree it is stated against misses
+//! by 545,596 kB, and it costs a peak-RSS assertion on CI runners that are not
+//! the 2 vCPU reference hardware — a number about the machine and the
+//! allocator, failing for reasons that are not the code's. So the proxy is
+//! recorded in `docs/decisions.md`, with its measurements, rather than
+//! asserted here.
 //!
 //! So this file guards the **mechanism** instead, which is the thing a future
 //! change would break: the driver does not retain a file's references between
 //! the walk and the phase that resolves them. That is exactly what regressed,
 //! it is CI-checkable on a synthetic tree in milliseconds, and it fails the
 //! moment someone puts `FileFacts` back into the retained record.
+//!
+//! # What a green run here does not mean
+//!
+//! The assertion is a count of extractor invocations, so it catches the
+//! regression it was written for — reverting to retention takes the counts to
+//! 1 and 2, verified by running this file against the parent commit. It does
+//! not catch the way back that keeps both: putting the references into the
+//! retained record *and* leaving the re-read in place. The counts stay 2 and
+//! 3, this file stays green, and peak RSS goes back over the ceiling. Nothing
+//! here can see that — the record is private to `pipeline.rs` and this test
+//! reaches it only through `scan` — and the corpus proxy above is the thing
+//! that would, at the price named there. Anyone who adds a field to that
+//! record owes the ceiling a measurement, and this file cannot ask for one.
 //!
 //! # The measurement, for a human to run
 //!
@@ -34,10 +58,13 @@
 //! ```
 //!
 //! Against a 17,873-file / 5,353,211-line Go tree yielding 1,678,021 Go
-//! references, on the commit that added this file: **286,544 kB peak RSS,
-//! 108.9 s wall** — 54.7% of the 524,288 kB ceiling, and 20.4 s per 1M lines
-//! against a 60 s target. The commit before it measured 830,612 kB, 158.4% of
-//! the ceiling. `docs/decisions.md` carries the full table.
+//! references: **286,872 kB peak RSS, 109.62 s wall** — 54.7% of the
+//! 524,288 kB ceiling, and 20.5 s per 1M lines against a 60 s target. That is
+//! the worst of five runs, which spanned 286,404–286,872 kB and
+//! 106.56–109.62 s. The commit before this work measures 830,612 kB and
+//! 832,468 kB on two independent runs, 158.4% and 158.8% of the ceiling.
+//! `docs/decisions.md` carries the full table, including the corpora where
+//! cold indexing now misses the 60 s target.
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;

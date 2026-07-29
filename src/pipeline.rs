@@ -175,9 +175,17 @@ struct RefAcc {
 /// which is why they are dropped by name below rather than at the end of the
 /// function.
 ///
-/// Peak RSS is therefore linear in the *declaration* count and in the single
-/// largest file, not in the tree's references. The 512 MB ceiling is checked
-/// by `tests/rss_ceiling.rs`, which states exactly what it can and cannot
+/// Peak RSS is therefore linear in the changed-*file* count and in the
+/// declaration count, and in the single largest file, but not in the tree's
+/// references. Both per-file terms are real: every changed file keeps a
+/// path, a hash and a language header beside its declarations, and the walk
+/// keeps another path per *owned* file in `owned`. Measured on the
+/// 5.35M-line Go tree, the walk ends at 110,896 kB with the store still
+/// untouched, against a 10,240 kB fixed cost — so the 13.3 MiB
+/// `docs/decisions.md` accounts to the declarations is one term of a
+/// retained set an order of magnitude larger, and the rest of it has not
+/// been decomposed. The 512 MB ceiling is checked by
+/// `tests/rss_ceiling.rs`, which states exactly what it can and cannot
 /// prove — see [`BATCH_FILES`].
 pub fn scan<L: Language>(
     root: &Path,
@@ -535,8 +543,17 @@ pub fn scan<L: Language>(
         let mut supers_now: BTreeMap<NodeId, SuperRecord> = BTreeMap::new();
         for file in changed.iter().chain(waking.iter()) {
             // Re-read rather than held: see [`reread`]. A file whose bytes
-            // moved under the scan is skipped here and again in phase 2, and
-            // both times it lands in `stale`.
+            // moved under the scan is skipped, and the skip narrows this
+            // round: no supertype row of its own is derived, so `supers_now`
+            // is missing it, the comparison below under-approximates which
+            // identities moved, and a file that should have been roused is
+            // not. Bounded and self-correcting rather than silent — the file
+            // is in `stale`, so its hash is forgotten and the next scan reads
+            // it whole and redoes this comparison. The skip is also per
+            // phase, not sticky: bytes that move and move back are skipped
+            // here and resolved in phase 2, which leaves this event's
+            // supertype rows for that file the previous event's until the
+            // next scan replaces them.
             let Some(facts) = reread(ex, file, &mut file_errors, &mut stale) else {
                 continue;
             };
@@ -777,11 +794,19 @@ fn add_invalidated(
     }
 }
 
-/// Extract one file and hand back the slack.
+/// Extract one file and hand back the slack on the half that is kept.
 ///
-/// A `Vec` doubles, so a file's references land in a buffer holding up to
-/// twice what the extractor emitted. Measured over a large Go tree that
-/// overshoot was 99.7 MiB of live capacity holding nothing at all.
+/// A `Vec` doubles, so a file's declarations land in a buffer holding up to
+/// twice what the extractor emitted — and the walk holds that buffer, for
+/// every changed file at once, until the scan ends. Over a large Go tree the
+/// overshoot on the extractor's two vectors measured 99.7 MiB of live
+/// capacity holding nothing at all.
+///
+/// Only `defs` is shrunk here, because on this path only `defs` outlives the
+/// statement: the walk drops a file's references where it makes them, so
+/// shrinking them would buy a `realloc` and a copy per file for slack
+/// nothing was holding. [`reread`] shrinks the references it hands out,
+/// because there they are held.
 ///
 /// Capacity is not an observable of the facts: the records, their order and
 /// their count are untouched, and no resolver can ask a `Vec` how much room
@@ -789,7 +814,6 @@ fn add_invalidated(
 fn extract_facts<L: Language>(ex: &dyn Extractor<L>, rel_path: &str, source: &str) -> FileFacts<L> {
     let mut facts = ex.extract(rel_path, source);
     facts.defs.shrink_to_fit();
-    facts.refs.shrink_to_fit();
     facts
 }
 
@@ -826,6 +850,12 @@ fn scan_file<L: Language>(
 /// declarations its source no longer makes. It goes to `stale` instead —
 /// exactly where an unreadable file goes — so the store withdraws its
 /// currency claim and the next scan reads the file whole.
+///
+/// Every caller must be able to lose a file here, and what each loses
+/// differs: phase 2 writes no references for it, and phase 1.5 derives no
+/// supertype row for it and so widens over a comparison it is missing from.
+/// Both are recoverable for the same reason — the file is in `stale` — and
+/// neither is reachable unless the tree is being written while it is read.
 fn reread<L: Language>(
     ex: &dyn Extractor<L>,
     file: &ScannedFile<L>,
@@ -842,18 +872,28 @@ fn reread<L: Language>(
     };
     if *blake3::hash(source.as_bytes()).as_bytes() != file.hash {
         stale.insert(file.rel_path.clone());
+        // The path is the key of this map and the report prints it in front
+        // of the message, so the message does not repeat it.
         file_errors.insert(
             file.rel_path.clone(),
-            format!(
-                "{}: the bytes changed while this scan was reading the tree, so this \
-                 file's references are left unresolved and its store rows stale until \
-                 the next scan",
-                file.rel_path,
-            ),
+            "the bytes changed while this scan was reading the tree, so this file's \
+             references are left unresolved and its store rows stale until the next \
+             scan"
+                .to_owned(),
         );
         return None;
     }
-    Some(extract_facts(ex, &file.rel_path, &source))
+    let mut facts = extract_facts(ex, &file.rel_path, &source);
+    // Held, unlike the walk's: this file's references live until the phase
+    // that asked for them has resolved them, so the doubling slack on the
+    // single largest file is a term of peak RSS. A small one — without this
+    // line three cold runs of a 5.35M-line Go tree measured 278,444–286,660 kB
+    // against 286,404–286,872 kB over five runs with it, which is no
+    // difference at that spread — but this is the path where the term exists
+    // at all, and the walk's, which drops a file's references where it makes
+    // them, no longer pays for it.
+    facts.refs.shrink_to_fit();
+    Some(facts)
 }
 
 fn read_source(path: &Path, rel_path: &str) -> Result<String, String> {

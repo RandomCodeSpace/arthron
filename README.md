@@ -410,32 +410,45 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 
 | Budget | Target | Measured |
 |---|---|---|
-| Peak RSS | **< 512 MB (hard)** | 279.8 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling |
-| Cold index throughput | < 60 s / 1M lines | 20.4 s / 1M lines on the same scan |
-| Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes **on the pre-Wave-3 build** — a miss, recorded as a finding rather than hidden, and not yet re-measured |
+| Peak RSS | **< 512 MB (hard)** | 280.2 MiB cold-scanning a 5,353,211-line Go tree yielding 1,678,021 references — 54.7% of the ceiling, worst of five runs spanning 468 kB |
+| Cold index throughput | < 60 s / 1M lines | 20.5 s / 1M lines on the same scan, five runs spanning 19.9–20.5 — but **70.1 s / 1M on TypeScript**, a miss, measured below |
+| Warm re-index, unchanged tree | < 1 s | 12.37 s re-scanning that same tree, unchanged — a miss by 12×, recorded as a finding rather than hidden |
 
-The RSS percentage and the ceiling are read in the same binary units: 279.8 of
+The RSS percentage and the ceiling are read in the same binary units: 280.2 of
 512 is 54.7%. That is the basis every RSS verdict on this project was recorded
 on — the 729.1 MiB that failed this gate once was recorded as **1.42× the
 ceiling**, which is 729.1/512 — so it is said here rather than left to be
 inferred. Read `512 MB` as decimal MB instead and the same measurement is
-293.4 MB, 57% of it: under the ceiling on either reading, but only one of the
+293.8 MB, 57% of it: under the ceiling on either reading, but only one of the
 two matches the record.
 
-The first two rows were re-measured on a larger tree than the one they used to
-name: 5,353,211 lines against 1,789,247. The earlier 337.1 MiB is therefore not
-restated beside them — it was a real measurement, of a smaller tree, by a build
-that no longer exists here, and setting it next to a number from neither would
-invite the two to be read as a before-and-after of the same scan.
+All three rows are now the shipped build on one tree, cold-scanned and then
+re-scanned unchanged: 5,353,211 lines, where the first two rows used to name
+1,789,247 and the third a build two waves older. The earlier 337.1 MiB is
+therefore not restated beside them — it was a real measurement, of a smaller
+tree, by a build that no longer exists here, and setting it next to a number
+from neither would invite the two to be read as a before-and-after of the same
+scan.
 
-The first two rows are the shipped build. The third is not, and the column
-says so rather than letting three numbers read as one benchmark run: warm
-timing was last measured on the binary whose cold RSS was 729.1 MiB, and the
-memory work that replaced it was explicitly not aimed at the warm path (warm
-cost is per-file re-read and re-hash). Warm RSS improved 13% on the same
-change; warm wall time has not been re-run on the reference hardware, so the
-number here is the last one that was actually executed and it is labelled
-rather than refreshed by inference.
+Warm is the miss, and it is not this build's doing: 11.73 s and 12.37 s over
+two runs here, against 12.35 s and 12.63 s for the same pair on the commit
+before the memory change, with warm peak RSS identical to within 0.2%
+(125,872–126,012 kB against 125,880–126,008 kB). Warm cost is per-file re-read
+and re-hash of every file in the tree, so it tracks the tree's size rather than
+the changed set: a target set against a 1.8M-line tree is missed by 13× against
+a 5.35M-line one. It is stated as measured rather than normalised away.
+
+Cold throughput is a per-language number, and one language misses the target.
+Median of three runs each on the shipped build, per 1M lines: Go `caddy` 32.6 s,
+Java `commons-lang` 44.4 s, Java `gson` 48.7 s, JavaScript `fastify` 37.1 s,
+JavaScript `express` 42.9 s, Python `django` 42.7 s, Python `flask` 43.5 s, and
+the 5.35M-line Go tree 20.2 s — every one inside the 60 s target — against
+TypeScript `vue-core` at **70.1 s** and TypeScript `zod` at **82.5 s**, both
+outside it. The extra parse per file that bought the memory ceiling roughly
+doubled all of them, and TypeScript was the language with the least room:
+36.7 s and 45.3 s before it. Timing is a target and the ceiling is hard, so
+this ships — but a target that is now missed is recorded here rather than left
+to be inferred from the Go row.
 
 The RSS number is the interesting one, and it has failed this gate twice. It
 was **729.1 MiB**; per-500-file commits on every phase, a capped redb page cache

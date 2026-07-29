@@ -39,6 +39,21 @@ Phase 1 needs every changed file's declarations before it names anything, so
 those stay. Nothing needs every file's references at once, so nothing holds
 them.
 
+**That 13.3 MiB is one term of the retained set and not the whole of it, which
+this entry originally left to be inferred.** Sampled at 200 ms, the fixed build's
+walk ends at **110,896 kB with the store still at 1.1 MB** — nothing written yet
+— against a **10,240 kB** fixed cost measured on a two-file tree. So the walk
+retains ~100 MB, not 13 MB: a `String`, a `PathBuf`, a 32-byte hash and a
+language header ride beside every changed file's declarations, and the walk
+keeps a second path per *owned* file in `owned`. It is retention rather than
+recycled slack, which is checked and not assumed: forcing every allocation of
+128 kB or more through `mmap` — `MALLOC_MMAP_THRESHOLD_=131072`, so the big
+per-file transients go back to the kernel on free — moves that plateau to
+111,604 kB, 0.6% the wrong way. The remaining terms have not been decomposed
+per field. Whoever tunes this next should measure before assuming the
+declaration count is the term to shrink; the peak is linear in the file count
+too.
+
 Re-extraction cannot change an outcome, and the enforcement is structural
 rather than argued: `Extractor::extract(&self, rel_path, source)` takes no
 probe, no config and no other file, so the same bytes give the same facts.
@@ -52,13 +67,44 @@ makes.
 |---|---|---|---|
 | the wave, as measured | 830,612 kB | 70.59 s | 158.4% |
 | `shrink_to_fit` the extractor's two vectors | 778,328 kB | 70.57 s | 148.5% |
-| **and stop holding the references** | **286,544 kB** | **108.92 s** | **54.7%** |
+| **and stop holding the references** | **286,872 kB** | **109.62 s** | **54.7%** |
 
-**286,544 kB — 54.7% of the 524,288 kB ceiling, and below the 376,092 kB that
-v0.0.1 needed for a third of the references.** The cost is 38.3 s of wall clock,
-one extra parse per file: **20.4 s per 1M lines against a 60 s target**, so the
-tree could grow 2.9x before timing became the binding constraint. That is the
-trade taken deliberately — the ceiling is hard and the timing is a target.
+The last row is the worst of five runs of the shipped build, which spanned
+286,404–286,872 kB and 106.56–109.62 s; a single run is not a peak. The first
+row reproduces at 832,468 kB / 69.54 s on a re-measurement of the same commit.
+
+**286,872 kB — 54.7% of the 524,288 kB ceiling, and below the 376,092 kB that
+v0.0.1 needed for a third of the references.** The cost is 39.0 s of wall clock,
+one extra parse per file: **20.5 s per 1M lines against a 60 s target** on that
+Go tree. That is the trade taken deliberately — the ceiling is hard and the
+timing is a target.
+
+**The margin is not the same in every language, and TypeScript no longer has
+one.** Per 1M lines, median of three cold runs of each build on the reference
+hardware:
+
+| corpus | lines | before | after |
+|---|---|---|---|
+| `go/caddy` | 97,148 | 19.4 s | 32.6 s |
+| `javascript/fastify` | 69,250 | 19.2 s | 37.1 s |
+| `javascript/express` | 21,231 | 24.5 s | 42.9 s |
+| `python/django` | 161,112 | 18.4 s | 42.7 s |
+| `python/flask` | 17,019 | 20.0 s | 43.5 s |
+| `java/commons-lang` | 189,376 | 24.5 s | 44.4 s |
+| `java/gson` | 48,657 | 27.1 s | 48.7 s |
+| `typescript/vue-core` | 151,099 | 36.7 s | **70.1 s** |
+| `typescript/zod` | 68,361 | 45.3 s | **82.5 s** |
+| the 5.35M-line Go tree | 5,353,211 | 13.0 s | 20.2 s |
+
+The extra parse roughly doubles all of them, so the language that started
+nearest the target is the one that crossed it: **both TypeScript corpora now
+index above 60 s per 1M lines.** The earlier reading of this entry — that the
+tree could grow 2.9x before timing bound — was the Go number generalised, and
+it is wrong for TypeScript, which is already past the target. Timing is a
+target and not a gate, so this ships; a missed target is recorded rather than
+inferred, here and in `README.md`. TypeScript extraction being 2x the cost per
+line of every other track, before and after, is a separate piece of work and
+not this one.
 
 Every resolution number is unchanged, checked rather than asserted: all 29
 corpus gates and all 15 pin comparisons were re-run against the committed
@@ -94,24 +140,59 @@ re-parsing.* One extraction instead of two, but it needs a serialisable
 a new failure mode when it cannot be written. Re-extraction reaches the same
 peak with no new state and no new file.
 
-*Rejected: `shrink_to_fit` alone.* Kept — it is five lines and costs one
-realloc per file — but it is not a fix. Measured at **52,284 kB**, half the
-102.5 MiB the live-byte accounting projected, because glibc returns a shrunk
-allocation to its own arenas rather than to the kernel. That gap is the
-standing reminder that live bytes and RSS are different measurements.
+*Rejected: `shrink_to_fit` alone.* Kept, but only where something is held —
+and that placement was itself a review finding. Measured at **52,284 kB** on
+the build that still retained every file's references, half the 102.5 MiB the
+live-byte accounting projected, because glibc returns a shrunk allocation to
+its own arenas rather than to the kernel; that gap is the standing reminder
+that live bytes and RSS are different measurements. Once the references are no
+longer retained, shrinking them on the walk's path is dead work — they are
+dropped at the end of the statement that makes them — so the walk shrinks the
+declarations it keeps and nothing else, and `reread` shrinks the references it
+hands out, because those live until the phase that asked for them is done.
+Neither placement is visible in the total: removing the references' shrink
+entirely measured 278,444–286,660 kB over three runs on the 5.35M-line tree
+against 286,404–286,872 kB over five with it — overlapping ranges, and the
+widest single-run excursion in either direction (8,216 kB) is larger than the
+difference between them.
 
 **The regression guard is a mechanism test, and `tests/rss_ceiling.rs` says so
 in its own comment rather than implying CI covers the ceiling.** CI cannot run
 this measurement: the tree it is stated against is not in the corpus
-repository. Nor is an in-corpus proxy a substitute, which is measured rather
-than assumed — on the largest Go corpus this change moved peak RSS from
-55,840 kB to 56,140 kB, 300 kB *worse*, because at that size the peak is fixed
-cost and the retained references were never the peak at all. **A threshold set
-on any corpus tree would have passed on the code this guard exists to reject.**
-So the test pins the mechanism instead: a Go file is extracted exactly twice
-and a Java file exactly three times, counted through the public `scan` entry
-with a wrapped extractor. It fails with `1` on the parent commit, which was
-verified by running it there.
+repository.
+
+The first version of this entry went further and said a threshold on *any*
+corpus tree would have passed on the code the guard rejects, resting on a
+single-run 300 kB delta on the largest Go corpus. Three runs of each build say
+otherwise on both counts. On Go the two builds are indistinguishable, which is
+the weaker and truer version of that claim — `go/caddy` 55,752–55,952 kB before
+against 55,808–56,320 kB after, `go/codeiq` 46,184–46,208 kB against
+46,168–46,296 kB, overlapping ranges with each build's own spread as large as
+the difference between them — so the direction of the original 300 kB is not
+reproducible and it should never have been stated as a measured regression. But
+three non-Go corpora *do* separate the builds: `python/django` 68,908–69,020 kB
+against 59,160–59,288 kB, `javascript/fastify` 26,112–26,368 kB against
+19,688–20,080 kB, and `javascript/express` 16,172–16,336 kB against a flat
+14,592 kB — gaps of 9,620 kB, 6,032 kB and 1,580 kB, where no build's own
+spread on any of them exceeded 512 kB. Their fixed cost is small enough that
+the retained references cleared it, which the Go corpora's does not.
+
+**So a corpus proxy exists and is still not the gate.** It would separate the
+builds by ~10,000 kB where the tree the ceiling is stated against separates
+them by 545,596 kB, and a peak-RSS threshold is a statement about the hardware
+and the allocator — the reference hardware is 2 vCPU under `taskset`, and CI
+runners are not it. Asserting a memory number where the memory is not the
+reference machine's buys a check that fails for reasons unrelated to the code.
+Recorded rather than built, so the option is on the record with its own
+measurements.
+
+The test therefore pins the mechanism: a Go file is extracted exactly twice and
+a Java file exactly three times, counted through the public `scan` entry with a
+wrapped extractor. It fails with `1` on the parent commit, which was verified
+by running it there. Its blind spot is named in its own comment — putting the
+references back into the retained record while *keeping* the re-read leaves
+both counts unchanged and the test green — because a guard whose limits are
+undocumented is read as covering more than it does.
 
 ---
 
