@@ -9,6 +9,18 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Added
+
+- **Binary-release automation for five native targets.** The generated
+  cargo-dist 0.32.0 workflow builds `x86_64-unknown-linux-gnu`,
+  `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+  `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. A `v*` tag push is the
+  only path that can upload artifacts and create a GitHub Release; manual
+  dispatch builds the same artifacts but has read-only repository permission
+  and cannot publish.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added

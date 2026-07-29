@@ -34,6 +34,25 @@ include = [
     "/LICENSE",
 ]
 
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Build release artifacts on a pull request or manual dispatch, but only a tag
+# push may upload them or create a GitHub Release.
+pr-run-mode = "upload"
+# release.yml has the repository's tag and dispatch safety policy below; retain
+# cargo-dist's generated build graph while preventing regeneration from erasing it.
+allow-dirty = ["ci"]
+# Where to host releases
+hosting = "github"
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The installers to generate for each app
+installers = []
+
 [dependencies]
 ast-grep-config = "=0.44.1"
 ast-grep-core = "=0.44.1"
@@ -48,6 +67,11 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 
 [lints.rust]
 missing_docs = "deny"
+
+# The profile cargo-dist uses for release artifacts.
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dev-dependencies]
 tempfile = "3"
