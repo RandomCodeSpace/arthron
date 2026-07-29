@@ -21,8 +21,13 @@
 # How it fails. A pinned row whose target changed fails by name —
 # `target_moved` — printing the file, the line, the site text, the old target
 # and the new one. A row that appeared is coverage growth and passes. A row
-# that vanished is flagged, not failed: the counting gate owns that half, and a
-# re-pin that drops rows shows the drop as deleted lines in this file's diff.
+# that vanished with nothing in its place is flagged, not failed: the counting
+# gate owns that half, and a re-pin that drops rows shows the drop as deleted
+# lines in this file's diff. A row that vanished *while another appeared* is a
+# row whose key changed, and that fails by name too — `rows_rekeyed` — because
+# re-keying preserves all four of the integers `arthron gate` compares by
+# construction, so nothing else in the build would ever say the row stopped
+# being checked.
 #
 # Re-pinning is a deliberate act. Every changed target is a claim that the old
 # edge was wrong, and belongs in docs/decisions.md with the reason.

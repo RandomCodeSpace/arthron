@@ -24,6 +24,16 @@
 //! `local_binding`), and a re-pin that drops rows shows the drop as deleted
 //! lines in the pin file's own diff.
 //!
+//! That last hand-off holds exactly as far as the vanished rows are *not*
+//! replaced. A row's key is its identity here, so a row whose key changed is
+//! one that vanished and one that appeared — and an edit to what the key is
+//! made of (`argc`, `enclosing`, `raw_target`, `locally_bound`) re-keys rows
+//! wholesale while preserving all four gated integers by construction. The
+//! counting gate cannot see that: nothing shrank, nothing drifted, and the
+//! re-keyed rows simply stopped being checked. So the part of `vanished` that
+//! is offset by `appeared` — [`PinVerdict::rekeyed`] — fails here, and only
+//! the part that is a genuinely smaller resolved set is handed on.
+//!
 //! # Why this format
 //!
 //! Written out in full — file, kind, declaration space, enclosing FQN, site
@@ -232,14 +242,17 @@ pub fn render(
     let mut targets: Vec<&str> = rows.iter().map(|r| r.target.as_str()).collect();
     targets.sort_unstable();
     targets.dedup();
-    let index: BTreeMap<&str, u32> = targets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, u32::try_from(i).unwrap_or(u32::MAX)))
-        .collect();
     if targets.len() > u32::MAX as usize {
         return Err("more distinct targets than a 32-bit index can name".to_string());
     }
+    let index: BTreeMap<&str, u32> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let i = u32::try_from(i).expect("guarded above: fewer targets than u32::MAX");
+            (*t, i)
+        })
+        .collect();
 
     let mut files: BTreeMap<&str, Vec<(u64, u32)>> = BTreeMap::new();
     for row in rows {
@@ -309,8 +322,13 @@ fn header(corpus: &str, commit: &str, pins_path: &str) -> String {
 # How it fails. A pinned row whose target changed fails by name —
 # `target_moved` — printing the file, the line, the site text, the old target
 # and the new one. A row that appeared is coverage growth and passes. A row
-# that vanished is flagged, not failed: the counting gate owns that half, and a
-# re-pin that drops rows shows the drop as deleted lines in this file's diff.
+# that vanished with nothing in its place is flagged, not failed: the counting
+# gate owns that half, and a re-pin that drops rows shows the drop as deleted
+# lines in this file's diff. A row that vanished *while another appeared* is a
+# row whose key changed, and that fails by name too — `rows_rekeyed` — because
+# re-keying preserves all four of the integers `arthron gate` compares by
+# construction, so nothing else in the build would ever say the row stopped
+# being checked.
 #
 # Re-pinning is a deliberate act. Every changed target is a claim that the old
 # edge was wrong, and belongs in docs/decisions.md with the reason.
@@ -335,7 +353,8 @@ fn header(corpus: &str, commit: &str, pins_path: &str) -> String {
 ///
 /// A version this build does not read, a missing field, a section out of
 /// order, a row before any file names it, a target index no dictionary entry
-/// carries, and a header whose counts disagree with the body.
+/// carries, two rows of one file at one key hash, and a header whose counts
+/// disagree with the body.
 pub fn parse(text: &str) -> Result<Pins, String> {
     let mut format = None;
     let mut corpus = None;
@@ -461,12 +480,24 @@ pub fn parse(text: &str) -> Result<Pins, String> {
         ));
     }
     for (file, entries) in &files {
+        // The same ambiguity [`render`] refuses to write, refused on the way
+        // back in. The two header counts do not catch it — a duplicated row
+        // balances `rows` as readily as a distinct one — and a file this
+        // parser accepted would have one key standing for two targets, with
+        // [`compare`] free to join either.
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
         for (hash, target) in entries {
             if *target as usize >= targets.len() {
                 return Err(format!(
                     "{file}: row {hash:016x} names target {target}, and the dictionary \
                      holds {}",
                     targets.len(),
+                ));
+            }
+            if !seen.insert(*hash) {
+                return Err(format!(
+                    "{file}: two rows share the key hash {hash:016x}; this file cannot \
+                     say which target belongs to which, so it is not read",
                 ));
             }
         }
@@ -537,12 +568,31 @@ pub struct PinVerdict {
 }
 
 impl PinVerdict {
+    /// Pinned rows that stopped being produced while rows appeared to take
+    /// their place: `min(appeared, vanished)`.
+    ///
+    /// A row's key is its identity here, so a row whose key changed is one
+    /// that vanished and one that appeared. Neither reading fails on its own,
+    /// and the reason a bare vanished row does not is that the counting gate
+    /// owns it — `denominator_shrank` refuses a resolved set that got smaller.
+    /// Re-keying preserves all four of the integers that gate compares *by
+    /// construction*: nothing shrank, nothing drifted, and the re-keyed rows
+    /// merely stopped being checked.
+    ///
+    /// `min(appeared, vanished)` is exactly the part of `vanished` that is
+    /// offset rather than lost, which is exactly the part the counting gate
+    /// cannot see; the remainder is a smaller denominator, which it refuses.
+    pub fn rekeyed(&self) -> u64 {
+        self.appeared.min(self.vanished.len() as u64)
+    }
+
     /// Whether this verdict fails a build.
     ///
-    /// A moved target, or an ambiguity that stops one from being read. Not a
-    /// vanished row: see the module header for which check owns that.
+    /// A moved target, an ambiguity that stops one from being read, or a
+    /// pinned row re-keyed out of the comparison. Not a vanished row that
+    /// nothing replaced: see the module header for which check owns that.
     pub fn failed(&self) -> bool {
-        !self.moved.is_empty() || !self.collisions.is_empty()
+        !self.moved.is_empty() || !self.collisions.is_empty() || self.rekeyed() > 0
     }
 
     /// The verdict as text a person can act on without opening the pin file.
@@ -560,6 +610,20 @@ impl PinVerdict {
             self.vanished.len(),
             self.moved.len(),
         );
+        if self.rekeyed() > 0 {
+            let _ = writeln!(
+                out,
+                "  rows_rekeyed {} — {} pinned rows stopped being produced and {} rows \
+                 appeared, so at least {} of them changed key rather than left. A row's \
+                 key is its identity: its target stops being checked, and none of the \
+                 four integers `arthron gate` compares moves. Re-pin only with the key \
+                 change attributed.",
+                self.rekeyed(),
+                self.vanished.len(),
+                self.appeared,
+                self.rekeyed(),
+            );
+        }
         for m in &self.moved {
             let argc = m.argc.map_or_else(|| "-".to_string(), |n| n.to_string());
             let _ = writeln!(
@@ -590,8 +654,17 @@ impl PinVerdict {
 /// The join is `(file, key hash)`, which is what the pin file is keyed by, so
 /// a row that kept its key is compared on its target and a row that changed
 /// its key is one that vanished and one that appeared. Both readings are
-/// reported; only a changed target fails.
-pub fn compare(pins: &Pins, rows: &[ResolvedRow]) -> PinVerdict {
+/// reported, and a changed key that is offset by an appearance fails as
+/// [`PinVerdict::rekeyed`] — see that method for why the counting gate cannot
+/// be left to own it.
+///
+/// # Errors
+///
+/// When a row names a target index the dictionary does not hold. [`parse`]
+/// refuses such a file, so this is unreachable for pins read off disk; a
+/// [`Pins`] built from its public fields can still carry one, and answering
+/// that with a panic would be this module deciding a caller's error is fatal.
+pub fn compare(pins: &Pins, rows: &[ResolvedRow]) -> Result<PinVerdict, String> {
     let mut verdict = PinVerdict::default();
 
     let mut current: BTreeMap<(&str, u64), &ResolvedRow> = BTreeMap::new();
@@ -607,7 +680,17 @@ pub fn compare(pins: &Pins, rows: &[ResolvedRow]) -> PinVerdict {
     let mut matched: BTreeSet<(&str, u64)> = BTreeSet::new();
     for (file, entries) in &pins.files {
         for (hash, target) in entries {
-            let was = pins.targets[*target as usize].as_str();
+            let was = pins
+                .targets
+                .get(*target as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "{file}: row {hash:016x} names target {target}, and the \
+                         dictionary holds {}",
+                        pins.targets.len(),
+                    )
+                })?
+                .as_str();
             match current.get(&(file.as_str(), *hash)) {
                 Some(row) => {
                     matched.insert((file.as_str(), *hash));
@@ -642,5 +725,5 @@ pub fn compare(pins: &Pins, rows: &[ResolvedRow]) -> PinVerdict {
         }
     }
     verdict.appeared = current.keys().filter(|key| !matched.contains(*key)).count() as u64;
-    verdict
+    Ok(verdict)
 }

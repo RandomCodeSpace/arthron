@@ -217,8 +217,11 @@ enum Command {
     ///
     /// A pinned row whose target changed fails, by name, printing the file,
     /// the line, the site text, the old target and the new one. A row that
-    /// appeared is coverage growth and passes. A row that vanished is flagged
-    /// and does not fail: the counting gate owns that half.
+    /// appeared is coverage growth and passes. A row that vanished with
+    /// nothing in its place is flagged and does not fail: the counting gate
+    /// owns that half. A row that vanished while another appeared is a row
+    /// whose key changed — `rows_rekeyed` — and that fails, because re-keying
+    /// preserves every integer the counting gate reads.
     ///
     /// `--write` records what this run measured instead of comparing against
     /// it. That is the one command a deliberate capability landing runs per
@@ -843,6 +846,23 @@ fn run_pin(
         noteln!("arthron: {shown} does not exist; record it with --write");
         return ExitCode::from(EXIT_USAGE);
     }
+    // Provenance the parser deliberately does not check, checked here — where
+    // it decides something. A pin file compared against a tree it was not
+    // taken over joins on nothing: every pinned row reads as vanished, every
+    // scanned row as appeared, and a typo in a CI line or a renamed corpus is
+    // a green run that checked no edge at all.
+    if !write
+        && let Some(pinned) = &existing
+        && Path::new(&pinned.corpus) != path
+    {
+        noteln!(
+            "arthron: {shown} pins {}, and this run scanned {}; a pin file compared \
+             against another tree checks no edge at all",
+            pinned.corpus,
+            path.display(),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
 
     let config = match Config::load(path) {
         Ok(c) => c,
@@ -881,14 +901,22 @@ fn run_pin(
         }
     };
 
+    // A scan that resolved nothing is not a measurement either way round. A
+    // pin file written from it looks exactly as authoritative as a correct one
+    // and would bless every later run; a comparison against it reads every
+    // pinned row as vanished with nothing appearing in its place — flagged,
+    // not failed — which is a green run over an empty tree. Refuse both, the
+    // way a baseline of all zeros is refused.
+    if rows.is_empty() {
+        noteln!(
+            "arthron: {}: this scan resolved no reference at all, so it pins nothing \
+             and agrees with nothing",
+            path.display(),
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+
     if write {
-        // A pin file with no row in it looks exactly as authoritative as a
-        // correct one and would bless every later run. Refuse, the way a
-        // baseline of all zeros is refused.
-        if rows.is_empty() {
-            noteln!("arthron: refusing to write {shown}: this scan resolved no reference at all");
-            return ExitCode::from(EXIT_USAGE);
-        }
         // `/`-separated on every platform, like the repo-relative keys a scan
         // builds: the pin format has no escapes, so a Windows `\` would write
         // a header no later run could read back.
@@ -904,6 +932,20 @@ fn run_pin(
                 return ExitCode::from(EXIT_USAGE);
             }
         };
+        // What changed against what was there, so a re-pin is never a silent
+        // overwrite: the numbers a reviewer needs are on stdout before the
+        // diff is read. Computed before the write, so a comparison that cannot
+        // be made does not leave a replaced file and no account of it.
+        let mut out = String::new();
+        if let Some(before) = &existing {
+            match pins::compare(before, &rows) {
+                Ok(verdict) => out.push_str(&verdict.report()),
+                Err(e) => {
+                    noteln!("arthron: {shown}: {e}");
+                    return ExitCode::from(EXIT_USAGE);
+                }
+            }
+        }
         if let Some(parent) = pins_path.parent()
             && !parent.as_os_str().is_empty()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -915,14 +957,6 @@ fn run_pin(
             noteln!("arthron: writing {shown}: {e}");
             return ExitCode::from(EXIT_USAGE);
         }
-        // What changed against what was there, so a re-pin is never a silent
-        // overwrite: the numbers a reviewer needs are on stdout before the
-        // diff is read.
-        let mut out = String::new();
-        if let Some(before) = &existing {
-            let verdict = pins::compare(before, &rows);
-            out.push_str(&verdict.report());
-        }
         outln!(
             out,
             "pins: wrote {shown} at {commit} ({corpus}) — {} rows",
@@ -932,16 +966,23 @@ fn run_pin(
     }
 
     let pinned = existing.expect("checked above: a comparison without a pin file is a usage error");
-    let verdict = pins::compare(&pinned, &rows);
+    let verdict = match pins::compare(&pinned, &rows) {
+        Ok(v) => v,
+        Err(e) => {
+            noteln!("arthron: {shown}: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let mut out = format!("pins: {shown} ({})\n", pinned.corpus);
     out.push_str(&verdict.report());
     if verdict.failed() {
         outln!(
             out,
-            "pins: FAIL — a resolved reference points somewhere else than it did. \
-             A wrong edge moves none of the four integers `arthron gate` compares, \
-             which is why this check exists. Re-pin only with every changed edge \
-             attributed in docs/decisions.md.",
+            "pins: FAIL — a pinned edge is not where it was pinned: a target moved, a \
+             pinned row was re-keyed out of the comparison, or two rows share one key. \
+             None of those moves the four integers `arthron gate` compares, which is \
+             why this check exists. Re-pin only with every change attributed in \
+             docs/decisions.md.",
         );
         emit(&out, ExitCode::from(EXIT_GATE_FAILED))
     } else {
