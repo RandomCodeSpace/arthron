@@ -797,6 +797,29 @@ impl EcmaResolver {
             };
         }
 
+        // 4. The other half of the universe scope: a name a *package* injects
+        //    into it. Consulted after the host's half, so a host global is
+        //    the host's whatever a dependency also puts in scope, and after
+        //    steps 1 and 2, so any import or declaration of the name wins.
+        //
+        //    The head decides, exactly as it does for the host half above:
+        //    `console.log` is `External` rather than a type question, and
+        //    `vi.fn` is in vitest rather than a type this resolver failed to
+        //    infer. What follows the head is inside the package the head
+        //    names, and neither half of the universe scope has to look at it.
+        //
+        //    `Unresolved`, never `External`: the reference stays in both
+        //    terms of the rate. See [`globals::INJECTED`] for why the reason
+        //    is the one it is.
+        if globals::injected_by(head, |package| cfg.declares_ambient(&scope.module, package))
+            .is_some()
+        {
+            return Resolution {
+                outcome: Outcome::Unresolved(UnresolvedReason::UnknownPackage),
+                candidates,
+            };
+        }
+
         let reason = if segments.len() > 1 {
             // The head is neither imported, nor declared here, nor global:
             // it is a value whose type this resolver does not compute.

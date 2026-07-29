@@ -5,11 +5,13 @@
 //! into exactly one [`Outcome`]. Every candidate probed — hit or miss — is
 //! returned for the invalidation index.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::extract_go::GoHeader;
-use crate::lang::{FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe};
+use crate::lang::{
+    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, SymbolProbe,
+};
 use crate::model::{
     DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, Reference, TargetRoot, node_id,
 };
@@ -182,6 +184,10 @@ pub struct FileScope {
     pub imports: HashMap<String, String>,
     /// Paths dot-imported into this file's scope.
     pub dot_imports: Vec<String>,
+    /// Byte offsets of this file's composite-literal keys, carried through
+    /// from [`GoHeader::literal_keys`] — the one thing about a
+    /// [`RefKind::FieldAccess`] that only the syntax could say.
+    pub literal_keys: HashSet<u32>,
 }
 
 /// Whether a path segment is a Go major-version marker (`v2`, `v3`, …).
@@ -321,6 +327,7 @@ pub fn file_scope(
         pkg_path,
         imports,
         dot_imports,
+        literal_keys: header.literal_keys.iter().copied().collect(),
     }
 }
 
@@ -464,6 +471,139 @@ impl GoResolver {
         }
     }
 
+    /// Classify a field access: `pkg.Name`, `t.field`, `T.Method`, and the
+    /// `Field` in `T{Field: v}`.
+    ///
+    /// A call and a read share most shapes, and this shares
+    /// [`Self::resolve_call`]'s answers on those: a two-segment `pkg.Name` is
+    /// handed straight to it, a receiver root goes to
+    /// [`Self::resolve_receiver`], and a root bound by an enclosing block
+    /// never reaches here at all.
+    ///
+    /// One shape they answer differently, and the doc says so rather than
+    /// claiming a symmetry that is not there. A *three*-segment path rooted
+    /// in an import — `pkg.T.Member`, which is what `pkg.T{Member: v}` and
+    /// `pkg.Var.Field` both reduce to — is [`Outcome::External`] here and
+    /// [`UnresolvedReason::NeedsTypeInference`] in [`Self::resolve_call`],
+    /// which files every path longer than a `QualifiedIdent` under one
+    /// answer. Reading it as `External` is what a literal key on a
+    /// dependency's type is — a reference *into* that dependency, filed the
+    /// way every other reference into one is — and a selector read of the
+    /// same shape rides along. Making the two agree moves a measured number
+    /// in one direction or the other and is its own change, with its own
+    /// attribution.
+    ///
+    /// What it adds is the shape a call does not have: a member named on an
+    /// owner that is *written at the site*. `T.Method` is Go's method
+    /// expression, `T{Field: v}` states its own type, and `pkg.T{Field: v}`
+    /// states it through an import — in all three the owner is a type name,
+    /// not a value whose type has to be inferred. So the member is probed
+    /// under that owner, and only a miss needs a reason.
+    ///
+    /// The reason on a miss is decided by *what the owner is*, which the graph
+    /// already knows: an owner that is a type in this repository makes the
+    /// miss [`UnresolvedReason::NeedsReceiverType`] — the declared type is
+    /// known and the member is not indexed, exactly as for a receiver, because
+    /// this track indexes neither Go embedding nor struct fields. An owner
+    /// that is anything else — a package-level `var`, a name this build has
+    /// never seen — leaves the site's type genuinely unstated, which is
+    /// [`UnresolvedReason::NeedsTypeInference`].
+    ///
+    /// Deliberately not applied to a `Call`. `T.Method(x)` is the same shape
+    /// in callee position and would resolve the same way, but every such row
+    /// already exists with an answer, and moving one is a change to a measured
+    /// number that this piece of work is not making. It is its own change,
+    /// with its own attribution.
+    ///
+    /// # A composite-literal key never links
+    ///
+    /// A site [`FileScope::literal_keys`] marks is the `Field` in
+    /// `T{Field: v}`, and the member probe is skipped for it entirely: it can
+    /// only ever find the wrong node. A Go struct field is not a node in this
+    /// build, and Go forbids a type from declaring a method and a field of one
+    /// name, so `T.Field` existing in the table proves `T` is *not* a struct —
+    /// a named map, slice or array type, whose literal key is an index
+    /// expression rather than a member name and whose same-named method the
+    /// key does not name. Linking it would emit a wrong edge, which is
+    /// strictly worse than an unresolved reference. Skipping the probe costs
+    /// nothing a compiling corpus could have earned.
+    pub fn resolve_field(
+        &self,
+        cfg: &GoModule,
+        r: &Reference,
+        scope: &FileScope,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        let unresolved = |reason| Resolution {
+            outcome: Outcome::Unresolved(reason),
+            candidates: vec![],
+        };
+        if matches!(r.target.root, TargetRoot::This { .. }) {
+            return self.resolve_receiver(scope, r, probe);
+        }
+        if r.target.root != TargetRoot::Name {
+            // `f().x`, `m[k].x`. No name is written, so no lookup was even
+            // attempted — and that is a different fact from a name whose type
+            // is unstated, which is why the taxonomy carries both.
+            return unresolved(UnresolvedReason::NeedsExpressionType);
+        }
+        // Split the path into the package it is rooted in, the owner, and the
+        // member. Only an import can supply a package here: a bare `a.b` is
+        // rooted in this file's own package.
+        let (pkg, owner, member) = match r.target.segments.as_slice() {
+            [owner, member] => (scope.pkg_path.clone(), owner, member),
+            [qualifier, owner, member] => match scope.imports.get(qualifier) {
+                Some(path) if self.is_internal(cfg, path) => (path.clone(), owner, member),
+                Some(path) => {
+                    return Resolution {
+                        outcome: Outcome::External(path.clone()),
+                        candidates: vec![],
+                    };
+                }
+                // `a.b.c` where `a` is a package-level value: its type is not
+                // stated at the site.
+                None => return unresolved(UnresolvedReason::NeedsTypeInference),
+            },
+            // A bare name, or a chain longer than one owner and one member.
+            _ => return unresolved(UnresolvedReason::NeedsTypeInference),
+        };
+        // A two-segment path may still be `pkg.Name` — a package member read
+        // through an import — which is the same lookup a call makes and must
+        // give the same answer.
+        if r.target.segments.len() == 2 && scope.imports.contains_key(owner) {
+            return self.resolve_call(cfg, r, scope, probe);
+        }
+        let mut candidates = Vec::new();
+        // A composite-literal key is the one shape that must not be probed:
+        // see the type-level note above. Every other site asks the member
+        // question the shape states.
+        if !scope.literal_keys.contains(&r.span.byte_start) {
+            let id = node_id(Domain::Go, &format!("{pkg}#{owner}.{member}"));
+            candidates.push(id);
+            if probe.probe(&id).is_some() {
+                return Resolution {
+                    outcome: Outcome::Resolved(id),
+                    candidates,
+                };
+            }
+        }
+        // The member is not indexed under that owner. Whether that is a gap in
+        // this track or a type nobody stated is decided by the owner itself.
+        let owner_id = node_id(Domain::Go, &format!("{pkg}#{owner}"));
+        candidates.push(owner_id);
+        let reason = match probe.probe(&owner_id) {
+            Some(Entry::Definition {
+                kind: DefKind::Type,
+                ..
+            }) => UnresolvedReason::NeedsReceiverType,
+            _ => UnresolvedReason::NeedsTypeInference,
+        };
+        Resolution {
+            outcome: Outcome::Unresolved(reason),
+            candidates,
+        }
+    }
+
     /// Classify a call reference against a file's scope.
     ///
     /// The dispatch is on `(root, segments.len())`. A name root with one
@@ -535,11 +675,39 @@ impl GoResolver {
                 // uses existed and is a separate piece of work — teaching the
                 // resolver which single-argument calls are conversions —
                 // rather than something this list can fix by growing.
-                let universe = match r.kind {
-                    RefKind::TypeUse => GO_UNIVERSE_TYPES,
-                    _ => GO_BUILTINS,
+                //
+                // A call written with exactly one argument is the third case,
+                // and it is why this is a *list* of lists. Go writes the
+                // conversion `string(b)` exactly as it writes the call `f(b)`,
+                // and the grammar files both as `call_expression`, so the site
+                // arrives here as a `Call` naming a predeclared *type*. It
+                // missed `GO_BUILTINS` and was reported
+                // `NoMatchingDefinition` — the bucket whose contract is that
+                // the lookup table was complete and the name absent. The name
+                // is not absent: it is in the universe block, one list over.
+                // That was 123 rows on `codeiq` and 269 on `caddy`, every one
+                // of them a predeclared type name, and they were the whole of
+                // that bucket on both corpora. A type cannot be called, so a
+                // one-argument call naming one is a conversion and nothing
+                // else; arity is what separates it, and no other arity can
+                // reach a type at all.
+                //
+                // Two names in the type list are excluded from that widening,
+                // because the argument for it does not reach them. `nil` and
+                // `comparable` are in [`GO_UNIVERSE_TYPES`] for the two
+                // positions that write them — a `case nil:` arm and a type
+                // constraint — and neither is a type a conversion can name, so
+                // `nil(x)` and `comparable(x)` are not Go. Admitting them
+                // would have the list claim something wider than "a type
+                // cannot be called"; no compiling corpus can reach either.
+                let universe: &[&[&str]] = match r.kind {
+                    RefKind::TypeUse => &[GO_UNIVERSE_TYPES],
+                    _ if r.argc == Some(1) && !matches!(name.as_str(), "nil" | "comparable") => {
+                        &[GO_BUILTINS, GO_UNIVERSE_TYPES]
+                    }
+                    _ => &[GO_BUILTINS],
                 };
-                let outcome = if universe.contains(&name.as_str()) {
+                let outcome = if universe.iter().any(|list| list.contains(&name.as_str())) {
                     Outcome::External("go:builtin".to_string())
                 } else {
                     Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
@@ -763,6 +931,7 @@ impl Resolver<GoLang> for GoResolver {
         }
         match r.kind {
             RefKind::Import => self.resolve_import(cfg, &r.raw_target, probe),
+            RefKind::FieldAccess => self.resolve_field(cfg, r, scope, probe),
             _ => self.resolve_call(cfg, r, scope, probe),
         }
     }
@@ -773,7 +942,6 @@ mod tests {
     use super::*;
     use crate::extract_go::Import;
     use crate::model::{DeclSpace, DefFacets, Encloser, RefTarget, Span};
-    use std::collections::HashSet;
 
     const NOWHERE: Span = Span {
         byte_start: 0,
@@ -807,6 +975,7 @@ mod tests {
             rel_path: rel_path.to_string(),
             package: Some(package.to_string()),
             imports,
+            literal_keys: Vec::new(),
         }
     }
 
@@ -846,6 +1015,7 @@ mod tests {
             pkg_path: "example.com/app/server".into(),
             imports,
             dot_imports: vec![],
+            literal_keys: HashSet::new(),
         }
     }
 

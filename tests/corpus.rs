@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 
 use arthron::extract_go::extract;
 use arthron::gate::{Counts, GateVerdict, evaluate, parse_baseline};
-use arthron::model::{DefKind, Lang, node_id, reason_name};
+use arthron::model::{DefKind, Lang, RefKind, node_id, reason_name};
 use arthron::pipeline::{scan_go, source_files};
 use arthron::query::{NodeKind, definition};
 use arthron::resolve_go::GoLang;
-use arthron::store::{NodeRecord, ReadStore, Store};
+use arthron::store::{NodeRecord, ReadStore, Store, StoredOutcome};
 
 mod support;
 
@@ -215,7 +215,13 @@ const CODEIQ: Census = Census {
     // so the store held `std:io/fs` for the import and nothing for the use
     // until type uses were emitted. Every other new Go reference in this
     // corpus reached a package it already had a node for.
-    externals: 84,
+    //
+    // 85 and not 84 since field reads: `syscall` is imported here and *named*
+    // only as a value (`syscall.SIGTERM`), so the store held `std:syscall` for
+    // the import and nothing for the use. An external package reached by a
+    // qualified reference is filed under its bare path and one reached by an
+    // import under `std:`, which is why the two are different nodes.
+    externals: 85,
     pinned: &[
         (
             "github.com/randomcodespace/codeiq/internal/analyzer#Analyzer",
@@ -300,7 +306,11 @@ const CADDY: Census = Census {
     // 249 and not 241, and the same shape as codeiq's 84: `crypto`,
     // `crypto/ed25519`, `crypto/rsa`, `crypto/x509/pkix`, `flag`, `hash`,
     // `math/big` and `sync/atomic` are each imported and used only as a type.
-    externals: 249,
+    //
+    // 251 and not 249 since field reads, and the same shape as codeiq's 85:
+    // `net/http/pprof` and `unicode/utf8` are each imported and named only as
+    // a value — `pprof.Index`, `utf8.RuneSelf`.
+    externals: 251,
     pinned: &[
         (
             "github.com/caddyserver/caddy/v2/modules/caddyhttp#Server",
@@ -436,6 +446,174 @@ fn assert_census(corpus: &str, census: &Census) {
             here.len(),
         );
     }
+}
+
+// -- the reference census ---------------------------------------------------
+//
+// The definition census above cannot see a *reference* rule go missing, and
+// neither can anything else here: the ratchet compares four occurrence totals,
+// so deleting one rule and gaining rows from another passes it, and the reason
+// tally is blind to a kind that stops being emitted at all. `ref-select` and
+// `ref-litkey` are 11,334 occurrences on codeiq and 13,723 on caddy, and every
+// one of them would vanish under a green suite without this. So each kind is
+// counted, exactly, on both axes — rows and occurrences, because a rule that
+// stops deduplicating moves one and not the other — with named rows beside the
+// totals, since a census pins the scale and only a name pins the shape.
+
+/// One corpus's reference surface: `(kind name, rows, occurrences)` for every
+/// kind it emits, and the rows worth naming.
+struct RefCensus {
+    /// Every [`RefKind`] the corpus produces, with its exact row and
+    /// occurrence counts. A kind with no rows is absent, and a kind that
+    /// appears here with zero would be a contradiction.
+    kinds: &'static [(&'static str, u64, u64)],
+    /// `(file, site text, outcome)`, where the outcome is rendered as the
+    /// *name* it reaches — so a reference linked to the wrong node fails here
+    /// rather than counting as one more `resolved`.
+    pinned: &'static [(&'static str, &'static str, &'static str)],
+}
+
+/// codeiq's, exactly.
+const CODEIQ_REFS: RefCensus = RefCensus {
+    kinds: &[
+        ("call", 9271, 13933),
+        ("import", 1694, 1694),
+        ("type-use", 6401, 9596),
+        ("field-access", 7436, 11334),
+    ],
+    pinned: &[
+        // A method value reached through the method's own receiver: `this.m`
+        // with no call, resolved from the type the signature states.
+        (
+            "internal/graph/indexes.go",
+            "s.searchByLabelFallback",
+            "resolved github.com/randomcodespace/codeiq/internal/graph#Store.searchByLabelFallback",
+        ),
+        // A package-qualified value read — the shape that was resolvable all
+        // along and simply not emitted.
+        (
+            "internal/analyzer/file_discovery.go",
+            "parser.LanguageUnknown",
+            "resolved github.com/randomcodespace/codeiq/internal/parser#LanguageUnknown",
+        ),
+        // A struct literal's key, carried as the target it names rather than
+        // the bare `Files` the site writes: two literals of two types in one
+        // function would otherwise share a row and an outcome.
+        (
+            "internal/analyzer/analyzer.go",
+            "Stats.Files",
+            "NeedsReceiverType",
+        ),
+        ("internal/analyzer/analyzer.go", "os.Stderr", "external os"),
+    ],
+};
+
+/// caddy's, exactly.
+const CADDY_REFS: RefCensus = RefCensus {
+    kinds: &[
+        ("call", 13979, 21388),
+        ("import", 2429, 2429),
+        ("type-use", 11015, 16544),
+        ("field-access", 8332, 13723),
+    ],
+    pinned: &[
+        (
+            "modules/caddyhttp/celmatcher.go",
+            "m.caddyPlaceholderFunc",
+            "resolved github.com/caddyserver/caddy/v2/modules/caddyhttp#MatchExpression.caddyPlaceholderFunc",
+        ),
+        (
+            "caddyconfig/httpcaddyfile/builtins.go",
+            "caddy.DefaultLoggerName",
+            "resolved github.com/caddyserver/caddy/v2#DefaultLoggerName",
+        ),
+        // A struct literal's key on a *dependency's* type: the type is stated
+        // and it is outside this repository, so the key is a link out of it
+        // and sits outside both terms of the rate.
+        (
+            "admin.go",
+            "certmagic.Config.Logger",
+            "external github.com/caddyserver/certmagic",
+        ),
+        ("admin.go", "adminHandler.mux", "NeedsReceiverType"),
+    ],
+};
+
+/// Count every stored reference row by kind, and read the named ones back as
+/// the node they reach.
+fn assert_ref_census(corpus: &str, census: &RefCensus) {
+    let root = Path::new(corpus);
+    if !corpus_present(root) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("graph.redb");
+    scan_go(root, &db).expect("scan");
+
+    let store = Store::open(&db).expect("store opens");
+    let snapshot = store.snapshot().expect("snapshot");
+    let names: BTreeMap<_, _> = snapshot
+        .nodes
+        .iter()
+        .filter_map(|(id, record)| match record {
+            NodeRecord::Definition { fqn, .. } => Some((*id, fqn.clone())),
+            NodeRecord::Package { import_path, .. } => Some((*id, import_path.clone())),
+            NodeRecord::External { .. } => None,
+        })
+        .collect();
+    let render = |record: &arthron::store::RefRecord| match &record.outcome {
+        StoredOutcome::Resolved(id) => format!(
+            "resolved {}",
+            names.get(id).map_or("<unnamed node>", String::as_str)
+        ),
+        StoredOutcome::External(package) => format!("external {package}"),
+        StoredOutcome::Unresolved(code) => reason_name(*code).to_string(),
+    };
+
+    let mut counted: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for (key, record) in &snapshot.rows {
+        let kind = RefKind::from_code(key.kind)
+            .unwrap_or_else(|| panic!("{corpus}: row kind {} names no variant", key.kind));
+        let entry = counted.entry(kind.name()).or_default();
+        entry.0 += 1;
+        entry.1 += u64::from(record.count);
+    }
+    println!("{corpus}: reference rows by kind {counted:?}");
+    let want: BTreeMap<&str, (u64, u64)> = census
+        .kinds
+        .iter()
+        .map(|(name, rows, occurrences)| (*name, (*rows, *occurrences)))
+        .collect();
+    assert_eq!(
+        counted, want,
+        "{corpus}: the reference census moved — a kind that stops being \
+         emitted moves no baseline and no reason bucket",
+    );
+
+    for (file, raw_target, outcome) in census.pinned {
+        let hits: Vec<String> = snapshot
+            .rows
+            .iter()
+            .filter(|(key, _)| key.file == *file && key.raw_target == *raw_target)
+            .map(|(_, record)| render(record))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{corpus}: expected one `{raw_target}` row in {file}, found {hits:?}",
+        );
+        assert_eq!(&hits[0], outcome, "{corpus}: {file} `{raw_target}`");
+    }
+}
+
+#[test]
+fn the_codeiq_reference_census_is_exact() {
+    assert_ref_census("corpus/go/codeiq", &CODEIQ_REFS);
+}
+
+#[test]
+fn the_caddy_reference_census_is_exact() {
+    assert_ref_census("corpus/go/caddy", &CADDY_REFS);
 }
 
 #[test]
@@ -629,26 +807,37 @@ fn deleting_a_file_from_the_collision_corpus_lands_a_cold_scans_store() {
 ///
 /// Every unresolved reason codeiq produces, exactly.
 ///
-/// Go's resolver runs no type checker, so a receiver whose type is not stated
-/// in the file is honestly unresolved — that is `NeedsTypeInference`, and it
-/// is most of this. `NoMatchingDefinition` is the rest: a name this build
-/// indexed a package for and found nothing under. `NeedsReceiverType` is the
-/// third and smallest: a member selected through the method's own receiver,
-/// whose type *is* stated, that the receiver type does not itself declare —
-/// Go promotes an embedded type's members and this track indexes neither
-/// embedding nor struct fields.
+/// `NeedsReceiverType` is now the largest, and that is the honest shape of
+/// this build: a member named on a type that *is* stated — through a method's
+/// receiver, through a struct literal's own type, or through a package's type
+/// — which this track cannot find because it indexes neither Go embedding nor
+/// struct fields. Go struct fields are not nodes here, so every field read and
+/// every struct-literal key lands in it.
+///
+/// `NeedsTypeInference` is the name whose type nobody wrote down, and
+/// `NeedsExpressionType` the operand that is not a name at all (`f().x`,
+/// `m[k].x`) — a distinction the taxonomy already carried and that nothing in
+/// Go had produced until reads were emitted.
+///
+/// `NoMatchingDefinition` is **absent, and that is the assertion**. Its
+/// contract is that the lookup table was complete and the name absent, which
+/// in a corpus that compiles means arthron's own bug — and every one of the
+/// 123 rows it held here was a predeclared type name at a conversion
+/// (`string(b)`, `int64(n)`), a name that is not absent at all. An empty
+/// bucket is what that contract looks like when it is kept.
 const CODEIQ_REASONS: &[(&str, u64)] = &[
-    ("NeedsReceiverType", 3),
-    ("NeedsTypeInference", 758),
-    ("NoMatchingDefinition", 123),
+    ("NeedsReceiverType", 3116),
+    ("NeedsTypeInference", 770),
+    ("NeedsExpressionType", 409),
 ];
 
 /// caddy's, exactly. Twice the tree and the same three reasons in the same
-/// proportion, which is the point of measuring two corpora.
+/// proportion, which is the point of measuring two corpora — and the same
+/// empty `NoMatchingDefinition`, from 269 rows of the same one cause.
 const CADDY_REASONS: &[(&str, u64)] = &[
-    ("NeedsReceiverType", 123),
-    ("NeedsTypeInference", 2308),
-    ("NoMatchingDefinition", 269),
+    ("NeedsReceiverType", 5852),
+    ("NeedsTypeInference", 2855),
+    ("NeedsExpressionType", 307),
 ];
 
 /// One baseline per corpus, never one aggregated number. They are written by
