@@ -13,6 +13,10 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Fixed
 
+- **A track switched off in `arthron.toml` no longer reprints its retained
+  measurement as current.** Its rows stay in the graph, because a skipped
+  track cannot say they are gone, but its tally is omitted from this run and a
+  language-named report marker says the track was switched off.
 - **FQN collision counts are now durable graph facts.** A mergeable
   multi-file definition such as C# `N#Shared` reports zero on a cold scan, an
   unchanged warm scan, direct `Store::report`, and a full-registry scan while
