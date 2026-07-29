@@ -110,6 +110,121 @@ Decisions and their rationale — including what was rejected — live in
   `ModuleNotFound`, the 187 on express and 800 on vue-core all out of the
   ambient class above, and fastify changed nothing.
 
+- **Go reads a member as well as calling one — the last two un-emitted Go
+  reference sites, and a re-base of two baselines.** The extractor emitted a
+  reference for a call through a selector and for a written type name, and
+  nothing for the two other places the Go grammar names a member: a selector
+  *read* (`pkg.Name`, `t.field`, `T.Method`, `x.y`) and a struct literal's
+  field keys (the `Field` in `T{Field: v}`). Both are now
+  `RefKind::FieldAccess` rows — 8,200 selector-read occurrences on `codeiq`
+  and 9,947 on `caddy`, 3,134 and 3,776 literal keys — which is every one of
+  those sites in both corpora, counted at the grammar and matched exactly by
+  what the store holds.
+
+  A read resolves the way a call of the same shape already did: `pkg.Name`
+  through the import table, a receiver root as `this` (so `c.Name` reaches
+  `Conn.Name`), a root some enclosing block binds as `LocalBinding`. What is
+  new is the owner written *at the site* — `T.Method`, `T{Field: v}`,
+  `pkg.T{Field: v}` — where the member is probed under that owner and a miss is
+  answered by what the owner is: `NeedsReceiverType` when the owner is a type
+  in this repository, `NeedsTypeInference` when it is not. Go struct fields are
+  not nodes in this build, so an honest field read lands in the first of those,
+  exactly as a receiver-rooted call already did. A map or array literal's key
+  is an expression rather than a member name and is not a reference; an
+  anonymous `struct{…}` has no canonical name, so neither it nor its fields are
+  nodes and its keys name nothing.
+
+  Both of those read the type *as written*, which is the whole of what one
+  file says. `map[K]V{k: v}` is rejected because the site writes `map`;
+  `type Registry map[K]V` used as `Registry{k: v}` is not, because the site
+  writes a name and the declaration is usually in a sibling file. So a named
+  map, slice or array type keyed by an identifier is reported as a member of
+  it — 9 rows / 90 occurrences on `codeiq` (`CapabilityMatrix` in
+  `internal/intelligence/query`), 0 on `caddy` — and lands in
+  `NeedsReceiverType`, inside the denominator, understating the rate rather
+  than flattering it: 69.5% as measured against 70.0% without those rows.
+  Closing it needs a fact no single file holds, so it is stated where it is
+  made (`named_type_path` in `extract_go.rs`, and `ref-litkey` in
+  `rules/go.yml`) rather than fixed by guessing. What is closed is the harm:
+  a literal key's member is never probed, so no such site can *link*. A named
+  non-struct type may carry a method, and a method name and a map-key
+  constant do not collide the way a method name and a field name do, so the
+  probe could only ever have found the wrong node — and a wrong edge is
+  strictly worse than an unresolved reference. Nothing a compiling corpus had
+  earned is lost by skipping it: a Go struct field is not a node in this
+  build, so every literal key on both corpora was already unresolved, and all
+  three Go gates hold their counts to the row.
+
+  Separately, **`NoMatchingDefinition` is now empty on both Go corpora**, from
+  123 rows on `codeiq` and 269 on `caddy`. Every one of them was a predeclared
+  type name at a conversion — `string(b)`, `int64(n)`, `byte(c)` — which Go
+  writes exactly as it writes a call, so the grammar filed it as a
+  `call_expression` and the resolver checked it against the predeclared
+  *functions*. The name was never absent; it was in the universe block, one
+  list over. That bucket's contract is that the lookup table was complete and
+  the name missing, which in a corpus that compiles means arthron's own bug, so
+  a row that does not mean that does not belong in it. A type cannot be called,
+  so a one-argument call naming one is a conversion and nothing else.
+
+  Measured, release build, cold store:
+
+  | baseline | resolved | unresolved | external | local_binding | rate |
+  |---|---:|---:|---:|---:|---:|
+  | `go-codeiq` | 8,016 → 9,794 | 884 → 4,295 | 12,210 → 12,595 | 4,113 → 9,873 | 90.1% → **69.5%** |
+  | `go-caddy` | 10,208 → 10,585 | 2,700 → 9,014 | 19,201 → 21,304 | 8,252 → 13,181 | 79.1% → **54.0%** |
+  | `go-probes` | 17 | 0 | 26 | 1 | 100.0% |
+
+  `go-probes` is byte-identical: it writes no selector read and no keyed
+  literal. No other baseline is touched — this is a Go rule file and a Go
+  resolver.
+
+  **A rate that falls here is not a regression.** It is the same argument the
+  `LocalBinding` unification made in the other direction: what is *in* the
+  rate's terms changed, so the two numbers are not measurements of the same
+  thing. Go's denominator — `resolved + unresolved` — grew from 8,900 to 14,089
+  on `codeiq` and from 12,908 to 19,599 on `caddy`, which is 5,312 and 6,960
+  new references inside the rate's terms less the 123 and 269 the conversion
+  fix moved out of it. 1,778 and 377 of the new occurrences resolved to a
+  definition, and nothing that resolved before stopped resolving.
+
+  **Attributed per row, not inferred from the totals.** A whole-row join
+  between a binary built from the previous commit and this one, keyed
+  `file + kind + declaration space + enclosing FQN + site text + argument count
+  + locally-bound`, over both corpora:
+
+  - The conversion fix moves **89 pre-existing rows on `codeiq` (123
+    occurrences) and 199 on `caddy` (269)**, every one of them
+    `NoMatchingDefinition → External("go:builtin")`, and nothing else: no row
+    added, none removed, and `resolved`, `local_binding` and every other reason
+    identical on both sides.
+  - The two new constructs then change **zero** pre-existing rows. Every
+    movement is a new row, all of kind `field-access`: 7,436 rows / 11,334
+    occurrences on `codeiq` and 8,332 / 13,723 on `caddy`. Split by construct
+    and outcome —
+
+    | corpus | construct | resolved | external | local_binding | NeedsReceiverType | NeedsTypeInference | NeedsExpressionType |
+    |---|---|---:|---:|---:|---:|---:|---:|
+    | `codeiq` | selector reads | 1,778 | 51 | 5,745 | 205 | 12 | 409 |
+    | `codeiq` | literal keys | 0 | 211 | 15 | 2,908 | 0 | 0 |
+    | `caddy` | selector reads | 377 | 1,184 | 4,634 | 2,904 | 541 | 307 |
+    | `caddy` | literal keys | 0 | 650 | 287 | 2,825 | 6 | 0 |
+
+    — where each row of the table sums to that construct's whole site count as
+    counted at the grammar: 8,200 and 3,134 on `codeiq`, 9,947 and 3,776 on
+    `caddy`. `caddy`'s literal keys sum to 3,768 there and not 3,776 because
+    the last eight land on two rows the *first* construct created rather than
+    on rows of their own: `TestBuffering` declares a function-local
+    `type args`, and the read `args.body` and the four literal keys
+    `args{body: …}` are one target, `LocalBinding` either way, so each of the
+    two keys they share carries five occurrences instead of one.
+
+  The reference census in `tests/corpus.rs` is new and is what makes this
+  observable next time: a rule that stops being emitted moves no baseline —
+  the gate compares four occurrence totals and another rule can supply them —
+  and moves no reason bucket either. Rows *and* occurrences are now pinned per
+  kind on both corpora, because a rule that stops deduplicating moves one and
+  not the other.
+
 - **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
   deliberate re-base of seven baselines.** The ratified rule is that a
   reference whose root is a parameter or a local variable names a thing that is
