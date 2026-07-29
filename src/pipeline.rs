@@ -888,7 +888,7 @@ fn reread<L: Language>(
     // that asked for them has resolved them, so the doubling slack on the
     // single largest file is a term of peak RSS. A small one — without this
     // line three cold runs of a 5.35M-line Go tree measured 278,444–286,660 kB
-    // against 286,404–286,872 kB over five runs with it, which is no
+    // against 285,124–286,872 kB over seven runs with it, which is no
     // difference at that spread — but this is the path where the term exists
     // at all, and the walk's, which drops a file's references where it makes
     // them, no longer pays for it.

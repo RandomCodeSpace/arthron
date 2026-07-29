@@ -60,7 +60,7 @@
 //! Against a 17,873-file / 5,353,211-line Go tree yielding 1,678,021 Go
 //! references: **286,872 kB peak RSS, 109.62 s wall** — 54.7% of the
 //! 524,288 kB ceiling, and 20.5 s per 1M lines against a 60 s target. That is
-//! the worst of five runs, which spanned 286,404–286,872 kB and
+//! the worst of seven runs, which spanned 285,124–286,872 kB and
 //! 106.56–109.62 s. The commit before this work measures 830,612 kB and
 //! 832,468 kB on two independent runs, 158.4% and 158.8% of the ceiling.
 //! `docs/decisions.md` carries the full table, including the corpora where
