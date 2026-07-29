@@ -39,6 +39,25 @@ The resulting extraction delta is **33,625 `FieldAccess` occurrences**:
 deduplication means these occurrence counts are not predictions of committed
 row movement; the corpus join and re-base own that measurement.
 
+The Fastify whole-row join measures **2,865 resolved, 5,348 external, 26,957
+local-binding and 2,530 unresolved** occurrences: a rate denominator of
+**5,395 of 37,700 references (14.3%)**, from **4,435 of 31,136 (14.2%)**.
+The member-read change adds 960 denominator occurrences but 6,564 total
+occurrences, and its rate is consequently 63.0% -> 53.1% (2,795 / 4,435 ->
+2,865 / 5,395). This is an accounting result, not a reason to relabel local
+names: the shape audit finds 1,889 appeared lexical name-root rows marked
+`locally_bound`, which policy correctly keeps outside both terms.
+
+The card's Fastify >=40% denominator-share expectation is a repository
+program forecast, not a Stream D-only acceptance. D owns only 6,565 authorized
+Fastify syntax occurrences; even the invalidly optimistic allocation that put
+every one in `Resolved + Unresolved` could reach only
+**(4,435 + 6,565) / (31,136 + 6,565) = 11,000 / 37,701 = 29.2%**. The later
+Stream J owns resolving the existing 21,542 local bindings that the forecast
+also needs. The measured D result is 14.3%; it must not be inflated by
+reclassifying locals, emitting computed or write-only names, or duplicating
+nested, call, construction, or type-position rows.
+
 **Decided: emit the outermost static `member_expression` once as
 `FieldAccess`.** It reuses the same target roots, binding verdict and resolver
 paths as call position: an imported namespace member can resolve, a lexical
@@ -59,6 +78,12 @@ its source text as a member name would invent a target.
 
 *Rejected: emitting type-position members again.* Their existing `TypeUse` row
 is both more precise and already in the measurement.
+
+*Rejected: changing outcomes to satisfy the D-only percentage.* `LocalBinding`
+means a lexical name is not a node, and the extractor's shape tests separately
+guard its partition from imported, expression, receiver, computed, write-only
+and call/new sites. A percentage is not authority to create a wrong edge or a
+second reference.
 
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 

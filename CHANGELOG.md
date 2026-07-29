@@ -23,6 +23,15 @@ Decisions and their rationale — including what was rejected — live in
   Type-position members also keep their existing `TypeUse` rows instead of
   gaining a duplicate field-access row.
 
+  The Fastify denominator share is measured at **14.2% -> 14.3%**
+  (4,435 / 31,136 -> 5,395 / 37,700); D adds 960 denominator occurrences and
+  6,564 total occurrences. The card's >=40% figure is a D+J program forecast:
+  D's complete 6,565-site syntax allocation has a 29.2% arithmetic ceiling
+  even if every site were incorrectly placed in the denominator. Stream J owns
+  the separate 21,542-local-binding resolution work that the forecast includes.
+  This change preserves the honest `LocalBinding` partition instead of gaming
+  the percentage with false or duplicate rows.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added
