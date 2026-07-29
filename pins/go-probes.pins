@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/go/probes --pins pins/go-probes.pins --write --commit 6a2275c
+#   arthron pin corpus/go/probes --pins pins/go-probes.pins --write --commit 4ed8b2c1c974afafc255df3390543931cea3b938
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -10,8 +10,8 @@
 # What it is. One line per resolved reference row, grouped under the file the
 # reference sits in: the row's 64-bit key hash, and an index into the [targets]
 # dictionary above it. The key hashed is the store's own canonical row key —
-# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
-# so a row's identity here is the row's identity there.
+# kind, declaration space, enclosing FQN, site text, arity, file-local argument
+# types, binding verdict — so a row's identity here is the row's identity there.
 #
 # What it is for. `arthron gate` compares four integers, and a reference that
 # resolves to the *wrong* definition moves none of them: it is still one
@@ -38,7 +38,7 @@
 # rather than read.
 format = 1
 corpus = "corpus/go/probes"
-commit = "6a2275c"
+commit = "4ed8b2c1c974afafc255df3390543931cea3b938"
 targets = 14
 rows = 17
 
@@ -60,26 +60,26 @@ pkg example.com/arthron/probes/testpkg/api_test
 
 [rows]
 clauseheader/clauseheader.go
-	4612fd55bfb16ae7 0
-	651cdc092cade04d 0
-	a7c4612a45571877 0
+	0838449f5cd7ebd8 0
+	4d8763e84caea63c 0
+	f9e4e4dd7ac433f8 0
 dotted/consumer.go
-	57c575a709706261 8
-	7f6e4044ed519fa9 2
-	d5f363fbb19f7454 9
-	d829058bf4725475 1
+	14fd07a2be80798c 2
+	47c305f19b885a59 1
+	687d7a323dad3bba 9
+	f54d2ebcff3a9fff 8
 pkgrename/consumer.go
-	20542e40cdd33166 11
-	2d67900e9d473c97 4
-	cb4db02768debd2c 3
-	d8817f6fa32394cd 10
+	46c2082a4ecee40b 4
+	7e87c6187c704969 3
+	87e1083804abb5d8 10
+	94800de4e6f8df88 11
 shadowpair/shadowpair.go
-	dbd37634c65129cc 5
+	9b09de94aebe252a 5
 testpkg/api/api_ext_test.go
-	07e5492977a69c18 12
-	49554994ec07ca79 6
+	9c69f4982197ed10 6
+	b573b49cc4baefff 12
 testpkg/api_test/api_ext_test.go
-	c800f64a2d90b21e 13
-	e51e3c9a27a4733a 7
+	8f494024f398317b 7
+	d2b557b76c9b3277 13
 testpkg/api_test/api_test.go
-	806f6435a148d28c 7
+	3bd2478dc48fb7bf 7
