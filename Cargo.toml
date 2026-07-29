@@ -40,11 +40,11 @@ include = [
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# Build release artifacts on a pull request or manual dispatch, but only a tag
-# push may upload them or create a GitHub Release.
+# This repository's reviewed release.yml has no pull_request trigger. Retain
+# upload mode because its generated build condition also enables manual dispatch.
 pr-run-mode = "upload"
-# release.yml has the repository's tag and dispatch safety policy below; retain
-# cargo-dist's generated build graph while preventing regeneration from erasing it.
+# release.yml is a reviewed project-maintained cargo-dist customization; see
+# docs/decisions.md for the required regeneration review.
 allow-dirty = ["ci"]
 # Where to host releases
 hosting = "github"
@@ -52,6 +52,11 @@ hosting = "github"
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # The installers to generate for each app
 installers = []
+
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 
 [dependencies]
 ast-grep-config = "=0.44.1"
