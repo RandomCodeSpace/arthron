@@ -9,6 +9,19 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Fixed
+
+- **FQN collision counts are now durable graph facts.** A mergeable
+  multi-file definition such as C# `N#Shared` reports zero on a cold scan, an
+  unchanged warm scan, direct `Store::report`, and a full-registry scan while
+  retaining every declaration site. A genuinely nonmergeable identity remains
+  one collision in each path. Collision classification sorts declarations by
+  file and line, checks every unordered pair, and is persisted before phase 2
+  restores file currency. The store schema moves from 9 to 10 and rebuilds
+  older caches.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added

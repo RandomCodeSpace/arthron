@@ -48,14 +48,16 @@ use redb::{
 
 use crate::UnresolvedReason;
 use crate::lang::Entry;
-use crate::model::{DefFacets, DefKind, Lang, NodeId, reason_code};
+use crate::model::{
+    DeclSpace, DefFacets, DefKind, Definition, Lang, NodeId, Params, Span, reason_code,
+};
 
 /// On-disk schema generation.
 ///
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -163,6 +165,8 @@ pub const NOT_ALL_CURRENT: &str = "this store no longer claims to be current for
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const NODES: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("nodes");
+const COLLISION_DISPOSITIONS: TableDefinition<&[u8; 16], u8> =
+    TableDefinition::new("collision_dispositions");
 const REFS: TableDefinition<(&str, &[u8]), &[u8]> = TableDefinition::new("refs");
 /// One edge, as the tables key it: `(src, dst, `[`crate::model::RefKind`]` code)`.
 type EdgeKey<'a> = (&'a [u8; 16], &'a [u8; 16], u8);
@@ -222,6 +226,104 @@ pub struct DeclSite {
     /// record be re-derived when a file is forgotten, instead of stranding
     /// the departing file's answer on the survivor.
     pub payload: NodePayload,
+    /// The declaration facts a language's [`crate::lang::Resolver::mergeable`]
+    /// implementation may inspect.
+    ///
+    /// Present only for definition nodes. Keeping them per site lets the
+    /// pipeline ask about every surviving pair after an incremental replace;
+    /// an event-local vector cannot answer for declarations written by an
+    /// earlier scan.
+    pub merge_definition: Option<StoredDefinition>,
+}
+
+/// Serializable mirror of [`Definition`] for durable collision disposition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub struct StoredDefinition {
+    kind: u8,
+    name: String,
+    owner: Vec<String>,
+    space: u8,
+    facets: u16,
+    params: Option<StoredParams>,
+    byte_start: u32,
+    byte_end: u32,
+    line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+struct StoredParams {
+    count: u32,
+    varargs: bool,
+    types: Vec<String>,
+}
+
+impl StoredDefinition {
+    /// Capture every field a resolver may read when comparing declarations.
+    pub fn from_definition(def: &Definition) -> StoredDefinition {
+        StoredDefinition {
+            kind: def.kind.code(),
+            name: def.name.clone(),
+            owner: def.owner.clone(),
+            space: def.space.code(),
+            facets: def.facets.bits(),
+            params: def.params.as_ref().map(|params| StoredParams {
+                count: params.count,
+                varargs: params.varargs,
+                types: params.types.clone(),
+            }),
+            byte_start: def.span.byte_start,
+            byte_end: def.span.byte_end,
+            line: def.span.line,
+        }
+    }
+
+    fn definition(&self) -> Result<Definition, String> {
+        Ok(Definition {
+            kind: DefKind::from_code(self.kind)
+                .ok_or_else(|| format!("stored definition kind {} is invalid", self.kind))?,
+            name: self.name.clone(),
+            owner: self.owner.clone(),
+            space: DeclSpace::from_code(self.space)
+                .ok_or_else(|| format!("stored declaration space {} is invalid", self.space))?,
+            facets: DefFacets::from_bits(self.facets),
+            params: self.params.as_ref().map(|params| Params {
+                count: params.count,
+                varargs: params.varargs,
+                types: params.types.clone(),
+            }),
+            span: Span {
+                byte_start: self.byte_start,
+                byte_end: self.byte_end,
+                line: self.line,
+            },
+        })
+    }
+}
+
+/// The language's durable verdict for a multi-file definition identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum CollisionDisposition {
+    /// At least one declaration pair describes different entities.
+    Collision,
+    /// Every unordered declaration pair describes one entity.
+    Mergeable,
+}
+
+impl CollisionDisposition {
+    fn code(self) -> u8 {
+        match self {
+            CollisionDisposition::Collision => 0,
+            CollisionDisposition::Mergeable => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<CollisionDisposition, String> {
+        match code {
+            0 => Ok(CollisionDisposition::Collision),
+            1 => Ok(CollisionDisposition::Mergeable),
+            _ => Err(format!("stored collision disposition {code} is invalid")),
+        }
+    }
 }
 
 /// A stored node: something a reference can name.
@@ -371,7 +473,7 @@ impl NodeRecord {
     /// its directory is what a package *is*, and an external node reached
     /// from four hundred files is four hundred references, not four hundred
     /// declarations — counting either would drown the signal §3.5 asks for.
-    fn is_definition_collision(&self) -> bool {
+    fn is_multi_file_definition(&self) -> bool {
         let NodeRecord::Definition { declarations, .. } = self else {
             return false;
         };
@@ -717,6 +819,8 @@ pub struct Snapshot {
     pub files: BTreeMap<String, Option<[u8; 32]>>,
     /// Every node, by identity.
     pub nodes: BTreeMap<NodeId, NodeRecord>,
+    /// Durable language verdict for every classified multi-file definition.
+    pub collision_dispositions: BTreeMap<NodeId, CollisionDisposition>,
     /// Every reference row, by key.
     pub rows: BTreeMap<RefKey, RefRecord>,
     /// Every edge `(src, dst, kind code)`.
@@ -903,6 +1007,9 @@ impl Store {
         let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+            let mut dispositions = txn
+                .open_table(COLLISION_DISPOSITIONS)
+                .map_err(|e| e.to_string())?;
             let mut owned = txn.open_table(DEF_OWNED).map_err(|e| e.to_string())?;
             let mut files = txn.open_table(FILES).map_err(|e| e.to_string())?;
             let cands = txn
@@ -920,6 +1027,11 @@ impl Store {
                 for id in &previous.nodes {
                     note_payload(&nodes, &mut before, id)?;
                     drop_site(&mut nodes, id, &file.path)?;
+                    if !read_node(&nodes, id)?
+                        .is_some_and(|record| record.is_multi_file_definition())
+                    {
+                        dispositions.remove(id).map_err(|e| e.to_string())?;
+                    }
                 }
                 let mut ids = Vec::with_capacity(file.nodes.len());
                 let mut seen: HashSet<NodeId> = HashSet::with_capacity(file.nodes.len());
@@ -941,7 +1053,7 @@ impl Store {
                 let record = read_node(&nodes, id)?;
                 if record
                     .as_ref()
-                    .is_some_and(NodeRecord::is_definition_collision)
+                    .is_some_and(NodeRecord::is_multi_file_definition)
                 {
                     colliding.push(*id);
                 }
@@ -978,9 +1090,109 @@ impl Store {
         let mut out = Vec::new();
         for id in ids {
             if let Some(record) = read_node(&nodes, id)?
-                && record.is_definition_collision()
+                && record.is_multi_file_definition()
             {
                 out.push(*id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Current declaration definitions for the requested multi-file nodes.
+    ///
+    /// Sites are already sorted by `(file, line)`, so the returned vectors
+    /// have one deterministic order regardless of batch or creation order.
+    pub fn collision_definitions(
+        &self,
+        ids: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, Vec<Definition>>, String> {
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = BTreeMap::new();
+        for id in ids {
+            let Some(record) = read_node(&nodes, id)? else {
+                continue;
+            };
+            if !record.is_multi_file_definition() {
+                continue;
+            }
+            let mut definitions = Vec::with_capacity(record.declarations().len());
+            for site in record.declarations() {
+                let stored = site.merge_definition.as_ref().ok_or_else(|| {
+                    format!(
+                        "definition {}:{} has no stored merge facts",
+                        site.file, site.line
+                    )
+                })?;
+                definitions.push(stored.definition()?);
+            }
+            out.insert(*id, definitions);
+        }
+        Ok(out)
+    }
+
+    /// Persist language collision verdicts after phase 1 and before any file
+    /// regains its currency claim in phase 2.
+    pub fn set_collision_dispositions(
+        &self,
+        touched: &BTreeSet<NodeId>,
+        dispositions: &BTreeMap<NodeId, CollisionDisposition>,
+    ) -> Result<(), String> {
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = txn
+                .open_table(COLLISION_DISPOSITIONS)
+                .map_err(|e| e.to_string())?;
+            for id in touched {
+                match dispositions.get(id) {
+                    Some(disposition) => {
+                        table
+                            .insert(id, disposition.code())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    None => {
+                        table.remove(id).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Declaring files for these identities, excluding files already leaving.
+    ///
+    /// A deletion can change a persisted collision verdict without applying
+    /// a definition half for any surviving file. The pipeline withdraws these
+    /// files' currency claims before deleting, then restores them through its
+    /// normal waking round after the new verdict is durable.
+    pub fn declaration_files(
+        &self,
+        ids: &BTreeSet<NodeId>,
+        excluding: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, String> {
+        if ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let mut out = BTreeSet::new();
+        for id in ids {
+            let Some(record) = read_node(&nodes, id)? else {
+                continue;
+            };
+            if !record.is_multi_file_definition() {
+                continue;
+            }
+            for site in record.declarations() {
+                if !excluding.contains(&site.file) {
+                    out.insert(site.file.clone());
+                }
             }
         }
         Ok(out)
@@ -1198,6 +1410,9 @@ impl Store {
         let invalidated;
         {
             let mut nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+            let mut dispositions = txn
+                .open_table(COLLISION_DISPOSITIONS)
+                .map_err(|e| e.to_string())?;
             let mut refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
             let mut edges = txn.open_table(EDGES).map_err(|e| e.to_string())?;
             let mut rev = txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
@@ -1225,6 +1440,11 @@ impl Store {
                     for id in &previous.nodes {
                         note_payload(&nodes, &mut before, id)?;
                         drop_site(&mut nodes, id, path)?;
+                        if !read_node(&nodes, id)?
+                            .is_some_and(|record| record.is_multi_file_definition())
+                        {
+                            dispositions.remove(id).map_err(|e| e.to_string())?;
+                        }
                     }
                 }
                 def_owned.remove(path.as_str()).map_err(|e| e.to_string())?;
@@ -1504,6 +1724,7 @@ impl Store {
         let mut snapshot = Snapshot {
             files: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            collision_dispositions: BTreeMap::new(),
             rows: BTreeMap::new(),
             edges: BTreeSet::new(),
             candidates: BTreeMap::new(),
@@ -1521,6 +1742,16 @@ impl Store {
         for entry in nodes.iter().map_err(|e| e.to_string())? {
             let (key, value) = entry.map_err(|e| e.to_string())?;
             snapshot.nodes.insert(*key.value(), decode(value.value())?);
+        }
+        let dispositions = txn
+            .open_table(COLLISION_DISPOSITIONS)
+            .map_err(|e| e.to_string())?;
+        for entry in dispositions.iter().map_err(|e| e.to_string())? {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            snapshot.collision_dispositions.insert(
+                *key.value(),
+                CollisionDisposition::from_code(value.value())?,
+            );
         }
         let refs = txn.open_table(REFS).map_err(|e| e.to_string())?;
         for entry in refs.iter().map_err(|e| e.to_string())? {
@@ -1588,10 +1819,22 @@ impl Store {
         // the number is a property of the graph: a warm scan that touched
         // one file reports the same count a cold scan of the same tree does.
         let nodes = txn.open_table(NODES).map_err(|e| e.to_string())?;
+        let dispositions = txn
+            .open_table(COLLISION_DISPOSITIONS)
+            .map_err(|e| e.to_string())?;
         for entry in nodes.iter().map_err(|e| e.to_string())? {
-            let (_, value) = entry.map_err(|e| e.to_string())?;
+            let (id, value) = entry.map_err(|e| e.to_string())?;
             let record: NodeRecord = decode(value.value())?;
-            if record.is_definition_collision() {
+            let disposition = dispositions
+                .get(id.value())
+                .map_err(|e| e.to_string())?
+                .map(|guard| CollisionDisposition::from_code(guard.value()))
+                .transpose()?
+                // Direct store API callers do not have a resolver to provide
+                // a language verdict. Preserve the mechanical collision
+                // answer unless the pipeline explicitly persisted mergeable.
+                .unwrap_or(CollisionDisposition::Collision);
+            if record.is_multi_file_definition() && disposition == CollisionDisposition::Collision {
                 report.fqn_collisions += 1;
             }
         }
@@ -1944,6 +2187,8 @@ impl ReadStore {
 /// the generation and fingerprint that decided the drop.
 fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.delete_table(NODES).map_err(|e| e.to_string())?;
+    txn.delete_table(COLLISION_DISPOSITIONS)
+        .map_err(|e| e.to_string())?;
     txn.delete_table(REFS).map_err(|e| e.to_string())?;
     txn.delete_table(EDGES).map_err(|e| e.to_string())?;
     txn.delete_table(REV_EDGES).map_err(|e| e.to_string())?;
@@ -1959,6 +2204,8 @@ fn drop_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
 /// Create every graph table, so a later read transaction finds it.
 fn create_graph(txn: &redb::WriteTransaction) -> Result<(), String> {
     txn.open_table(NODES).map_err(|e| e.to_string())?;
+    txn.open_table(COLLISION_DISPOSITIONS)
+        .map_err(|e| e.to_string())?;
     txn.open_table(REFS).map_err(|e| e.to_string())?;
     txn.open_table(EDGES).map_err(|e| e.to_string())?;
     txn.open_table(REV_EDGES).map_err(|e| e.to_string())?;
@@ -2341,6 +2588,7 @@ mod tests {
             file: file.to_string(),
             line,
             payload: NodePayload::Definition(0, 0),
+            merge_definition: None,
         }
     }
 
