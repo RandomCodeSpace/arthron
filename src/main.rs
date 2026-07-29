@@ -8,13 +8,21 @@
 //! - **0** — the command ran and this is the answer.
 //! - **1** — the command ran and the answer is *no*: a gate regression, a
 //!   query that matched nothing or matched several. Never an error.
-//! - **2** — nothing was measured: usage, I/O, or the environment.
+//! - **2** — no verdict: usage, I/O, or the environment, *and* a gate
+//!   comparison that could not be made at all.
 //!
 //! `scan` has no verdict to fail, so `scan` never returns 1. Everything that
 //! can go wrong for it — a store another scan is holding, a root that is not
 //! there, a directory it cannot create, a config file that will not parse — is
 //! a 2. That distinction is the point: a build may retry a 2 and must never
 //! retry a 1, and a lock collision answering 1 made the two indistinguishable.
+//!
+//! 2 is not only the environment. `gate` answers 2 when the baseline's or the
+//! run's `resolved + unresolved` is zero: there is no rate on one side, so the
+//! comparison is neither a pass nor a regression and must not be reported as
+//! either. That one is deterministic — retrying it returns 2 again until the
+//! corpus, the configuration or the baseline changes — while the
+//! environmental cases are the ones worth retrying.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,13 +54,19 @@ const EXIT_GATE_FAILED: u8 = 1;
 /// neither means the run failed. A store that would not open is
 /// [`EXIT_USAGE`] instead, because then there is no answer at all.
 const EXIT_NO_ANSWER: u8 = 1;
-/// Exit code for usage, I/O and environment problems: nothing was measured, so
-/// neither a pass nor a failure may be reported.
+/// Exit code for usage, I/O and environment problems, and for a gate
+/// comparison that could not be made: nothing was measured, or nothing could
+/// be concluded, so neither a pass nor a failure may be reported.
 ///
 /// The environment half is what keeps 1 meaning one thing. A store another
 /// scan is holding is not a worse measurement, it is no measurement, and a
 /// build that cannot tell the two apart either retries a real regression or
 /// fails a run that only needed to wait.
+///
+/// [`GateVerdict::Error`] shares this code for the same reason and not the
+/// same cause: a zero `resolved + unresolved` on either side leaves no rate to
+/// compare, which is no verdict rather than a bad one. It is deterministic,
+/// so unlike the environmental cases a retry answers 2 again.
 const EXIT_USAGE: u8 = 2;
 
 /// Where a query looks for the graph when `--db` is not given: the path
@@ -153,8 +167,15 @@ enum Command {
     Scan {
         /// Repository root.
         path: PathBuf,
-        /// Database file (default: the config's `db`, else
-        /// <path>/.arthron/graph.redb).
+        /// Database file. Default: the repository's `arthron.toml` `db`, else
+        /// <path>/.arthron/graph.redb.
+        ///
+        /// Resolved against the current working directory, while the config's
+        /// `db` is resolved against the scanned repository — so
+        /// `arthron scan ./repo --db graph.redb` writes `./graph.redb`, not
+        /// `./repo/graph.redb`. That asymmetry is deliberate: the config's
+        /// `db` is the repository speaking about itself and may not leave its
+        /// own tree, and this flag is you speaking about your machine.
         #[arg(long)]
         db: Option<PathBuf>,
         /// Print one JSON document instead of the report.
@@ -164,17 +185,22 @@ enum Command {
     /// Scan a corpus and compare its counts against a committed baseline.
     ///
     /// Exit codes: 0 pass (or a successful --rebase), 1 gate failure — the run
-    /// worked and the numbers are worse — and 2 for usage, I/O or the
-    /// environment, where nothing was measured at all. The baseline's
-    /// `corpus` and `commit` fields are
+    /// worked and the numbers are worse — and 2 where there is no verdict:
+    /// usage, I/O or the environment, and also a comparison that could not be
+    /// made, which is a baseline or a run whose `resolved + unresolved` is
+    /// zero. There is no rate on that side, so it is neither a pass nor a
+    /// regression; unlike the environmental cases it is deterministic, and a
+    /// retry answers 2 again. The baseline's `corpus` and `commit` fields are
     /// provenance: printed, never verified — a vendored corpus snapshot
     /// carries no git metadata to check them against.
     ///
     /// `arthron.toml` at the corpus root is read for its globs and its
     /// `[tracks]` table, so a gate measures the file set a scan measures. Its
-    /// `db` key is deliberately ignored: a gate is only meaningful against a
-    /// cold store, and a config that pointed it at a warm one would move the
-    /// number without moving the graph.
+    /// `db` key is deliberately ignored: where this run writes is not the
+    /// scanned repository's decision to make. `--db` on the command line is
+    /// yours, and it is honoured as given — including at a store that already
+    /// holds a graph, which is then re-scanned warm. The default is a fresh
+    /// temporary store, because that is what makes the number a cold one.
     #[command(after_long_help = json::CONFIG_HELP)]
     Gate {
         /// Corpus root.
@@ -188,8 +214,14 @@ enum Command {
         #[arg(long)]
         baseline: PathBuf,
         /// Database file. Default: a fresh temporary store, deleted after the
-        /// run. The gate is only meaningful against a cold store, so pass
-        /// this only to keep the graph for inspection.
+        /// run.
+        ///
+        /// Honoured as given, and resolved against the current working
+        /// directory rather than the corpus root. A path that already holds a
+        /// graph is re-scanned warm, and a warm store measures only what
+        /// changed — so pass this to keep the graph for inspection, not to
+        /// produce a number worth committing. The cold default is what makes
+        /// a baseline reproducible.
         #[arg(long)]
         db: Option<PathBuf>,
         /// Overwrite the baseline with what this run measured instead of
@@ -222,8 +254,13 @@ enum Command {
     Query {
         #[command(subcommand)]
         verb: QueryVerb,
-        /// Database file (default: the config's `db`, else
-        /// .arthron/graph.redb).
+        /// Database file. Default: the working directory's `arthron.toml`
+        /// `db`, else .arthron/graph.redb.
+        ///
+        /// A query names a symbol rather than a repository, so its config is
+        /// the one you are standing in — both the file and this flag are read
+        /// relative to the working directory, so there is no asymmetry here
+        /// of the kind `scan --db` documents.
         #[arg(long, global = true)]
         db: Option<PathBuf>,
         /// Print one JSON document instead of the report.
@@ -239,9 +276,14 @@ enum Command {
     /// No socket is opened and no address is bound.
     #[command(after_long_help = mcp::HELP)]
     Mcp {
-        /// The graph the query tools read (default: the config's `db`, else
-        /// .arthron/graph.redb). `scan_repo` writes wherever its own
-        /// arguments say.
+        /// The graph the query tools read. Default: the working directory's
+        /// `arthron.toml` `db`, else .arthron/graph.redb — both read relative
+        /// to the working directory, since the server is started in the
+        /// repository it answers about.
+        ///
+        /// `scan_repo` writes wherever its own arguments say: its `db`
+        /// argument, else the scanned repository's `arthron.toml` `db`, else
+        /// <path>/.arthron/graph.redb. This flag does not decide that.
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -848,6 +890,30 @@ fn report_text(report: &arthron::store::Report) -> String {
             tally.external,
             tally.local_binding,
             unresolved
+        );
+        // How much of this language's reference surface the rate is taken
+        // over. `external` and `local_binding` sit outside both terms by
+        // design, and on a real corpus they are most of the rows: a rate of
+        // 90.1% over a third of the references is a different claim from
+        // 90.1% over all of them, and the two are indistinguishable unless
+        // the share is printed beside the number. Not in `--json`: the
+        // document carries all four counts, so a consumer derives this
+        // exactly, and the schema does not grow a field for arithmetic.
+        let counted = Counts {
+            resolved: tally.resolved,
+            external: tally.external,
+            local_binding: tally.local_binding,
+            unresolved,
+        };
+        let (denominator, total) = (counted.denominator(), counted.total());
+        let share = if total == 0 {
+            "n/a (nothing to measure)".to_string()
+        } else {
+            format!("{:.1}%", denominator as f64 / total as f64 * 100.0)
+        };
+        outln!(
+            text,
+            "             rate denominator {denominator} of {total} references ({share})"
         );
         for (code, count) in &tally.unresolved {
             outln!(text, "             {} {count}", reason_name(*code));

@@ -89,6 +89,29 @@ Decisions and their rationale — including what was rejected — live in
   target needs the type of a binding no other file can see. Python loses
   almost nothing this way: django 0 and flask 7.
 
+- **`arthron scan` prints the rate's denominator under every language line.**
+  `rate denominator 8900 of 25223 references (35.3%)`: `(resolved +
+  unresolved)` over every reference the language emitted. Excluding `external`
+  and `local_binding` from both of the rate's terms is correct and it also
+  makes the denominator a fraction of the surface — codeiq's Go rate of 90.1%
+  covers 35.3% of Go's references, fastify's 63.0% covers 14.2% of
+  JavaScript's — and a rate published without its share reads as a claim about
+  the whole. Text report only, on `scan` and on `gate`. **`--json` is
+  unchanged and its `schema` does not move**: the document already carries all
+  four counts, so a consumer derives the share exactly, and a field for
+  arithmetic is not a field.
+
+- **The tier-1 claim is retracted to what is measured.** The README, the
+  changelog and the report line called tier 1 "call-graph resolution". It is
+  not: method dispatch mostly does not resolve, and `NeedsTypeInference` — 758
+  of codeiq's 884 unresolved rows — is most of what tier 1 leaves unlinked in
+  all five languages. A call through a receiver whose type its own signature
+  states does resolve, in all five, since the locals re-base above. Tier 1 now
+  reads "definitions, references, and cross-file import and function-call
+  resolution", and the scan line prints `tier 1: call, import and type-use
+  resolution` — which is what the denominator holds. Nothing measured changed;
+  no baseline moved.
+
 ### Fixed
 
 - **Two Go definition defects the new type-use surface exposed.** `def-type`
@@ -142,6 +165,41 @@ Decisions and their rationale — including what was rejected — live in
   numbers this run did not produce.
 - A symbolic link out of the tree is now named as such whatever is on the other
   end of it; the message no longer says "definitions" about a directory.
+- **Documented exit code 2 was narrower than the code.** Every place that
+  described it — the README table, `--json`'s help, the module docs, `gate
+  --help` — said "nothing was measured: usage, I/O or the environment, safe to
+  retry". `gate` also returns 2 for `GateVerdict::Error`, a baseline or a run
+  whose `resolved + unresolved` is zero: measured, deterministic, and not
+  worth retrying. The exit code is unchanged and the documentation now says
+  both halves and which is which.
+- **`gate --help` contradicted itself about `db`.** It refused the config's
+  `db` key on the grounds that "a gate is only meaningful against a cold
+  store", and then documented a `--db` flag that is honoured as given —
+  including at a store that already holds a graph, which is re-scanned warm.
+  The real reason the config key is ignored is that where the run writes is
+  not the scanned repository's decision; `--db` is yours, warm store and all,
+  which is why the default is a fresh temporary one.
+- **`arthron mcp --help` stated the wrong default for `scan_repo`'s `db`.** It
+  said `<path>/.arthron/graph.redb`, omitting that the scanned repository's
+  `arthron.toml` `db` wins first — which the tool's own JSON schema already
+  said correctly. The two now agree.
+- **The `--db` cwd-versus-config-root asymmetry is written down.** A config's
+  `db` is resolved against the repository it sits in; `--db` is resolved
+  against the current working directory, so `arthron scan ./repo --db
+  graph.redb` writes `./graph.redb`. Documented on `scan --db`, on `gate
+  --db`, and in the README's `arthron.toml` section. Behaviour unchanged.
+- **`CONTEXT.md` defined an edge as a resolved reference only.** An `External`
+  reference produces an edge too, to the dependency node it reached — that is
+  what makes `query impact` see a call into a dependency instead of a dead
+  end. The glossary entry now says `Resolved` **or** `External`, and that
+  `Unresolved` produces none.
+- **Two comments still described the tier-2 tracks as disabled** — `src/lib.rs`
+  and the `REGISTRY` list — from before all fourteen went live. Comments only.
+- The 0.0.1 changelog omitted the Windows baseline round-trip fix; it is now
+  recorded under that release, where it shipped.
+- The kubernetes cold-scan RSS that failed the hard gate is quoted as its
+  measured value, **729.1 MiB**, everywhere it appears. It was rounded to
+  729.0 in the summaries downstream of the benchmark that measured it.
 
 ## [0.0.1] - 2026-07-28
 
@@ -152,11 +210,15 @@ and `arthron mcp` answer questions about the result.
 ### Added
 
 - **Nineteen live languages, tiered and declared.** Five at **tier 1** —
-  definitions, references and call-graph resolution: Go, Java, JavaScript,
-  TypeScript, Python. Fourteen at **tier 2** — definitions, structure and
-  imports, with no verified call edges, so the rate is an import-resolution
-  rate: C++, C#, Kotlin, Swift, Ruby, PHP, Rust, Scala, Dart, Elixir, Haskell,
-  Lua, Bash, HCL. Each language family is its own identity domain; JavaScript
+  definitions, references, and cross-file import and function-call resolution,
+  the rate taken over call sites, imports and type uses together: Go, Java,
+  JavaScript, TypeScript, Python. Tier 1 is which reference kinds are in the
+  denominator, not a claim that the call graph is complete; method dispatch
+  through a value whose type must be inferred is `NeedsTypeInference` and is
+  most of what tier 1 leaves unlinked. Fourteen at **tier 2** — definitions,
+  structure and imports, with no verified call edges, so the rate is an
+  import-resolution rate: C++, C#, Kotlin, Swift, Ruby, PHP, Rust, Scala,
+  Dart, Elixir, Haskell, Lua, Bash, HCL. Each language family is its own identity domain; JavaScript
   and TypeScript deliberately share one, and Kotlin/Scala deliberately do not
   share Java's.
 - **The three-outcome resolution contract.** Extractors emit references and
@@ -201,7 +263,7 @@ and `arthron mcp` answer questions about the result.
 ### Changed
 
 - **Cold-scan memory is bounded.** Peak RSS on a 1,789,247-line kubernetes
-  scan fell from **729.0 MiB to 337.1 MiB** — 66% of the hard 512 MB ceiling on
+  scan fell from **729.1 MiB to 337.1 MiB** — 66% of the hard 512 MB ceiling on
   the 2 vCPU reference hardware, six runs spanning 0.2% — by committing every
   phase per 500 files, capping the redb page cache on both open paths, and
   having phase 2 consume extracted facts per file instead of borrowing the whole
@@ -222,7 +284,15 @@ and `arthron mcp` answer questions about the result.
   rows has no entry and is not a rate of zero. A scan that produced no
   reference row at all now says so in one line instead of naming a language to
   fill the space.
-
+- **A baseline re-based on Windows could not be read back.** `--rebase` wrote
+  the corpus path as the platform spells it, so on Windows the `corpus` field
+  came out `corpus\go\codeiq`. The baseline format has no escapes, and its
+  reader rejects a `\` for exactly that reason — so the gate wrote a file no
+  later gate run could parse, and the next run failed as a usage error on a
+  baseline it had just produced itself. The path is now written `/`-separated
+  on every platform, the way the repo-relative keys in the store already are,
+  and `\` joined `"` and newline in the set of characters a provenance field
+  is refused for before anything is written rather than after.
 ### Packaging
 
 - Crate metadata for crates.io: description, license, repository, keywords,

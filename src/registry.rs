@@ -86,9 +86,10 @@ pub static REGISTRY: &[Track] = &[
     crate::track_python::TRACK,
     // The ratified tier-2 tracks, in ratified order: the full tier-2 set
     // (C++ through Scala), then the best-effort set (Dart through HCL).
-    // Every one carries `scan: None`, so listing them here adds no read, no
-    // row and no report line — it only fixes their place in the order, so
-    // that the commit bringing one up is confined to that track's own file.
+    // Every one is live and carries `scan: Some(...)`. Their place in this
+    // list was fixed while they were still `None`, which is what kept each
+    // going-live commit confined to that track's own file — the zero-conflict
+    // rule above, and the reason this list did not move when they landed.
     crate::track_cpp::TRACK,
     crate::track_csharp::TRACK,
     crate::track_kotlin::TRACK,

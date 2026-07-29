@@ -47,16 +47,24 @@ release.)
 arthron scan ./my-repo
 ```
 
-Builds or refreshes the graph and prints per-language resolution rates with a
-breakdown of every unresolved reason:
+Builds or refreshes the graph and prints per-language resolution rates, the
+share of the language's references the rate is taken over, and a breakdown of
+every unresolved reason:
 
 ```console
 $ arthron scan corpus/go/codeiq
-go           resolved 8016     external 12210    local-binding 4113     unresolved 884      rate 90.1% (tier 1: call-graph resolution)
+go           resolved 8016     external 12210    local-binding 4113     unresolved 884      rate 90.1% (tier 1: call, import and type-use resolution)
+             rate denominator 8900 of 25223 references (35.3%)
              NoMatchingDefinition 123
              NeedsTypeInference 758
              NeedsReceiverType 3
 ```
+
+The second line is the one to read next to the rate. `external` and
+`local_binding` sit outside both of the rate's terms by design, and on a real
+corpus they are most of the rows — so 90.1% here is a rate over 35.3% of the
+references Go emitted, not over all of them. Both numbers are true and neither
+stands in for the other.
 
 The graph is stored at `<PATH>/.arthron/graph.redb` unless `--db` says
 otherwise. Re-running against an unchanged tree re-reads the stored graph: the
@@ -105,7 +113,7 @@ what a build script reads.
 | --- | --- |
 | `0` | The command ran and this is the answer. |
 | `1` | The command ran and the answer is **no**: a gate regression, a query that matched nothing or matched several. Never an error — never retry it. |
-| `2` | Nothing was measured: usage, I/O or the environment. A config that will not parse, a root that is not there, a store another scan is holding open for writing. Safe to retry. |
+| `2` | No verdict. Usually nothing was measured: usage, I/O or the environment — a config that will not parse, a root that is not there, a store another scan is holding open for writing — and those are safe to retry. `gate` also answers `2` when the comparison could not be made at all: a baseline or a run whose `resolved + unresolved` is zero has no rate on that side, so the result is neither a pass nor a regression. That case is deterministic; retrying returns `2` again. |
 
 `scan` has no verdict to fail, so `scan` never returns `1`; every failure it can
 have is a `2`. A store somebody else is scanning against is the case that
@@ -147,6 +155,17 @@ not get to choose which of your files a scan replaces. The command-line `--db`
 flag is deliberately free to name anything, inside the tree or out: you typing
 a path is you saying it, and a file sitting in a scanned tree is not.
 
+The two are also resolved against different directories, and the difference is
+worth knowing before it surprises you. The config's `db` is relative to the
+**repository it sits in**; `--db` is relative to your **current working
+directory**. So `arthron scan ./repo --db graph.redb` writes `./graph.redb`,
+not `./repo/graph.redb`. That follows from what each one is — the file is the
+repository speaking about itself, the flag is you speaking about your machine
+— and it is why the file may not leave its own tree and the flag may go
+anywhere. `query` and `mcp` have no such split: they take no repository
+argument, so both their config and their `--db` are read relative to the
+working directory.
+
 The `[tracks]` keys are track names, not language names, and the two differ in
 one place: **`ecma` is the single track that owns JavaScript and TypeScript**,
 so `ecma = false` switches off both and neither `javascript` nor `typescript`
@@ -162,34 +181,60 @@ be conjured by config.
 
 ## Languages
 
-Nineteen live languages. Coverage is *tiered and declared* rather than assumed,
-and every rate below is derived from a committed baseline in
-[`baselines/`](baselines) — `resolved / (resolved + unresolved)`, measured on a
-release build against a pinned corpus snapshot.
+Nineteen live languages. Coverage is *tiered and declared* rather than assumed.
+Every column below is read out of a committed baseline in
+[`baselines/`](baselines), measured on a release build against a pinned corpus
+snapshot; the two derived columns are `rate = resolved / (resolved +
+unresolved)` and `rate denom. = (resolved + unresolved) / (resolved + external
++ local_binding + unresolved)`, the share of the language's references the rate
+is taken over.
 
-### Tier 1 — definitions, references, and call-graph resolution
+### Tier 1 — definitions, references, and cross-file import and function-call resolution
 
 Five languages: Go, Java, JavaScript, TypeScript, Python. The rate is over call
-sites, imports and type uses.
+sites, imports and type uses — the reference kinds these tracks emit.
 
-| language | corpus | resolved | unresolved | rate |
-|---|---|---:|---:|---:|
-| Go | `codeiq` `853efde` | 8,016 | 884 | **90.1%** |
-| Go | `caddy` `853efde` | 10,208 | 2,700 | **79.1%** |
-| Go | `probes` `synthetic` | 17 | 0 | **100.0%** † |
-| Java | `commons-lang` `598dfc1` | 34,217 | 16,279 | **67.8%** |
-| Java | `gson` `3ff35d6` | 12,885 | 6,105 | **67.9%** |
-| JavaScript | `fastify` `94bcbcc` | 2,795 | 1,640 | **63.0%** |
-| JavaScript | `express` `dbac741` | 2,267 | 5,553 | **29.0%** |
-| TypeScript | `vue-core` `fa2885d` | 26,297 | 27,945 | **48.5%** |
-| TypeScript | `zod` `1fb56a5` | 10,043 | 26,821 | **27.2%** |
-| Python | `django` `af67523` | 19,103 | 6,185 | **75.5%** |
-| Python | `flask` `22d9247` | 1,185 | 877 | **57.5%** |
+That is not a complete call graph, and this section used to say it was. Method
+dispatch mostly does not resolve yet. A call through a receiver whose type the
+enclosing signature states does resolve — Go joined the other four in doing so
+— but a call on a value whose type has to be inferred is `NeedsTypeInference`,
+which is 758 of `codeiq`'s 884 unresolved rows and the great majority of what
+tier 1 leaves unlinked in every one of the five. Closing it is the
+type-environment work, and it has not been done. What tier 1 delivers today is
+definitions, references, and cross-file import and function-call resolution
+with the accounting to show which is which.
 
-Six of these eleven numbers moved in one deliberate re-base — Go's two real
-corpora, both Java corpora, both Python corpora. `probes` is byte-identical on
-every column this table prints. Three changes landed together, and they do not
-move a rate for the same reason:
+The last column is the rate's denominator as a share of every reference the
+language emitted: `(resolved + unresolved) / (resolved + external +
+local_binding + unresolved)`. `external` and `local_binding` are legitimately
+outside both of the rate's terms, and they are also most of the rows on a real
+corpus — Go's 90.1% is a rate over 35.3% of what Go emitted. Publishing the
+rate without the share invites reading the first number as the second.
+
+<!-- tier-1 table: every column is read straight out of baselines/<file>.toml.
+     rate  = resolved / (resolved + unresolved)
+     denom = (resolved + unresolved) / (resolved + external + local_binding + unresolved)
+     Refresh = re-read the baselines and re-render these rows; nothing here is
+     derived from anything else, and no row may be edited by hand. -->
+| language | corpus | resolved | external | local-binding | unresolved | rate | rate denom. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Go | `codeiq` `853efde` | 8,016 | 12,210 | 4,113 | 884 | **90.1%** | 35.3% |
+| Go | `caddy` `853efde` | 10,208 | 19,201 | 8,252 | 2,700 | **79.1%** | 32.0% |
+| Go | `probes` `synthetic` | 17 | 26 | 1 | 0 | **100.0%** † | 38.6% |
+| Java | `commons-lang` `598dfc1` | 34,217 | 63,385 | 15,162 | 16,279 | **67.8%** | 39.1% |
+| Java | `gson` `3ff35d6` | 12,885 | 16,737 | 6,706 | 6,105 | **67.9%** | 44.8% |
+| JavaScript | `fastify` `94bcbcc` | 2,795 | 5,159 | 21,542 | 1,640 | **63.0%** | 14.2% |
+| JavaScript | `express` `dbac741` | 2,267 | 701 | 3,039 | 5,553 | **29.0%** | 67.6% |
+| TypeScript | `vue-core` `fa2885d` | 26,297 | 3,694 | 9,564 | 27,945 | **48.5%** | 80.4% |
+| TypeScript | `zod` `1fb56a5` | 10,043 | 1,952 | 8,143 | 26,821 | **27.2%** | 78.5% |
+| Python | `django` `af67523` | 19,103 | 13,326 | 8,405 | 6,185 | **75.5%** | 53.8% |
+| Python | `flask` `22d9247` | 1,185 | 2,317 | 2,146 | 877 | **57.5%** | 31.6% |
+
+Six of these eleven rates moved in one deliberate re-base — Go's two real
+corpora, both Java corpora, both Python corpora. `probes` held every column
+but `external`, which went from 0 to 26 when the Go track began emitting type
+uses. Three changes landed together, and they do not move a rate for the same
+reason:
 
 1. **One `LocalBinding` rule.** A reference whose *root* is a parameter or a
    local is reported beside `external`, outside **both** terms of the rate,
@@ -224,24 +269,31 @@ other file can see. It does not claim the target has no name.
 
 Fourteen languages. A tier-2 rate is an **import-resolution rate**, and it is
 not comparable to a tier-1 rate — different denominators measuring different
-things.
+things. The `rate denom.` column is the same share as tier 1's, and it is where
+that difference shows: `local_binding` is zero across all fourteen, because a
+track that emits no expression-level reference has no local to bind.
 
-| language | corpus | resolved | unresolved | rate |
-|---|---|---:|---:|---:|
-| Rust | `ripgrep` `e89fff8` | 649 | 13 | **98.0%** |
-| Elixir | `plug` `9fa11c8` | 116 | 1 | **99.1%** |
-| Kotlin | `okio` `6604edb` | 683 | 80 | **89.5%** |
-| C++ | `fmt` `1be298e` | 127 | 18 | **87.6%** |
-| Ruby | `rack` `e1f22fd` | 291 | 50 | **85.3%** |
-| PHP | `guzzle` `3aeea04` | 360 | 170 | **67.9%** |
-| C# | `serilog` `6d9fc0b` | 53 | 0 | **100.0%** |
-| Dart | `collection` `dec28c1` | 75 | 0 | **100.0%** |
-| Haskell | `aeson` `e00ef15` | 278 | 0 | **100.0%** |
-| HCL | `terraform-aws-vpc` `3ffbd46` | 23 | 0 | **100.0%** |
-| Swift | `alamofire` `7595cbc` | 40 | 0 | **100.0%** |
-| Scala | `upickle` `87e0b24` | 267 | 364 | **42.3%** |
-| Lua | `busted` `56e6d68` | 99 | 153 | **39.3%** |
-| Bash | `bats-core` `eb7f42f` | 0 | 6 | **0.0%** |
+<!-- tier-2 table: every column is read straight out of baselines/<file>.toml.
+     rate  = resolved / (resolved + unresolved)
+     denom = (resolved + unresolved) / (resolved + external + local_binding + unresolved)
+     Refresh = re-read the baselines and re-render these rows; nothing here is
+     derived from anything else, and no row may be edited by hand. -->
+| language | corpus | resolved | external | local-binding | unresolved | rate | rate denom. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Rust | `ripgrep` `e89fff8` | 649 | 411 | 0 | 13 | **98.0%** | 61.7% |
+| Elixir | `plug` `9fa11c8` | 116 | 55 | 0 | 1 | **99.1%** | 68.0% |
+| Kotlin | `okio` `6604edb` | 683 | 1,136 | 0 | 80 | **89.5%** | 40.2% |
+| C++ | `fmt` `1be298e` | 127 | 254 | 0 | 18 | **87.6%** | 36.3% |
+| Ruby | `rack` `e1f22fd` | 291 | 1 | 0 | 50 | **85.3%** | 99.7% |
+| PHP | `guzzle` `3aeea04` | 360 | 265 | 0 | 170 | **67.9%** | 66.7% |
+| C# | `serilog` `6d9fc0b` | 53 | 36 | 0 | 0 | **100.0%** | 59.6% |
+| Dart | `collection` `dec28c1` | 75 | 49 | 0 | 0 | **100.0%** | 60.5% |
+| Haskell | `aeson` `e00ef15` | 278 | 796 | 0 | 0 | **100.0%** | 25.9% |
+| HCL | `terraform-aws-vpc` `3ffbd46` | 23 | 1 | 0 | 0 | **100.0%** | 95.8% |
+| Swift | `alamofire` `7595cbc` | 40 | 130 | 0 | 0 | **100.0%** | 23.5% |
+| Scala | `upickle` `87e0b24` | 267 | 0 | 0 | 364 | **42.3%** | 100.0% |
+| Lua | `busted` `56e6d68` | 99 | 0 | 0 | 153 | **39.3%** | 100.0% |
+| Bash | `bats-core` `eb7f42f` | 0 | 0 | 0 | 6 | **0.0%** | 100.0% |
 
 Tier 2 is honest rather than degraded: you get symbols, structure and imports,
 you do not get call edges, and the tool says which is which instead of inventing
@@ -261,7 +313,7 @@ not as evidence about real Go.
 
 **A rate is never aggregated.** There is no "arthron resolves N% of code"
 figure, and there will not be one. Rates are reported per language, per corpus,
-because averaging Go's call-graph rate with Bash's import rate produces a number
+because averaging Go's tier-1 rate with Bash's import rate produces a number
 that means nothing and hides every regression underneath it. Nineteen languages,
 twenty-five committed baselines, twenty-five separate numbers.
 
@@ -278,6 +330,15 @@ dependency import is not a resolver failure, and a reference to a parameter or
 local variable is excluded by policy — locals are not nodes. Neither may be used
 to inflate a rate, so the gate checks both for drift and fails on any movement
 in either.
+
+**The rate's denominator is published beside it, every time.** Excluding those
+two is correct and it also makes the denominator smaller than the surface the
+scan read — on `fastify` the rate covers 14.2% of the references JavaScript
+emitted. A high rate over a small share is a real measurement and a partial
+one, and the only way to read it as the first without the second is for the
+second not to be there. So `arthron scan` prints it under every language line,
+and every table here carries it as a column. It is not in `--json`: the
+document already has all four counts, and a consumer divides.
 
 **The gate refuses a shrinking denominator.** At a 100% baseline a *dropped*
 `Resolved` row would otherwise be invisible, and at any baseline a dropped
@@ -308,14 +369,14 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 
 The first two rows are the shipped build. The third is not, and the column
 says so rather than letting three numbers read as one benchmark run: warm
-timing was last measured on the binary whose cold RSS was 729 MiB, and the
+timing was last measured on the binary whose cold RSS was 729.1 MiB, and the
 memory work that replaced it was explicitly not aimed at the warm path (warm
 cost is per-file re-read and re-hash). Warm RSS improved 13% on the same
 change; warm wall time has not been re-run on the reference hardware, so the
 number here is the last one that was actually executed and it is labelled
 rather than refreshed by inference.
 
-The RSS number is the interesting one: it was **729.0 MiB** and failed the hard
+The RSS number is the interesting one: it was **729.1 MiB** and failed the hard
 gate. Bounding it — per-500-file commits on every phase, a capped redb page
 cache, phase 2 consuming facts per file — brought it to 337.1 MiB, and
 byte-identity of the resulting graph was proven at the level of full blake3
