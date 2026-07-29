@@ -343,6 +343,7 @@ fn import(facts: &mut FileFacts<HsLang>, node: &SgNode) {
         // a local: `LocalBinding` does not apply to this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         // An import sits at the top of a file, inside no declaration, so the
         // driver sources its edge at the file's own module node — which is
         // exactly what an import graph's edges start at.

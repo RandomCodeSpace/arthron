@@ -27,7 +27,8 @@
 //! That last hand-off holds exactly as far as the vanished rows are *not*
 //! replaced. A row's key is its identity here, so a row whose key changed is
 //! one that vanished and one that appeared — and an edit to what the key is
-//! made of (`argc`, `enclosing`, `raw_target`, `locally_bound`) re-keys rows
+//! made of (`argc`, `arg_types`, `enclosing`, `raw_target`, `locally_bound`)
+//! re-keys rows
 //! wholesale while preserving all four gated integers by construction. The
 //! counting gate cannot see that: nothing shrank, nothing drifted, and the
 //! re-keyed rows simply stopped being checked. So the part of `vanished` that
@@ -311,8 +312,8 @@ fn header(corpus: &str, commit: &str, pins_path: &str) -> String {
 # What it is. One line per resolved reference row, grouped under the file the
 # reference sits in: the row's 64-bit key hash, and an index into the [targets]
 # dictionary above it. The key hashed is the store's own canonical row key —
-# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
-# so a row's identity here is the row's identity there.
+# kind, declaration space, enclosing FQN, site text, arity, file-local argument
+# types, binding verdict — so a row's identity here is the row's identity there.
 #
 # What it is for. `arthron gate` compares four integers, and a reference that
 # resolves to the *wrong* definition moves none of them: it is still one
@@ -529,6 +530,8 @@ pub struct TargetMoved {
     pub raw_target: String,
     /// Argument count at the site, when the extractor recorded one.
     pub argc: Option<u32>,
+    /// File-locally evident argument types at the site, when recorded.
+    pub arg_types: Option<Vec<String>>,
     /// The target it was pinned to.
     pub was: String,
     /// The target it resolves to now.
@@ -626,10 +629,23 @@ impl PinVerdict {
         }
         for m in &self.moved {
             let argc = m.argc.map_or_else(|| "-".to_string(), |n| n.to_string());
+            let arg_types = m
+                .arg_types
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |types| types.join(","));
             let _ = writeln!(
                 out,
-                "  target_moved {}:{} [{} {} argc={}] in {}\n    site  {}\n    was   {}\n    now   {}",
-                m.file, m.line, m.kind, m.space, argc, m.enclosing, m.raw_target, m.was, m.now,
+                "  target_moved {}:{} [{} {} argc={} arg_types={}] in {}\n    site  {}\n    was   {}\n    now   {}",
+                m.file,
+                m.line,
+                m.kind,
+                m.space,
+                argc,
+                arg_types,
+                m.enclosing,
+                m.raw_target,
+                m.was,
+                m.now,
             );
         }
         for v in &self.vanished {
@@ -711,6 +727,7 @@ pub fn compare(pins: &Pins, rows: &[ResolvedRow]) -> Result<PinVerdict, String> 
                             enclosing: row.key.enclosing.clone(),
                             raw_target: row.key.raw_target.clone(),
                             argc: row.key.argc,
+                            arg_types: row.key.arg_types.clone(),
                             was: was.to_string(),
                             now: row.target.clone(),
                         });

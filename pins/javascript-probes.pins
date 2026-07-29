@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/javascript/probes --pins pins/javascript-probes.pins --write --commit 6a2275c
+#   arthron pin corpus/javascript/probes --pins pins/javascript-probes.pins --write --commit 4ed8b2c1c974afafc255df3390543931cea3b938
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -10,8 +10,8 @@
 # What it is. One line per resolved reference row, grouped under the file the
 # reference sits in: the row's 64-bit key hash, and an index into the [targets]
 # dictionary above it. The key hashed is the store's own canonical row key —
-# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
-# so a row's identity here is the row's identity there.
+# kind, declaration space, enclosing FQN, site text, arity, file-local argument
+# types, binding verdict — so a row's identity here is the row's identity there.
 #
 # What it is for. `arthron gate` compares four integers, and a reference that
 # resolves to the *wrong* definition moves none of them: it is still one
@@ -38,7 +38,7 @@
 # rather than read.
 format = 1
 corpus = "corpus/javascript/probes"
-commit = "6a2275c"
+commit = "4ed8b2c1c974afafc255df3390543931cea3b938"
 targets = 4
 rows = 6
 
@@ -50,10 +50,10 @@ pkg greeter.js
 
 [rows]
 caller.js
-	139781bb105c2ac5 2
-	613e6e98aaf2ebf9 0
-	917e3cb3df00d5b9 3
-	df56cb2d850d0732 0
-	f199ae33e69b3390 1
+	03df03a9528d3dfe 3
+	1fd297283bdb6376 0
+	2b5b3effc5d3169f 0
+	540a50929e1205d2 2
+	63f89acf242a0232 1
 greeter.js
-	50f7acb1e1bf8383 0
+	9d7a7d4c2362f397 0

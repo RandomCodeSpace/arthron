@@ -1002,6 +1002,7 @@ mod tests {
             target,
             locally_bound: false,
             argc: None,
+            arg_types: None,
             enclosing: None,
             span: NOWHERE,
         }

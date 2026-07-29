@@ -943,6 +943,7 @@ fn reference(node: &SgNode, spec: &ImportSpec, namespace: String) -> Reference {
         // expression-level reference to be bound.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         // A directive inside a braced `namespace N { using …; }` belongs to
         // that namespace. One at compilation-unit scope belongs to no
         // definition, and the driver sources it at the file's own container.

@@ -1860,6 +1860,7 @@ fn header_ref(
         },
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: None,
         span,
     }
@@ -2008,6 +2009,7 @@ fn reference(
         locally_bound: is_locally_bound(header, kind, &target, site),
         target,
         argc,
+        arg_types: None,
         enclosing: enclosing_definition(node),
         span: span_of(node),
     }

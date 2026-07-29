@@ -635,6 +635,7 @@ impl Ctx {
             target,
             locally_bound,
             argc,
+            arg_types: None,
             enclosing: enclosing_definition(node),
             span: span_of(node),
         });
@@ -674,6 +675,7 @@ impl Ctx {
             target,
             locally_bound: false,
             argc: None,
+            arg_types: None,
             enclosing: enclosing_definition(node),
             span,
         });
@@ -990,6 +992,7 @@ fn export_reference(ctx: &mut Ctx, node: &SgNode, specifier: Option<String>, spa
         target,
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: None,
         span: span_of(node),
     });
@@ -1026,6 +1029,7 @@ fn reexport_reference(
         },
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: Some(Encloser {
             path,
             kind: DefKind::Alias,
@@ -1213,6 +1217,7 @@ fn export_statement(ctx: &mut Ctx, node: &SgNode) {
                     },
                     locally_bound: false,
                     argc: None,
+                    arg_types: None,
                     enclosing: Some(Encloser {
                         path,
                         kind: DefKind::Alias,

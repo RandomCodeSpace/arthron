@@ -254,7 +254,8 @@ fn a_scan_that_agrees_with_its_pins_holds_every_row() {
 
 #[test]
 fn a_target_that_moved_fails_and_names_the_row() {
-    let rows = fixture_rows();
+    let mut rows = fixture_rows();
+    rows[1].key.arg_types = Some(vec!["int".to_string()]);
     let pins = parse(&render("corpus/x", "abc1234", "pins/x.pins", &rows).expect("rendering"))
         .expect("parsing");
 
@@ -267,6 +268,7 @@ fn a_target_that_moved_fails_and_names_the_row() {
     let moved = &verdict.moved[0];
     assert_eq!(moved.file, wrong[1].key.file);
     assert_eq!(moved.raw_target, wrong[1].key.raw_target);
+    assert_eq!(moved.arg_types, wrong[1].key.arg_types);
     assert_eq!(moved.line, wrong[1].line);
     assert_eq!(moved.was, rows[1].target);
     assert_eq!(moved.now, "def x/y.Wrong");
@@ -278,6 +280,7 @@ fn a_target_that_moved_fails_and_names_the_row() {
         "target_moved".to_string(),
         moved.file.clone(),
         moved.raw_target.clone(),
+        "arg_types=int".to_string(),
         moved.was.clone(),
         moved.now.clone(),
         moved.line.to_string(),
@@ -325,7 +328,8 @@ fn a_row_that_vanished_is_flagged_and_does_not_fail() {
 /// change that retires a pin file without failing anything.
 ///
 /// A row's key is its identity here, so touching what the key is made of —
-/// `argc`, `enclosing`, `raw_target`, `locally_bound` — re-keys rows wholesale.
+/// `argc`, `arg_types`, `enclosing`, `raw_target`, `locally_bound` — re-keys
+/// rows wholesale.
 /// Every re-keyed row reads as one that vanished and one that appeared, and
 /// both of those were legal: the counting gate was said to own the vanished
 /// half. It cannot own this one. Re-keying preserves `resolved`, `external`,
@@ -473,6 +477,23 @@ fn two_rows_of_one_file_that_differ_only_in_arity_are_two_pins() {
 }
 
 #[test]
+fn two_rows_of_one_file_that_differ_only_in_argument_types_are_two_pins() {
+    let mut rows = fixture_rows();
+    rows[0].key.arg_types = Some(vec!["int".to_string()]);
+    let mut other = rows[0].clone();
+    other.key.arg_types = Some(vec!["java.lang.String".to_string()]);
+    other.target = "def x/y.StringOverload".to_string();
+    rows.push(other.clone());
+    assert_ne!(row_hash(&rows[0].key), row_hash(&other.key));
+
+    let pins = parse(&render("corpus/x", "abc1234", "pins/x.pins", &rows).expect("rendering"))
+        .expect("parsing");
+    let verdict = compare(&pins, &rows).expect("a rendered pin file names every target it uses");
+    assert!(!verdict.failed(), "{}", verdict.report());
+    assert_eq!(verdict.held, rows.len() as u64);
+}
+
+#[test]
 fn a_pin_file_whose_header_disagrees_with_its_body_is_refused() {
     let rows = fixture_rows();
     let text = render("corpus/x", "abc1234", "pins/x.pins", &rows).expect("rendering");
@@ -496,6 +517,7 @@ fn fixture_rows() -> Vec<arthron::pins::ResolvedRow> {
         enclosing: enclosing.to_string(),
         raw_target: raw.to_string(),
         argc,
+        arg_types: None,
         locally_bound: false,
     };
     vec![

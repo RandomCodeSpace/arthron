@@ -412,6 +412,7 @@ mod tests {
             },
             locally_bound: false,
             argc: None,
+            arg_types: None,
             enclosing: None,
             span: Span {
                 byte_start: 0,
