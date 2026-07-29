@@ -388,6 +388,79 @@ public class Imports { }
     );
 }
 
+/// §15.12.2: argument types written at the invocation site narrow a shared
+/// arity key to the one applicable full-signature definition.
+#[test]
+fn written_argument_types_select_full_signature_overloads() {
+    let scan = scan(&[(
+        "com/acme/Arguments.java",
+        r#"package com.acme;
+public class Arguments {
+    static class Built {
+        Built(int value) {}
+        Built(String value) {}
+    }
+
+    static void byInt(int value) {}
+    static void byInt(String value) {}
+    static void byString(int value) {}
+    static void byString(String value) {}
+    static void widen(long value) {}
+    static void widen(String value) {}
+    static void box(Integer value) {}
+    static void box(String value) {}
+    static void object(Object value) {}
+    static void object(String value) {}
+    static void casted(long value) {}
+    static void casted(String value) {}
+    static void created(Integer value) {}
+    static void created(String value) {}
+    static void unknown(int value) {}
+    static void unknown(String value) {}
+    static Object value() { return null; }
+
+    static void calls() {
+        Integer integer = 1;
+        byInt(1);
+        byString("text");
+        widen(1);
+        box(1);
+        object(integer);
+        casted((long) 1);
+        created(new Integer(1));
+        new Built(1);
+        unknown(value());
+    }
+}
+"#,
+    )]);
+
+    for (raw, target) in [
+        ("byInt", "com.acme#Arguments.byInt(int)"),
+        ("byString", "com.acme#Arguments.byString(String)"),
+        ("widen", "com.acme#Arguments.widen(long)"),
+        ("box", "com.acme#Arguments.box(Integer)"),
+        ("object", "com.acme#Arguments.object(Object)"),
+        ("casted", "com.acme#Arguments.casted(long)"),
+        ("created", "com.acme#Arguments.created(Integer)"),
+    ] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED {target}"),
+            "`{raw}` selected the wrong full-signature target",
+        );
+    }
+    assert_eq!(
+        scan.one("Built", RefKind::New),
+        "RESOLVED com.acme#Arguments$Built.<init>(int)",
+    );
+    assert_eq!(
+        scan.one("unknown", RefKind::Call),
+        "AmbiguousOverload",
+        "an argument whose type is not written must stay honest",
+    );
+}
+
 /// N-04 / B-02: a fully qualified name is attributed to its package in value
 /// position exactly as it is in type position.
 #[test]

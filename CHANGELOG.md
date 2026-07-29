@@ -9,6 +9,16 @@ Pre-1.0, the public API and the CLI surface may change in any release.
 Decisions and their rationale — including what was rejected — live in
 [`docs/decisions.md`](docs/decisions.md); this file records what shipped.
 
+## [Unreleased]
+
+### Changed
+
+- Java calls and constructor invocations now narrow a same-arity overload set
+  to its full-signature target when every argument type is stated locally by a
+  literal, declared name, cast or class creation. Unknown expressions remain
+  `AmbiguousOverload`; the conversion cut is identity, `int` to `long`,
+  `Integer` to `Object`, and `int` to `Integer`.
+
 ## [0.0.2] - 2026-07-29
 
 ### Added

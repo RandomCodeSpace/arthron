@@ -48,7 +48,9 @@ use crate::model::{
     DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
 };
 use crate::track_java::JavaLang;
-use crate::track_java::extract::{Binding, BindingKind, ErasedType, JavaHeader, TypeDecl};
+use crate::track_java::extract::{
+    Binding, BindingKind, CallArguments, ErasedType, JavaHeader, TypeDecl,
+};
 use crate::track_java::fqn;
 use crate::{Outcome, UnresolvedReason};
 
@@ -269,6 +271,8 @@ pub struct JavaScope {
     supers: HashMap<String, TypeDecl>,
     /// X-02's declared-type environment, with the extents §6.3 scopes it by.
     bindings: Vec<Binding>,
+    /// File-local argument types, keyed by the invocation's byte start.
+    call_arguments: Vec<CallArguments>,
     /// T-03..T-05's type frames that are not nodes, with the extents that say
     /// which sites are inside them.
     erased: Vec<ErasedType>,
@@ -354,6 +358,14 @@ impl JavaScope {
         frames.sort_by_key(|f| std::cmp::Reverse(f.start));
         frames
     }
+
+    /// Every argument type at this invocation, when all are stated locally.
+    fn argument_types_at(&self, site: u32) -> Option<&[String]> {
+        self.call_arguments
+            .iter()
+            .find(|arguments| arguments.start == site)
+            .and_then(|arguments| arguments.types.as_deref())
+    }
 }
 
 /// A type a reference named, once it has been placed.
@@ -397,6 +409,15 @@ struct Site<'a> {
     types: &'a [String],
     /// Byte offset of the reference.
     at: u32,
+}
+
+/// The overload-discriminating facts one invocation site states.
+#[derive(Debug, Clone, Copy)]
+struct Invocation<'a> {
+    /// Written argument count.
+    argc: Option<u32>,
+    /// Written argument types, when every one is file-local.
+    arguments: Option<&'a [String]>,
 }
 
 /// Every declaration one *member name* reaches on a type (I-04, C-08).
@@ -1063,6 +1084,7 @@ impl JavaResolver {
         scope: &JavaScope,
         owner: &Owner,
         keys: &[String],
+        arguments: Option<&[String]>,
         p: &mut Probes<'_>,
     ) -> Member {
         let (fqn_start, local_start) = match owner {
@@ -1084,7 +1106,11 @@ impl JavaResolver {
                     Some(Entry::Definition {
                         kind: DefKind::Alias,
                         ..
-                    }) => return Member::Ambiguous,
+                    }) => {
+                        return arguments.map_or(Member::Ambiguous, |arguments| {
+                            self.typed_overload(&type_fqn, &keys[0], arguments, p)
+                        });
+                    }
                     // §8.2: a private member is not inherited, so a
                     // supertype's is not a candidate here at all. Skipped and
                     // not returned — the walk carries on to whatever the
@@ -1140,6 +1166,106 @@ impl JavaResolver {
             Some(id) => Member::Found(id),
             None => Member::Missing { unindexed },
         }
+    }
+
+    /// Narrow one shared arity key with types stated at the invocation.
+    ///
+    /// JLS §15.12.2 runs strict invocation before loose invocation. This
+    /// implementation proves only the file-local subset exercised here:
+    /// identity, `int -> long`, `Integer -> Object`, and `int -> Integer`.
+    /// It does not infer generic arguments, return types, arrays, other
+    /// widening steps, boxing followed by widening, user-defined subtype
+    /// relations, poly expressions, or choose between multiple non-exact
+    /// applicable signatures. Those shapes stay `AmbiguousOverload`; a short
+    /// answer is safer than a wrong edge.
+    fn typed_overload(
+        &self,
+        owner_fqn: &str,
+        arity_key: &str,
+        arguments: &[String],
+        p: &mut Probes<'_>,
+    ) -> Member {
+        let name = arity_key.split('/').next().unwrap_or(arity_key);
+        for loose in [false, true] {
+            let Some(signatures) = Self::applicable_signatures(arguments, loose) else {
+                return Member::Ambiguous;
+            };
+            let mut found = Vec::new();
+            for types in signatures {
+                let key = fqn::signature_key(name, &types);
+                let member_fqn = fqn::member_fqn(owner_fqn, &key);
+                if matches!(p.get(&member_fqn), Some(Entry::Definition { .. })) {
+                    let id = node_id(JavaLang::DOMAIN, &member_fqn);
+                    if !found.contains(&id) {
+                        found.push(id);
+                    }
+                    // An identity match is more specific than every widening
+                    // candidate in the same phase.
+                    if types == arguments {
+                        return Member::Found(id);
+                    }
+                }
+            }
+            match found.as_slice() {
+                [only] => return Member::Found(*only),
+                [] => {}
+                _ => return Member::Ambiguous,
+            }
+        }
+        Member::Ambiguous
+    }
+
+    /// Full parameter lists reachable in one invocation phase.
+    ///
+    /// The Cartesian product is capped: wide calls with many conversion
+    /// alternatives are exactly where this intentionally refuses to guess.
+    fn applicable_signatures(arguments: &[String], loose: bool) -> Option<Vec<Vec<String>>> {
+        const MAX_SIGNATURE_PROBES: usize = 64;
+        let alternatives: Vec<Vec<String>> = arguments
+            .iter()
+            .map(|argument| Self::conversion_targets(argument, loose))
+            .collect();
+        if alternatives.iter().any(Vec::is_empty) {
+            return Some(Vec::new());
+        }
+        let mut signatures = vec![Vec::new()];
+        for choices in alternatives {
+            let mut next = Vec::new();
+            for prefix in &signatures {
+                for choice in &choices {
+                    if next.len() >= MAX_SIGNATURE_PROBES {
+                        return None;
+                    }
+                    let mut signature = prefix.clone();
+                    signature.push(choice.clone());
+                    next.push(signature);
+                }
+            }
+            signatures = next;
+        }
+        Some(signatures)
+    }
+
+    /// Parameter types reachable from one known argument in one proven phase.
+    fn conversion_targets(argument: &str, loose: bool) -> Vec<String> {
+        if loose {
+            return match argument {
+                // Fixture-proven boxing. Boxing followed by widening
+                // reference conversion deliberately waits for a fixture.
+                "int" => vec!["Integer".to_string()],
+                _ => Vec::new(),
+            };
+        }
+        let mut targets = vec![argument.to_string()];
+        match argument {
+            // Fixture-proven first widening step only. `int -> float` and
+            // `int -> double` are legal but stay ambiguous until exercised.
+            "int" => targets.push("long".to_string()),
+            // Fixture-proven widening reference conversion.
+            "Integer" => targets.push("Object".to_string()),
+            _ => {}
+        }
+        targets
     }
 
     /// The one interface declaration a class actually inherits (§9.4.1).
@@ -1217,19 +1343,19 @@ impl JavaResolver {
         scope: &JavaScope,
         owner: Owner,
         name: &str,
-        argc: Option<u32>,
+        invocation: Invocation<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
         match owner {
             Owner::Failed(reason) => Outcome::Unresolved(reason),
             Owner::Outside(package) => Outcome::External(package),
             owner @ Owner::InRepo { .. } => {
-                let keys = Self::member_keys(name, argc);
-                match self.lookup(cfg, scope, &owner, &keys, p) {
+                let keys = Self::member_keys(name, invocation.argc);
+                match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
                     Member::Found(id) => Outcome::Resolved(id),
                     Member::Ambiguous => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
                     Member::Missing { unindexed } => {
-                        if is_object_member(name, argc) {
+                        if is_object_member(name, invocation.argc) {
                             // Every class inherits it (§4.3.2), and `Object`
                             // is never a definition in this repository.
                             Outcome::External(JAVA_LANG_PACKAGE.to_string())
@@ -1262,6 +1388,7 @@ impl JavaResolver {
         scope: &JavaScope,
         frame: &ErasedType,
         keys: &[String],
+        arguments: Option<&[String]>,
         p: &mut Probes<'_>,
     ) -> FrameMember {
         if keys.iter().any(|key| frame.members.contains(key)) {
@@ -1277,7 +1404,7 @@ impl JavaResolver {
                 unindexed = true;
                 continue;
             }
-            match self.lookup(cfg, scope, &owner, keys, p) {
+            match self.lookup(cfg, scope, &owner, keys, arguments, p) {
                 Member::Found(id) => return FrameMember::Found(id),
                 Member::Ambiguous => return FrameMember::Ambiguous,
                 Member::Missing { unindexed: more } => unindexed |= more,
@@ -1372,6 +1499,11 @@ impl JavaResolver {
             types: &enclosing,
             at: r.span.byte_start,
         };
+        let arguments = scope.argument_types_at(site.at);
+        let invocation = Invocation {
+            argc: r.argc,
+            arguments,
+        };
         let segments = &r.target.segments;
 
         // C-03: `this(…)` and `super(…)` name a constructor exactly, and
@@ -1403,7 +1535,7 @@ impl JavaResolver {
                     && let Some(frame) = scope.erased_at(site.at).first()
                 {
                     let keys = Self::member_keys(name, argc);
-                    let found = self.frame_lookup(cfg, scope, frame, &keys, p);
+                    let found = self.frame_lookup(cfg, scope, frame, &keys, arguments, p);
                     return self.frame_outcome(found, name, argc, false);
                 }
                 let path = self.this_path(scope, outer, site.types);
@@ -1422,7 +1554,7 @@ impl JavaResolver {
                 // N-02: an unqualified invocation. §6.5.1 makes a bare
                 // `m(…)` a MethodName and nothing else, so no local can
                 // shadow it and the search is purely the enclosing chain.
-                return self.unqualified(cfg, scope, name, argc, site, p);
+                return self.unqualified(cfg, scope, name, invocation, site, p);
             }
             TargetRoot::Name => {
                 let (owner, consumed) = self.qualifier(cfg, scope, qualifier, site, p);
@@ -1460,7 +1592,7 @@ impl JavaResolver {
                 return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
             };
             let owner = self.declared_owner(cfg, scope, &declared, site.at, 0, p);
-            return self.select(cfg, scope, owner, name, argc, p);
+            return self.select(cfg, scope, owner, name, invocation, p);
         }
         if r.kind == RefKind::MethodRef {
             // C-08 / X-05: the overload is chosen by the target
@@ -1477,7 +1609,7 @@ impl JavaResolver {
                 }
             };
         }
-        self.select(cfg, scope, owner, name, argc, p)
+        self.select(cfg, scope, owner, name, invocation, p)
     }
 
     /// The type path a `this` or `Outer.this` names (§15.8.4).
@@ -1535,11 +1667,11 @@ impl JavaResolver {
         cfg: &JavaConfig,
         scope: &JavaScope,
         name: &str,
-        argc: Option<u32>,
+        invocation: Invocation<'_>,
         site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
-        let keys = Self::member_keys(name, argc);
+        let keys = Self::member_keys(name, invocation.argc);
         let enclosing = site.types;
         let mut unindexed = enclosing.is_empty();
         // 0: the erased type frames the site sits in, innermost first. They
@@ -1547,7 +1679,7 @@ impl JavaResolver {
         // outside them, and they are not in `enclosing` because they are not
         // nodes (T-03..T-05).
         for frame in scope.erased_at(site.at) {
-            match self.frame_lookup(cfg, scope, frame, &keys, p) {
+            match self.frame_lookup(cfg, scope, frame, &keys, invocation.arguments, p) {
                 FrameMember::Own => {
                     return Outcome::Unresolved(UnresolvedReason::LocalBinding);
                 }
@@ -1567,7 +1699,7 @@ impl JavaResolver {
                         return self.frame_outcome(
                             FrameMember::Missing { unindexed: more },
                             name,
-                            argc,
+                            invocation.argc,
                             unindexed,
                         );
                     }
@@ -1582,7 +1714,7 @@ impl JavaResolver {
                 unindexed = true;
                 continue;
             };
-            match self.lookup(cfg, scope, &owner, &keys, p) {
+            match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
                 Member::Found(id) => return Outcome::Resolved(id),
                 Member::Ambiguous => {
                     return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
@@ -1608,7 +1740,7 @@ impl JavaResolver {
                 }
                 Owner::InRepo { .. } => {}
             }
-            match self.lookup(cfg, scope, &owner, &keys, p) {
+            match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
                 Member::Found(id) => return Outcome::Resolved(id),
                 Member::Ambiguous => {
                     return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
@@ -1616,7 +1748,7 @@ impl JavaResolver {
                 Member::Missing { unindexed: more } => unindexed |= more,
             }
         }
-        if is_object_member(name, argc) {
+        if is_object_member(name, invocation.argc) {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
         }
         if unindexed {
@@ -1688,7 +1820,17 @@ impl JavaResolver {
             .anonymous_body_at(r.span.byte_start, r.span.byte_end)
             .is_some()
             && self.interface_owner(&owner, p);
-        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
+        let settled = self.select(
+            cfg,
+            scope,
+            owner,
+            fqn::INIT,
+            Invocation {
+                argc: r.argc,
+                arguments: scope.argument_types_at(r.span.byte_start),
+            },
+            p,
+        );
         if on_interface
             && matches!(
                 settled,
@@ -1800,6 +1942,7 @@ fn build_scope(cfg: &JavaConfig, file: &FileFacts<JavaLang>) -> JavaScope {
             header.module.as_deref(),
         ),
         bindings: header.bindings.clone(),
+        call_arguments: header.call_arguments.clone(),
         erased: header.erased.clone(),
         ..JavaScope::default()
     };

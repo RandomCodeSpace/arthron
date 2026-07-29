@@ -162,6 +162,16 @@ pub struct Binding {
     pub end: u32,
 }
 
+/// Argument types stated directly at one invocation site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallArguments {
+    /// Byte offset of the call or creation reference.
+    pub start: u32,
+    /// One source-level type per argument, or `None` when any argument needs
+    /// expression typing rather than a file-local read.
+    pub types: Option<Vec<String>>,
+}
+
 /// One type declared in this file, with the supertypes it names.
 ///
 /// H-01: member lookup cannot start until `extends`/`implements` have been
@@ -256,6 +266,8 @@ pub struct JavaHeader {
     pub imports: Vec<Import>,
     /// Every name this file binds, with extents and declared types (X-02).
     pub bindings: Vec<Binding>,
+    /// Argument types readable without inference, keyed by invocation start.
+    pub call_arguments: Vec<CallArguments>,
     /// Every type this file declares, in declaration order.
     pub types: Vec<TypeDecl>,
     /// Every anonymous class body, enum-constant body and local class, in
@@ -283,6 +295,26 @@ impl JavaHeader {
                 && b.start <= site
                 && site < b.end
         })
+    }
+
+    /// The innermost value binding visible at `site`.
+    fn binding_at(&self, name: &str, site: u32) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .filter(|b| {
+                b.name == name
+                    && b.start <= site
+                    && site < b.end
+                    && matches!(
+                        b.kind,
+                        BindingKind::Field
+                            | BindingKind::Local
+                            | BindingKind::Parameter
+                            | BindingKind::PatternVariable
+                            | BindingKind::CatchParameter
+                    )
+            })
+            .max_by_key(|b| b.start)
     }
 }
 
@@ -473,6 +505,71 @@ fn argument_count(node: &SgNode) -> Option<u32> {
         .filter(|c| c.is_named() && c.kind() != "comment")
         .count();
     u32::try_from(count).ok()
+}
+
+/// A source-level type that is evident from an argument expression alone.
+///
+/// This is deliberately a cut line, not a miniature type checker: literals,
+/// declared names, casts and class creation are readable in one file.
+/// Calls, operators, conditionals, lambdas, method references, arrays,
+/// `null`, and anything else stay unknown and therefore cannot narrow an
+/// overload set.
+fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String> {
+    match &*node.kind() {
+        "string_literal" => Some("String".to_string()),
+        "character_literal" => Some("char".to_string()),
+        "true" | "false" => Some("boolean".to_string()),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal" => {
+            let text = node.text();
+            Some(
+                if text.ends_with('l') || text.ends_with('L') {
+                    "long"
+                } else {
+                    "int"
+                }
+                .to_string(),
+            )
+        }
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => {
+            let text = node.text();
+            Some(
+                if text.ends_with('f') || text.ends_with('F') {
+                    "float"
+                } else {
+                    "double"
+                }
+                .to_string(),
+            )
+        }
+        "identifier" => header
+            .binding_at(&node.text(), site)
+            .and_then(|binding| binding.declared_type.as_ref())
+            .map(|segments| segments.join(".")),
+        "cast_expression" | "object_creation_expression" => node
+            .field("type")
+            .map(|ty| compact(&ty.text()))
+            .filter(|ty| !ty.is_empty()),
+        "parenthesized_expression" => node
+            .children()
+            .find(|child| child.is_named())
+            .and_then(|child| argument_type(&child, header, site)),
+        _ => None,
+    }
+}
+
+/// The complete argument-type vector when every argument is file-local.
+fn call_arguments(node: &SgNode, header: &JavaHeader) -> CallArguments {
+    let start = node.range().start as u32;
+    let types = node.field("arguments").and_then(|list| {
+        list.children()
+            .filter(|child| child.is_named() && child.kind() != "comment")
+            .map(|child| argument_type(&child, header, start))
+            .collect::<Option<Vec<_>>>()
+    });
+    CallArguments { start, types }
 }
 
 /// The literal text of a call site's callee, minus explicit type arguments.
@@ -1965,6 +2062,7 @@ fn collect_references(
     header: &JavaHeader,
     inherit_heads: &HashSet<(usize, usize)>,
     refs: &mut Vec<Reference>,
+    call_args: &mut Vec<CallArguments>,
 ) {
     if in_error_region(node) {
         return;
@@ -1975,6 +2073,7 @@ fn collect_references(
                 return;
             };
             let target = call_target(node);
+            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2000,6 +2099,7 @@ fn collect_references(
             if segments.is_empty() {
                 return;
             }
+            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2030,6 +2130,7 @@ fn collect_references(
                 "super" => TargetRoot::Super { qualifier },
                 _ => return,
             };
+            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2058,6 +2159,7 @@ fn collect_references(
                 return;
             };
             let name = owner.text().to_string();
+            call_args.push(call_arguments(node, header));
             refs.push(reference(
                 node,
                 header,
@@ -2293,9 +2395,18 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<JavaLang> {
     }
     header.types = types;
     header.overloaded = mark_overload_sets(&mut defs);
+    let mut call_arguments = Vec::new();
     for (_, node) in &matched {
-        collect_references(source, node, &header, &inherit_heads, &mut refs);
+        collect_references(
+            source,
+            node,
+            &header,
+            &inherit_heads,
+            &mut refs,
+            &mut call_arguments,
+        );
     }
+    header.call_arguments = call_arguments;
 
     // The file's container definition, emitted whether or not a package
     // clause parsed: a file that lost its clause still belongs somewhere, and

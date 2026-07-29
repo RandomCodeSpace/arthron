@@ -4,6 +4,35 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — Java overload narrowing stops at file-local argument types
+
+**Decision:** when a Java call or creation site reaches a shared arity key, the
+resolver may probe the overloads' full-signature identities using argument
+types the same file states directly. The extractor records literals, declared
+names, casts and class creations in the Java header; it still emits the same
+core `Reference`, and only the resolver links.
+
+JLS §15.12.2's phase order is preserved: strict invocation is tried before
+loose invocation. The implemented conversion surface is deliberately smaller
+than Java's: identity, `int` to `long`, `Integer` to `Object`, and `int` to
+`Integer`. Each is target-asserted by a fixture, including overloaded
+constructors. An expression call used as an argument remains
+`AmbiguousOverload`.
+
+This stage only narrows an arity-key alias. A call that never reached
+`AmbiguousOverload` keeps its existing path, so the expected row movement is
+`AmbiguousOverload` to a named full-signature `Resolved` target or no movement.
+Corpus attribution, baseline re-base and pin regeneration wait for the
+independent whole-row review.
+
+*Rejected:* implementing all invocation conversions from a hand-written type
+table. Generic inference, arrays, poly expressions, user-defined subtype
+relations, further primitive widenings, boxing followed by widening, and
+multiple non-exact applicable signatures stay ambiguous until a fixture proves
+the next cut.
+
+---
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and
