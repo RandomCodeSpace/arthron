@@ -218,9 +218,9 @@ and `arthron mcp` answer questions about the result.
   most of what tier 1 leaves unlinked. Fourteen at **tier 2** — definitions,
   structure and imports, with no verified call edges, so the rate is an
   import-resolution rate: C++, C#, Kotlin, Swift, Ruby, PHP, Rust, Scala,
-  Dart, Elixir, Haskell, Lua, Bash, HCL. Each language family is its own identity domain; JavaScript
-  and TypeScript deliberately share one, and Kotlin/Scala deliberately do not
-  share Java's.
+  Dart, Elixir, Haskell, Lua, Bash, HCL. Each language family is its own
+  identity domain; JavaScript and TypeScript deliberately share one, and
+  Kotlin/Scala deliberately do not share Java's.
 - **The three-outcome resolution contract.** Extractors emit references and
   never edges; one resolver owns all linking; every reference ends as
   `Resolved`, `External`, or `Unresolved` carrying a reason. There is no way to
@@ -267,9 +267,12 @@ and `arthron mcp` answer questions about the result.
   the 2 vCPU reference hardware, six runs spanning 0.2% — by committing every
   phase per 500 files, capping the redb page cache on both open paths, and
   having phase 2 consume extracted facts per file instead of borrowing the whole
-  set. No timing regression (~17 s per 1M lines against a 60 s target). Graph
-  identity was proven byte-for-byte across five corpora at the level of full
-  blake3 snapshot digests, not matching tallies.
+  set. That percentage reads ceiling and measurement in the same binary units,
+  337.1 of 512 MiB; it is the basis the failing 729.1 was recorded against as
+  1.42× the ceiling, and reading `512 MB` as decimal MB instead makes the same
+  measurement 353.5 MB, 69%. No timing regression (~17 s per 1M lines against a
+  60 s target). Graph identity was proven byte-for-byte across five corpora at
+  the level of full blake3 snapshot digests, not matching tallies.
 
 ### Fixed
 
@@ -293,6 +296,7 @@ and `arthron mcp` answer questions about the result.
   on every platform, the way the repo-relative keys in the store already are,
   and `\` joined `"` and newline in the set of characters a provenance field
   is refused for before anything is written rather than after.
+
 ### Packaging
 
 - Crate metadata for crates.io: description, license, repository, keywords,

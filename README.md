@@ -367,6 +367,14 @@ developer's laptop. Resource ceilings are hard limits; timings are targets.
 | Cold index throughput | < 60 s / 1M lines | ~17 s / 1M lines on the same scan |
 | Warm re-index, unchanged tree | < 1 s | 2.75 s on kubernetes **on the pre-Wave-3 build** — a miss, recorded as a finding rather than hidden, and not yet re-measured |
 
+The RSS percentage and the ceiling are read in the same binary units: 337.1 of
+512 is 66%. That is the basis every RSS verdict on this project was recorded
+on — the 729.1 MiB that failed this gate was recorded as **1.42× the ceiling**,
+which is 729.1/512 — so it is said here rather than left to be inferred. Read
+`512 MB` as decimal MB instead and the same measurement is 353.5 MB, 69% of it:
+under the ceiling on either reading, but only one of the two matches the
+record.
+
 The first two rows are the shipped build. The third is not, and the column
 says so rather than letting three numbers read as one benchmark run: warm
 timing was last measured on the binary whose cold RSS was 729.1 MiB, and the

@@ -9,13 +9,15 @@
 //!
 //! # Tier 2 is a smaller promise, kept exactly
 //!
-//! Tier 1 is definitions, references and a call graph. **Tier 2 is
-//! definitions, structure and imports, and its gate is an import-resolution
-//! rate.** So this track emits one reference kind — [`crate::model::RefKind::Import`],
-//! the `use` statement — and no call site, no type use and no supertype. That
-//! is not a staging decision to be quietly relaxed: a tier-2 language that
-//! emitted call references un-gated would put them in a denominator no tier-2
-//! resolver links, which is tier-1 coverage claimed without tier-1 work.
+//! Tier 1 is definitions, references, and cross-file import and
+//! function-call resolution — the reference kinds in its denominator, not a
+//! complete call graph. **Tier 2 is definitions, structure and imports, and
+//! its gate is an import-resolution rate.** So this track emits one reference
+//! kind — [`crate::model::RefKind::Import`], the `use` statement — and no
+//! call site, no type use and no supertype. That is not a staging decision to
+//! be quietly relaxed: a tier-2 language that emitted call references
+//! un-gated would put them in a denominator no tier-2 resolver links, which
+//! is tier-1 coverage claimed without tier-1 work.
 //!
 //! What tier 2 keeps in full is the never-drop contract. Every `use` this
 //! track extracts ends `Resolved`, `External`, or `Unresolved` with a reason,
