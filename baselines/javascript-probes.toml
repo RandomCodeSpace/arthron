@@ -1,5 +1,5 @@
 # arthron gate baseline — regenerate with:
-#   arthron gate corpus/go/caddy --baseline <this file> --rebase --commit <sha>
+#   arthron gate corpus/javascript/probes --baseline <this file> --rebase --commit <sha>
 # Release build, cold store. Counts are measured, never estimated.
 #
 # `corpus` and `commit` are provenance: printed, never verified.
@@ -9,10 +9,10 @@
 # `external` and `local_binding` sit outside both rate terms; any
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
-corpus = "corpus/go/caddy"
-commit = "853efde"
-language = "go"
-resolved = 10585
-external = 21304
-local_binding = 13181
-unresolved = 9014
+corpus = "corpus/javascript/probes"
+commit = "e4dc880"
+language = "javascript"
+resolved = 6
+external = 0
+local_binding = 1
+unresolved = 2

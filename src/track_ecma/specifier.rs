@@ -49,13 +49,43 @@ pub enum Spec {
 /// resolve to two different files from two importers in one repository. The
 /// `"types"` condition leads TypeScript's, per the documented requirement that
 /// it precede `"import"`/`"require"`.
-fn conditions(kind: ModuleKind, dialect: Dialect) -> &'static [&'static str] {
+fn default_conditions(kind: ModuleKind, dialect: Dialect) -> &'static [&'static str] {
     match (dialect, kind) {
         (Dialect::TypeScript, ModuleKind::CommonJs) => &["types", "node", "require", "default"],
         (Dialect::TypeScript, _) => &["types", "node", "import", "default"],
         (Dialect::JavaScript, ModuleKind::CommonJs) => &["node", "require", "default"],
         (Dialect::JavaScript, _) => &["node", "import", "default"],
     }
+}
+
+/// The whole condition set for one importing file: the defaults above, plus
+/// whatever `compilerOptions.customConditions` adds for the TypeScript project
+/// that file sits in.
+///
+/// A **set**, not a priority list. NODE walks the conditions object in the
+/// *map's* key order and takes the first key this set contains, so adding a
+/// condition can only make a branch reachable that was unreachable — which is
+/// exactly what the option means. Which branch wins stays the package
+/// author's decision, written in their own `package.json`.
+///
+/// Read from the nearest project rather than gated on the dialect: the option
+/// is a fact the project stated about how *its* imports resolve, and a
+/// `jsconfig.json` states it the same way for JavaScript.
+fn conditions<'a>(
+    cfg: &'a EcmaConfig,
+    importer: &str,
+    kind: ModuleKind,
+    dialect: Dialect,
+) -> Vec<&'a str> {
+    let mut conds: Vec<&str> = default_conditions(kind, dialect).to_vec();
+    if let Some(project) = cfg.ts_for(importer) {
+        for c in &project.custom_conditions {
+            if !conds.contains(&c.as_str()) {
+                conds.push(c.as_str());
+            }
+        }
+    }
+    conds
 }
 
 /// Resolve one module specifier from one importing file.
@@ -101,7 +131,7 @@ pub fn resolve(
         let Some(map) = &scope.imports else {
             return Spec::Unresolved(UnresolvedReason::ModuleNotFound);
         };
-        return match subpath_resolve(map, spec, conditions(kind, dialect)) {
+        return match subpath_resolve(map, spec, &conditions(cfg, importer, kind, dialect)) {
             Target::Path(target) => from_package_relative(cfg, scope, &target, kind, dialect),
             Target::Blocked => Spec::Unresolved(UnresolvedReason::NotExported),
             Target::None => Spec::Unresolved(UnresolvedReason::ModuleNotFound),
@@ -147,7 +177,7 @@ fn bare(cfg: &EcmaConfig, importer: &str, spec: &str, kind: ModuleKind, dialect:
     // specifier names it, and skipping this turns every intra-monorepo edge
     // into `External`.
     if let Some(scope) = cfg.workspace_package(package) {
-        match package_entry(scope, subpath, kind, dialect) {
+        match package_entry(scope, subpath, &conditions(cfg, importer, kind, dialect)) {
             Target::Path(target) => match from_package_relative(cfg, scope, &target, kind, dialect)
             {
                 Spec::Candidates { paths, .. } => extend(&mut candidates, paths),
@@ -449,16 +479,11 @@ enum Target {
 }
 
 /// A12/A8/A4: the entry point a package exposes for one subpath.
-fn package_entry(
-    scope: &PackageScope,
-    subpath: String,
-    kind: ModuleKind,
-    dialect: Dialect,
-) -> Target {
+fn package_entry(scope: &PackageScope, subpath: String, conds: &[&str]) -> Target {
     if let Some(exports) = &scope.exports {
         // A12: self-reference and workspace resolution go through `"exports"`
         // when it is present, and it is exhaustive when it is.
-        return subpath_resolve(exports, &subpath, conditions(kind, dialect));
+        return subpath_resolve(exports, &subpath, conds);
     }
     if subpath == "." {
         // No `"exports"`: `LOAD_AS_DIRECTORY` on the package root, which
@@ -710,6 +735,86 @@ mod tests {
             Target::Path("./src/b.js".into()),
         );
         assert_eq!(subpath_resolve(&exports, "./x", conds), Target::Blocked);
+    }
+
+    #[test]
+    fn a_custom_condition_is_added_to_the_set_and_changes_nothing_else() {
+        // The option adds to the set; it does not reorder it. Which branch of
+        // a conditions object wins stays the package author's decision,
+        // written in their own key order, so the only thing a custom
+        // condition can do is make a branch reachable that was unreachable.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", r#"{"name":"root"}"#);
+        write(
+            root,
+            "packages/app/tsconfig.json",
+            r#"{"compilerOptions":{"customConditions":["@lib/source"]}}"#,
+        );
+        let cfg = build(root);
+
+        let with = conditions(
+            &cfg,
+            "packages/app/a.ts",
+            ModuleKind::Esm,
+            Dialect::TypeScript,
+        );
+        assert_eq!(with, ["types", "node", "import", "default", "@lib/source"]);
+        // A file outside the project that stated it is unaffected: the option
+        // belongs to the importer, exactly as `paths` and `baseUrl` do.
+        let without = conditions(&cfg, "other/a.ts", ModuleKind::Esm, Dialect::TypeScript);
+        assert_eq!(
+            without,
+            default_conditions(ModuleKind::Esm, Dialect::TypeScript)
+        );
+    }
+
+    #[test]
+    fn the_source_branch_of_a_dual_published_package_needs_the_condition() {
+        // zod's `exports` in miniature. The source branch is written first,
+        // so once the condition is in the set it wins and the import lands on
+        // a `.ts` file this scan indexed; without it the `"types"` branch
+        // wins and names a built artefact that is not in the tree.
+        let exports = parse(
+            r#"{".":{"@zod/source":"./src/index.ts","types":"./index.d.cts","import":"./index.js"}}"#,
+        )
+        .unwrap();
+        let plain = &["types", "node", "import", "default"][..];
+        let custom = &["types", "node", "import", "default", "@zod/source"][..];
+        assert_eq!(
+            subpath_resolve(&exports, ".", plain),
+            Target::Path("./index.d.cts".into()),
+        );
+        assert_eq!(
+            subpath_resolve(&exports, ".", custom),
+            Target::Path("./src/index.ts".into()),
+        );
+    }
+
+    #[test]
+    fn a_custom_condition_flattens_through_the_extends_chain() {
+        // Same rule `paths` follows: the nearest config that states the
+        // option wins, and a config that states nothing inherits the base's.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            ".configs/tsconfig.base.json",
+            r#"{"compilerOptions":{"customConditions":["@lib/source"]}}"#,
+        );
+        write(
+            root,
+            "packages/app/tsconfig.json",
+            r#"{"extends":"../../.configs/tsconfig.base.json"}"#,
+        );
+        let cfg = build(root);
+        let conds = conditions(
+            &cfg,
+            "packages/app/a.ts",
+            ModuleKind::Esm,
+            Dialect::TypeScript,
+        );
+        assert!(conds.contains(&"@lib/source"), "{conds:?}");
     }
 
     #[test]

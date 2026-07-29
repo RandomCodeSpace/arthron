@@ -13,6 +13,218 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Changed
 
+- **The EcmaScript universe scope has a second half, and it un-pollutes
+  `NoMatchingDefinition`.** That reason's contract says the reference was
+  understood, the lookup table was complete, and the name is absent — "in a
+  corpus that compiles this should mean *our* bug, and should sit near zero."
+  Both halves were false. All 1,728 occurrences on express were five names —
+  `it` 1,111, `describe` 554, `before` 59, `after` 3, `XMLHttpRequest` 1 — and
+  13,833 of vue-core's 15,276 were eight more: `expect` 9,930, `test` 2,860,
+  `it` 609, `describe` 373, `beforeEach` 37, `afterEach` 21, `afterAll` 2,
+  `beforeAll` 1. They are what a test runner puts in the global scope of the
+  files it runs, reaching the file with no import because the runner injects
+  them.
+
+  The universe scope now models both provenances. The *host*'s half is
+  unchanged: a name ECMA-262, Node or the web platform declares is `External`,
+  because the thing on the other end genuinely exists. The new half is a
+  **package**'s: a name a declared dependency injects is
+  `Unresolved(UnknownPackage)`, filed against the package the definition is
+  actually in. Six environments are recognised (mocha, jasmine, jest,
+  vitest, cypress, qunit), each by its *documented* global set in full rather
+  than by the subset that looked unlikely to collide: what makes `it` mocha's
+  is not its spelling but the project declaring mocha, checked per file against
+  `package.json` and `tsconfig.json`'s `compilerOptions.types`. A repository
+  that declares no runner still gets `NoMatchingDefinition` for `describe`, and
+  any declaration or import of the name wins, because the universe scope is
+  consulted last.
+
+  **No rate moves and nothing is reclassified into `External`,** which is the
+  point: `UnknownPackage` is `Unresolved`, so every one of these references
+  stays in both terms. express `NoMatchingDefinition` 1,728 → 0 with the rate
+  at 28.99% before and after; vue-core 15,276 → 1,443 with the rate at 48.48%
+  before and after (13,833 from `NoMatchingDefinition` and 785 from
+  `NeedsTypeInference`, the latter being `vi.fn` and `expect.any`, where the
+  head decides exactly as it already does for `console.log`). fastify does not
+  move at all — it injects nothing. The one external that did move is
+  `XMLHttpRequest`, absent from the host list while `WebSocket`,
+  `AbortController` and `fetch` were all in it: express `external` 701 → 702,
+  the same shape of omission as `Error`'s and worth one row.
+
+  **The written-out import of the same name does not always agree, and the two
+  channels differ.** An environment turns on through either `package.json` or
+  `tsconfig.json`'s `compilerOptions.types`. Through `types` the two spellings
+  match exactly: zod states `"types": ["vitest"]` and declares no dependencies
+  at all, so its 168 `from "vitest"` specifiers, the names bound by them and
+  the injected spellings all report `UnknownPackage`. Through `package.json`
+  they do not: a declared dependency is the dependency boundary, so the import
+  and every name reached through it answer `External("npm:<pkg>")`. vue-core
+  declares vitest in its root `devDependencies` and carries both — 95
+  occurrences of vitest's names under `External`, written as imports, against
+  14,618 injected under `Unresolved(UnknownPackage)`. The injected half is not
+  the one that may move: `Unresolved` keeps it in both terms of the rate, where
+  `External` would take it out of both and raise the gate without linking
+  anything. Closing the asymmetry means moving the *imported* side, which is a
+  change to what `External` means at the dependency boundary for every package
+  and is not made here. Both halves are pinned by a test so neither drifts in
+  silence.
+
+- **TypeScript's `compilerOptions.customConditions` is read, and it is the
+  largest single miss on zod.** The condition set handed to NODE
+  `PACKAGE_TARGET_RESOLVE` was hardcoded per dialect and module kind, so a
+  monorepo that publishes built artefacts and points its own compilation at the
+  sources instead — `"@zod/source"` written ahead of `"types"` in the same
+  `exports` entry, and named in `packages/zod/tsconfig.json` — took the
+  `"types"` branch. That branch names an `index.d.cts` beside the manifest that
+  no scan of the sources can see, so every self-import missed, and every name
+  reached through one missed with it. The option is now read (flattened through
+  `extends`, folded into the config fence) and added to the set for the nearest
+  TypeScript project, for both `exports` and `imports` maps. It is a *set*, not
+  a priority list: NODE matches conditions in the map's own key order, so a
+  custom condition can only make a branch reachable that was unreachable, and
+  which branch wins stays the package author's decision.
+
+  zod: `ModuleNotFound` 7,822 → 1, `resolved` 10,043 → 17,080, rate 27.24% →
+  **46.33%** (+19.09 points), every one of the 7,037 new edges landing in
+  `packages/zod/src/`. `NoMatchingDefinition` 524 → 1,123 and
+  `NeedsTypeInference` 1,576 → 1,761 in the same movement, and neither is a new
+  miss: a module that could not be found gave every name reached through it one
+  answer, and a module that *is* found gives each of them its own — including,
+  for a namespace re-exported by name, an honest miss this resolver does not
+  yet follow. No other corpus states a `customConditions` and none of the other
+  three moved a row.
+
+  `extends` is nearest-wins on *stated*, not on non-empty. `"types": []` is the
+  documented way to say "no ambient type packages" and `"customConditions": []`
+  says the same about conditions; both were read as "unstated" and silently
+  given the base's value back, turning an ambient environment on under a config
+  that turned it off and sending an import down a branch `tsc` would not take.
+  Presence of the key now decides. No corpus states either as an empty list, so
+  no gated number moves — verified by a whole-row join against the previous
+  scan on all four, which changed nothing.
+
+  **Every changed row on all four corpora was joined whole-row against the
+  previous scan.** The row-key set is byte-identical — nothing added, nothing
+  removed — and **no reference that already resolved changed its target or its
+  outcome**, on any corpus. The 2,194 rows that changed on zod all came out of
+  `ModuleNotFound`, the 187 on express and 800 on vue-core all out of the
+  ambient class above, and fastify changed nothing.
+
+- **Go reads a member as well as calling one — the last two un-emitted Go
+  reference sites, and a re-base of two baselines.** The extractor emitted a
+  reference for a call through a selector and for a written type name, and
+  nothing for the two other places the Go grammar names a member: a selector
+  *read* (`pkg.Name`, `t.field`, `T.Method`, `x.y`) and a struct literal's
+  field keys (the `Field` in `T{Field: v}`). Both are now
+  `RefKind::FieldAccess` rows — 8,200 selector-read occurrences on `codeiq`
+  and 9,947 on `caddy`, 3,134 and 3,776 literal keys — which is every one of
+  those sites in both corpora, counted at the grammar and matched exactly by
+  what the store holds.
+
+  A read resolves the way a call of the same shape already did: `pkg.Name`
+  through the import table, a receiver root as `this` (so `c.Name` reaches
+  `Conn.Name`), a root some enclosing block binds as `LocalBinding`. What is
+  new is the owner written *at the site* — `T.Method`, `T{Field: v}`,
+  `pkg.T{Field: v}` — where the member is probed under that owner and a miss is
+  answered by what the owner is: `NeedsReceiverType` when the owner is a type
+  in this repository, `NeedsTypeInference` when it is not. Go struct fields are
+  not nodes in this build, so an honest field read lands in the first of those,
+  exactly as a receiver-rooted call already did. A map or array literal's key
+  is an expression rather than a member name and is not a reference; an
+  anonymous `struct{…}` has no canonical name, so neither it nor its fields are
+  nodes and its keys name nothing.
+
+  Both of those read the type *as written*, which is the whole of what one
+  file says. `map[K]V{k: v}` is rejected because the site writes `map`;
+  `type Registry map[K]V` used as `Registry{k: v}` is not, because the site
+  writes a name and the declaration is usually in a sibling file. So a named
+  map, slice or array type keyed by an identifier is reported as a member of
+  it — 9 rows / 90 occurrences on `codeiq` (`CapabilityMatrix` in
+  `internal/intelligence/query`), 0 on `caddy` — and lands in
+  `NeedsReceiverType`, inside the denominator, understating the rate rather
+  than flattering it: 69.5% as measured against 70.0% without those rows.
+  Closing it needs a fact no single file holds, so it is stated where it is
+  made (`named_type_path` in `extract_go.rs`, and `ref-litkey` in
+  `rules/go.yml`) rather than fixed by guessing. What is closed is the harm:
+  a literal key's member is never probed, so no such site can *link*. A named
+  non-struct type may carry a method, and a method name and a map-key
+  constant do not collide the way a method name and a field name do, so the
+  probe could only ever have found the wrong node — and a wrong edge is
+  strictly worse than an unresolved reference. Nothing a compiling corpus had
+  earned is lost by skipping it: a Go struct field is not a node in this
+  build, so every literal key on both corpora was already unresolved, and all
+  three Go gates hold their counts to the row.
+
+  Separately, **`NoMatchingDefinition` is now empty on both Go corpora**, from
+  123 rows on `codeiq` and 269 on `caddy`. Every one of them was a predeclared
+  type name at a conversion — `string(b)`, `int64(n)`, `byte(c)` — which Go
+  writes exactly as it writes a call, so the grammar filed it as a
+  `call_expression` and the resolver checked it against the predeclared
+  *functions*. The name was never absent; it was in the universe block, one
+  list over. That bucket's contract is that the lookup table was complete and
+  the name missing, which in a corpus that compiles means arthron's own bug, so
+  a row that does not mean that does not belong in it. A type cannot be called,
+  so a one-argument call naming one is a conversion and nothing else.
+
+  Measured, release build, cold store:
+
+  | baseline | resolved | unresolved | external | local_binding | rate |
+  |---|---:|---:|---:|---:|---:|
+  | `go-codeiq` | 8,016 → 9,794 | 884 → 4,295 | 12,210 → 12,595 | 4,113 → 9,873 | 90.1% → **69.5%** |
+  | `go-caddy` | 10,208 → 10,585 | 2,700 → 9,014 | 19,201 → 21,304 | 8,252 → 13,181 | 79.1% → **54.0%** |
+  | `go-probes` | 17 | 0 | 26 | 1 | 100.0% |
+
+  `go-probes` is byte-identical: it writes no selector read and no keyed
+  literal. No other baseline is touched — this is a Go rule file and a Go
+  resolver.
+
+  **A rate that falls here is not a regression.** It is the same argument the
+  `LocalBinding` unification made in the other direction: what is *in* the
+  rate's terms changed, so the two numbers are not measurements of the same
+  thing. Go's denominator — `resolved + unresolved` — grew from 8,900 to 14,089
+  on `codeiq` and from 12,908 to 19,599 on `caddy`, which is 5,312 and 6,960
+  new references inside the rate's terms less the 123 and 269 the conversion
+  fix moved out of it. 1,778 and 377 of the new occurrences resolved to a
+  definition, and nothing that resolved before stopped resolving.
+
+  **Attributed per row, not inferred from the totals.** A whole-row join
+  between a binary built from the previous commit and this one, keyed
+  `file + kind + declaration space + enclosing FQN + site text + argument count
+  + locally-bound`, over both corpora:
+
+  - The conversion fix moves **89 pre-existing rows on `codeiq` (123
+    occurrences) and 199 on `caddy` (269)**, every one of them
+    `NoMatchingDefinition → External("go:builtin")`, and nothing else: no row
+    added, none removed, and `resolved`, `local_binding` and every other reason
+    identical on both sides.
+  - The two new constructs then change **zero** pre-existing rows. Every
+    movement is a new row, all of kind `field-access`: 7,436 rows / 11,334
+    occurrences on `codeiq` and 8,332 / 13,723 on `caddy`. Split by construct
+    and outcome —
+
+    | corpus | construct | resolved | external | local_binding | NeedsReceiverType | NeedsTypeInference | NeedsExpressionType |
+    |---|---|---:|---:|---:|---:|---:|---:|
+    | `codeiq` | selector reads | 1,778 | 51 | 5,745 | 205 | 12 | 409 |
+    | `codeiq` | literal keys | 0 | 211 | 15 | 2,908 | 0 | 0 |
+    | `caddy` | selector reads | 377 | 1,184 | 4,634 | 2,904 | 541 | 307 |
+    | `caddy` | literal keys | 0 | 650 | 287 | 2,825 | 6 | 0 |
+
+    — where each row of the table sums to that construct's whole site count as
+    counted at the grammar: 8,200 and 3,134 on `codeiq`, 9,947 and 3,776 on
+    `caddy`. `caddy`'s literal keys sum to 3,768 there and not 3,776 because
+    the last eight land on two rows the *first* construct created rather than
+    on rows of their own: `TestBuffering` declares a function-local
+    `type args`, and the read `args.body` and the four literal keys
+    `args{body: …}` are one target, `LocalBinding` either way, so each of the
+    two keys they share carries five occurrences instead of one.
+
+  The reference census in `tests/corpus.rs` is new and is what makes this
+  observable next time: a rule that stops being emitted moves no baseline —
+  the gate compares four occurrence totals and another rule can supply them —
+  and moves no reason bucket either. Rows *and* occurrences are now pinned per
+  kind on both corpora, because a rule that stops deduplicating moves one and
+  not the other.
+
 - **One `LocalBinding` rule in every tier-1 track, and Go emits type uses — a
   deliberate re-base of seven baselines.** The ratified rule is that a
   reference whose root is a parameter or a local variable names a thing that is
@@ -113,6 +325,28 @@ Decisions and their rationale — including what was rejected — live in
   no baseline moved.
 
 ### Fixed
+
+- **A mixed `.js`/`.ts` tree reported a higher JavaScript rate the second time
+  it was scanned.** The track runs two passes over one store, and the wake set
+  each computes is filtered to the files that pass owns. So when the TypeScript
+  pass declared an identity a JavaScript row had already probed and missed — a
+  workspace member whose entry point is a `.ts` file is the shape that does it
+  — applying it withdrew that file's currency claim and no pass in that scan
+  could give it back. The scan ended with the claim outstanding, the *next*
+  scan re-read exactly those files, and they resolved against a store that by
+  then held the TypeScript definitions. On a two-package fixture the JavaScript
+  rate is 0% cold and 100% warm, for a tree nobody touched. A rate that depends
+  on how many times it has been measured is not a measurement, and the cold
+  number is the one every baseline is taken from. The track now runs JavaScript
+  once more to converge; that pass's changed set is exactly the files whose
+  claims are outstanding, which is empty in the ordinary case, and it
+  terminates because a module's identity here is its path. Measured cost, best
+  of three interleaved cold runs: express +0.03 s, fastify +0.01 s, vue-core
+  +0.09 s, zod within noise. The returned report's `file_errors` are now the
+  union of all three passes' rather than the last one's — a tally is
+  whole-store, but a file error belongs to the pass that tried to read the
+  file. None of the four gated corpora is mixed, so no committed number moves;
+  the fixture is the gate.
 
 - **Two Go definition defects the new type-use surface exposed.** `def-type`
   read only `type_spec`, so a package-level `type X = Y` declared no node —

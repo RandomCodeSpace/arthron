@@ -8,8 +8,9 @@
 //! `tests/csharp_corpus.rs`, `tests/swift_corpus.rs`, `tests/cpp_corpus.rs`,
 //! `tests/bash_corpus.rs`, `tests/hcl_corpus.rs`, `tests/lua_corpus.rs`,
 //! `tests/dart_corpus.rs`, `tests/haskell_corpus.rs`, `tests/elixir_corpus.rs`,
-//! and `tests/probes.rs` for
-//! the probe pin — because
+//! and `tests/probes.rs`, `tests/java_probes.rs`, `tests/python_probes.rs`,
+//! `tests/javascript_probes.rs` and `tests/typescript_probes.rs` for the five
+//! probe pins — because
 //! each of them measures with its own track's entry point. That spread has one
 //! failure mode: a baseline lands in `baselines/` and nothing compares against
 //! it, which looks exactly like a passing gate and is the absence of one.
@@ -48,12 +49,22 @@ const GATED: &[(&str, &str)] = &[
     ("baselines/go-probes.toml", "tests/probes.rs"),
     ("baselines/java-commons-lang.toml", "tests/java_corpus.rs"),
     ("baselines/java-gson.toml", "tests/java_corpus.rs"),
+    ("baselines/java-probes.toml", "tests/java_probes.rs"),
     ("baselines/javascript-fastify.toml", "tests/corpus_ecma.rs"),
     ("baselines/javascript-express.toml", "tests/corpus_ecma.rs"),
+    (
+        "baselines/javascript-probes.toml",
+        "tests/javascript_probes.rs",
+    ),
     ("baselines/typescript-vue-core.toml", "tests/corpus_ecma.rs"),
     ("baselines/typescript-zod.toml", "tests/corpus_ecma.rs"),
+    (
+        "baselines/typescript-probes.toml",
+        "tests/typescript_probes.rs",
+    ),
     ("baselines/python-django.toml", "tests/corpus_python.rs"),
     ("baselines/python-flask.toml", "tests/corpus_python.rs"),
+    ("baselines/python-probes.toml", "tests/python_probes.rs"),
     // Tier 2. The file format is the same and the comparison is the same;
     // what the numbers mean is not — these rates are over each track's
     // imports.
@@ -495,7 +506,7 @@ fn no_gate_step_can_pass_without_measuring() {
         // baseline it exists to enforce with whatever this build measured,
         // prints what it wrote, and exits 0. Against a baseline holding
         // `resolved = 999999` the same step exits 1 without the flag and 0
-        // with it. Twenty-five of those is a corpus gate that self-approves
+        // with it. Twenty-nine of those is a corpus gate that self-approves
         // every regression it sees, forever, in green.
         //
         // An allow-list, not a deny-list: `--rebase` is the flag that does it
