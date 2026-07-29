@@ -4,6 +4,86 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-29 — binary releases use cargo-dist, with dispatch as a build-only proof
+
+**Decided: cargo-dist 0.32.0 supplies the release build graph, while
+`release.yml` is a reviewed project-maintained customization derived from it.**
+It builds the five requested native targets: `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+`aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. The five target release
+archive/checksum pairs are
+`arthron-x86_64-unknown-linux-gnu.tar.xz` and `.sha256`,
+`arthron-aarch64-unknown-linux-gnu.tar.xz` and `.sha256`,
+`arthron-x86_64-apple-darwin.tar.xz` and `.sha256`,
+`arthron-aarch64-apple-darwin.tar.xz` and `.sha256`, and
+`arthron-x86_64-pc-windows-msvc.zip` and `.sha256`. They are release outputs,
+not workflow-artifact bundle names. The release also has `source.tar.gz`, its
+checksum, and `sha256.sum`.
+
+A `push` matching `v*` is the only publishing event: its host job receives
+`contents: write`, uploads every generated asset, and creates the GitHub
+Release. `workflow_dispatch` has no publishing condition; it runs `dist plan`
+and the full build matrix with root `contents: read`, so it cannot create a
+tag, upload a release asset, or create a release. Its multiple temporary
+workflow bundles are `cargo-dist-cache`, `artifacts-plan-dist-manifest`, one
+`artifacts-build-local-<target>` bundle for each of the five targets, and
+`artifacts-build-global`; their names do not assert a one-to-one release asset
+mapping.
+
+This is the safest test path available before the workflow exists on the
+default branch. GitHub only loads workflow definitions from the default branch
+for manual dispatch, so an end-to-end dispatch cannot be run from this worker
+branch without first shipping the workflow. The ship-stage proof is therefore:
+dispatch `Release` on the merged default-branch commit, inspect the multiple
+workflow bundles for the five named target archive/checksum pairs, and verify
+that no GitHub Release exists; then, only for the planned release tag, verify
+those named pairs are attached to its GitHub Release.
+
+**Selection evidence, checked 2026-07-29.** GitHub's latest cargo-dist release
+is stable `v0.32.0`, published 2026-05-22; its release asset checksum verified
+locally before its `dist` binary was used. Its workspace declares
+`MIT OR Apache-2.0`, ships both license texts, and has a `SECURITY.md` with
+private GitHub vulnerability reporting and a security contact. GitHub's
+advisory API query for the Rust `cargo-dist` package returned an empty list at
+this check. That is a point-in-time vulnerability query, not a claim that no
+future advisory can exist. cargo-dist is a CI tool only: this repository adds
+no Cargo dependency, no `Cargo.lock` entry, and no product transitive
+dependency. The workflow pins every action invocation and cargo-dist's
+`github-action-commits` metadata to the verified immutable commits
+`actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803`,
+`actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`, and
+`actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`.
+Build-time downloads are confined to CI.
+
+The workflow deliberately carries `allow-dirty = ["ci"]` because cargo-dist
+0.32.0 cannot represent the project's hybrid tag-push and dry-dispatch policy.
+The reviewed deviations are: the `v*` trigger; non-publishing dispatch through
+the tag/publishing outputs and host guard; removal of the pull-request trigger
+and rust-cache integration; root `contents: read` with `contents: write` only
+on `host`; immutable action SHAs; shell quoting and grouped
+`$GITHUB_OUTPUT` writes; and the plan/local/global/host job grouping and
+handoff. `pr-run-mode = "upload"` remains only because cargo-dist's generated
+build condition uses it to enable the dispatch matrix; this workflow has no PR
+trigger. On a cargo-dist update, regenerate the baseline, review the complete
+diff against this customization and reapply only these documented deviations.
+`dist generate --check --allow-dirty` does not prove this customized workflow
+is consistent and is not a release-workflow acceptance test.
+
+*Rejected: a hand-rolled matrix and release upload workflow.* It would recreate
+cargo-dist's target-to-runner mapping, archive layout, checksums, manifest
+handoff, and release asset collection as project-maintained logic. cargo-dist
+already supplies that maintained build graph while adding no runtime network
+behavior or product dependency.
+
+*Rejected: a release-capable manual dispatch.* A pre-tag test must not create
+an external release. Dispatch deliberately cannot reach the host job; the
+publishing branch is reachable only through a pushed `v*` tag.
+
+*Resolved after Stream G merged: README binary-install instructions.* Stream E
+now documents the five target archive/checksum pairs without disturbing
+Stream G's README changes. Stream M retains only the final proof that the
+versioned 0.1.0 tag publishes those named assets.
+
 ## 2026-07-29 — collision disposition belongs to the stored definition set
 
 Two files declaring C# `N#Shared` as a partial type exposed a split answer:
