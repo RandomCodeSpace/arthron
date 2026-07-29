@@ -79,10 +79,10 @@ behavior or product dependency.
 an external release. Dispatch deliberately cannot reach the host job; the
 publishing branch is reachable only through a pushed `v*` tag.
 
-*Deferred: README binary-install instructions.* Stream G has not merged and
-owns the current README collision. Stream M must add the final install paths
-after its 0.1.0 release workflow proof; this stream intentionally does not edit
-README.md.
+*Resolved after Stream G merged: README binary-install instructions.* Stream E
+now documents the five target archive/checksum pairs without disturbing
+Stream G's README changes. Stream M retains only the final proof that the
+versioned 0.1.0 tag publishes those named assets.
 
 ## 2026-07-29 — collision disposition belongs to the stored definition set
 
