@@ -101,6 +101,27 @@ fn scan_reports_honest_per_language_counts() {
 }
 
 #[test]
+fn current_extractors_freeze_argument_types_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let db = dir.path().join("graph.redb");
+
+    scan_go(dir.path(), &db).expect("scan succeeds");
+    let snapshot = Store::open(&db)
+        .expect("store opens")
+        .snapshot()
+        .expect("store snapshots");
+    assert!(
+        !snapshot.rows.is_empty(),
+        "the fixture must exercise row keys"
+    );
+    assert!(
+        snapshot.rows.keys().all(|key| key.arg_types.is_none()),
+        "C0 changes key representation only; language-owned work populates argument types later",
+    );
+}
+
+#[test]
 fn every_extracted_reference_has_exactly_one_stored_outcome() {
     // The non-negotiable, counted rather than asserted in prose: the three
     // outcome columns are a partition of the references the extractor found,

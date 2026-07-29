@@ -104,6 +104,7 @@ fn key(file: &str, enclosing: &str, raw: &str) -> RefKey {
         enclosing: enclosing.to_string(),
         raw_target: raw.to_string(),
         argc: None,
+        arg_types: None,
         locally_bound: false,
     }
 }
@@ -115,6 +116,22 @@ fn record(outcome: StoredOutcome) -> RefRecord {
         first_line: 7,
         lang: Lang::Go.code(),
     }
+}
+
+#[test]
+fn schema_eleven_round_trips_argument_types_in_reference_keys() {
+    assert_eq!(SCHEMA_VERSION, 11);
+
+    let mut typed = key("pkg/a.java", "pkg#Caller.m()", "pick");
+    typed.argc = Some(1);
+    typed.arg_types = Some(vec!["int".to_string()]);
+
+    let (file, encoded) = typed.split();
+    assert_eq!(RefKey::join(file, &encoded).expect("join"), typed);
+
+    let mut other = typed.clone();
+    other.arg_types = Some(vec!["java.lang.String".to_string()]);
+    assert_ne!(typed.split().1, other.split().1);
 }
 
 /// One file's phase-2 half: one row, one edge, one candidate entry.
@@ -135,10 +152,10 @@ fn open(path: &Path) -> Store {
 }
 
 #[test]
-fn a_schema_nine_store_is_wiped_and_rebuilt_at_schema_ten() {
+fn a_schema_ten_store_is_wiped_and_rebuilt_at_schema_eleven() {
     assert_eq!(
-        SCHEMA_VERSION, 10,
-        "persisting collision disposition is the schema 9 -> 10 break",
+        SCHEMA_VERSION, 11,
+        "adding argument types to reference keys is the schema 10 -> 11 break",
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("graph.redb");
@@ -151,27 +168,27 @@ fn a_schema_nine_store_is_wiped_and_rebuilt_at_schema_ten() {
                     nodes: vec![definition("m/pkg#Old", "pkg/a.go", 3)],
                 }],
             })
-            .expect("apply schema-nine definition");
+            .expect("apply schema-ten definition");
         assert!(
             store.node(&go("m/pkg#Old")).unwrap().is_some(),
             "the old store contains a graph to wipe",
         );
     }
 
-    let db = Database::create(&path).expect("raw schema-nine open");
-    let txn = db.begin_write().expect("write schema-nine stamp");
+    let db = Database::create(&path).expect("raw schema-ten open");
+    let txn = db.begin_write().expect("write schema-ten stamp");
     {
         let mut meta = txn.open_table(META).expect("meta");
-        meta.insert("schema_version", &9u32.to_le_bytes()[..])
-            .expect("stamp schema nine");
+        meta.insert("schema_version", &10u32.to_le_bytes()[..])
+            .expect("stamp schema ten");
     }
-    txn.commit().expect("commit schema nine");
+    txn.commit().expect("commit schema ten");
     drop(db);
 
     let rebuilt = open(&path);
     assert!(
         rebuilt.known_files().unwrap().is_empty(),
-        "schema-nine ownership was wiped",
+        "schema-ten ownership was wiped",
     );
     assert!(
         rebuilt
@@ -179,7 +196,7 @@ fn a_schema_nine_store_is_wiped_and_rebuilt_at_schema_ten() {
             .expect("rebuilt snapshot")
             .nodes
             .is_empty(),
-        "schema-nine nodes were wiped before schema ten was created",
+        "schema-ten nodes were wiped before schema eleven was created",
     );
     assert_eq!(rebuilt.report().unwrap().fqn_collisions, 0);
 }

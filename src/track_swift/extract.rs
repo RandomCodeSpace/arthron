@@ -424,6 +424,7 @@ fn import(facts: &mut FileFacts<SwiftLang>, node: &SgNode) {
         // name a local: `LocalBinding` does not apply to this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         // A Swift `import` is a file-scope declaration, so there is never a
         // nameable definition between it and the file's module; the driver
         // sources every one of them at the module itself.

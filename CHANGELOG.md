@@ -11,6 +11,13 @@ Decisions and their rationale — including what was rejected — live in
 
 ## [Unreleased]
 
+### Changed
+
+- Reference rows now carry file-locally evident call argument types in their
+  canonical key. Schema generation 11 forces older stores to rescan. Current
+  extractors initialize the field to `None`, freezing graph behavior until a
+  language track deliberately starts recording types.
+
 ### Added
 
 - **Binary-release automation for five native targets.** The reviewed,

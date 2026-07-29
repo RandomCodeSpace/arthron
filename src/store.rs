@@ -57,7 +57,7 @@ use crate::model::{
 /// A store written under any other value is dropped and rebuilt rather than
 /// migrated: a graph is a cache of facts that can always be recomputed from
 /// the source tree, and a half-migrated one is worse than an absent one.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// The [`META`] key the schema generation is stored under.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -511,8 +511,8 @@ pub enum StoredOutcome {
 ///
 /// A row carries exactly one outcome, so the key must separate every pair of
 /// references whose outcomes can legitimately differ. Everything the resolver
-/// reads is either in this key or derived from it — except the extractor's
-/// binding verdict, which is why [`RefKey::locally_bound`] is part of it.
+/// reads is either in this key or derived from it. The extractor's binding
+/// verdict and any file-local argument types are therefore key fields too.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct RefKey {
     /// Repo-relative path of the file the reference sits in.
@@ -530,6 +530,10 @@ pub struct RefKey {
     /// Argument count at a call or creation site, when the extractor
     /// records one. `None` and `Some(0)` are different keys.
     pub argc: Option<u32>,
+    /// File-locally evident argument types at a call or creation site.
+    /// `None` and a known list are different keys because overload outcomes
+    /// can legitimately differ for same-arity calls.
+    pub arg_types: Option<Vec<String>>,
     /// Whether some enclosing block binds the target's root name at this
     /// site.
     ///
@@ -544,8 +548,16 @@ pub struct RefKey {
 }
 
 /// The non-`file` half of a [`RefKey`], as [`RefKey::split`] encodes it:
-/// `(kind, space, enclosing, raw_target, argc, locally_bound)`.
-type RefKeyRest = (u8, u8, String, String, Option<u32>, bool);
+/// `(kind, space, enclosing, raw_target, argc, arg_types, locally_bound)`.
+type RefKeyRest = (
+    u8,
+    u8,
+    String,
+    String,
+    Option<u32>,
+    Option<Vec<String>>,
+    bool,
+);
 
 impl RefKey {
     /// Split into the redb key `(file, encoded rest)`.
@@ -553,14 +565,14 @@ impl RefKey {
     /// The file leads so that every row of one file is one contiguous range,
     /// which is what makes a per-file replace a bounded operation. The rest
     /// is bincode over
-    /// `(kind, space, enclosing, raw_target, argc, locally_bound)` and is
-    /// canonical: one key, one byte string.
+    /// `(kind, space, enclosing, raw_target, argc, arg_types, locally_bound)`
+    /// and is canonical: one key, one byte string.
     ///
     /// # Panics
     ///
-    /// Never in practice: the encoded tuple is two bytes, two strings, an
-    /// optional integer and a bool, and encoding those into a `Vec` cannot
-    /// fail.
+    /// Never in practice: the encoded tuple is two bytes, two strings,
+    /// optional arity and argument types, and a bool; encoding those into a
+    /// `Vec` cannot fail.
     pub fn split(&self) -> (&str, Vec<u8>) {
         let rest = (
             self.kind,
@@ -568,10 +580,13 @@ impl RefKey {
             self.enclosing.as_str(),
             self.raw_target.as_str(),
             self.argc,
+            self.arg_types.as_ref(),
             self.locally_bound,
         );
-        let encoded = bincode::encode_to_vec(rest, config::standard())
-            .expect("a row key encodes: two bytes, two strings, an optional integer and a bool");
+        let encoded = bincode::encode_to_vec(rest, config::standard()).expect(
+            "a row key encodes: two bytes, two strings, optional arity and argument types, \
+                 and a bool",
+        );
         (self.file.as_str(), encoded)
     }
 
@@ -580,8 +595,10 @@ impl RefKey {
     /// Trailing bytes are an error rather than ignored padding: an encoding
     /// that accepts two byte strings for one key is not a key at all.
     pub fn join(file: &str, encoded: &[u8]) -> Result<RefKey, String> {
-        let ((kind, space, enclosing, raw_target, argc, locally_bound), used): (RefKeyRest, usize) =
-            bincode::decode_from_slice(encoded, config::standard()).map_err(|e| e.to_string())?;
+        let ((kind, space, enclosing, raw_target, argc, arg_types, locally_bound), used): (
+            RefKeyRest,
+            usize,
+        ) = bincode::decode_from_slice(encoded, config::standard()).map_err(|e| e.to_string())?;
         if used != encoded.len() {
             return Err(format!(
                 "row key has {} trailing byte(s) after a complete decode",
@@ -595,6 +612,7 @@ impl RefKey {
             enclosing,
             raw_target,
             argc,
+            arg_types,
             locally_bound,
         })
     }
@@ -2733,6 +2751,7 @@ mod tests {
             enclosing: "m/pkg#Caller".to_string(),
             raw_target: raw.to_string(),
             argc: None,
+            arg_types: None,
             locally_bound: false,
         }
     }
