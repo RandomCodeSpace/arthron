@@ -217,7 +217,7 @@ reasons are where that shows. The buckets that need a type environment —
 `NeedsExpressionType`, `NeedsReceiverType`, `NeedsTypeInference`,
 `AmbiguousOverload`, `UnindexedSupertype`, `DynamicDispatch` — are the majority
 of what tier 1 leaves unlinked on nine of the ten real corpora, from 51.9% on
-`flask` to 100.0% on both Go corpora. The tenth is `vue-core` at 42.1%, where
+`flask` to 100.0% on both Go corpora. The tenth is `vue-core` at 46.6%, where
 the largest single bucket is instead the 14,618 names a declared test runner
 injects into the global scope.
 
@@ -255,23 +255,20 @@ rate without the share invites reading the first number as the second.
 | Java | `commons-lang` `598dfc1` | 38,222 | 63,385 | 15,162 | 12,274 | **75.7%** | 39.1% |
 | Java | `gson` `3ff35d6` | 13,306 | 16,737 | 6,706 | 5,684 | **70.1%** | 44.8% |
 | Java | `probes` `e4dc880` | 13 | 7 | 1 | 1 | **92.9%** † | 63.6% |
-| JavaScript | `fastify` `94bcbcc` | 2,795 | 5,159 | 21,542 | 1,640 | **63.0%** | 14.2% |
-| JavaScript | `express` `dbac741` | 2,267 | 702 | 3,039 | 5,552 | **29.0%** | 67.6% |
-| JavaScript | `probes` `e4dc880` | 6 | 0 | 1 | 2 | **75.0%** † | 88.9% |
-| TypeScript | `vue-core` `fa2885d` | 26,297 | 3,694 | 9,564 | 27,945 | **48.5%** | 80.4% |
-| TypeScript | `zod` `1fb56a5` | 17,080 | 1,952 | 8,143 | 19,784 | **46.3%** | 78.5% |
-| TypeScript | `probes` `e4dc880` | 12 | 0 | 1 | 3 | **80.0%** † | 93.8% |
+| JavaScript | `fastify` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 2,865 | 5,348 | 26,957 | 2,530 | **53.1%** | 14.3% |
+| JavaScript | `express` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 2,272 | 748 | 3,642 | 5,910 | **27.8%** | 65.1% |
+| JavaScript | `probes` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 6 | 0 | 1 | 2 | **75.0%** † | 88.9% |
+| TypeScript | `vue-core` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 29,763 | 3,817 | 20,551 | 30,557 | **49.3%** | 71.2% |
+| TypeScript | `zod` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 17,530 | 2,059 | 14,456 | 21,773 | **44.6%** | 70.4% |
+| TypeScript | `probes` `00708f3fae0cf8134e718fc8ec35e436d4f481b7` | 12 | 0 | 1 | 3 | **80.0%** † | 93.8% |
 | Python | `django` `af67523` | 19,103 | 13,326 | 8,405 | 6,185 | **75.5%** | 53.8% |
 | Python | `flask` `22d9247` | 1,185 | 2,317 | 2,146 | 877 | **57.5%** | 31.6% |
 | Python | `probes` `e4dc880` | 5 | 0 | 2 | 1 | **83.3%** † | 75.0% |
 
-Ten real corpora and five synthetic probe pins. Since the last published table
-four rows are new, three rates moved, one row changed without its rate moving,
-and every other cell is byte-identical. A rate moves for more than one reason
-and only one of those reasons is "it got better", so each movement below is
-attributed per row in [`CHANGELOG.md`](CHANGELOG.md) — by a whole-row join
-against a binary built from the previous commit — rather than inferred from
-these totals.
+Ten real corpora and five synthetic probe pins. The table is a direct rendering
+of the committed baselines. Its six ECMA rows include the static member-read
+capability; their movement is attributed by a whole-row join in the Stream D
+decision record rather than inferred from these totals.
 
 1. **Both Go rates fell, and that is coverage.** The extractor now emits the
    two member sites it never had: a selector *read* (`pkg.Name`, `t.field`)
@@ -297,16 +294,19 @@ these totals.
    the `local_binding` column in [`baselines/`](baselines), which is gated for
    drift exactly so this cannot be done quietly.
 
-`express` is the row that changed without its rate moving: `XMLHttpRequest` was
+`express` previously changed without its rate moving: `XMLHttpRequest` was
 missing from the host global list while `WebSocket`, `AbortController` and
-`fetch` were all in it, so `external` went 701 → 702 and the rate reads 28.99%
-on both sides. The same change reclassified the 1,728 express and 13,833
-vue-core references that a declared test runner injects — `it`, `describe`,
-`expect` — out of `NoMatchingDefinition`, a bucket whose contract is that it
-means *arthron's* bug. They became `Unresolved(UnknownPackage)` rather than
-`External` deliberately: `Unresolved` keeps them inside both of the rate's
-terms, where `External` would take them out of both and raise the rate without
-linking anything. No gated number moved.
+`fetch` were all in it, so `external` went 701 → 702 and the rate read 28.99%
+on both sides. Its current baseline is 2,272 resolved, 748 external, 3,642
+local-binding and 5,910 unresolved: a 27.8% rate after static member reads
+entered the denominator. The same earlier change reclassified the 1,728
+express and 13,833 vue-core references that a declared test runner injects —
+`it`, `describe`, `expect` — out of `NoMatchingDefinition`, a bucket whose
+contract is that it means *arthron's* bug. They became
+`Unresolved(UnknownPackage)` rather than `External` deliberately:
+`Unresolved` keeps them inside both of the rate's terms, where `External` would
+take them out of both and raise the rate without linking anything. No gated
+number moved in that earlier change.
 
 What the third change costs is *edges*, and the counts are in
 [`CHANGELOG.md`](CHANGELOG.md): 5,374 commons-lang and 3,189 gson occurrences
@@ -395,7 +395,7 @@ in either.
 
 **The rate's denominator is published beside it, every time.** Excluding those
 two is correct and it also makes the denominator smaller than the surface the
-scan read — on `fastify` the rate covers 14.2% of the references JavaScript
+scan read — on `fastify` the rate covers 14.3% of the references JavaScript
 emitted. A high rate over a small share is a real measurement and a partial
 one, and the only way to read it as the first without the second is for the
 second not to be there. So `arthron scan` prints it under every language line,

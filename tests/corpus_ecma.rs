@@ -14,9 +14,9 @@
 //! arthron gate corpus/typescript/vue-core --language typescript \
 //!     --baseline baselines/typescript-vue-core.toml --rebase --commit <pin>
 //! arthron gate corpus/javascript/express  --language javascript \
-//!     --baseline baselines/javascript-express.toml --rebase --commit dbac741
+//!     --baseline baselines/javascript-express.toml --rebase --commit 00708f3
 //! arthron gate corpus/typescript/zod      --language typescript \
-//!     --baseline baselines/typescript-zod.toml     --rebase --commit 1fb56a5
+//!     --baseline baselines/typescript-zod.toml     --rebase --commit 00708f3
 //! ```
 //!
 //! `--language` is load-bearing and the rendered header comment omits it: the
@@ -71,10 +71,10 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         &[
             ("DynamicModuleSpecifier", 1),
             ("ModuleNotFound", 10),
-            ("NeedsExpressionType", 993),
-            ("NeedsReceiverType", 102),
-            ("NeedsTypeInference", 296),
-            ("NoMatchingDefinition", 238),
+            ("NeedsExpressionType", 1534),
+            ("NeedsReceiverType", 291),
+            ("NeedsTypeInference", 356),
+            ("NoMatchingDefinition", 338),
         ],
     ),
     (
@@ -94,10 +94,10 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         // occurrence of it is a real one.
         &[
             ("DynamicModuleSpecifier", 3),
-            ("NeedsExpressionType", 2906),
-            ("NeedsReceiverType", 132),
-            ("NeedsTypeInference", 781),
-            ("UnknownPackage", 1730),
+            ("NeedsExpressionType", 2949),
+            ("NeedsReceiverType", 385),
+            ("NeedsTypeInference", 842),
+            ("UnknownPackage", 1731),
         ],
     ),
     (
@@ -114,11 +114,11 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         // globals, and members the resolver genuinely did not reach.
         &[
             ("ModuleNotFound", 108),
-            ("NeedsExpressionType", 11151),
-            ("NeedsReceiverType", 85),
-            ("NeedsTypeInference", 535),
-            ("NoMatchingDefinition", 1443),
-            ("UnindexedSupertype", 5),
+            ("NeedsExpressionType", 12646),
+            ("NeedsReceiverType", 444),
+            ("NeedsTypeInference", 1154),
+            ("NoMatchingDefinition", 1577),
+            ("UnindexedSupertype", 10),
             ("UnknownPackage", 14618),
         ],
     ),
@@ -148,11 +148,11 @@ const CORPORA: &[(&str, Lang, &str, &str, &[(&str, u64)])] = &[
         // this resolver does not yet follow.
         &[
             ("ModuleNotFound", 1),
-            ("NeedsExpressionType", 8811),
-            ("NeedsReceiverType", 50),
-            ("NeedsTypeInference", 1761),
-            ("NoMatchingDefinition", 1123),
-            ("UnindexedSupertype", 2),
+            ("NeedsExpressionType", 10215),
+            ("NeedsReceiverType", 62),
+            ("NeedsTypeInference", 2153),
+            ("NoMatchingDefinition", 1302),
+            ("UnindexedSupertype", 4),
             ("UnknownPackage", 8036),
         ],
     ),
