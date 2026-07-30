@@ -13,20 +13,21 @@ Decisions and their rationale — including what was rejected — live in
 
 ### Changed
 
-- Java calls and constructor invocations now store complete file-local
-  argument vectors on `Reference.arg_types` and select applicable declarations
-  across the receiver and indexed supertypes in strict, loose, then varargs
-  phases. Fixture-proven conversions cover primitive widening, boxing,
-  unboxing plus widening, and built-in wrapper-to-`Number`/`Object` chains;
-  incomparable or expression-typed candidates remain `AmbiguousOverload`.
-  Unique callables retain their arity target through forwarding signature
-  aliases, and unary numeric literals preserve their promoted primitive type.
+- Java now retries typed applicability only for a legacy
+  `AmbiguousOverload` whose complete file-local argument vector is known.
+  Legacy resolved, external, local, and other unresolved rows keep their
+  outcome and coarse key. The retry preserves strict, loose, then varargs
+  phase order, including exact-array fixed-arity and zero-tail varargs calls;
+  incomparable candidates remain a refined `AmbiguousOverload`. Integer
+  literal radix, suffix, range, unary numeric promotion, and canonical
+  `java.lang` spellings are handled without guessing user subtype relations.
+  Candidate dependencies are the stable legacy-first union of both passes.
 - Reference-key argument types are now selected by the resolver that saw the
   candidate set. The default keeps the existing coarse key, and a resolver may
   explicitly refine it with a complete argument-type vector. A default-zero
   per-language graph revision leaves existing manifest fences byte-identical;
   nonzero revisions force only that language's unchanged files to rebuild.
-  Every language remains at revision zero in this change.
+  Java is revision one; every other language remains at revision zero.
 - Reference rows now carry file-locally evident call argument types in their
   canonical key. Schema generation 11 forces older stores to rescan. Current
   extractors initialize the field to `None`, freezing graph behavior until a

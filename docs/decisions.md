@@ -22,6 +22,15 @@ resolution plus no refinement. Only ordinary phase two calls the combined
 operation; supertype linking continues to call `resolve`. The pipeline neither
 panics nor drops a reference for either refinement.
 
+**Stream C uses that hook only after the authoritative legacy Java pass
+returns `AmbiguousOverload`.** A complete `Reference.arg_types` vector then
+permits one typed applicability retry. A typed resolution may replace that
+ambiguity; a typed ambiguity or any typed miss retains an honestly refined
+`AmbiguousOverload`. Legacy resolved, external, local, and every other
+unresolved outcome return unchanged with no refinement. Candidate dependencies
+are the deterministic union of every identity read by both passes: legacy
+order first, followed by each typed-only identity at its first occurrence.
+
 **A resolver also publishes a graph-semantics revision, defaulting to zero.**
 Revision zero feeds the established manifest digest to the per-language store
 fence byte-for-byte unchanged. A nonzero revision is domain-separated and
@@ -30,6 +39,13 @@ manifest digest is empty, so the existing fence forgets only files owned by
 that language. Every language stays at revision zero in C1. Java moves to
 revision one in Stream C, when it first consumes resolver-owned argument-type
 refinement.
+
+Java's finite typed surface includes exact-array use of a varargs declaration
+in the fixed-arity phases and zero-tail varargs selection through Java-owned
+prefix aliases. It parses integer literal radix, suffix, and legal range,
+applies unary numeric promotion from `byte`, `short`, and `char` to `int`, and
+compares simple and qualified `java.lang` spellings canonically. It does not
+infer return types or user-defined subtype relations.
 
 *Rejected: defer Stream C to 0.2.0 and revert C0.* That slips the Java overload
 capability and spends two revert changes.
@@ -40,6 +56,16 @@ schema break with no resolver owning when the dimension is populated.
 *Rejected: amend pin semantics to accept the attributed Java rekey.* That
 weakens the gate which exposed this defect and makes a later semantic rekey
 indistinguishable from an accepted one.
+
+*Rejected: run typed applicability for every call with known arguments.* That
+would move already-resolved legacy targets and recreate C0's key churn.
+
+*Rejected: replace the legacy candidate set with the typed pass's probes.*
+That would remove invalidation dependencies and leave refined rows stale after
+an overload edit.
+
+*Rejected: turn unsupported typed shapes into a new reason.* The taxonomy does
+not need another bucket; the legacy `AmbiguousOverload` remains honest.
 
 ---
 

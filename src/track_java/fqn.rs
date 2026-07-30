@@ -132,6 +132,22 @@ pub fn varargs_key(name: &str, min: u32) -> String {
     format!("{name}/*{min}")
 }
 
+/// Synthetic lookup key for a variable-arity declaration whose fixed prefix
+/// is known but whose repeated component has no argument at the call site.
+///
+/// `;...` cannot be a Java parameter type, so this cannot collide with a
+/// source signature.
+pub fn varargs_prefix_key(name: &str, prefix: &[String]) -> String {
+    format!("{name}({};...)", prefix.join(","))
+}
+
+/// Recover the callable name from [`varargs_prefix_key`].
+pub fn varargs_prefix_name(key: &str) -> Option<&str> {
+    key.strip_suffix(";...)")?
+        .split_once('(')
+        .map(|(name, _)| name)
+}
+
 /// The signature form used by overload definitions and unique-callable aliases.
 pub fn signature_key(name: &str, types: &[String]) -> String {
     format!("{name}({})", types.join(","))

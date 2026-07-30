@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 
-use arthron::model::RefKind;
-use arthron::store::{NodeRecord, Store, StoredOutcome};
+use arthron::model::{NodeId, RefKind};
+use arthron::store::{NodeRecord, RefKey, Store, StoredOutcome};
 use arthron::track_java::scan_java;
 
 /// Every reference row of one scan, rendered as a readable outcome.
@@ -24,11 +24,14 @@ struct Scan {
 }
 
 struct Row {
+    key: RefKey,
     file: String,
     raw_target: String,
     kind: u8,
     enclosing: String,
     outcome: String,
+    candidates: Vec<NodeId>,
+    count: u32,
 }
 
 /// Write `files` to a scratch tree, scan it, and render every row's outcome.
@@ -63,6 +66,7 @@ fn scan(files: &[(&str, &str)]) -> Scan {
         .rows
         .iter()
         .map(|(key, record)| Row {
+            key: key.clone(),
             file: key.file.clone(),
             raw_target: key.raw_target.clone(),
             kind: key.kind,
@@ -75,19 +79,20 @@ fn scan(files: &[(&str, &str)]) -> Scan {
                 StoredOutcome::External(package) => format!("EXTERNAL {package}"),
                 StoredOutcome::Unresolved(code) => arthron::model::reason_name(*code).to_string(),
             },
+            candidates: snapshot
+                .candidates
+                .iter()
+                .filter_map(|(id, keys)| keys.contains(key).then_some(*id))
+                .collect(),
+            count: record.count,
         })
         .collect();
     Scan { rows }
 }
 
 impl Scan {
-    /// The outcome of the one row with this site text and kind.
-    ///
-    /// Panics when there is not exactly one: a test that silently read the
-    /// first of two rows would assert about whichever the row order happened
-    /// to put first.
     #[track_caller]
-    fn one(&self, raw_target: &str, kind: RefKind) -> &str {
+    fn row(&self, raw_target: &str, kind: RefKind) -> &Row {
         let code = kind.code();
         let mut hits = self
             .rows
@@ -101,7 +106,17 @@ impl Scan {
             "`{raw_target}` {kind:?} has more than one row\n{}",
             self.dump(),
         );
-        &first.outcome
+        first
+    }
+
+    /// The outcome of the one row with this site text and kind.
+    ///
+    /// Panics when there is not exactly one: a test that silently read the
+    /// first of two rows would assert about whichever the row order happened
+    /// to put first.
+    #[track_caller]
+    fn one(&self, raw_target: &str, kind: RefKind) -> &str {
+        &self.row(raw_target, kind).outcome
     }
 
     /// Every row, for a failure message that says what was actually measured.
@@ -502,8 +517,8 @@ public class Applicability {
 
     assert_eq!(
         scan.one("inherited", RefKind::Call),
-        "RESOLVED com.acme#Applicability$Base.inherited(int)",
-        "an inapplicable direct declaration must not hide an inherited applicable overload",
+        "RESOLVED com.acme#Applicability$Child.inherited/1",
+        "a legacy-resolved row must not be re-aimed by typed applicability",
     );
     assert_eq!(
         scan.one("flexible", RefKind::Call),
@@ -1219,5 +1234,385 @@ public class Owner {
     assert_eq!(
         scan.one("this.only", RefKind::Call),
         "RESOLVED com.acme#Owner.only/0",
+    );
+}
+
+const REFINEMENT_SOURCE: &str = r#"package com.acme;
+public class Refinement {
+    static void singleton(int value) {}
+    static void zero() {}
+    static void typed(int value) {}
+    static void typed(String value) {}
+    static void still(int left, long right) {}
+    static void still(long left, int right) {}
+    static Object unknownValue() { return null; }
+    static void unknown(int value) {}
+    static void unknown(String value) {}
+
+    static void calls() {
+        singleton(1);
+        zero();
+        typed(1);
+        typed(1);
+        still(1, 1);
+        unknown(unknownValue());
+    }
+}
+"#;
+
+#[test]
+fn a_singleton_typed_call_preserves_its_c0_pin_identity() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("singleton", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.singleton/1");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn a_zero_argument_call_preserves_its_c0_pin_identity() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("zero", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.zero/0");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn typed_overloads_refine_only_a_legacy_ambiguous_row() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("typed", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.typed(int)");
+    assert_eq!(row.key.arg_types, Some(vec!["int".to_string()]));
+    assert_eq!(
+        scan.row("singleton", RefKind::Call).key.arg_types,
+        None,
+        "a legacy-resolved row was refined",
+    );
+}
+
+#[test]
+fn a_typed_but_still_ambiguous_call_keeps_an_honest_refined_row() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("still", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(
+        row.key.arg_types,
+        Some(vec!["int".to_string(), "int".to_string()])
+    );
+}
+
+#[test]
+fn equal_argument_vectors_still_deduplicate() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let rows = scan
+        .rows
+        .iter()
+        .filter(|row| row.raw_target == "typed" && row.kind == RefKind::Call.code())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key.arg_types, Some(vec!["int".to_string()]));
+    assert_eq!(rows[0].count, 2);
+}
+
+#[test]
+fn unknown_argument_types_keep_the_legacy_ambiguous_key() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("unknown", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn a_refined_row_records_the_union_of_legacy_and_typed_candidates() {
+    use arthron::model::{Domain, node_id};
+
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("typed", RefKind::Call);
+    let stored = row
+        .candidates
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "com.acme#Refinement",
+        "com.acme#Refinement.typed/1",
+        "com.acme#Refinement.typed(int)",
+        "com.acme#Refinement.typed(long)",
+        "com.acme#Refinement.typed(float)",
+        "com.acme#Refinement.typed(double)",
+    ]
+    .into_iter()
+    .map(|fqn| node_id(Domain::Jvm, fqn))
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(stored, expected);
+}
+
+#[test]
+fn every_recorded_overload_candidate_edit_wakes_the_refined_reference() {
+    for (candidate, edited) in [
+        (
+            "com.acme#Refinement",
+            REFINEMENT_SOURCE.replace("public class Refinement", "public interface Refinement"),
+        ),
+        (
+            "com.acme#Refinement.typed/1",
+            REFINEMENT_SOURCE.replace(
+                "static void typed(String value) {}",
+                "static void typed(boolean value) {}",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(int)",
+            REFINEMENT_SOURCE.replace(
+                "static void typed(int value) {}",
+                "static void typed(long value) {}",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(long)",
+            REFINEMENT_SOURCE.replace(
+                "static void typed(String value) {}",
+                "static void typed(long value) {}",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(float)",
+            REFINEMENT_SOURCE.replace(
+                "static void typed(String value) {}",
+                "static void typed(float value) {}",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(double)",
+            REFINEMENT_SOURCE.replace(
+                "static void typed(String value) {}",
+                "static void typed(double value) {}",
+            ),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = root.join("com/acme/Refinement.java");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, REFINEMENT_SOURCE).unwrap();
+        let warm_db = root.join("warm.redb");
+        scan_java(root, &warm_db).unwrap();
+        let before = Store::open(&warm_db).unwrap().snapshot().unwrap();
+        let row = before
+            .rows
+            .keys()
+            .find(|key| key.raw_target == "typed" && key.kind == RefKind::Call.code())
+            .unwrap();
+        let candidate_id = arthron::model::node_id(arthron::model::Domain::Jvm, candidate);
+        assert!(
+            before
+                .candidates
+                .get(&candidate_id)
+                .is_some_and(|rows| rows.contains(row)),
+            "fixture did not record {candidate}",
+        );
+
+        std::fs::write(&source, edited).unwrap();
+        scan_java(root, &warm_db).unwrap();
+        let warm = Store::open(&warm_db).unwrap().snapshot().unwrap();
+        let cold_db = root.join("cold.redb");
+        scan_java(root, &cold_db).unwrap();
+        let cold = Store::open(&cold_db).unwrap().snapshot().unwrap();
+        assert_eq!(warm, cold, "editing {candidate} left a stale warm graph");
+    }
+}
+
+#[test]
+fn a_java_graph_revision_rebuild_matches_a_fresh_scan() {
+    use arthron::lang::Resolver;
+    use arthron::track_java::{JavaLang, JavaResolver};
+    use redb::{Database, TableDefinition};
+
+    assert_eq!(
+        <JavaResolver as Resolver<JavaLang>>::graph_revision(&JavaResolver),
+        1,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("com/acme/Refinement.java");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, REFINEMENT_SOURCE).unwrap();
+    let warm_db = root.join("warm.redb");
+    scan_java(root, &warm_db).unwrap();
+    let before = Store::open(&warm_db).unwrap().snapshot().unwrap();
+    assert!(
+        !before.rows.is_empty(),
+        "the pre-upgrade Java store had no rows to rebuild",
+    );
+
+    // A manifestless revision-zero Java scan stored no fence digest. Remove
+    // only revision one's metadata to recreate that exact C0 state while
+    // preserving every unchanged Java row and file hash.
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let raw = Database::open(&warm_db).unwrap();
+    let txn = raw.begin_write().unwrap();
+    {
+        let mut meta = txn.open_table(META).unwrap();
+        assert!(
+            meta.remove("config_digest:java").unwrap().is_some(),
+            "revision one did not publish a Java fence",
+        );
+    }
+    txn.commit().unwrap();
+    drop(raw);
+
+    scan_java(root, &warm_db).unwrap();
+    let warm = Store::open(&warm_db).unwrap().snapshot().unwrap();
+
+    let cold_db = root.join("cold.redb");
+    scan_java(root, &cold_db).unwrap();
+    let cold = Store::open(&cold_db).unwrap().snapshot().unwrap();
+    assert_eq!(warm, cold);
+}
+
+#[test]
+fn unqualified_static_imports_aggregate_every_matching_owner() {
+    let scan = scan(&[
+        (
+            "com/acme/Left.java",
+            "package com.acme; public class Left { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Right.java",
+            "package com.acme; public class Right { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Use.java",
+            r#"package com.acme;
+import static com.acme.Left.*;
+import static com.acme.Right.*;
+public class Use { void call() { pick(1); } }
+"#,
+        ),
+    ]);
+    let row = scan.row("pick", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(row.key.arg_types, Some(vec!["int".to_string()]));
+}
+
+#[test]
+fn integer_literal_suffix_radix_and_range_select_honest_types() {
+    let scan = scan(&[(
+        "com/acme/Literals.java",
+        r#"package com.acme;
+public class Literals {
+    static void decimal(int v) {} static void decimal(String v) {}
+    static void hexInt(int v) {} static void hexInt(String v) {}
+    static void hexLong(long v) {} static void hexLong(String v) {}
+    static void suffix(long v) {} static void suffix(String v) {}
+    static void minLong(long v) {} static void minLong(String v) {}
+    static void calls() {
+        decimal(2147483647);
+        hexInt(0xffff_ffff);
+        hexLong(0x1_0000_0000);
+        suffix(1L);
+        minLong(-9223372036854775808L);
+    }
+}
+"#,
+    )]);
+    for (name, ty) in [
+        ("decimal", "int"),
+        ("hexInt", "int"),
+        ("hexLong", "long"),
+        ("suffix", "long"),
+        ("minLong", "long"),
+    ] {
+        assert_eq!(
+            scan.one(name, RefKind::Call),
+            format!("RESOLVED com.acme#Literals.{name}({ty})"),
+        );
+    }
+}
+
+#[test]
+fn a_varargs_method_accepts_an_exact_array_in_the_fixed_phase() {
+    let scan = scan(&[(
+        "com/acme/Arrays.java",
+        r#"package com.acme;
+public class Arrays {
+    static void choose(long head, String... values) {}
+    static void choose(int left, int right) {}
+    static void choose(boolean left, boolean right) {}
+    static void call(String[] values) { choose(1, values); }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("choose", RefKind::Call),
+        "RESOLVED com.acme#Arrays.choose/*1",
+    );
+}
+
+#[test]
+fn a_zero_tail_varargs_call_uses_its_fixed_prefix() {
+    let scan = scan(&[(
+        "com/acme/ZeroTail.java",
+        r#"package com.acme;
+public class ZeroTail {
+    static void choose(int head, String... tail) {}
+    static void choose(String head, String... tail) {}
+    static void call() { choose(1); }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("choose", RefKind::Call),
+        "RESOLVED com.acme#ZeroTail.choose(int,String...)",
+    );
+}
+
+#[test]
+fn unary_numeric_promotion_maps_small_integrals_to_int() {
+    let scan = scan(&[(
+        "com/acme/UnarySmall.java",
+        r#"package com.acme;
+public class UnarySmall {
+    static void choose(int value) {}
+    static void choose(String value) {}
+    static void call(byte b, short s, char c) {
+        choose(-b);
+        choose(+s);
+        choose(~c);
+    }
+}
+"#,
+    )]);
+    let rows = scan
+        .rows
+        .iter()
+        .filter(|row| row.raw_target == "choose")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "RESOLVED com.acme#UnarySmall.choose(int)");
+    assert_eq!(rows[0].key.arg_types, Some(vec!["int".to_string()]));
+}
+
+#[test]
+fn java_lang_fqn_and_simple_spellings_compare_canonically() {
+    let scan = scan(&[(
+        "com/acme/Spellings.java",
+        r#"package com.acme;
+public class Spellings {
+    static void simple(String value) {} static void simple(int value) {}
+    static void qualified(java.lang.String value) {} static void qualified(int value) {}
+    static void call(java.lang.String qualifiedValue, String simpleValue) {
+        simple(qualifiedValue);
+        qualified(simpleValue);
+    }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("simple", RefKind::Call),
+        "RESOLVED com.acme#Spellings.simple(String)",
+    );
+    assert_eq!(
+        scan.one("qualified", RefKind::Call),
+        "RESOLVED com.acme#Spellings.qualified(java.lang.String)",
     );
 }

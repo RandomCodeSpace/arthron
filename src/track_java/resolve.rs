@@ -42,8 +42,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::lang::{
-    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, Supertypes,
-    SymbolProbe,
+    Entry, FileFacts, FileIndex, Language, LayoutError, RefKeyRefinement, Resolution, Resolver,
+    Supertypes, SymbolProbe,
 };
 use crate::model::{
     DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
@@ -436,6 +436,7 @@ struct Applicability {
     candidates: Vec<Applicable>,
     saw_member: bool,
     unindexed: bool,
+    ambiguous: bool,
 }
 
 /// Every declaration one *member name* reaches on a type (I-04, C-08).
@@ -1215,6 +1216,9 @@ impl JavaResolver {
             let found = self.collect_applicable(cfg, scope, &site, phase, p);
             saw_member |= found.saw_member;
             unindexed |= found.unindexed;
+            if found.ambiguous {
+                return Member::Ambiguous;
+            }
             if !found.candidates.is_empty() {
                 return self.select_applicable(found.candidates, p);
             }
@@ -1247,14 +1251,36 @@ impl JavaResolver {
                     let declaration = fqn::member_fqn(&type_fqn, &key);
                     let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
                     out.saw_member |= visible;
-                    if visible {
+                    let mut shapes = if visible {
                         Self::fixed_signatures(site.arguments, phase)
                             .into_iter()
                             .map(|(types, depths)| (types, depths, declaration.clone()))
                             .collect()
                     } else {
                         Vec::new()
+                    };
+                    if !site.arguments.is_empty()
+                        && site.arguments.last().is_some_and(|ty| ty.ends_with("[]"))
+                    {
+                        let key = fqn::varargs_key(site.name, site.arguments.len() as u32 - 1);
+                        let varargs_declaration = fqn::member_fqn(&type_fqn, &key);
+                        let varargs_visible =
+                            Self::visible_member(&varargs_declaration, &type_fqn, site.owner, p);
+                        out.saw_member |= varargs_visible;
+                        if varargs_visible {
+                            let last = site.arguments.last().expect("nonempty checked above");
+                            let component = &last[..last.len() - 2];
+                            for (mut types, mut depths) in Self::fixed_signatures(
+                                &site.arguments[..site.arguments.len() - 1],
+                                phase,
+                            ) {
+                                types.push(format!("{component}..."));
+                                depths.push(0);
+                                shapes.push((types, depths, varargs_declaration.clone()));
+                            }
+                        }
                     }
+                    shapes
                 }
                 InvocationPhase::Varargs => {
                     let mut shapes = Vec::new();
@@ -1264,6 +1290,31 @@ impl JavaResolver {
                         let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
                         out.saw_member |= visible;
                         if visible {
+                            if min as usize == site.arguments.len() {
+                                for (prefix, depths) in
+                                    Self::fixed_signatures(site.arguments, InvocationPhase::Loose)
+                                {
+                                    let prefix_fqn = fqn::member_fqn(
+                                        &type_fqn,
+                                        &fqn::varargs_prefix_key(site.name, &prefix),
+                                    );
+                                    match p.get(&prefix_fqn) {
+                                        Some(Entry::Alias { target }) => {
+                                            out.candidates.push(Applicable {
+                                                owner: type_fqn.clone(),
+                                                target,
+                                                depths,
+                                            });
+                                        }
+                                        Some(Entry::Definition {
+                                            kind: DefKind::Alias,
+                                            ..
+                                        }) => out.ambiguous = true,
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
                             shapes.extend(
                                 Self::varargs_signatures(site.arguments, min as usize)
                                     .into_iter()
@@ -1423,11 +1474,22 @@ impl JavaResolver {
     /// guessed: only primitive widening, boxing, unboxing plus widening, and
     /// the built-in wrapper-to-`Number`/`Object` chains are represented.
     fn conversion_targets(argument: &str, phase: InvocationPhase) -> Vec<(String, u8)> {
-        let mut targets = vec![(argument.to_string(), 0)];
-        Self::push_strict_widening(argument, &mut targets);
-        if phase != InvocationPhase::Strict {
-            Self::push_loose_conversions(argument, &mut targets);
+        let simple = argument
+            .strip_prefix("java.lang.")
+            .filter(|name| JAVA_LANG.binary_search(name).is_ok())
+            .unwrap_or(argument);
+        let mut targets = vec![(simple.to_string(), 0)];
+        if simple != argument {
+            targets.push((argument.to_string(), 0));
+        } else if JAVA_LANG.binary_search(&simple).is_ok() {
+            targets.push((format!("java.lang.{simple}"), 0));
         }
+        Self::push_strict_widening(simple, &mut targets);
+        if phase != InvocationPhase::Strict {
+            Self::push_loose_conversions(simple, &mut targets);
+        }
+        let mut seen = HashSet::new();
+        targets.retain(|target| seen.insert(target.0.clone()));
         targets
     }
 
@@ -2022,10 +2084,16 @@ impl JavaResolver {
             .filter(|(member, _)| member == name)
             .map(|(_, owner)| owner.clone())
             .chain(scope.static_on_demand.iter().cloned());
+        let mut imported = Vec::new();
+        let mut imported_external = None;
+        let mut imported_ambiguous = false;
         for segments in statics {
             let owner = self.canonical_type(cfg, scope, &segments, p);
             match &owner {
-                Owner::Outside(package) => return Outcome::External(package.clone()),
+                Owner::Outside(package) => {
+                    imported_external.get_or_insert_with(|| package.clone());
+                    continue;
+                }
                 Owner::Failed(_) => {
                     unindexed = true;
                     continue;
@@ -2033,12 +2101,24 @@ impl JavaResolver {
                 Owner::InRepo { .. } => {}
             }
             match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
-                Member::Found(id) => return Outcome::Resolved(id),
-                Member::Ambiguous => {
-                    return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
-                }
+                Member::Found(id) => imported.push(id),
+                Member::Ambiguous => imported_ambiguous = true,
                 Member::Missing { unindexed: more } => unindexed |= more,
             }
+        }
+        imported.sort_unstable();
+        imported.dedup();
+        if imported_ambiguous
+            || imported.len() > 1
+            || (!imported.is_empty() && imported_external.is_some())
+        {
+            return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
+        }
+        if let Some(id) = imported.into_iter().next() {
+            return Outcome::Resolved(id);
+        }
+        if let Some(package) = imported_external {
+            return Outcome::External(package);
         }
         if is_object_member(name, invocation.argc) {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
@@ -2278,6 +2358,53 @@ fn build_scope(cfg: &JavaConfig, file: &FileFacts<JavaLang>) -> JavaScope {
     scope
 }
 
+impl JavaResolver {
+    /// Resolve with exactly the argument facts carried by `r`.
+    ///
+    /// Ordinary resolution passes an untyped clone. The key-refinement hook
+    /// calls this a second time only after that legacy pass reports overload
+    /// ambiguity.
+    fn resolve_dispatch(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        let mut p = Probes {
+            table: probe,
+            seen: Vec::new(),
+        };
+        if r.locally_bound {
+            return Resolution {
+                outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
+                candidates: Vec::new(),
+            };
+        }
+        let outcome = match r.kind {
+            RefKind::Import => self.resolve_import(cfg, scope, r, &mut p),
+            RefKind::Export => {
+                let dotted = r.target.segments.join(".");
+                match p.get(&dotted) {
+                    Some(Entry::Container) => Outcome::Resolved(node_id(JavaLang::DOMAIN, &dotted)),
+                    _ => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+                }
+            }
+            RefKind::TypeUse | RefKind::Inherit | RefKind::Annotation => {
+                self.resolve_type_ref(cfg, scope, r, &mut p)
+            }
+            RefKind::Call | RefKind::New | RefKind::FieldAccess | RefKind::MethodRef => {
+                self.resolve_member_ref(cfg, scope, r, &mut p)
+            }
+            RefKind::Rebind => Outcome::Unresolved(UnresolvedReason::DynamicDispatch),
+        };
+        Resolution {
+            outcome,
+            candidates: p.seen,
+        }
+    }
+}
+
 impl Resolver<JavaLang> for JavaResolver {
     /// Phase 0 never fails for Java. B-04: there may be no parseable
     /// manifest at all, so requiring one would make every Gradle project a
@@ -2292,6 +2419,10 @@ impl Resolver<JavaLang> for JavaResolver {
     /// fingerprint on every scan and wipe the graph each time.
     fn config_digest(&self, _cfg: &JavaConfig) -> Vec<u8> {
         Vec::new()
+    }
+
+    fn graph_revision(&self) -> u64 {
+        1
     }
 
     /// P-01: the container a file decides the name of is the one it
@@ -2389,7 +2520,6 @@ impl Resolver<JavaLang> for JavaResolver {
         if def.kind != DefKind::Alias || !def.name.contains('(') {
             return Vec::new();
         }
-        let callable = fqn::callable_of(def);
         let owner = fqn::type_fqn(
             &fqn::container(
                 header.package.as_deref().unwrap_or(""),
@@ -2397,6 +2527,15 @@ impl Resolver<JavaLang> for JavaResolver {
             ),
             &def.owner,
         );
+        if let Some(name) = fqn::varargs_prefix_name(&def.name) {
+            return def.params.as_ref().map_or_else(Vec::new, |params| {
+                vec![Fqn::new(fqn::member_fqn(
+                    &owner,
+                    &fqn::signature_key(name, &params.types),
+                ))]
+            });
+        }
+        let callable = fqn::callable_of(def);
         vec![Fqn::new(fqn::member_fqn(&owner, &callable.key()))]
     }
 
@@ -2444,72 +2583,53 @@ impl Resolver<JavaLang> for JavaResolver {
         r: &Reference,
         probe: &dyn SymbolProbe,
     ) -> Resolution {
-        let mut p = Probes {
-            table: probe,
-            seen: Vec::new(),
-        };
-        // The uniform root-binding rule, written down on
-        // [`UnresolvedReason::LocalBinding`] and read the same way by all four
-        // tier-1 tracks: a reference whose leftmost segment some enclosing
-        // *non-node* region binds is a `LocalBinding`, however long the member
-        // path after it — `T`, a local class, `f.m()` and `f.x.y` alike.
-        //
-        // Depth used to matter here, and that was the divergence this closes.
-        // `f.m()` was answered by X-02's declared-type lookup and counted as
-        // `resolved`, while Go, TypeScript and JavaScript had already taken
-        // the identical shape out of both rate terms — so Java's rate and
-        // Go's were computed over differently-sized denominators and could
-        // not be compared.
-        //
-        // What it costs is real and is not hidden: X-02 had *found* many of
-        // these. 5,374 commons-lang and 3,189 gson occurrences were
-        // `Resolved` to a node this store still holds — `TypeTestClass.field`
-        // has an FQN and is nameable from anywhere — and they are edges the
-        // graph no longer carries. The claim the reason makes is the narrower
-        // one on [`UnresolvedReason::LocalBinding`]: not that the target is
-        // unnameable, but that reaching it needs the type of a binding no
-        // other file can see, so the reference is not evidence about
-        // cross-file linking either way. `CHANGELOG.md` states the per-corpus
-        // counts.
-        //
-        // Three things this deliberately is not. A *field* is a node
-        // (`BindingKind::is_local` is false for one), so `field.m()` still
-        // resolves through the declared-type lookup; `this.m()` is a receiver,
-        // never a bound name, and stays in both terms exactly as Go's
-        // `t.m()` and Python's `self.m()` do; and §6.5.1 makes a bare `foo()`
-        // a MethodName no local can shadow, which the extractor answers
-        // before the flag is ever set. All three are visibility questions,
-        // and visibility stays per language: the policy is uniform about
-        // which *positions* bind, not about how each language computes scope.
-        if r.locally_bound {
-            return Resolution {
-                outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
-                candidates: Vec::new(),
-            };
+        let mut legacy = r.clone();
+        legacy.arg_types = None;
+        self.resolve_dispatch(cfg, scope, &legacy, probe)
+    }
+
+    fn resolve_with_key_refinement(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> (Resolution, RefKeyRefinement) {
+        let legacy = self.resolve(cfg, scope, r, probe);
+        if !matches!(
+            legacy.outcome,
+            Outcome::Unresolved(UnresolvedReason::AmbiguousOverload)
+        ) {
+            return (legacy, RefKeyRefinement::None);
         }
-        let outcome = match r.kind {
-            RefKind::Import => self.resolve_import(cfg, scope, r, &mut p),
-            RefKind::Export => {
-                // §7.7.2: a module exports one of its own packages.
-                let dotted = r.target.segments.join(".");
-                match p.get(&dotted) {
-                    Some(Entry::Container) => Outcome::Resolved(node_id(JavaLang::DOMAIN, &dotted)),
-                    _ => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
-                }
-            }
-            RefKind::TypeUse | RefKind::Inherit | RefKind::Annotation => {
-                self.resolve_type_ref(cfg, scope, r, &mut p)
-            }
-            RefKind::Call | RefKind::New | RefKind::FieldAccess | RefKind::MethodRef => {
-                self.resolve_member_ref(cfg, scope, r, &mut p)
-            }
-            // The Java extractor emits none: nothing in Java rebinds a name
-            // at a site the way a monkeypatch does.
-            RefKind::Rebind => Outcome::Unresolved(UnresolvedReason::DynamicDispatch),
+        let Some(arguments) = r.arg_types.clone() else {
+            return (legacy, RefKeyRefinement::None);
         };
-        Resolution {
-            outcome,
-            candidates: p.seen,
+        let typed = self.resolve_dispatch(cfg, scope, r, probe);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for candidate in legacy
+            .candidates
+            .into_iter()
+            .chain(typed.candidates.into_iter())
+        {
+            if seen.insert(candidate) {
+                candidates.push(candidate);
+            }
         }
+        let outcome = match typed.outcome {
+            Outcome::Resolved(id) => Outcome::Resolved(id),
+            Outcome::Unresolved(UnresolvedReason::AmbiguousOverload) => {
+                Outcome::Unresolved(UnresolvedReason::AmbiguousOverload)
+            }
+            _ => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
+        };
+        (
+            Resolution {
+                outcome,
+                candidates,
+            },
+            RefKeyRefinement::ArgumentTypes(arguments),
+        )
     }
 }

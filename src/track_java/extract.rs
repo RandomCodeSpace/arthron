@@ -495,6 +495,54 @@ fn argument_count(node: &SgNode) -> Option<u32> {
     u32::try_from(count).ok()
 }
 
+/// JLS §3.10.1's integer-literal type, including the two spellings reserved
+/// for the operand of unary minus.
+fn integer_literal_type(node: &SgNode) -> Option<String> {
+    let raw = node.text();
+    let long_suffix = raw.ends_with(['l', 'L']);
+    let digits = raw.trim_end_matches(['l', 'L']).replace('_', "");
+    let (radix, body, decimal) = if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, rest, false)
+    } else if let Some(rest) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, rest, false)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..], false)
+    } else {
+        (10, digits.as_str(), true)
+    };
+    let value = u128::from_str_radix(body, radix).ok()?;
+    let negated = node.parent().is_some_and(|parent| {
+        parent.kind() == "unary_expression"
+            && parent.text().trim_start().starts_with('-')
+            && parent
+                .children()
+                .find(|child| child.is_named())
+                .is_some_and(|child| child.range() == node.range())
+    });
+    let ty = if decimal {
+        match (long_suffix, value) {
+            (false, 0..=2_147_483_647) => "int",
+            (false, 2_147_483_648) if negated => "int",
+            (true, 0..=9_223_372_036_854_775_807) => "long",
+            (true, 9_223_372_036_854_775_808) if negated => "long",
+            _ => return None,
+        }
+    } else {
+        match (long_suffix, value) {
+            (false, 0..=4_294_967_295) => "int",
+            (_, 0..=18_446_744_073_709_551_615) => "long",
+            _ => return None,
+        }
+    };
+    Some(ty.to_string())
+}
+
 /// A source-level type that is evident from an argument expression alone.
 ///
 /// This is deliberately a cut line, not a miniature type checker: literals,
@@ -511,17 +559,7 @@ fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String
         "decimal_integer_literal"
         | "hex_integer_literal"
         | "octal_integer_literal"
-        | "binary_integer_literal" => {
-            let text = node.text();
-            Some(
-                if text.ends_with('l') || text.ends_with('L') {
-                    "long"
-                } else {
-                    "int"
-                }
-                .to_string(),
-            )
-        }
+        | "binary_integer_literal" => integer_literal_type(node),
         "decimal_floating_point_literal" | "hex_floating_point_literal" => {
             let text = node.text();
             Some(
@@ -554,7 +592,10 @@ fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String
                 promoted.as_str(),
                 "byte" | "short" | "char" | "int" | "long" | "float" | "double"
             )
-            .then_some(promoted)
+            .then(|| match promoted.as_str() {
+                "byte" | "short" | "char" => "int".to_string(),
+                _ => promoted,
+            })
         }
         _ => None,
     }
@@ -990,7 +1031,12 @@ fn declared_type_from(type_node: Option<SgNode>, value: Option<SgNode>) -> Optio
         }
         return some_type(name_segments(&initializer.field("type")?));
     }
-    some_type(name_segments(&declared))
+    let segments = name_segments(&declared);
+    if !segments.is_empty() && declared.kind() != "array_type" {
+        return Some(segments);
+    }
+    let written = compact(&declared.text());
+    (!written.is_empty()).then(|| vec![written])
 }
 
 /// The end of the region a statement-scoped binding is visible in.
@@ -2351,6 +2397,36 @@ fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
             DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
             None,
             def.span,
+        ));
+    }
+    let mut varargs_prefixes: HashMap<String, Vec<Definition>> = HashMap::new();
+    for def in defs.iter() {
+        let Some(params) = def.params.as_ref().filter(|params| params.varargs) else {
+            continue;
+        };
+        let callable = fqn::callable_of(def);
+        let prefix = &params.types[..params.types.len().saturating_sub(1)];
+        let key = format!(
+            "{}.{}",
+            def.owner.join(&fqn::NEST.to_string()),
+            fqn::varargs_prefix_key(&callable.name, prefix)
+        );
+        varargs_prefixes.entry(key).or_default().push(def.clone());
+    }
+    for declarations in varargs_prefixes.into_values() {
+        let first = &declarations[0];
+        let callable = fqn::callable_of(first);
+        let prefix = &callable.types[..callable.types.len().saturating_sub(1)];
+        aliases.push(java_def(
+            DefKind::Alias,
+            fqn::varargs_prefix_key(&callable.name, prefix),
+            first.owner.clone(),
+            DeclSpace::Value,
+            DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
+            (declarations.len() == 1)
+                .then(|| first.params.clone())
+                .flatten(),
+            first.span,
         ));
     }
     defs.extend(aliases);
