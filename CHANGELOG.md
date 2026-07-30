@@ -22,6 +22,13 @@ Decisions and their rationale — including what was rejected — live in
   literal radix, suffix, range, unary numeric promotion, and canonical
   `java.lang` spellings are handled without guessing user subtype relations.
   Candidate dependencies are the stable legacy-first union of both passes.
+- Java's attributed corpus rebases record that retry: `AmbiguousOverload`
+  falls from 9,218 to 5,213 on commons-lang and from 1,282 to 861 on gson,
+  with every other unresolved-reason bucket unchanged. The 4,005 and 421 newly
+  resolved occurrences add target pins without moving or re-keying an existing
+  pin. Synthetic runtime signature aliases grow from 390 to 9,617 and 30 to
+  3,083, respectively, so typed applicability can inspect unique callables
+  without re-aiming their existing edges.
 - Reference-key argument types are now selected by the resolver that saw the
   candidate set. The default keeps the existing coarse key, and a resolver may
   explicitly refine it with a complete argument-type vector. A default-zero

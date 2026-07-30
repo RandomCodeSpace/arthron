@@ -4,6 +4,48 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — Stream C's Java measurements are rebased with attributed aliases
+
+**Decided: rebase the two Java baselines and target pins from the signed
+`babb1f5` release binary.** `commons-lang` moves from `AmbiguousOverload`
+9,218 to 5,213 and `gson` from 1,282 to 861; every other unresolved-reason
+bucket is byte-identical. The gained resolved occurrences are 4,005 and 421,
+respectively, while 2,061 and 321 remain honestly ambiguous. Both scans retain
+their prior `external` and `local_binding` counts, and the attributed row join
+has zero non-AO rows and zero non-AO occurrences changed.
+
+The corresponding exact definition censuses deliberately change only
+`DefKind::Alias`: `commons-lang` 390 -> 9,617 and `gson` 30 -> 3,083. In
+`mark_overload_sets`, a unique callable now gets a
+`SYNTHETIC | RUNTIME` forwarding signature identity, while a shared arity
+continues to get its arity identity. Typed applicability can therefore inspect
+the callable's parameter shape without re-aiming an existing edge; this is an
+extension of the established alias mechanism, not a new definition category.
+
+Before re-pinning, the target check held 16,111 commons-lang rows and 9,075
+gson rows; 1,768 and 286 newly resolved rows appeared. Both checks reported
+zero vanished rows, zero moved targets, and zero re-keyed rows. The regenerated
+pins record that coverage growth without accepting an existing target movement.
+
+The prior `<= 2800` `AmbiguousOverload` target is dropped: it was an
+unmeasured estimate, not a committed gate. Measurement establishes a floor of
+3,152 occurrences with no argument vector at all (calls, `null`, lambdas,
+method references, member expressions, array access, and general operators).
+Even resolving every typed ambiguity cannot reach the estimate. Unknown-vector
+typing remains deferred to Streams H/I.
+
+*Rejected: force an unknown vector through typed applicability.* That would
+guess a type environment the Java track does not have.
+
+*Rejected: suppress synthetic aliases from the census.* They are the precise
+signature identities the resolver uses; hiding them would make the extraction
+change unauditable.
+
+*Rejected: weaken pins for a re-key or a target move.* Neither occurred; those
+remain failures rather than a property of this rebase.
+
+---
+
 ## 2026-07-30 — Stream C keeps array receivers in `NeedsTypeInference`
 
 **Decided: a declared Java array receiver stops before ordinary canonical-type

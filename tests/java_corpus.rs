@@ -47,14 +47,14 @@ const CORPORA: &[(&str, &str, &str)] = &[
 
 /// Every unresolved reason commons-lang produces, exactly.
 ///
-/// `AmbiguousOverload` dominates because this corpus is overload sets without
-/// the argument types to discriminate them, and `NeedsExpressionType` is the
+/// `AmbiguousOverload` dominates because many calls still lack an argument
+/// vector the finite typed surface can use, and `NeedsExpressionType` is the
 /// honest cost of not running a type checker on `f().m()`. The two are
-/// different facts and the gate cannot tell them apart: moving all 9218 of
+/// different facts and the gate cannot tell them apart: moving all 5213 of
 /// the first into `NoMatchingDefinition` leaves every gated integer where it
 /// was.
 const COMMONS_LANG_REASONS: &[(&str, u64)] = &[
-    ("AmbiguousOverload", 9218),
+    ("AmbiguousOverload", 5213),
     ("NeedsExpressionType", 6566),
     ("NeedsTypeInference", 342),
     ("NoMatchingDefinition", 123),
@@ -65,7 +65,7 @@ const COMMONS_LANG_REASONS: &[(&str, u64)] = &[
 /// threaded through `TypeAdapter<T>` push `NeedsExpressionType` past
 /// `AmbiguousOverload`, which commons-lang never does.
 const GSON_REASONS: &[(&str, u64)] = &[
-    ("AmbiguousOverload", 1282),
+    ("AmbiguousOverload", 861),
     ("NeedsExpressionType", 4713),
     ("NeedsTypeInference", 72),
     ("NoMatchingDefinition", 37),
@@ -214,16 +214,16 @@ struct Census {
 const COMMONS_LANG: Census = Census {
     files: 527,
     // `Module` is one per file: every file states the package its
-    // definitions live in. `Alias` is the overload key — one entry per
-    // `name/arity` that two or more signatures answer to — which is how a
-    // call site with three arguments finds a set rather than a guess.
+    // definitions live in. `Alias` is the overload key for shared arities,
+    // and a synthetic signature identity for every unique callable so typed
+    // applicability can inspect parameter shape without re-aiming an edge.
     defs: &[
         (DefKind::Method, 9433),
         (DefKind::Type, 957),
         (DefKind::Constructor, 1006),
         (DefKind::Field, 2199),
         (DefKind::Module, 527),
-        (DefKind::Alias, 390),
+        (DefKind::Alias, 9617),
     ],
     // Seven methods lower: a signature written identically in two files of
     // one package is one identity. `Module` is absent because a package is
@@ -233,7 +233,7 @@ const COMMONS_LANG: Census = Census {
         (DefKind::Type, 957),
         (DefKind::Constructor, 1006),
         (DefKind::Field, 2199),
-        (DefKind::Alias, 390),
+        (DefKind::Alias, 9617),
     ],
     packages: 20,
     externals: 47,
@@ -292,14 +292,14 @@ const GSON: Census = Census {
         (DefKind::Constructor, 617),
         (DefKind::Field, 912),
         (DefKind::Module, 209),
-        (DefKind::Alias, 30),
+        (DefKind::Alias, 3083),
     ],
     stored: &[
         (DefKind::Method, 2509),
         (DefKind::Type, 587),
         (DefKind::Constructor, 617),
         (DefKind::Field, 912),
-        (DefKind::Alias, 30),
+        (DefKind::Alias, 3083),
     ],
     // Fourteen: thirteen packages plus the JPMS descriptor, which declares a
     // module and no package and is the one commons-lang has nothing like.
