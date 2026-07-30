@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 
-use arthron::model::RefKind;
-use arthron::store::{NodeRecord, Store, StoredOutcome};
+use arthron::model::{DeclSpace, NodeId, RefKind};
+use arthron::store::{NodeRecord, RefKey, Store, StoredOutcome};
 use arthron::track_java::scan_java;
 
 /// Every reference row of one scan, rendered as a readable outcome.
@@ -24,11 +24,14 @@ struct Scan {
 }
 
 struct Row {
+    key: RefKey,
     file: String,
     raw_target: String,
     kind: u8,
     enclosing: String,
     outcome: String,
+    candidates: Vec<NodeId>,
+    count: u32,
 }
 
 /// Write `files` to a scratch tree, scan it, and render every row's outcome.
@@ -63,6 +66,7 @@ fn scan(files: &[(&str, &str)]) -> Scan {
         .rows
         .iter()
         .map(|(key, record)| Row {
+            key: key.clone(),
             file: key.file.clone(),
             raw_target: key.raw_target.clone(),
             kind: key.kind,
@@ -75,19 +79,20 @@ fn scan(files: &[(&str, &str)]) -> Scan {
                 StoredOutcome::External(package) => format!("EXTERNAL {package}"),
                 StoredOutcome::Unresolved(code) => arthron::model::reason_name(*code).to_string(),
             },
+            candidates: snapshot
+                .candidates
+                .iter()
+                .filter_map(|(id, keys)| keys.contains(key).then_some(*id))
+                .collect(),
+            count: record.count,
         })
         .collect();
     Scan { rows }
 }
 
 impl Scan {
-    /// The outcome of the one row with this site text and kind.
-    ///
-    /// Panics when there is not exactly one: a test that silently read the
-    /// first of two rows would assert about whichever the row order happened
-    /// to put first.
     #[track_caller]
-    fn one(&self, raw_target: &str, kind: RefKind) -> &str {
+    fn row(&self, raw_target: &str, kind: RefKind) -> &Row {
         let code = kind.code();
         let mut hits = self
             .rows
@@ -101,7 +106,17 @@ impl Scan {
             "`{raw_target}` {kind:?} has more than one row\n{}",
             self.dump(),
         );
-        &first.outcome
+        first
+    }
+
+    /// The outcome of the one row with this site text and kind.
+    ///
+    /// Panics when there is not exactly one: a test that silently read the
+    /// first of two rows would assert about whichever the row order happened
+    /// to put first.
+    #[track_caller]
+    fn one(&self, raw_target: &str, kind: RefKind) -> &str {
+        &self.row(raw_target, kind).outcome
     }
 
     /// Every row, for a failure message that says what was actually measured.
@@ -386,6 +401,247 @@ public class Imports { }
         scan.one("com.acme.Only.absent", RefKind::Import),
         "UnindexedSupertype",
     );
+}
+
+/// §15.12.2: argument types written at the invocation site narrow a shared
+/// arity key to the one applicable full-signature definition.
+#[test]
+fn written_argument_types_select_full_signature_overloads() {
+    let scan = scan(&[(
+        "com/acme/Arguments.java",
+        r#"package com.acme;
+public class Arguments {
+    static class Built {
+        Built(int value) {}
+        Built(String value) {}
+    }
+
+    static void byInt(int value) {}
+    static void byInt(String value) {}
+    static void byString(int value) {}
+    static void byString(String value) {}
+    static void widen(long value) {}
+    static void widen(String value) {}
+    static void box(Integer value) {}
+    static void box(String value) {}
+    static void object(Object value) {}
+    static void object(String value) {}
+    static void casted(long value) {}
+    static void casted(String value) {}
+    static void created(Integer value) {}
+    static void created(String value) {}
+    static void unknown(int value) {}
+    static void unknown(String value) {}
+    static Object value() { return null; }
+
+    static void calls() {
+        Integer integer = 1;
+        byInt(1);
+        byString("text");
+        widen(1);
+        box(1);
+        object(integer);
+        casted((long) 1);
+        created(new Integer(1));
+        new Built(1);
+        unknown(value());
+    }
+}
+"#,
+    )]);
+
+    for (raw, target) in [
+        ("byInt", "com.acme#Arguments.byInt(int)"),
+        ("byString", "com.acme#Arguments.byString(String)"),
+        ("widen", "com.acme#Arguments.widen(long)"),
+        ("box", "com.acme#Arguments.box(Integer)"),
+        ("object", "com.acme#Arguments.object(Object)"),
+        ("casted", "com.acme#Arguments.casted(long)"),
+        ("created", "com.acme#Arguments.created(Integer)"),
+    ] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED {target}"),
+            "`{raw}` selected the wrong full-signature target",
+        );
+    }
+    assert_eq!(
+        scan.one("Built", RefKind::New),
+        "RESOLVED com.acme#Arguments$Built.<init>(int)",
+    );
+    assert_eq!(
+        scan.one("unknown", RefKind::Call),
+        "AmbiguousOverload",
+        "an argument whose type is not written must stay honest",
+    );
+}
+
+/// §15.12.2.1-.5: every declaration at the invocation's arity participates
+/// in applicability before phase order and specificity select a target.
+#[test]
+fn applicability_collects_direct_inherited_and_varargs_candidates() {
+    let scan = scan(&[(
+        "com/acme/Applicability.java",
+        r#"package com.acme;
+public class Applicability {
+    static class Base {
+        void inherited(int value) {}
+        void inherited(long value) {}
+    }
+
+    static class Child extends Base {
+        void inherited(String value) {}
+
+        void callInherited() {
+            inherited(1);
+        }
+    }
+
+    static void flexible(String value) {}
+    static void flexible(boolean value) {}
+    static void flexible(int... value) {}
+    static void flexible(long... value) {}
+
+    static void phased(int value) {}
+    static void phased(long value) {}
+    static void phased(Integer... value) {}
+    static void phased(Object... value) {}
+
+    static void calls() {
+        flexible(1);
+        phased(1);
+    }
+}
+"#,
+    )]);
+
+    assert_eq!(
+        scan.one("inherited", RefKind::Call),
+        "RESOLVED com.acme#Applicability$Child.inherited/1",
+        "a legacy-resolved row must not be re-aimed by typed applicability",
+    );
+    assert_eq!(
+        scan.one("flexible", RefKind::Call),
+        "RESOLVED com.acme#Applicability.flexible(int...)",
+        "an inapplicable fixed-arity set must not hide an applicable varargs set",
+    );
+    assert_eq!(
+        scan.one("phased", RefKind::Call),
+        "RESOLVED com.acme#Applicability.phased(int)",
+        "an applicable fixed-arity method must beat every varargs candidate",
+    );
+}
+
+/// JLS §5.1.2, §5.1.5, §5.1.7-.8 and §15.12.2.5: conversion depth is part
+/// of most-specific selection; a supported but less-specific target cannot
+/// win merely because it was the first signature probed.
+#[test]
+fn conversion_depths_choose_most_specific_primitive_and_wrapper_targets() {
+    let scan = scan(&[(
+        "com/acme/Conversions.java",
+        r#"package com.acme;
+public class Conversions {
+    static void number(Number value) {}
+    static void number(Object value) {}
+    static void boxedReference(Number value) {}
+    static void boxedReference(Object value) {}
+    static void primitive(float value) {}
+    static void primitive(double value) {}
+    static void unboxed(long value) {}
+    static void unboxed(double value) {}
+    static void characterObject(Object value) {}
+    static void characterObject(String value) {}
+    static void incomparable(int left, long right) {}
+    static void incomparable(long left, int right) {}
+    static void unknownNull(Number value) {}
+    static void unknownNull(Object value) {}
+    static void unknownCall(Number value) {}
+    static void unknownCall(Object value) {}
+    static void unknownPoly(java.util.function.Consumer<String> value) {}
+    static void unknownPoly(java.util.function.Function<String, String> value) {}
+    static Integer value() { return null; }
+
+    static void calls() {
+        Integer integer = 1;
+        Character character = 'x';
+        unknownNull(null);
+        unknownCall(value());
+        unknownPoly(value -> value.trim());
+        number(integer);
+        boxedReference(1);
+        primitive(1);
+        unboxed(integer);
+        characterObject(character);
+        incomparable(1, 1);
+    }
+}
+"#,
+    )]);
+
+    for raw in ["unknownNull", "unknownCall", "unknownPoly"] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            "AmbiguousOverload",
+            "`{raw}` has no file-local standalone argument type and must stay honest",
+        );
+    }
+    assert_eq!(
+        scan.one("incomparable", RefKind::Call),
+        "AmbiguousOverload",
+        "incomparable conversion vectors must not be resolved by probe order",
+    );
+    for (raw, target) in [
+        ("number", "com.acme#Conversions.number(Number)"),
+        (
+            "boxedReference",
+            "com.acme#Conversions.boxedReference(Number)",
+        ),
+        ("primitive", "com.acme#Conversions.primitive(float)"),
+        ("unboxed", "com.acme#Conversions.unboxed(long)"),
+        (
+            "characterObject",
+            "com.acme#Conversions.characterObject(Object)",
+        ),
+    ] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED {target}"),
+            "`{raw}` selected the wrong full-signature target",
+        );
+    }
+}
+
+/// §15.15.3-.5: unary numeric operators apply unary numeric promotion, so a
+/// literal operand still states a primitive argument type without inference.
+#[test]
+fn unary_numeric_literal_arguments_select_promoted_primitive_overloads() {
+    let scan = scan(&[(
+        "com/acme/UnaryArguments.java",
+        r#"package com.acme;
+public class UnaryArguments {
+    static void minus(long value) {}
+    static void minus(String value) {}
+    static void plus(long value) {}
+    static void plus(String value) {}
+    static void complement(long value) {}
+    static void complement(String value) {}
+
+    static void calls() {
+        minus(-1L);
+        plus(+1L);
+        complement(~1L);
+    }
+}
+"#,
+    )]);
+
+    for raw in ["minus", "plus", "complement"] {
+        assert_eq!(
+            scan.one(raw, RefKind::Call),
+            format!("RESOLVED com.acme#UnaryArguments.{raw}(long)"),
+            "`{raw}` did not preserve the promoted literal type",
+        );
+    }
 }
 
 /// N-04 / B-02: a fully qualified name is attributed to its package in value
@@ -978,5 +1234,622 @@ public class Owner {
     assert_eq!(
         scan.one("this.only", RefKind::Call),
         "RESOLVED com.acme#Owner.only/0",
+    );
+}
+
+const REFINEMENT_SOURCE: &str = r#"package com.acme;
+public class Refinement {
+    static void singleton(int value) {}
+    static void zero() {}
+    static void typed(int value) {}
+    static void typed(String value) {}
+    static void still(int left, long right) {}
+    static void still(long left, int right) {}
+    static Object unknownValue() { return null; }
+    static void unknown(int value) {}
+    static void unknown(String value) {}
+
+    static void calls() {
+        singleton(1);
+        zero();
+        typed(1);
+        typed(1);
+        still(1, 1);
+        unknown(unknownValue());
+    }
+}
+"#;
+
+const REFINEMENT_DECLARATIONS: &str = r#"package com.acme;
+public class Refinement {
+    static void typed(int value) {}
+    static void typed(String value) {}
+}
+"#;
+
+const REFINEMENT_CALLER: &str = r#"package com.acme;
+public class Use {
+    static void call() { Refinement.typed(1); }
+}
+"#;
+
+#[test]
+fn a_singleton_typed_call_preserves_its_c0_pin_identity() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("singleton", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.singleton/1");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn a_zero_argument_call_preserves_its_c0_pin_identity() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("zero", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.zero/0");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn typed_overloads_refine_only_a_legacy_ambiguous_row() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("typed", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Refinement.typed(int)");
+    assert_eq!(row.key.arg_types, Some(vec!["int".to_string()]));
+    assert_eq!(
+        scan.row("singleton", RefKind::Call).key.arg_types,
+        None,
+        "a legacy-resolved row was refined",
+    );
+}
+
+#[test]
+fn a_typed_but_still_ambiguous_call_keeps_an_honest_refined_row() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("still", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(
+        row.key.arg_types,
+        Some(vec!["int".to_string(), "int".to_string()])
+    );
+}
+
+#[test]
+fn equal_argument_vectors_still_deduplicate() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let rows = scan
+        .rows
+        .iter()
+        .filter(|row| row.raw_target == "typed" && row.kind == RefKind::Call.code())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key.arg_types, Some(vec!["int".to_string()]));
+    assert_eq!(rows[0].count, 2);
+}
+
+#[test]
+fn unknown_argument_types_keep_the_legacy_ambiguous_key() {
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("unknown", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn a_refined_row_records_the_union_of_legacy_and_typed_candidates() {
+    use arthron::model::{Domain, node_id};
+
+    let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
+    let row = scan.row("typed", RefKind::Call);
+    let stored = row
+        .candidates
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "com.acme#Refinement",
+        "com.acme#Refinement.typed/1",
+        "com.acme#Refinement.typed(int)",
+        "com.acme#Refinement.typed(long)",
+        "com.acme#Refinement.typed(float)",
+        "com.acme#Refinement.typed(double)",
+    ]
+    .into_iter()
+    .map(|fqn| node_id(Domain::Jvm, fqn))
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(stored, expected);
+}
+
+#[test]
+fn every_recorded_overload_candidate_edit_wakes_the_refined_reference() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    fn hash(bytes: &[u8]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    for (candidate, edited) in [
+        (
+            "com.acme#Refinement",
+            REFINEMENT_DECLARATIONS.replace("class Refinement", "class Renamed"),
+        ),
+        (
+            "com.acme#Refinement.typed/1",
+            REFINEMENT_DECLARATIONS.replace("    static void typed(String value) {}\n", ""),
+        ),
+        (
+            "com.acme#Refinement.typed(int)",
+            REFINEMENT_DECLARATIONS.replace(
+                "static void typed(int value) {}",
+                "static void typed(boolean value) {}",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(long)",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(long value) {}\n}\n",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(float)",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(float value) {}\n}\n",
+            ),
+        ),
+        (
+            "com.acme#Refinement.typed(double)",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(double value) {}\n}\n",
+            ),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let definitions = root.join("com/acme/Refinement.java");
+        let caller = root.join("com/acme/Use.java");
+        std::fs::create_dir_all(definitions.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(caller.parent().unwrap()).unwrap();
+        std::fs::write(&definitions, REFINEMENT_DECLARATIONS).unwrap();
+        std::fs::write(&caller, REFINEMENT_CALLER).unwrap();
+        let caller_before = std::fs::read(&caller).unwrap();
+        let caller_hash_before = hash(&caller_before);
+        let warm_db = root.join("warm.redb");
+        scan_java(root, &warm_db).unwrap();
+        let before = Store::open(&warm_db).unwrap().snapshot().unwrap();
+        let row = before
+            .rows
+            .keys()
+            .find(|key| {
+                key.file == "com/acme/Use.java"
+                    && key.raw_target == "Refinement.typed"
+                    && key.kind == RefKind::Call.code()
+            })
+            .unwrap();
+        let expected = [
+            "com.acme#Refinement",
+            "com.acme#Refinement.typed/1",
+            "com.acme#Refinement.typed(int)",
+            "com.acme#Refinement.typed(long)",
+            "com.acme#Refinement.typed(float)",
+            "com.acme#Refinement.typed(double)",
+        ]
+        .into_iter()
+        .map(|fqn| arthron::model::node_id(arthron::model::Domain::Jvm, fqn))
+        .collect::<std::collections::BTreeSet<_>>();
+        let recorded = before
+            .candidates
+            .iter()
+            .filter_map(|(id, rows)| rows.contains(row).then_some(*id))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(recorded, expected, "candidate set drifted before {candidate}");
+        let candidate_id = arthron::model::node_id(arthron::model::Domain::Jvm, candidate);
+        assert!(
+            before
+                .candidates
+                .get(&candidate_id)
+                .is_some_and(|rows| rows.contains(row)),
+            "fixture did not record {candidate}",
+        );
+
+        std::fs::write(&definitions, edited).unwrap();
+        let caller_after = std::fs::read(&caller).unwrap();
+        assert_eq!(
+            caller_after,
+            caller_before,
+            "definition edit for {candidate} changed caller bytes",
+        );
+        assert_eq!(
+            hash(&caller_after),
+            caller_hash_before,
+            "definition edit for {candidate} changed caller hash",
+        );
+        scan_java(root, &warm_db).unwrap();
+        let warm = Store::open(&warm_db).unwrap().snapshot().unwrap();
+        let cold_db = root.join("cold.redb");
+        scan_java(root, &cold_db).unwrap();
+        let cold = Store::open(&cold_db).unwrap().snapshot().unwrap();
+        assert_eq!(warm, cold, "editing {candidate} left a stale warm graph");
+    }
+}
+
+#[test]
+fn a_java_graph_revision_rebuild_matches_a_fresh_scan() {
+    use arthron::lang::Resolver;
+    use arthron::track_java::{JavaLang, JavaResolver};
+    use redb::{Database, TableDefinition};
+
+    assert_eq!(
+        <JavaResolver as Resolver<JavaLang>>::graph_revision(&JavaResolver),
+        1,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("com/acme/Refinement.java");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, REFINEMENT_SOURCE).unwrap();
+    let warm_db = root.join("warm.redb");
+    scan_java(root, &warm_db).unwrap();
+    let before = Store::open(&warm_db).unwrap().snapshot().unwrap();
+    assert!(
+        !before.rows.is_empty(),
+        "the pre-upgrade Java store had no rows to rebuild",
+    );
+
+    // A manifestless revision-zero Java scan stored no fence digest. Remove
+    // only revision one's metadata to recreate that exact C0 state while
+    // preserving every unchanged Java row and file hash.
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let raw = Database::open(&warm_db).unwrap();
+    let txn = raw.begin_write().unwrap();
+    {
+        let mut meta = txn.open_table(META).unwrap();
+        assert!(
+            meta.remove("config_digest:java").unwrap().is_some(),
+            "revision one did not publish a Java fence",
+        );
+    }
+    txn.commit().unwrap();
+    drop(raw);
+
+    scan_java(root, &warm_db).unwrap();
+    let warm = Store::open(&warm_db).unwrap().snapshot().unwrap();
+
+    let cold_db = root.join("cold.redb");
+    scan_java(root, &cold_db).unwrap();
+    let cold = Store::open(&cold_db).unwrap().snapshot().unwrap();
+    assert_eq!(warm, cold);
+}
+
+#[test]
+fn unqualified_static_imports_aggregate_every_matching_owner() {
+    let scan = scan(&[
+        (
+            "com/acme/Left.java",
+            "package com.acme; public class Left { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Right.java",
+            "package com.acme; public class Right { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Use.java",
+            r#"package com.acme;
+import static com.acme.Left.*;
+import static com.acme.Right.*;
+public class Use { void call() { pick(1); } }
+"#,
+        ),
+    ]);
+    let row = scan.row("pick", RefKind::Call);
+    assert_eq!(row.outcome, "AmbiguousOverload");
+    assert_eq!(row.key.arg_types, Some(vec!["int".to_string()]));
+}
+
+#[test]
+fn a_single_static_import_precedes_static_on_demand_imports() {
+    let scan = scan(&[
+        (
+            "com/acme/Left.java",
+            "package com.acme; public class Left { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Right.java",
+            "package com.acme; public class Right { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Use.java",
+            r#"package com.acme;
+import static com.acme.Left.pick;
+import static com.acme.Right.*;
+public class Use { void call() { pick(1); } }
+"#,
+        ),
+    ]);
+    let row = scan.row("pick", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Left.pick/1");
+    assert_eq!(row.key.arg_types, None);
+}
+
+#[test]
+fn integer_literal_suffix_radix_and_range_select_honest_types() {
+    let scan = scan(&[(
+        "com/acme/Literals.java",
+        r#"package com.acme;
+public class Literals {
+    static void decimal(int v) {} static void decimal(String v) {}
+    static void hexInt(int v) {} static void hexInt(String v) {}
+    static void hexLong(long v) {} static void hexLong(String v) {}
+    static void suffix(long v) {} static void suffix(String v) {}
+    static void minLong(long v) {} static void minLong(String v) {}
+    static void calls() {
+        decimal(2147483647);
+        hexInt(0xffff_ffff);
+        hexLong(0x1_0000_0000);
+        suffix(1L);
+        minLong(-9223372036854775808L);
+    }
+}
+"#,
+    )]);
+    for (name, ty) in [
+        ("decimal", "int"),
+        ("hexInt", "int"),
+        ("hexLong", "long"),
+        ("suffix", "long"),
+        ("minLong", "long"),
+    ] {
+        assert_eq!(
+            scan.one(name, RefKind::Call),
+            format!("RESOLVED com.acme#Literals.{name}({ty})"),
+        );
+    }
+}
+
+#[test]
+fn a_varargs_method_accepts_an_exact_array_in_the_fixed_phase() {
+    let scan = scan(&[(
+        "com/acme/Arrays.java",
+        r#"package com.acme;
+public class Arrays {
+    static void choose(long head, String... values) {}
+    static void choose(int left, int right) {}
+    static void choose(boolean left, boolean right) {}
+    static void call(String[] values) { choose(1, values); }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("choose", RefKind::Call),
+        "RESOLVED com.acme#Arrays.choose/*1",
+    );
+}
+
+/// Array members require array-member modeling, not ordinary declared-type
+/// selection; keeping their C0 keys prevents an unsupported receiver from
+/// rekeying a Java row.
+#[test]
+fn array_receivers_need_type_inference_without_rekeying_c0_rows() {
+    let scan = scan(&[(
+        "com/acme/ArrayReceivers.java",
+        r#"package com.acme;
+public class ArrayReceivers<T> {
+    static final String[] CHAR_STRING_ARRAY = {};
+    static final long[] LONG_VALUES = {};
+    static final byte[] BYTE_VALUES = {};
+    private T[][] typeArguments;
+    void use(long[] x) {
+        int staticLength = CHAR_STRING_ARRAY.length;
+        int bareLength = typeArguments.length;
+        Object bareClone = typeArguments.clone();
+        Object fieldClone = this.typeArguments.clone();
+        int longLength = LONG_VALUES.length;
+        Object byteClone = BYTE_VALUES.clone();
+        int parameterLength = x.length;
+        Object parameterClone = x.clone();
+    }
+}
+"#,
+    )]);
+    let cases = [
+        (
+            "CHAR_STRING_ARRAY.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "typeArguments.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "typeArguments.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "this.typeArguments.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "LONG_VALUES.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "BYTE_VALUES.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        ("x.length", RefKind::FieldAccess, None, true, "LocalBinding"),
+        ("x.clone", RefKind::Call, Some(0), true, "LocalBinding"),
+    ];
+    let outcomes = cases
+        .iter()
+        .map(|(raw_target, kind, ..)| scan.one(raw_target, *kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes,
+        [
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "LocalBinding",
+            "LocalBinding",
+        ],
+    );
+    for (raw_target, kind, argc, locally_bound, outcome) in cases {
+        let row = scan.row(raw_target, kind);
+        assert_eq!(row.outcome, outcome, "{raw_target}");
+        assert_eq!(
+            row.key,
+            RefKey {
+                file: "com/acme/ArrayReceivers.java".to_string(),
+                kind: kind.code(),
+                space: DeclSpace::Value.code(),
+                enclosing: "com.acme#ArrayReceivers.use/1".to_string(),
+                raw_target: raw_target.to_string(),
+                argc,
+                arg_types: None,
+                locally_bound,
+            },
+            "{raw_target} changed its C0 key",
+        );
+    }
+}
+
+#[test]
+fn a_zero_tail_varargs_call_uses_its_fixed_prefix() {
+    let scan = scan(&[(
+        "com/acme/ZeroTail.java",
+        r#"package com.acme;
+public class ZeroTail {
+    static void choose(int head, String... tail) {}
+    static void choose(String head, String... tail) {}
+    static void call() { choose(1); }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("choose", RefKind::Call),
+        "RESOLVED com.acme#ZeroTail.choose(int,String...)",
+    );
+}
+
+#[test]
+fn unary_numeric_promotion_maps_small_integrals_to_int() {
+    let scan = scan(&[(
+        "com/acme/UnarySmall.java",
+        r#"package com.acme;
+public class UnarySmall {
+    static void choose(int value) {}
+    static void choose(String value) {}
+    static void call(byte b, short s, char c) {
+        choose(-b);
+        choose(+s);
+        choose(~c);
+    }
+}
+"#,
+    )]);
+    let rows = scan
+        .rows
+        .iter()
+        .filter(|row| row.raw_target == "choose")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "RESOLVED com.acme#UnarySmall.choose(int)");
+    assert_eq!(rows[0].key.arg_types, Some(vec!["int".to_string()]));
+}
+
+#[test]
+fn java_lang_fqn_and_simple_spellings_compare_canonically() {
+    let scan = scan(&[(
+        "com/acme/Spellings.java",
+        r#"package com.acme;
+public class Spellings {
+    static void simple(String value) {} static void simple(int value) {}
+    static void qualified(java.lang.String value) {} static void qualified(int value) {}
+    static void call(java.lang.String qualifiedValue, String simpleValue) {
+        simple(qualifiedValue);
+        qualified(simpleValue);
+    }
+}
+"#,
+    )]);
+    assert_eq!(
+        scan.one("simple", RefKind::Call),
+        "RESOLVED com.acme#Spellings.simple(String)",
+    );
+    assert_eq!(
+        scan.one("qualified", RefKind::Call),
+        "RESOLVED com.acme#Spellings.qualified(java.lang.String)",
+    );
+}
+
+#[test]
+fn imported_source_type_simple_and_fqn_spellings_compare_canonically() {
+    let scan = scan(&[
+        (
+            "com/acme/Value.java",
+            "package com.acme; public class Value {}",
+        ),
+        (
+            "client/Spellings.java",
+            r#"package client;
+import com.acme.Value;
+public class Spellings {
+    static void simple(Value value) {} static void simple(Object value) {}
+    static void qualified(com.acme.Value value) {} static void qualified(Object value) {}
+    static void array(Value[] value) {} static void array(Object value) {}
+    static void varargs(Value... value) {} static void varargs(Object... value) {}
+    static void call(
+        com.acme.Value qualifiedValue,
+        Value simpleValue,
+        com.acme.Value[] qualifiedValues
+    ) {
+        simple(qualifiedValue);
+        qualified(simpleValue);
+        array(qualifiedValues);
+        varargs(qualifiedValues);
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("simple", RefKind::Call),
+        "RESOLVED client#Spellings.simple(Value)",
+    );
+    assert_eq!(
+        scan.one("qualified", RefKind::Call),
+        "RESOLVED client#Spellings.qualified(com.acme.Value)",
+    );
+    assert_eq!(
+        scan.one("array", RefKind::Call),
+        "RESOLVED client#Spellings.array(Value[])",
+    );
+    assert_eq!(
+        scan.one("varargs", RefKind::Call),
+        "RESOLVED client#Spellings.varargs(Value...)",
     );
 }

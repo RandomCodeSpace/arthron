@@ -400,6 +400,7 @@ fn import(facts: &mut FileFacts<KtLang>, node: &SgNode, package: &str) {
         // there is no expression-level reference to be bound.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: Some(Encloser {
             path: vec![package.to_string()],
             kind: DefKind::Module,

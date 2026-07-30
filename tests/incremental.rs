@@ -209,6 +209,88 @@ fn deleting_a_file_lands_the_same_state_as_a_cold_scan() {
 }
 
 #[test]
+fn deleting_a_reference_owning_file_with_none_arg_types_matches_a_fresh_cold_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let db = root.join("graph.redb");
+
+    scan_go(root, &db).expect("cold scan");
+    scan_go(root, &db).expect("unchanged warm scan");
+    let before = Store::open(&db).expect("open warm").snapshot().unwrap();
+    assert!(
+        before.rows.keys().any(|key| key.file == "server/server.go"),
+        "the deleted file must own reference rows before the deletion",
+    );
+    assert!(
+        before
+            .candidates
+            .values()
+            .flatten()
+            .any(|key| key.file == "server/server.go"),
+        "the deleted file must own candidate entries before the deletion",
+    );
+    let deleted_source = go("example.com/app/server#Serve");
+    assert!(
+        before
+            .edges
+            .iter()
+            .any(|(src, _, _)| *src == deleted_source),
+        "the deleted file must source edges before the deletion",
+    );
+
+    fs::remove_file(root.join("server/server.go")).expect("delete the reference-owning file");
+    scan_go(root, &db).expect("incremental deletion scan");
+    let incremental = Store::open(&db)
+        .expect("open incremental")
+        .snapshot()
+        .unwrap();
+
+    assert!(
+        incremental
+            .rows
+            .keys()
+            .all(|key| key.file != "server/server.go"),
+        "the deleted file left a reference row behind",
+    );
+    assert!(
+        incremental
+            .candidates
+            .values()
+            .flatten()
+            .all(|key| key.file != "server/server.go"),
+        "the deleted file left a candidate entry behind",
+    );
+    assert!(
+        incremental
+            .edges
+            .iter()
+            .all(|(src, _, _)| *src != deleted_source),
+        "the deleted file left an edge behind",
+    );
+    assert!(
+        incremental.rows.keys().all(|key| key.arg_types.is_none()),
+        "surviving pre-C argument-type keys must remain None",
+    );
+
+    let cold_dir = tempfile::tempdir().unwrap();
+    let cold_db = cold_dir.path().join("post-delete.redb");
+    scan_go(root, &cold_db).expect("fresh post-delete cold scan");
+    let cold = Store::open(&cold_db)
+        .expect("open fresh cold")
+        .snapshot()
+        .unwrap();
+    assert!(
+        cold.rows.keys().all(|key| key.arg_types.is_none()),
+        "fresh pre-C argument-type keys must remain None",
+    );
+    assert_eq!(
+        incremental, cold,
+        "the warm deletion must equal a fresh cold graph, including rows, candidates, and edges",
+    );
+}
+
+#[test]
 fn deleting_one_of_two_files_declaring_one_fqn_lands_a_cold_scans_store() {
     // Build-configuration-exclusive twins legitimately declare one FQN, and
     // nothing stops them declaring it as different kinds. The node keeps the

@@ -33,6 +33,21 @@ There is no fourth outcome and no way to express "dropped".
 
 ## Install
 
+Download the archive for your platform from
+[GitHub Releases](https://github.com/RandomCodeSpace/arthron/releases), verify
+it with the adjacent `.sha256` file, extract it, and put `arthron` (or
+`arthron.exe`) on your `PATH`:
+
+| Platform | Archive | Checksum |
+|---|---|---|
+| Linux x86_64 (GNU) | `arthron-x86_64-unknown-linux-gnu.tar.xz` | `arthron-x86_64-unknown-linux-gnu.tar.xz.sha256` |
+| Linux aarch64 (GNU) | `arthron-aarch64-unknown-linux-gnu.tar.xz` | `arthron-aarch64-unknown-linux-gnu.tar.xz.sha256` |
+| macOS x86_64 | `arthron-x86_64-apple-darwin.tar.xz` | `arthron-x86_64-apple-darwin.tar.xz.sha256` |
+| macOS aarch64 | `arthron-aarch64-apple-darwin.tar.xz` | `arthron-aarch64-apple-darwin.tar.xz.sha256` |
+| Windows x86_64 (MSVC) | `arthron-x86_64-pc-windows-msvc.zip` | `arthron-x86_64-pc-windows-msvc.zip.sha256` |
+
+Or install from crates.io:
+
 ```bash
 cargo install arthron
 ```
@@ -237,8 +252,8 @@ rate without the share invites reading the first number as the second.
 | Go | `codeiq` `853efde` | 9,794 | 12,595 | 9,873 | 4,295 | **69.5%** | 38.5% |
 | Go | `caddy` `853efde` | 10,585 | 21,304 | 13,181 | 9,014 | **54.0%** | 36.2% |
 | Go | `probes` `synthetic` | 17 | 26 | 1 | 0 | **100.0%** † | 38.6% |
-| Java | `commons-lang` `598dfc1` | 34,217 | 63,385 | 15,162 | 16,279 | **67.8%** | 39.1% |
-| Java | `gson` `3ff35d6` | 12,885 | 16,737 | 6,706 | 6,105 | **67.9%** | 44.8% |
+| Java | `commons-lang` `598dfc1` | 38,222 | 63,385 | 15,162 | 12,274 | **75.7%** | 39.1% |
+| Java | `gson` `3ff35d6` | 13,306 | 16,737 | 6,706 | 5,684 | **70.1%** | 44.8% |
 | Java | `probes` `e4dc880` | 13 | 7 | 1 | 1 | **92.9%** † | 63.6% |
 | JavaScript | `fastify` `94bcbcc` | 2,795 | 5,159 | 21,542 | 1,640 | **63.0%** | 14.2% |
 | JavaScript | `express` `dbac741` | 2,267 | 702 | 3,039 | 5,552 | **29.0%** | 67.6% |

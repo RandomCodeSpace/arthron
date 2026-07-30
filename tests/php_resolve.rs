@@ -358,6 +358,7 @@ fn a_reference_kind_this_tier_does_not_link_says_so() {
         },
         locally_bound: false,
         argc: Some(0),
+        arg_types: None,
         enclosing: None,
         span: Span {
             byte_start: 0,

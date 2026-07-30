@@ -585,6 +585,7 @@ fn emit(facts: &mut FileFacts<CppLang>, node: &SgNode, form: IncludeForm, spelle
         // name a local: `LocalBinding` does not apply to this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: enclosing_definition(node),
         span,
     });

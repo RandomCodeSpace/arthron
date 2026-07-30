@@ -394,6 +394,7 @@ fn module_source(facts: &mut FileFacts<HclLang>, node: &SgNode, call: &str) {
         // this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         // The edge starts at the module call, which is a definition this same
         // file declares — so its address is what the encloser spells, and
         // `Resolver::def_fqn` reads it back into the same identity.

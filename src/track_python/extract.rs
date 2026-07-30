@@ -1052,6 +1052,7 @@ fn reference(
         target,
         locally_bound,
         argc,
+        arg_types: None,
         enclosing: enclosing_definition(site),
         span,
     }

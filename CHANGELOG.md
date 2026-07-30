@@ -31,6 +31,60 @@ Decisions and their rationale — including what was rejected — live in
   the separate 21,542-local-binding resolution work that the forecast includes.
   This change preserves the honest `LocalBinding` partition instead of gaming
   the percentage with false or duplicate rows.
+- Java now retries typed applicability only for a legacy
+  `AmbiguousOverload` whose complete file-local argument vector is known.
+  Legacy resolved, external, local, and other unresolved rows keep their
+  outcome and coarse key. The retry preserves strict, loose, then varargs
+  phase order, including exact-array fixed-arity and zero-tail varargs calls;
+  incomparable candidates remain a refined `AmbiguousOverload`. Integer
+  literal radix, suffix, range, unary numeric promotion, and canonical
+  `java.lang` spellings are handled without guessing user subtype relations.
+  Candidate dependencies are the stable legacy-first union of both passes.
+- Java's attributed corpus rebases record that retry: `AmbiguousOverload`
+  falls from 9,218 to 5,213 on commons-lang and from 1,282 to 861 on gson,
+  with every other unresolved-reason bucket unchanged. The 4,005 and 421
+  `AmbiguousOverload` occurrences now resolve; separately, 1,768 and 286 new
+  resolved rows enter the target pins without moving or re-keying an existing
+  pin. Synthetic runtime signature aliases grow from 390 to 9,617 and 30 to
+  3,083, respectively, so typed applicability can inspect unique callables
+  without re-aiming their existing edges.
+- Reference-key argument types are now selected by the resolver that saw the
+  candidate set. The default keeps the existing coarse key, and a resolver may
+  explicitly refine it with a complete argument-type vector. A default-zero
+  per-language graph revision leaves existing manifest fences byte-identical;
+  nonzero revisions force only that language's unchanged files to rebuild.
+  Java is revision one; every other language remains at revision zero.
+- Reference rows now carry file-locally evident call argument types in their
+  canonical key. Schema generation 11 forces older stores to rescan. Current
+  extractors initialize the field to `None`, freezing graph behavior until a
+  language track deliberately starts recording types.
+
+### Added
+
+- **Binary-release automation for five native targets.** The reviewed,
+  project-maintained cargo-dist 0.32.0 workflow builds
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin`, `aarch64-apple-darwin`, and
+  `x86_64-pc-windows-msvc`. Each target produces its own archive and `.sha256`
+  checksum; these ten release outputs are distinct from the multiple temporary
+  workflow artifact bundles that carry them between jobs. A `v*` tag push is
+  the only path that can upload assets and create a GitHub Release; manual
+  dispatch builds all five targets under read-only repository permission and
+  cannot publish.
+### Fixed
+
+- **A track switched off in `arthron.toml` no longer reprints its retained
+  measurement as current.** Its rows stay in the graph, because a skipped
+  track cannot say they are gone, but its tally is omitted from this run and a
+  language-named report marker says the track was switched off.
+- **FQN collision counts are now durable graph facts.** A mergeable
+  multi-file definition such as C# `N#Shared` reports zero on a cold scan, an
+  unchanged warm scan, direct `Store::report`, and a full-registry scan while
+  retaining every declaration site. A genuinely nonmergeable identity remains
+  one collision in each path. Collision classification sorts declarations by
+  file and line, checks every unordered pair, and is persisted before phase 2
+  restores file currency. The store schema moves from 9 to 10 and rebuilds
+  older caches.
 
 ## [0.0.2] - 2026-07-29
 

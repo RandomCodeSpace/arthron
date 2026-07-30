@@ -510,6 +510,7 @@ fn import(facts: &mut FileFacts<LuaLang>, call: &SgNode, specifier: Option<&SgNo
         // name a local: `LocalBinding` does not apply to this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: enclosing_definition(call),
         span,
     });
