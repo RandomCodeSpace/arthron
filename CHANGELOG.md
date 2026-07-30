@@ -24,8 +24,9 @@ Decisions and their rationale — including what was rejected — live in
   Candidate dependencies are the stable legacy-first union of both passes.
 - Java's attributed corpus rebases record that retry: `AmbiguousOverload`
   falls from 9,218 to 5,213 on commons-lang and from 1,282 to 861 on gson,
-  with every other unresolved-reason bucket unchanged. The 4,005 and 421 newly
-  resolved occurrences add target pins without moving or re-keying an existing
+  with every other unresolved-reason bucket unchanged. The 4,005 and 421
+  `AmbiguousOverload` occurrences now resolve; separately, 1,768 and 286 new
+  resolved rows enter the target pins without moving or re-keying an existing
   pin. Synthetic runtime signature aliases grow from 390 to 9,617 and 30 to
   3,083, respectively, so typed applicability can inspect unique callables
   without re-aiming their existing edges.
