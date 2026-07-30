@@ -21,6 +21,12 @@ Decisions and their rationale — including what was rejected — live in
   incomparable or expression-typed candidates remain `AmbiguousOverload`.
   Unique callables retain their arity target through forwarding signature
   aliases, and unary numeric literals preserve their promoted primitive type.
+- Reference-key argument types are now selected by the resolver that saw the
+  candidate set. The default keeps the existing coarse key, and a resolver may
+  explicitly refine it with a complete argument-type vector. A default-zero
+  per-language graph revision leaves existing manifest fences byte-identical;
+  nonzero revisions force only that language's unchanged files to rebuild.
+  Every language remains at revision zero in this change.
 - Reference rows now carry file-locally evident call argument types in their
   canonical key. Schema generation 11 forces older stores to rescan. Current
   extractors initialize the field to `None`, freezing graph behavior until a

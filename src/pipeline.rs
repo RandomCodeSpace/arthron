@@ -39,7 +39,8 @@ use crate::Outcome;
 use crate::config::{CONFIG_FILE, Config, FileFilter};
 use crate::extract_go::GoExtractor;
 use crate::lang::{
-    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, Supertypes, SymbolProbe,
+    Entry, Extractor, FileFacts, FileIndex, Language, RefKeyRefinement, Resolution, Resolver,
+    Supertypes, SymbolProbe,
 };
 use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, node_id, reason_code};
 use crate::registry::REGISTRY;
@@ -67,6 +68,21 @@ use crate::store::{
 /// depends on the number — a file's facts are applied in the same order at
 /// any batch size — only the memory and the transaction count do.
 const BATCH_FILES: usize = 500;
+
+/// Combine a language's manifest fingerprint with its graph-semantics
+/// revision without changing the established revision-zero bytes.
+fn graph_fence_digest(manifest_digest: &[u8], graph_revision: u64) -> Vec<u8> {
+    if graph_revision == 0 {
+        return manifest_digest.to_vec();
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"arthron\0graph-revision-fence\0v1\0");
+    hasher.update(&(manifest_digest.len() as u64).to_le_bytes());
+    hasher.update(manifest_digest);
+    hasher.update(&graph_revision.to_le_bytes());
+    hasher.finalize().as_bytes().to_vec()
+}
 
 /// One file this event re-reads: its identity, and the half of its facts
 /// small enough to keep.
@@ -292,7 +308,9 @@ pub fn scan<L: Language>(
     // every identity in the graph. Fingerprinting it *before* the config
     // learns anything from the store is what keeps the comparison about the
     // project rather than about what the last scan happened to know.
-    store.fence_config(L::LANG, &rs.config_digest(&cfg))?;
+    let manifest_digest = rs.config_digest(&cfg);
+    let fence_digest = graph_fence_digest(&manifest_digest, rs.graph_revision());
+    store.fence_config(L::LANG, &fence_digest)?;
 
     // Every container name the store already holds. Binding an unaliased
     // import needs a fact out of the *imported* container's source, so a
@@ -1096,7 +1114,7 @@ fn phase_two<L: Language>(
     let mut acc = RefAcc::default();
 
     for r in &facts.refs {
-        let res = rs.resolve(cfg, &scope, r, probe);
+        let (res, refinement) = rs.resolve_with_key_refinement(cfg, &scope, r, probe);
         // The source of an edge is the reference's nearest nameable
         // encloser, named by the same function that names definitions — so
         // an edge and the node it starts at cannot disagree.
@@ -1109,19 +1127,32 @@ fn phase_two<L: Language>(
             Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
             None => (container_id, container_name),
         };
-        let key = RefKey {
-            file: file.rel_path.clone(),
-            kind: r.kind.code(),
-            space: r.space.code(),
-            enclosing: enclosing_name.to_string(),
-            raw_target: r.raw_target.clone(),
-            argc: r.argc,
-            arg_types: r.arg_types.clone(),
-            locally_bound: r.locally_bound,
-        };
+        let key = reference_key(&file.rel_path, enclosing_name, r, refinement);
         record::<L>(key, r, src, res, &mut acc);
     }
     finish(acc, &file.rel_path, file.hash)
+}
+
+fn reference_key(
+    file: &str,
+    enclosing: &str,
+    reference: &Reference,
+    refinement: RefKeyRefinement,
+) -> RefKey {
+    let arg_types = match refinement {
+        RefKeyRefinement::None => None,
+        RefKeyRefinement::ArgumentTypes(types) => Some(types),
+    };
+    RefKey {
+        file: file.to_string(),
+        kind: reference.kind.code(),
+        space: reference.space.code(),
+        enclosing: enclosing.to_string(),
+        raw_target: reference.raw_target.clone(),
+        argc: reference.argc,
+        arg_types,
+        locally_bound: reference.locally_bound,
+    }
 }
 
 /// Scan a Go repository, reading every Go file the walk finds.
@@ -1242,6 +1273,75 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
     }
     report.file_errors = named(file_errors);
     Ok(report)
+}
+
+#[cfg(test)]
+mod ref_key_refinement_tests {
+    use super::*;
+    use crate::lang::RefKeyRefinement;
+    use crate::model::{DeclSpace, RefTarget, Span, TargetRoot};
+
+    fn typed_reference() -> Reference {
+        Reference {
+            kind: RefKind::Call,
+            space: DeclSpace::Value,
+            raw_target: "pick".to_string(),
+            target: RefTarget {
+                root: TargetRoot::Name,
+                segments: vec!["pick".to_string()],
+            },
+            locally_bound: false,
+            argc: Some(1),
+            arg_types: Some(vec!["extractor-type".to_string()]),
+            enclosing: None,
+            span: Span {
+                byte_start: 0,
+                byte_end: 4,
+                line: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn argument_type_refinement_is_the_only_way_types_enter_the_key() {
+        let reference = typed_reference();
+
+        let coarse = reference_key("src/A.java", "p#A.m()", &reference, RefKeyRefinement::None);
+        assert_eq!(coarse.arg_types, None);
+
+        let refined = reference_key(
+            "src/A.java",
+            "p#A.m()",
+            &reference,
+            RefKeyRefinement::ArgumentTypes(vec!["resolver-type".to_string()]),
+        );
+        assert_eq!(refined.arg_types, Some(vec!["resolver-type".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod graph_revision_tests {
+    use super::*;
+
+    #[test]
+    fn revision_zero_preserves_the_manifest_digest() {
+        let manifest = b"manifest bytes that already fence stores";
+        assert_eq!(graph_fence_digest(manifest, 0), manifest);
+    }
+
+    #[test]
+    fn nonzero_revision_is_domain_separated() {
+        let manifest = b"manifest bytes that already fence stores";
+        let first = graph_fence_digest(manifest, 1);
+        let manifestless = graph_fence_digest(b"", 1);
+
+        assert_eq!(first, graph_fence_digest(manifest, 1));
+        assert_ne!(first, manifest);
+        assert_ne!(first, graph_fence_digest(manifest, 2));
+        assert_ne!(first, graph_fence_digest(b"different manifest", 1));
+        assert!(!manifestless.is_empty());
+        assert_eq!(manifestless, graph_fence_digest(b"", 1));
+    }
 }
 
 /// Whether a repo-relative path carries an extension this language owns.
