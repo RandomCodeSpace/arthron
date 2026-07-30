@@ -1,15 +1,24 @@
 //! The store's schema contract, exercised without a scan: version fencing,
 //! per-file ownership, and the encoding of a reference row key.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use arthron::lang::Entry;
-use arthron::model::{DefFacets, DefKind, Domain, Lang, NodeId, node_id};
+use arthron::Outcome;
+use arthron::config::FileFilter;
+use arthron::lang::{
+    Entry, Extractor, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver,
+    SymbolProbe,
+};
+use arthron::model::{
+    DefFacets, DefKind, Definition, Domain, Fqn, Lang, NodeId, RefKind, Reference, node_id,
+};
+use arthron::pipeline::scan;
 use arthron::store::{
     DeclSite, DefBatch, FileDefs, FileRefs, NodePayload, NodeRecord, RefBatch, RefKey, RefRecord,
     SCHEMA_VERSION, Store, StoredOutcome,
 };
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// The metadata table, restated so a test can stamp a foreign generation on
 /// a store the way an older build would have left one. Renaming the table in
@@ -149,6 +158,201 @@ fn refs_of(file: &str, raw: &str, target: NodeId) -> FileRefs {
 
 fn open(path: &Path) -> Store {
     Store::open(path).expect("open")
+}
+
+struct RevisionLang;
+
+impl Language for RevisionLang {
+    const LANG: Lang = Lang::Go;
+    const DOMAIN: Domain = Domain::Go;
+
+    fn extensions() -> &'static [&'static str] {
+        &["go"]
+    }
+
+    type Header = ();
+    type Scope = ();
+    type Config = Vec<u8>;
+}
+
+struct RevisionExtractor;
+
+impl Extractor<RevisionLang> for RevisionExtractor {
+    fn extract(&self, _rel_path: &str, _source: &str) -> FileFacts<RevisionLang> {
+        FileFacts::default()
+    }
+}
+
+struct RevisionResolver {
+    digest: Vec<u8>,
+    revision: u64,
+}
+
+impl Resolver<RevisionLang> for RevisionResolver {
+    fn config(&self, _root: &Path, _files: &FileIndex) -> Result<Vec<u8>, LayoutError> {
+        Ok(self.digest.clone())
+    }
+
+    fn config_digest(&self, cfg: &Vec<u8>) -> Vec<u8> {
+        cfg.clone()
+    }
+
+    fn graph_revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn declared_container(&self, _cfg: &Vec<u8>, _header: &()) -> Option<(String, String)> {
+        None
+    }
+
+    fn learn_containers(&self, _cfg: &mut Vec<u8>, _names: &HashMap<String, String>) {}
+
+    fn owns_file(&self, _cfg: &Vec<u8>, _rel_path: &str) -> bool {
+        true
+    }
+
+    fn def_fqn(
+        &self,
+        _cfg: &Vec<u8>,
+        _header: &(),
+        _owner: &[String],
+        _def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Option<Fqn> {
+        None
+    }
+
+    fn index_keys(&self, _cfg: &Vec<u8>, _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    fn mergeable(&self, _a: &Definition, _b: &Definition) -> bool {
+        false
+    }
+
+    fn scope(&self, _cfg: &Vec<u8>, _file: &FileFacts<RevisionLang>, _probe: &dyn SymbolProbe) {}
+
+    fn link_kinds(&self) -> &'static [RefKind] {
+        &[]
+    }
+
+    fn resolve(
+        &self,
+        _cfg: &Vec<u8>,
+        _scope: &(),
+        _reference: &Reference,
+        _probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        Resolution {
+            outcome: Outcome::Unresolved(arthron::UnresolvedReason::NoMatchingDefinition),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+fn scan_revision(root: &Path, db: &Path, digest: &[u8], revision: u64) {
+    scan::<RevisionLang>(
+        root,
+        db,
+        &RevisionExtractor,
+        &RevisionResolver {
+            digest: digest.to_vec(),
+            revision,
+        },
+        &FileFilter::none(),
+    )
+    .expect("revision scan");
+}
+
+fn stored_go_config_digest(path: &Path) -> Vec<u8> {
+    let db = Database::open(path).expect("raw store open");
+    let txn = db.begin_read().expect("read metadata");
+    let meta = txn.open_table(META).expect("metadata table");
+    let key = format!("config_digest:{}", Lang::Go.name());
+    meta.get(key.as_str())
+        .expect("digest lookup")
+        .expect("Go digest")
+        .value()
+        .to_vec()
+}
+
+#[test]
+fn graph_revision_zero_preserves_the_existing_fence_digest() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    std::fs::write(scratch.path().join("main.go"), "package main\n").expect("fixture");
+    let db = scratch.path().join("graph.redb");
+    let manifest = b"the existing manifest digest";
+
+    scan_revision(scratch.path(), &db, manifest, 0);
+
+    assert_eq!(stored_go_config_digest(&db), manifest);
+}
+
+#[test]
+fn a_graph_revision_change_forgets_only_that_languages_files() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    std::fs::write(scratch.path().join("main.go"), "package main\n").expect("fixture");
+    let other_source = "package main\n";
+    std::fs::write(scratch.path().join("other.go"), other_source).expect("Go fixture");
+    std::fs::create_dir(scratch.path().join("src")).expect("source directory");
+    std::fs::write(scratch.path().join("src/A.java"), "class A {}\n").expect("Java fixture");
+    let warm_db = scratch.path().join("warm.redb");
+    let fresh_db = scratch.path().join("fresh.redb");
+    let manifest = b"the same manifest digest";
+    scan_revision(scratch.path(), &warm_db, manifest, 0);
+
+    {
+        let store = open(&warm_db);
+        let mut stale_go = refs_of("other.go", "GoOnly", go("m/pkg#GoOnly"));
+        stale_go.hash = *blake3::hash(other_source.as_bytes()).as_bytes();
+        store
+            .apply_refs(&RefBatch {
+                files: vec![
+                    stale_go,
+                    refs_of("src/A.java", "JavaOnly", go("j/pkg#JavaOnly")),
+                ],
+            })
+            .expect("seed language slices");
+    }
+
+    scan_revision(scratch.path(), &warm_db, manifest, 0);
+    {
+        let store = open(&warm_db);
+        assert!(
+            store
+                .snapshot()
+                .expect("revision-zero snapshot")
+                .rows
+                .keys()
+                .any(|row| row.file == "other.go"),
+            "revision zero and an unchanged hash preserve the existing Go row",
+        );
+    }
+
+    scan_revision(scratch.path(), &warm_db, manifest, 1);
+
+    let warm = open(&warm_db).snapshot().expect("warm snapshot");
+    assert!(
+        warm.rows.keys().any(|row| row.file == "src/A.java"),
+        "Java rows survive a Go graph revision",
+    );
+    assert!(
+        warm.rows.keys().all(|row| row.file != "other.go"),
+        "the stale Go slice is forgotten",
+    );
+
+    {
+        let store = open(&fresh_db);
+        store
+            .apply_refs(&RefBatch {
+                files: vec![refs_of("src/A.java", "JavaOnly", go("j/pkg#JavaOnly"))],
+            })
+            .expect("seed the same distinct language slice");
+    }
+    scan_revision(scratch.path(), &fresh_db, manifest, 1);
+    let fresh = open(&fresh_db).snapshot().expect("fresh snapshot");
+
+    assert_eq!(warm, fresh, "revision fencing rebuilds the fresh graph");
 }
 
 #[test]
