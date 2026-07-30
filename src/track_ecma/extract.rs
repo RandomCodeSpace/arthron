@@ -16,10 +16,11 @@
 //! Recorded rather than hidden, because an undercount that is known is a work
 //! item and an undercount that is not is a lie:
 //!
-//! - **Property reads are not references.** A getter invoked as `obj.value`
-//!   is a call in the language and a member read in the grammar; extracting
-//!   every member read would swamp the denominator with names no static
-//!   analysis can resolve. Undercount, never a wrong edge.
+//! - **Dotted property reads are references.** The extractor emits the
+//!   outermost `member_expression` once as [`RefKind::FieldAccess`]. A member
+//!   in call/new position is already that site's `Call`/`New` reference, and
+//!   a plain assignment target writes without reading, so neither is emitted
+//!   twice. Computed `a[b]` stays absent: the key has no static name.
 //! - **`Object.assign(C.prototype, {…})` and `util.inherits`** are ordinary
 //!   calls with runtime meaning; no rule pretends otherwise.
 //! - **Transpiler output** (`__exportStar`, `_interopRequireDefault`) is not
@@ -721,6 +722,7 @@ pub fn extract(dialect: Dialect, rel_path: &str, source: &str) -> EcmaFacts {
             "def-namespace" => namespace_declaration(&mut ctx, &node),
             "def-ambient" => ambient_declaration(&mut ctx, &node),
             "ref-call" => call(&mut ctx, &node),
+            "ref-member" => member_read(&mut ctx, &node),
             "ref-new" => new_expression(&mut ctx, &node),
             "ref-jsx" => jsx_element(&mut ctx, &node),
             "ref-heritage" => heritage(&mut ctx, &node),
@@ -1970,6 +1972,59 @@ fn call(ctx: &mut Ctx, node: &SgNode) {
             );
         }
     }
+}
+
+/// A dotted property read outside call/new position.
+///
+/// One chain is one reference. The rule matches both `a.b` and the outer
+/// `a.b.c`, but only the outermost selector names the value the expression
+/// reads. A member used as a callee or constructor already has the more
+/// precise `Call`/`New` kind, so emitting it here too would double-count one
+/// site.
+///
+/// A plain assignment target (`a.b = x`) writes the property without reading
+/// its old value and is omitted. An augmented assignment (`a.b += x`) does
+/// read the old value, so it remains a `FieldAccess`. Computed access is a
+/// `subscript_expression`, not a `member_expression`, and never reaches this
+/// function: `a[b]` has no static member name to emit. A member in a
+/// TypeScript type position is already the more precise `TypeUse` reference
+/// and is likewise not duplicated.
+fn member_read(ctx: &mut Ctx, node: &SgNode) {
+    if in_type_position(node) {
+        return;
+    }
+    let mut current = node.clone();
+    while let Some(parent) = current.parent() {
+        let is_field = |name: &str| {
+            parent
+                .field(name)
+                .is_some_and(|field| field.range() == current.range())
+        };
+        if (parent.kind() == "member_expression" && is_field("object"))
+            || (parent.kind() == "call_expression" && is_field("function"))
+            || (parent.kind() == "new_expression" && is_field("constructor"))
+            || (parent.kind() == "assignment_expression" && is_field("left"))
+        {
+            return;
+        }
+        if parent.kind() == "parenthesized_expression"
+            && parent
+                .children()
+                .any(|child| child.is_named() && child.range() == current.range())
+        {
+            current = parent;
+            continue;
+        }
+        break;
+    }
+    ctx.push_ref(
+        RefKind::FieldAccess,
+        DeclSpace::Value,
+        node,
+        node.text().to_string(),
+        member_target(node),
+        None,
+    );
 }
 
 /// Whether `require` at this call site is a name the file itself bound rather
@@ -3780,6 +3835,62 @@ mod tests {
         let chained = site(&facts, "f().m");
         assert_eq!(chained.target.root, TargetRoot::Expr);
         assert_eq!(segments(chained), ["m"]);
+    }
+
+    #[test]
+    fn dotted_member_reads_have_the_same_cut_in_both_ecma_grammars() {
+        let source = concat!(
+            "function f(local) {\n",
+            "  const a = imported.member;\n",
+            "  const b = local.member;\n",
+            "  const c = make().member;\n",
+            "  local.writeOnly = 1;\n",
+            "  local.readWrite += 1;\n",
+            "  imported.called();\n",
+            "  const d = local['computed'];\n",
+            "}\n",
+        );
+        for facts in [js(source), ts(source)] {
+            let fields = refs(&facts, RefKind::FieldAccess);
+            let targets: Vec<&str> = fields.iter().map(|r| r.raw_target.as_str()).collect();
+            assert_eq!(
+                targets,
+                [
+                    "imported.member",
+                    "local.member",
+                    "make().member",
+                    "local.readWrite",
+                ],
+            );
+            assert!(!site(&facts, "imported.member").locally_bound);
+            assert!(site(&facts, "local.member").locally_bound);
+            assert_eq!(site(&facts, "make().member").target.root, TargetRoot::Expr,);
+            assert_eq!(
+                refs(&facts, RefKind::Call)
+                    .iter()
+                    .filter(|r| r.raw_target == "imported.called")
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                refs(&facts, RefKind::FieldAccess)
+                    .iter()
+                    .filter(|r| r.raw_target == "imported.called")
+                    .count(),
+                0,
+                "a member callee keeps its more precise kind",
+            );
+        }
+        let type_query = ts("type T = typeof imported.member;\n");
+        assert_eq!(refs(&type_query, RefKind::FieldAccess).len(), 0);
+        assert_eq!(
+            refs(&type_query, RefKind::TypeUse)
+                .iter()
+                .filter(|r| r.raw_target == "imported.member")
+                .count(),
+            1,
+            "a member in a type query keeps its more precise kind",
+        );
     }
 
     #[test]

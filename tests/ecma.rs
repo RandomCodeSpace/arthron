@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use arthron::model::{Lang, reason_name};
+use arthron::model::{Lang, RefKind, reason_name};
 use arthron::store::{Store, StoredOutcome};
 use arthron::track_ecma::scan_ecma;
 
@@ -31,6 +31,34 @@ fn rows(db: &Path) -> BTreeMap<(String, String, String), Vec<String>> {
     let snapshot = store.snapshot().expect("snapshot");
     let mut out = BTreeMap::new();
     for (key, record) in &snapshot.rows {
+        let rendered = match &record.outcome {
+            StoredOutcome::Resolved(id) => match store.node(id).expect("node read") {
+                Some(node) => format!("resolved {}", node_name(&node)),
+                None => "resolved <dangling>".to_string(),
+            },
+            StoredOutcome::External(package) => format!("external {package}"),
+            StoredOutcome::Unresolved(code) => format!("unresolved {}", reason_name(*code)),
+        };
+        out.entry((
+            key.file.clone(),
+            key.raw_target.clone(),
+            key.enclosing.clone(),
+        ))
+        .or_insert_with(Vec::new)
+        .push(rendered);
+    }
+    out
+}
+
+/// Stored rows of one kind, rendered exactly like [`rows`].
+fn rows_of_kind(db: &Path, kind: RefKind) -> BTreeMap<(String, String, String), Vec<String>> {
+    let store = Store::open(db).expect("store opens");
+    let snapshot = store.snapshot().expect("snapshot");
+    let mut out = BTreeMap::new();
+    for (key, record) in &snapshot.rows {
+        if key.kind != kind.code() {
+            continue;
+        }
         let rendered = match &record.outcome {
             StoredOutcome::Resolved(id) => match store.node(id).expect("node read") {
                 Some(node) => format!("resolved {}", node_name(&node)),
@@ -406,6 +434,8 @@ fn a_commonjs_tree_resolves_its_four_require_shapes() {
     let db = root.join("graph.redb");
     let report = scan_ecma(root, &db).expect("scan");
     let table = rows(&db);
+    let imports = rows_of_kind(&db, RefKind::Import);
+    let fields = rows_of_kind(&db, RefKind::FieldAccess);
     let main = "index.js#value:main";
 
     // A4: `LOAD_AS_DIRECTORY` — `./lib/util` is a directory with an index.
@@ -444,12 +474,22 @@ fn a_commonjs_tree_resolves_its_four_require_shapes() {
     // find the method", which are different work items.
     assert_eq!(
         row(
-            &table,
+            &imports,
             "index.js",
             "process.env.PLUGIN",
             "index.js#value:plugin"
         ),
         "unresolved DynamicModuleSpecifier",
+    );
+    assert_eq!(
+        row(
+            &fields,
+            "index.js",
+            "process.env.PLUGIN",
+            "index.js#value:plugin"
+        ),
+        "external node:global",
+        "the dynamic specifier expression still reads the global member",
     );
     // The module's export map was computed and the name is not in it.
     assert_eq!(
@@ -470,6 +510,151 @@ fn a_commonjs_tree_resolves_its_four_require_shapes() {
         !report.per_lang.contains_key(&Lang::TypeScript.code())
             || report.per_lang[&Lang::TypeScript.code()].resolved == 0,
     );
+}
+
+#[test]
+fn ecma_member_reads_are_emitted_once_and_keep_their_honest_root_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"member-reads","type":"module"}"#,
+    );
+    write(
+        root,
+        "values.js",
+        "export const named = 1;\nexport function called() {}\n",
+    );
+    write(
+        root,
+        "read.js",
+        concat!(
+            "import * as imported from './values.js';\n",
+            "function make() { return { named: 1 }; }\n",
+            "export function read(local) {\n",
+            "  const importedValue = imported.named;\n",
+            "  const localValue = local.read;\n",
+            "  const complexValue = make().named;\n",
+            "  const receiverValue = this.named;\n",
+            "  const computedValue = local['computed'];\n",
+            "  local.writeOnly = 1;\n",
+            "  local.readWrite += 1;\n",
+            "  imported.called();\n",
+            "  return [importedValue, localValue, complexValue, receiverValue, computedValue];\n",
+            "}\n",
+        ),
+    );
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let fields = rows_of_kind(&db, RefKind::FieldAccess);
+    let calls = rows_of_kind(&db, RefKind::Call);
+    let enclosing = "read.js#value:read";
+
+    assert_eq!(
+        row(&fields, "read.js", "imported.named", enclosing),
+        "resolved values.js#value:named",
+        "a namespace-import member read reaches the exported definition",
+    );
+    assert_eq!(
+        row(&fields, "read.js", "local.read", enclosing),
+        "unresolved LocalBinding",
+    );
+    assert_eq!(
+        row(&fields, "read.js", "make().named", enclosing),
+        "unresolved NeedsExpressionType",
+    );
+    assert_eq!(
+        row(&fields, "read.js", "this.named", enclosing),
+        "unresolved NeedsReceiverType",
+    );
+    assert_eq!(
+        row(&fields, "read.js", "local.readWrite", enclosing),
+        "unresolved LocalBinding",
+        "an augmented assignment reads the old value before writing the new one",
+    );
+
+    assert!(
+        !fields.keys().any(|(_, raw, _)| raw == "local['computed']"),
+        "computed members have no static name and emit no field-access row",
+    );
+    assert!(
+        !fields.keys().any(|(_, raw, _)| raw == "local.writeOnly"),
+        "a plain assignment target writes a property without reading its value",
+    );
+    assert!(
+        !fields.keys().any(|(_, raw, _)| raw == "imported.called"),
+        "the member callee is the call's reference and is not emitted twice",
+    );
+    assert_eq!(
+        row(&calls, "read.js", "imported.called", enclosing),
+        "resolved values.js#value:called",
+    );
+}
+
+#[test]
+fn parenthesized_member_callees_keep_their_call_or_new_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"parenthesized-member-callees","type":"module"}"#,
+    );
+    for extension in ["js", "ts"] {
+        write(
+            root,
+            &format!("values.{extension}"),
+            "export const named = 1;\nexport function called() {}\nexport class Constructed {}\n",
+        );
+        write(
+            root,
+            &format!("read.{extension}"),
+            &format!(
+                "import * as imported from './values.{extension}';\n\
+                 export function read() {{\n\
+                   const ordinaryRead = (imported.named);\n\
+                   (imported.called)();\n\
+                   new (imported.Constructed)();\n\
+                   return ordinaryRead;\n\
+                 }}\n"
+            ),
+        );
+    }
+    let db = root.join("graph.redb");
+    scan_ecma(root, &db).expect("scan");
+    let fields = rows_of_kind(&db, RefKind::FieldAccess);
+    let calls = rows_of_kind(&db, RefKind::Call);
+    let news = rows_of_kind(&db, RefKind::New);
+    for extension in ["js", "ts"] {
+        let read = format!("read.{extension}");
+        let values = format!("values.{extension}");
+        let enclosing = format!("{read}#value:read");
+
+        assert_eq!(
+            row(&fields, &read, "imported.named", &enclosing),
+            format!("resolved {values}#value:named"),
+            "an ordinary parenthesized member expression remains a field read",
+        );
+        assert_eq!(
+            row(&calls, &read, "(imported.called)", &enclosing),
+            format!("resolved {values}#value:called"),
+            "a parenthesized member callee keeps its call outcome",
+        );
+        assert_eq!(
+            row(&news, &read, "(imported.Constructed)", &enclosing),
+            format!("resolved {values}#value:Constructed"),
+            "a parenthesized member constructor keeps its new outcome",
+        );
+        for raw in ["imported.called", "imported.Constructed"] {
+            assert!(
+                !fields
+                    .keys()
+                    .any(|(file, field, _)| file == &read && field == raw),
+                "{read}: {raw} is already represented by its call or construction site",
+            );
+        }
+    }
 }
 
 #[test]

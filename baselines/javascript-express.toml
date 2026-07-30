@@ -10,9 +10,9 @@
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
 corpus = "corpus/javascript/express"
-commit = "dbac741"
+commit = "00708f3fae0cf8134e718fc8ec35e436d4f481b7"
 language = "javascript"
-resolved = 2267
-external = 702
-local_binding = 3039
-unresolved = 5552
+resolved = 2272
+external = 748
+local_binding = 3642
+unresolved = 5910

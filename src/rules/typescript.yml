@@ -46,6 +46,14 @@ language: typescript
 rule:
   kind: call_expression
 ---
+# A dotted property read outside call/new position. The interpreter rejects
+# nested selectors, plain assignment targets and every computed `a[b]` shape,
+# so one written read becomes one `FieldAccess`.
+id: ref-member
+language: typescript
+rule:
+  kind: member_expression
+---
 id: ref-new
 language: typescript
 rule:

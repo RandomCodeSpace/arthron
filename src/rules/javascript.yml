@@ -52,6 +52,14 @@ language: javascript
 rule:
   kind: call_expression
 ---
+# A dotted property read outside call/new position. The interpreter rejects
+# nested selectors, plain assignment targets and every computed `a[b]` shape,
+# so one written read becomes one `FieldAccess`.
+id: ref-member
+language: javascript
+rule:
+  kind: member_expression
+---
 # F8: `new C()` is not a `call_expression`; a single call rule misses every
 # construction site.
 id: ref-new

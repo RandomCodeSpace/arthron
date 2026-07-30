@@ -10,9 +10,9 @@
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
 corpus = "corpus/typescript/zod"
-commit = "1fb56a5"
+commit = "00708f3fae0cf8134e718fc8ec35e436d4f481b7"
 language = "typescript"
-resolved = 17080
-external = 1952
-local_binding = 8143
-unresolved = 19784
+resolved = 17530
+external = 2059
+local_binding = 14456
+unresolved = 21773
