@@ -10,9 +10,9 @@
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
 corpus = "corpus/typescript/vue-core"
-commit = "fa2885d"
+commit = "00708f3fae0cf8134e718fc8ec35e436d4f481b7"
 language = "typescript"
-resolved = 26297
-external = 3694
-local_binding = 9564
-unresolved = 27945
+resolved = 29763
+external = 3817
+local_binding = 20551
+unresolved = 30557

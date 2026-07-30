@@ -10,9 +10,9 @@
 # drift in either fails the gate and must be re-based deliberately.
 format = 1
 corpus = "corpus/javascript/fastify"
-commit = "94bcbcc"
+commit = "00708f3fae0cf8134e718fc8ec35e436d4f481b7"
 language = "javascript"
-resolved = 2795
-external = 5159
-local_binding = 21542
-unresolved = 1640
+resolved = 2865
+external = 5348
+local_binding = 26957
+unresolved = 2530

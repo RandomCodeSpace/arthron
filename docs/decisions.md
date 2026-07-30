@@ -425,6 +425,53 @@ also needs. The measured D result is 14.3%; it must not be inflated by
 reclassifying locals, emitting computed or write-only names, or duplicating
 nested, call, construction, or type-position rows.
 
+The final pre-rebase join uses the complete reference-row key
+(`file + kind + declaration space + enclosing FQN + raw target + argc +
+locally_bound`) against fresh release builds of `1ea3c87` and `00708f3`.
+Every pre-existing row holds byte-for-byte in all six ECMA corpora: zero
+vanished rows, zero changed outcomes or occurrence counts, zero duplicate
+keys. Every appeared row is the new `FieldAccess` kind. Rows and occurrences
+are separate units:
+
+| corpus | appeared rows / occurrences | in-repo resolved rows / occurrences | new `External` rows / occurrences | `LocalBinding` rows / occurrences | other unresolved rows / occurrences |
+|---|---:|---:|---:|---:|---:|
+| fastify | 2,452 / 6,564 | 41 / 70 | 85 / 189 | 1,906 / 5,415 | 420 / 890 |
+| express | 489 / 1,012 | 5 / 5 | 38 / 46 | 306 / 603 | 140 / 358 |
+| vue-core | 8,589 / 17,188 | 1,883 / 3,466 | 81 / 123 | 5,186 / 10,987 | 1,439 / 2,612 |
+| zod | 5,173 / 8,859 | 346 / 450 | 50 / 107 | 3,218 / 6,313 | 1,559 / 1,989 |
+| JavaScript probes | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| TypeScript probes | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+The unresolved side introduces no taxonomy. Its full per-reason attribution,
+again as rows / occurrences, is:
+
+| corpus | per-reason appeared rows / occurrences |
+|---|---|
+| fastify | `NoMatchingDefinition` 32 / 100; `NeedsTypeInference` 38 / 60; `LocalBinding` 1,906 / 5,415; `NeedsReceiverType` 66 / 189; `NeedsExpressionType` 284 / 541 |
+| express | `UnknownPackage` 1 / 1; `NeedsTypeInference` 56 / 61; `LocalBinding` 306 / 603; `NeedsReceiverType` 42 / 253; `NeedsExpressionType` 41 / 43 |
+| vue-core | `NoMatchingDefinition` 101 / 134; `NeedsTypeInference` 250 / 619; `LocalBinding` 5,186 / 10,987; `NeedsReceiverType` 153 / 359; `NeedsExpressionType` 930 / 1,495; `UnindexedSupertype` 5 / 5 |
+| zod | `NoMatchingDefinition` 137 / 179; `NeedsTypeInference` 289 / 392; `LocalBinding` 3,218 / 6,313; `NeedsReceiverType` 6 / 12; `NeedsExpressionType` 1,125 / 1,404; `UnindexedSupertype` 2 / 2 |
+| JavaScript / TypeScript probes | none |
+
+The six baselines were written only by `arthron gate --rebase --commit
+00708f3fae0cf8134e718fc8ec35e436d4f481b7`:
+
+| corpus | before `(resolved, external, local, unresolved)` | after `(resolved, external, local, unresolved)` |
+|---|---|---|
+| fastify | 2,795 / 5,159 / 21,542 / 1,640 | 2,865 / 5,348 / 26,957 / 2,530 |
+| express | 2,267 / 702 / 3,039 / 5,552 | 2,272 / 748 / 3,642 / 5,910 |
+| JavaScript probes | 6 / 0 / 1 / 2 | 6 / 0 / 1 / 2 |
+| vue-core | 26,297 / 3,694 / 9,564 / 27,945 | 29,763 / 3,817 / 20,551 / 30,557 |
+| zod | 17,080 / 1,952 / 8,143 / 19,784 | 17,530 / 2,059 / 14,456 / 21,773 |
+| TypeScript probes | 12 / 0 / 1 / 3 | 12 / 0 / 1 / 3 |
+
+Target pins were written only by `arthron pin --write` from the same binary.
+Old pins held with zero vanished and zero moved targets: fastify
+1,045 held / 41 appeared, express 496 / 5, vue-core 10,573 / 1,883,
+zod 10,289 / 346, JavaScript probes 6 / 0, and TypeScript probes 12 / 0.
+A fresh comparison against the generated pins then held every row with zero
+appeared, vanished, or moved.
+
 **Decided: emit the outermost static `member_expression` once as
 `FieldAccess`.** It reuses the same target roots, binding verdict and resolver
 paths as call position: an imported namespace member can resolve, a lexical

@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/javascript/fastify --pins pins/javascript-fastify.pins --write --commit 4ed8b2c1c974afafc255df3390543931cea3b938
+#   arthron pin corpus/javascript/fastify --pins pins/javascript-fastify.pins --write --commit 00708f3fae0cf8134e718fc8ec35e436d4f481b7
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -38,9 +38,9 @@
 # rather than read.
 format = 1
 corpus = "corpus/javascript/fastify"
-commit = "4ed8b2c1c974afafc255df3390543931cea3b938"
-targets = 253
-rows = 1045
+commit = "00708f3fae0cf8134e718fc8ec35e436d4f481b7"
+targets = 282
+rows = 1086
 
 [targets]
 def examples/asyncawait.js#value:result
@@ -59,10 +59,13 @@ def fastify.js#value:FST_ERR_ROUTE_METHOD_INVALID
 def fastify.js#value:FST_ERR_ROUTE_REWRITE_NOT_STR
 def fastify.js#value:FST_ERR_SCHEMA_CONTROLLER_BUCKET_OPT_NOT_FN
 def fastify.js#value:FST_ERR_SCHEMA_ERROR_FORMATTER_NOT_FN
+def fastify.js#value:LogController
 def fastify.js#value:fastify
 def fastify.js#value:lightMyRequest
 def fastify.js#value:processOptions
 def fastify.js#value:validateSchemaErrorFormatter
+def lib/config-validator.js#value:defaultInitOptions
+def lib/config-validator.js#value:schema11.properties
 def lib/config-validator.js#value:validate10
 def lib/content-type-parser.js#value:ContentTypeParser
 def lib/content-type-parser.js#value:Parser
@@ -70,13 +73,25 @@ def lib/content-type-parser.js#value:getDefaultJsonParser
 def lib/content-type-parser.js#value:rawBody
 def lib/content-type-parser.js#value:validateRegExp
 def lib/content-type.js#value:ContentType
+def lib/content-type.js#value:ContentType.prototype.%23empty
+def lib/content-type.js#value:ContentType.prototype.%23parameters
+def lib/content-type.js#value:ContentType.prototype.%23string
+def lib/content-type.js#value:ContentType.prototype.%23subtype
+def lib/content-type.js#value:ContentType.prototype.%23type
+def lib/content-type.js#value:ContentType.prototype.%23valid
 def lib/context.js#value:Context
 def lib/decorate.js#value:assertNotStarted
 def lib/decorate.js#value:checkDependencies
 def lib/decorate.js#value:checkExistence
 def lib/decorate.js#value:checkReferenceType
+def lib/decorate.js#value:checkReplyExistence
+def lib/decorate.js#value:checkRequestExistence
 def lib/decorate.js#value:decorate
 def lib/decorate.js#value:decorateConstructor
+def lib/decorate.js#value:decorateFastify
+def lib/decorate.js#value:decorateReply
+def lib/decorate.js#value:decorateRequest
+def lib/decorate.js#value:getInstanceDecorator
 def lib/decorate.js#value:hasInstanceProperty
 def lib/decorate.js#value:hasKey
 def lib/error-handler.js#value:buildErrorHandler
@@ -86,6 +101,11 @@ def lib/error-handler.js#value:setErrorHeaders
 def lib/error-serializer.js#value:default
 def lib/error-status.js#value:setErrorStatusCode
 def lib/errors.js#value:appendStackTrace
+def lib/errors.js#value:codes.FST_ERR_PARENT_PLUGIN_BOOTED
+def lib/errors.js#value:codes.FST_ERR_PLUGIN_CALLBACK_NOT_FN
+def lib/errors.js#value:codes.FST_ERR_PLUGIN_NOT_VALID
+def lib/errors.js#value:codes.FST_ERR_PLUGIN_TIMEOUT
+def lib/errors.js#value:codes.FST_ERR_ROOT_PLG_BOOTED
 def lib/four-oh-four.js#value:fourOhFour
 def lib/handle-request.js#value:handleRequest
 def lib/handle-request.js#value:handler
@@ -127,9 +147,14 @@ def lib/plugin-utils.js#value:getDisplayName
 def lib/plugin-utils.js#value:getFuncPreview
 def lib/plugin-utils.js#value:getMeta
 def lib/plugin-utils.js#value:getPluginName
+def lib/plugin-utils.js#value:kRegisteredPlugins
 def lib/plugin-utils.js#value:shouldSkipOverride
 def lib/promise.js#value:withResolvers
+def lib/reply.js#value:CONTENT_TYPE.JSON
+def lib/reply.js#value:CONTENT_TYPE.OCTET
+def lib/reply.js#value:CONTENT_TYPE.PLAIN
 def lib/reply.js#value:Reply
+def lib/reply.js#value:Reply.prototype.code
 def lib/reply.js#value:buildReply
 def lib/reply.js#value:isHttp2Reply
 def lib/reply.js#value:logStreamError
@@ -147,6 +172,7 @@ def lib/reply.js#value:sendStreamTrailer
 def lib/reply.js#value:sendTrailer
 def lib/reply.js#value:sendWebStream
 def lib/reply.js#value:serialize
+def lib/reply.js#value:setupResponseListeners
 def lib/reply.js#value:wrapSerializationError
 def lib/reply.js#value:writeHttp2Payload
 def lib/reply.js#value:writePayload
@@ -205,6 +231,9 @@ def scripts/validate-ecosystem-links.js#value:isValidGitHubReference
 def scripts/validate-ecosystem-links.js#value:validateAllLinks
 def test/build-certificate.js#value:buildCertificate
 def test/build-certificate.js#value:selfCert
+def test/chainable.test.js#value:opts.schema
+def test/context-config.test.js#value:schema.config
+def test/context-config.test.js#value:schema.schema
 def test/custom-http-server.test.js#value:setup
 def test/decorator.test.js#value:runTests
 def test/diagnostics-channel/error-before-handler.test.js#value:preHandlerCallback
@@ -299,1289 +328,1332 @@ pkg test/toolkit.js
 
 [rows]
 examples/asyncawait.js
-	4b36b2705dba7551 210
+	4b36b2705dba7551 239
 	b9c91ef8d9ca6a23 0
 examples/benchmark/hooks-benchmark-async-await.js
-	a97b56c3e0e17558 210
+	a97b56c3e0e17558 239
 examples/benchmark/hooks-benchmark.js
-	321b46e16b3dcb4d 210
+	321b46e16b3dcb4d 239
 examples/benchmark/parser.js
-	6cd6fdd5040419aa 210
+	6cd6fdd5040419aa 239
 examples/benchmark/simple.js
-	2225b42a5de8e461 210
+	2225b42a5de8e461 239
 examples/benchmark/webstream.js
-	3afd1046107b5920 210
+	3afd1046107b5920 239
 examples/hooks.js
-	fee53390fb7f2b5a 210
+	fee53390fb7f2b5a 239
 examples/http2.js
-	1cd96d1024773ac4 210
+	1cd96d1024773ac4 239
 examples/https.js
-	cb9b1c64aa371b46 210
+	cb9b1c64aa371b46 239
 examples/parser.js
-	e1e69ed5afcf9e1c 210
+	e1e69ed5afcf9e1c 239
 examples/route-prefix.js
-	1eb552287cceb394 210
+	1eb552287cceb394 239
 examples/shared-schema.js
-	c98304829eca584a 210
+	c98304829eca584a 239
 examples/simple-stream.js
-	39469296cbdaeaa2 210
+	39469296cbdaeaa2 239
 examples/simple.js
-	7262b6895d270712 210
+	7262b6895d270712 239
 examples/simple.mjs
-	6e1b1b0a50a2c745 16
-	ada57ee93bad6cc8 210
+	6e1b1b0a50a2c745 17
+	ada57ee93bad6cc8 239
 examples/use-plugin.js
-	4e0031a5bfd157c8 210
-	66520fd442d5575b 209
+	4e0031a5bfd157c8 239
+	66520fd442d5575b 238
 fastify.js
-	013ecf861ce9e07f 111
+	013ecf861ce9e07f 137
 	024e615578f2b3c8 12
 	087b3d4e2e6f365f 14
-	0c9f14546504da5f 231
-	0e370df42fec7d33 236
-	1277227d53703c55 118
+	0c9f14546504da5f 260
+	0d09b5e645941443 42
+	0e370df42fec7d33 265
+	1277227d53703c55 144
 	134b5f43a46051f6 5
-	187383fe6a623741 215
-	1a75302f68fc3b8f 223
-	1d05385c102989a4 226
-	351dbc6c273565ce 234
-	3ac6f7e8c938c47b 235
+	187383fe6a623741 244
+	1a75302f68fc3b8f 252
+	1d05385c102989a4 255
+	351dbc6c273565ce 263
+	3ac6f7e8c938c47b 264
 	3b418deeeb69c62e 8
-	3d3e2fa1d9c09823 73
-	461a75a3f52a6d54 86
+	3d3e2fa1d9c09823 93
+	461a75a3f52a6d54 110
 	46ebbd94a0e10a8f 13
+	4bcb6b798ffd1254 104
 	4e75d70b0515201c 2
-	4efb971d24792a08 71
+	4efb971d24792a08 91
 	502d0d97705890ff 9
-	517c803dda3e035d 232
-	531f92f1ffdec5c1 51
-	55848b07e4511802 42
-	58d59ae76a8f9b32 119
-	59bf6ca77f8d0186 149
-	5aab79acf72209a1 219
-	5bb3d7bee168b260 53
+	517c803dda3e035d 261
+	531f92f1ffdec5c1 71
+	55848b07e4511802 57
+	5873acf658a8ca34 41
+	58d59ae76a8f9b32 145
+	59bf6ca77f8d0186 175
+	5aab79acf72209a1 248
+	5bb3d7bee168b260 73
 	5d942df57c777ec8 4
-	61e4385170e7328b 19
-	63ec1b4c50a75d06 153
-	6ba4ed65b2fdb4a6 148
-	6d22726c735ca50c 230
-	71a9ac5dc8c190fc 27
-	71b657d373ebea2f 241
-	73814060b5fc6253 85
-	750ca5d98810a8f9 220
-	7de50de0548d7f79 216
-	800ed2b469c21684 238
+	5dfee47ead970ddb 48
+	61e4385170e7328b 20
+	63ec1b4c50a75d06 179
+	6ba4ed65b2fdb4a6 174
+	6d22726c735ca50c 259
+	6e88af59644d4b09 46
+	71a9ac5dc8c190fc 36
+	71b657d373ebea2f 270
+	73814060b5fc6253 106
+	750ca5d98810a8f9 249
+	7de50de0548d7f79 245
+	800ed2b469c21684 267
 	8424016afbd51b07 1
-	872ee83c3f70c641 224
-	8b81591b6ee5d01f 21
-	90c419ea89fa7886 36
-	9a9decbce811273d 67
-	9b5928fd2646003e 239
-	9e7d7dc9320b788d 17
-	a42e93691a23e91c 36
-	aca39ae64b4ce3de 229
+	872ee83c3f70c641 253
+	8b81591b6ee5d01f 24
+	90c419ea89fa7886 51
+	964dee70104e1ed5 39
+	9a9decbce811273d 87
+	9b5928fd2646003e 268
+	9e7d7dc9320b788d 18
+	a42e93691a23e91c 51
+	aca39ae64b4ce3de 258
+	ada8961052486272 47
 	b01f6a93a0ff8e01 11
-	b3cd7dfceaef55c6 127
+	b1f61c0ec3cd9ae1 129
+	b3cd7dfceaef55c6 153
 	b6ff09339fd218e9 7
-	b711382a4e68769c 121
+	b711382a4e68769c 147
 	b8ab1f2a36a9533d 3
-	b90c0bafaf2c1ba5 135
-	bfd0e2e1956af7c1 43
-	c4b9f9fa80fbd99e 110
-	ca732563171c2eab 214
-	cd10fa6bdf25a770 87
-	db1705a88892d465 114
+	b90c0bafaf2c1ba5 161
+	bfd0e2e1956af7c1 63
+	c4b9f9fa80fbd99e 136
+	ca732563171c2eab 243
+	cd10fa6bdf25a770 112
+	db1705a88892d465 140
 	dbf4d27319196329 10
-	dc07330416bf006a 109
-	e31de38d8a53cc69 18
-	e45691e2d6cbbb76 110
-	e4ac7ecfd2e0a0c5 212
+	dc07330416bf006a 135
+	df8eb30d55d9deef 45
+	e31de38d8a53cc69 19
+	e45691e2d6cbbb76 136
+	e4ac7ecfd2e0a0c5 241
 	e6969b0550db4d5a 15
-	e9c411b1b4d649fd 233
+	e9c411b1b4d649fd 262
 	ef7e0a1de265ea5b 6
-	f8fd3d1408e93143 17
-	fa4812038a341661 72
+	f8fd3d1408e93143 18
+	fa4812038a341661 92
 integration/server.js
-	2782db4115bb3ed0 210
-	e0ddd4bea112a4e2 16
+	2782db4115bb3ed0 239
+	e0ddd4bea112a4e2 17
+lib/config-validator.js
+	f924f504ee30200c 22
 lib/content-type-parser.js
-	186f5483437238ef 241
-	309b07b41b8473a0 239
-	37c5a97d2ce9f2a8 213
-	5a2be72558182162 26
-	84be81e0ce2f43c5 23
-	926ab3280cb67722 219
-	98ff2b3661e64093 22
-	bfd471b699375c6f 21
-	dba3386e7d6825a4 25
-	e75a74d27eb7f2f9 22
-	f25445a757d8e946 150
-	ff2a801c4dd8ea76 24
+	186f5483437238ef 270
+	309b07b41b8473a0 268
+	37c5a97d2ce9f2a8 242
+	5a2be72558182162 29
+	84be81e0ce2f43c5 26
+	926ab3280cb67722 248
+	98ff2b3661e64093 25
+	bfd471b699375c6f 24
+	dba3386e7d6825a4 28
+	e75a74d27eb7f2f9 25
+	f25445a757d8e946 176
+	ff2a801c4dd8ea76 27
 lib/content-type.js
-	71f298dabb355a9d 26
+	21fac4dff77af2e2 34
+	50895f5d1f8d93ca 33
+	5a2e0a01a1c49ace 35
+	6d11660112115c98 30
+	6e52760e651d71cf 34
+	71f298dabb355a9d 29
+	869c8ec78755ff4a 34
+	8e479c01a2ae676c 32
+	cf7d9319a44ce323 31
+	d48994142b5e3d3c 33
+	f801e779d6225e0c 33
 lib/context.js
-	a7c0f08eb2393d64 239
+	a7c0f08eb2393d64 268
 lib/decorate.js
-	02fcd464f8659d18 28
-	0a59920039e7f085 28
-	43cd49bb267ae4fb 33
-	4c71ee6d63d1957c 31
-	4e672aa11216678d 30
-	509b7c56a8932dd5 29
-	55754993690da770 31
-	5e23689bfa524ade 32
-	60b7703eae2fc3ea 34
-	698d9e2843589c1e 33
-	7e7b2bfcb5d3636c 30
-	87344d8a117633c3 29
-	8f3523044b9ae021 35
-	94451b64f1085f0a 30
-	a511c957d167ed4b 34
-	a5ba1677f830ea23 34
-	afb5e67fca89e618 30
-	c2cc2a743309006e 219
-	c6797f7ba2c70ac9 35
-	dd82b74966f12fed 239
-	deb11993946e8d8f 28
-	f53453c6cd8654d9 35
-	fbe7a4164679fc39 35
+	02fcd464f8659d18 37
+	0a59920039e7f085 37
+	43cd49bb267ae4fb 44
+	4c71ee6d63d1957c 40
+	4e672aa11216678d 39
+	509b7c56a8932dd5 38
+	55754993690da770 40
+	5e23689bfa524ade 43
+	60b7703eae2fc3ea 49
+	698d9e2843589c1e 44
+	7e7b2bfcb5d3636c 39
+	87344d8a117633c3 38
+	8f3523044b9ae021 50
+	94451b64f1085f0a 39
+	a511c957d167ed4b 49
+	a5ba1677f830ea23 49
+	afb5e67fca89e618 39
+	c2cc2a743309006e 248
+	c6797f7ba2c70ac9 50
+	dd82b74966f12fed 268
+	deb11993946e8d8f 37
+	f53453c6cd8654d9 50
+	fbe7a4164679fc39 50
 lib/error-handler.js
-	26cca3148257a06c 218
-	3107f6082cd00173 40
-	4ba910674332458e 131
-	86647b652560cf1f 242
-	a3019595bdca2ad1 39
-	b3c8656532603415 237
-	b834725e5948a7d3 219
-	c2b05a786e7d8a3f 217
-	ca10c1d77e51875c 41
-	ef15ed49a12052b0 154
-	ef5ef4504a983ae3 239
-	f8022d834f2a1b65 37
+	26cca3148257a06c 247
+	3107f6082cd00173 55
+	4ba910674332458e 157
+	86647b652560cf1f 271
+	a3019595bdca2ad1 54
+	b3c8656532603415 266
+	b834725e5948a7d3 248
+	c2b05a786e7d8a3f 246
+	ca10c1d77e51875c 56
+	ef15ed49a12052b0 180
+	ef5ef4504a983ae3 268
+	f8022d834f2a1b65 52
 lib/error-status.js
-	b0a7d7744430db52 239
+	b0a7d7744430db52 268
+lib/errors.js
+	0fce810d63933764 58
+	97cf695ee48130fe 62
+	cfdd34517d8e6210 59
+	e0de7609443800ad 60
+	ec1006552df55044 61
 lib/four-oh-four.js
-	3803d078790b366c 223
-	5be8d98a633c84d4 219
-	60b34c1b8dfe132a 234
-	662ca38ae099e572 216
-	7cb8439d0f1ba775 239
-	82734a58a19f29b2 27
-	8cf238bf0952900f 214
-	c06bdbb995094d01 232
-	c5a7780ac7d7e6f4 109
-	cac462ed8d9e9335 71
-	d3727e1f6cb421e9 111
-	d4128ecdbbaa7d40 233
-	dc0e970eb5360273 86
-	e02122e9396a44aa 36
-	e38b3fd2c6d0a8b1 226
+	3803d078790b366c 252
+	5be8d98a633c84d4 248
+	60b34c1b8dfe132a 263
+	662ca38ae099e572 245
+	7cb8439d0f1ba775 268
+	82734a58a19f29b2 36
+	8cf238bf0952900f 243
+	c06bdbb995094d01 261
+	c5a7780ac7d7e6f4 135
+	cac462ed8d9e9335 91
+	d3727e1f6cb421e9 137
+	d4128ecdbbaa7d40 262
+	dc0e970eb5360273 110
+	e02122e9396a44aa 51
+	e38b3fd2c6d0a8b1 255
 lib/handle-request.js
-	130038dcd373a77f 239
-	31991fe134308499 240
-	50cca9e559220725 61
-	51353e6f0cc43a10 223
-	78c6e5e3e0462b50 46
-	7f6f6b46426b9e52 242
-	9bc948476b1b3f05 140
-	9e95858131b34ef1 41
-	b1f1b35f131e5b6d 154
-	b3f27f252f11b7ea 45
-	d2bde3b2fe4ed68a 47
-	db2ddf360318c68d 219
-	e73bf942857193ed 64
-	e77ed59469daabce 218
-	e85a11ed4357b054 48
-	ec0125a36b87bd26 213
-	f0b0f802ea88d1aa 49
+	130038dcd373a77f 268
+	31991fe134308499 269
+	50cca9e559220725 81
+	51353e6f0cc43a10 252
+	78c6e5e3e0462b50 66
+	7f6f6b46426b9e52 271
+	9bc948476b1b3f05 166
+	9e95858131b34ef1 56
+	b1f1b35f131e5b6d 180
+	b3f27f252f11b7ea 65
+	d2bde3b2fe4ed68a 67
+	db2ddf360318c68d 248
+	e73bf942857193ed 84
+	e77ed59469daabce 247
+	e85a11ed4357b054 68
+	ec0125a36b87bd26 242
+	f0b0f802ea88d1aa 69
 lib/hooks.js
-	2846bb4277384525 55
-	36762c6a9315c6dc 54
-	4a2dd1a6689f4966 219
-	661e579b51607f52 42
-	6b34025e69c71ea7 53
-	7ac3b1749220f71d 54
-	8c74f155650cb887 239
-	a26401bf88e797d9 54
-	a3b6bf73bb4b1b17 54
-	c8e6e6a9d12ead15 51
-	e9c360e8c39383a2 54
+	2846bb4277384525 75
+	36762c6a9315c6dc 74
+	4a2dd1a6689f4966 248
+	661e579b51607f52 57
+	6b34025e69c71ea7 73
+	7ac3b1749220f71d 74
+	8c74f155650cb887 268
+	a26401bf88e797d9 74
+	a3b6bf73bb4b1b17 74
+	c8e6e6a9d12ead15 71
+	e9c360e8c39383a2 74
 lib/initial-config-validation.js
-	44dfca76f0ee8ba8 65
-	a3313cd3efb4b6fd 66
-	ad0b7377cd655e1c 211
-	edc7fb5cb65b6b43 66
-	ee5ab99bb15ccee8 20
-	fb295ed22321a162 219
+	1b57530ec92d5a9a 21
+	44dfca76f0ee8ba8 85
+	a3313cd3efb4b6fd 86
+	ad0b7377cd655e1c 240
+	edc7fb5cb65b6b43 86
+	ee5ab99bb15ccee8 23
+	fb295ed22321a162 248
 lib/log-controller.js
-	58ca682677a6e0e0 69
-	5f774c3b8dd010b3 69
-	72eaaddfdc063c17 69
-	8707c30ffe95ddfe 69
-	a96fe8c996548635 224
-	ac16d8b985f2fedf 69
-	bc1e17bbf1f41b56 69
-	e5ee2c20b4bf3f15 69
+	58ca682677a6e0e0 89
+	5f774c3b8dd010b3 89
+	72eaaddfdc063c17 89
+	8707c30ffe95ddfe 89
+	a96fe8c996548635 253
+	ac16d8b985f2fedf 89
+	bc1e17bbf1f41b56 89
+	e5ee2c20b4bf3f15 89
 lib/logger-factory.js
-	04a55371cf6b2be2 225
-	144b463ebfd6714b 68
-	1cc5ed0749f00d9d 75
-	24ba38a7fd20bf9a 219
-	8e0b9b89bbafe068 75
-	ed51004306f5c9ec 239
-	fa8c8717e9a2eaf2 227
+	04a55371cf6b2be2 254
+	144b463ebfd6714b 88
+	1cc5ed0749f00d9d 95
+	24ba38a7fd20bf9a 248
+	8e0b9b89bbafe068 95
+	ed51004306f5c9ec 268
+	fa8c8717e9a2eaf2 256
 lib/logger-pino.js
-	879454f39b45c780 219
+	879454f39b45c780 248
 lib/plugin-override.js
-	020382b8269961e6 83
-	1642062c9118d9df 234
-	328fcf9cf4660a7d 223
-	3cbf6c327b5b55d0 232
-	67f6510c87894beb 127
-	6f1ed182371322c3 212
-	79cdec4e813c30dc 236
-	8dc1f9f3ec057ec1 114
-	8eaaa8adc6ef432d 78
-	a6bfb5110914a346 52
-	a73ffcb6399e20e5 87
-	b8e486d48e2576ec 230
-	c689c89a33430e80 81
-	d31de88321ccaa9c 239
+	020382b8269961e6 103
+	1642062c9118d9df 263
+	328fcf9cf4660a7d 252
+	3cbf6c327b5b55d0 261
+	67f6510c87894beb 153
+	6f1ed182371322c3 241
+	79cdec4e813c30dc 265
+	862eb498f58d7853 104
+	8dc1f9f3ec057ec1 140
+	8eaaa8adc6ef432d 98
+	a6bfb5110914a346 72
+	a73ffcb6399e20e5 112
+	b8e486d48e2576ec 259
+	c689c89a33430e80 101
+	d31de88321ccaa9c 268
 lib/plugin-utils.js
-	0fddea58b99af429 83
-	17f57a8b4491cf98 84
-	3446cd4dc844b45d 79
-	58e3d93f17d1d686 80
-	5c5d025e21fcac0b 82
-	6380e99af32ee4ea 219
-	6e432124ced6e6d9 239
-	70fd6a4605f858e3 82
-	b1c9e1a80a7083d7 82
-	c12dc5805cd1cf03 82
-	fedc1b41f532c48d 215
+	0fddea58b99af429 103
+	17f57a8b4491cf98 105
+	3446cd4dc844b45d 99
+	58e3d93f17d1d686 100
+	5c5d025e21fcac0b 102
+	6380e99af32ee4ea 248
+	6e432124ced6e6d9 268
+	70fd6a4605f858e3 102
+	b1c9e1a80a7083d7 102
+	c12dc5805cd1cf03 102
+	fedc1b41f532c48d 244
 lib/promise.js
-	e2893b3e19df008b 239
+	e2893b3e19df008b 268
 lib/reply.js
-	04144fe53fc84f0f 88
-	04a9864086f710e3 221
-	0c89f0509c7b72e8 239
-	17029095082c3ecd 96
-	17a18b7a04519137 95
-	1a2552a80d348ca2 105
-	1ff0583df1d6b865 226
-	2058bdbdb65745d0 94
-	2814424b4f15a605 58
-	28d1e69f4f98631c 59
-	2ae0a331ca9b8e2a 35
-	2f7a060dc8125002 101
-	30ba2ddecb7528bd 131
-	375eae90c6531a55 92
-	3db7944309d6badf 106
-	3eb9feadf479e397 213
-	3f442800b64e3ab3 104
-	44a3fc1d5a13fa47 215
-	50bdd2316132f607 102
-	51d6c08fb01daec4 103
-	55ed2538e43184ea 95
-	5a119d90d1cc4417 237
-	63b3302a952b9503 219
-	640b745823983b43 94
-	6551fe194921a861 90
-	6dc6c0f523fdc721 92
-	701b2d5921255f45 91
-	70c21d584cccd6a4 92
-	847e2871b993dd2c 59
-	8505edab21891ba9 101
-	881607eb9f613eac 89
-	8a595d0e10969ad7 216
-	8a9b672eb0004a03 38
-	90198930fc476630 93
-	92ae0f74ed2397a1 91
-	95b5de1326aaee0b 92
-	9efd65d5c78a3d61 99
-	a9e60dc004042873 98
-	bdbee685f1666ec3 61
-	cc7bb0b6582f7118 223
-	cd780ba86d9fb063 103
-	ce211010df0e4307 100
-	cf10e86da1337099 92
-	d9f977d3cc4bfe32 101
-	da412ab3067cb442 101
-	da6a393ac4bf15d6 30
-	db644a8fd63d1c04 63
-	dfc4131010e4eee0 89
-	e885be8a521f2432 97
+	04144fe53fc84f0f 113
+	04a9864086f710e3 250
+	0c89f0509c7b72e8 268
+	17029095082c3ecd 121
+	17a18b7a04519137 120
+	1a2552a80d348ca2 131
+	1ff0583df1d6b865 255
+	2058bdbdb65745d0 119
+	2814424b4f15a605 78
+	28d1e69f4f98631c 79
+	2ae0a331ca9b8e2a 50
+	2f7a060dc8125002 126
+	30ba2ddecb7528bd 157
+	375eae90c6531a55 117
+	3db7944309d6badf 132
+	3eb9feadf479e397 242
+	3f442800b64e3ab3 130
+	44a3fc1d5a13fa47 244
+	50bdd2316132f607 127
+	51d6c08fb01daec4 128
+	55ed2538e43184ea 120
+	5a119d90d1cc4417 266
+	63b3302a952b9503 248
+	640b745823983b43 119
+	6551fe194921a861 115
+	66e67e09f331ae9f 94
+	695a84c54435ce0f 108
+	6dc6c0f523fdc721 117
+	701b2d5921255f45 116
+	70c21d584cccd6a4 117
+	7377a2234590a84b 109
+	847e2871b993dd2c 79
+	8505edab21891ba9 126
+	881607eb9f613eac 114
+	8a595d0e10969ad7 245
+	8a9b672eb0004a03 53
+	90198930fc476630 118
+	92ae0f74ed2397a1 116
+	95b5de1326aaee0b 117
+	9bc47f1a23b21d0b 111
+	9efd65d5c78a3d61 124
+	a9e60dc004042873 123
+	bdbee685f1666ec3 81
+	c5adbb5d93f0ea39 107
+	cc7bb0b6582f7118 252
+	cd780ba86d9fb063 128
+	ce211010df0e4307 125
+	cf10e86da1337099 117
+	d9f977d3cc4bfe32 126
+	da412ab3067cb442 126
+	da6a393ac4bf15d6 39
+	db644a8fd63d1c04 83
+	dfc4131010e4eee0 114
+	e885be8a521f2432 122
 lib/req-id-gen-factory.js
-	1f0ea7035d229fd7 107
-	5f42cbfc31b3c58d 239
-	d8b2674198f4141d 108
+	1f0ea7035d229fd7 133
+	5f42cbfc31b3c58d 268
+	d8b2674198f4141d 134
 lib/request.js
-	02908a30d9e6e99b 116
-	0fa2981406837138 219
-	3759de7806251b1b 239
-	66f9e3c804026596 113
-	904fd6e50af97775 30
-	9bbc0b3068e58092 117
-	a6ac40bda534b861 213
-	df0aa73b69509305 215
-	e1ebbb313de47051 112
-	e5eaeb08d767cd87 115
-	f37b1407fadcebb4 113
-	f9c0dd85d0c87292 35
+	02908a30d9e6e99b 142
+	0fa2981406837138 248
+	3759de7806251b1b 268
+	66f9e3c804026596 139
+	904fd6e50af97775 39
+	9bbc0b3068e58092 143
+	a6ac40bda534b861 242
+	df0aa73b69509305 244
+	e1ebbb313de47051 138
+	e5eaeb08d767cd87 141
+	f37b1407fadcebb4 139
+	f9c0dd85d0c87292 50
 lib/route.js
-	01b5b5cd78149d2f 120
-	0c64770e92ec45b8 233
-	0ea5445427ad4899 216
-	1aa3d9906f4802a9 226
-	2758386cd2b812f9 123
-	2a0de83548ab36cd 109
-	44592d1f59d4358c 241
-	498585de959e60d9 62
-	524583f0cccd4275 138
-	5262b2ba74162c14 240
-	57bb0acce189b066 71
-	5aadf6cfa3082d4b 239
-	602753e02228f272 56
-	61bbc9a32655f036 214
-	6301a4f1af81daf5 237
-	6368707bd005c215 121
-	967314eaccc886b4 50
-	a27575c20f96282b 221
-	c7eb05ab225f96b3 133
-	c864074d338606cd 57
-	cbceafbca5239a4a 222
-	df170477a91d3014 122
-	e0697da8068ea127 36
-	e4ab140493b0b992 27
-	eb012e752b3a0dd7 219
-	f401eb3fad5f16cd 60
-	f8329eba83374b6b 223
-	f9af2c26e4cd676e 139
-	fdb844534cc9e416 147
+	01b5b5cd78149d2f 146
+	0c64770e92ec45b8 262
+	0ea5445427ad4899 245
+	1aa3d9906f4802a9 255
+	2758386cd2b812f9 149
+	2a0de83548ab36cd 135
+	44592d1f59d4358c 270
+	498585de959e60d9 82
+	524583f0cccd4275 164
+	5262b2ba74162c14 269
+	57bb0acce189b066 91
+	5aadf6cfa3082d4b 268
+	602753e02228f272 76
+	61bbc9a32655f036 243
+	6301a4f1af81daf5 266
+	6368707bd005c215 147
+	967314eaccc886b4 70
+	a27575c20f96282b 250
+	c7eb05ab225f96b3 159
+	c864074d338606cd 77
+	cbceafbca5239a4a 251
+	df170477a91d3014 148
+	e0697da8068ea127 51
+	e4ab140493b0b992 36
+	eb012e752b3a0dd7 248
+	f401eb3fad5f16cd 80
+	f8329eba83374b6b 252
+	f9af2c26e4cd676e 165
+	fdb844534cc9e416 173
 lib/schema-controller.js
-	59698c9fc552967d 237
-	9fad649158ef8323 125
-	d31b83486b5a14de 124
-	e3d8a3daa33dbc35 126
+	59698c9fc552967d 266
+	9fad649158ef8323 151
+	d31b83486b5a14de 150
+	e3d8a3daa33dbc35 152
 lib/schemas.js
-	068974db28bd679a 130
-	16b9272f4b2989d9 239
-	46cabf6baa516331 128
-	6712e4ec1a4fe32e 219
-	6da7f85143e22e46 26
-	726b24d0ec78c266 129
-	b06a104b8010a95b 132
-	e59e525ad0975217 213
+	068974db28bd679a 156
+	16b9272f4b2989d9 268
+	46cabf6baa516331 154
+	6712e4ec1a4fe32e 248
+	6da7f85143e22e46 29
+	726b24d0ec78c266 155
+	b06a104b8010a95b 158
+	e59e525ad0975217 242
 lib/server.js
-	008f1ae153d1b9de 55
-	0e0038a549455d30 228
-	167361b2e981c8c4 219
-	169e22b1a5248c16 239
-	2315fb2c4bcda5dc 136
-	3a2096017fcce48e 152
-	3fb493396c723f39 223
-	82a05ee6ed8a90f0 241
-	93b945506341a745 134
-	ab1eadca6c3bd56b 77
-	b0f12d908168eb30 137
-	c03f718800f08d17 137
-	ce4668c0ca994a4b 85
-	d9b8413589947b3d 231
-	ea06003d6c8295e3 85
+	008f1ae153d1b9de 75
+	0e0038a549455d30 257
+	167361b2e981c8c4 248
+	169e22b1a5248c16 268
+	2315fb2c4bcda5dc 162
+	3a2096017fcce48e 178
+	3fb493396c723f39 252
+	82a05ee6ed8a90f0 270
+	93b945506341a745 160
+	ab1eadca6c3bd56b 97
+	b0f12d908168eb30 163
+	c03f718800f08d17 163
+	ce4668c0ca994a4b 106
+	d9b8413589947b3d 260
+	ea06003d6c8295e3 106
 lib/validation.js
-	0f1b4d2853696902 140
-	17740ac5a3235912 151
-	1bbab05778f07cd0 241
-	1d04738d82a99f63 239
-	28698b67d4013b09 146
-	7f3ac33aa4dcd441 146
-	86aefa7ebd0894c3 141
-	882d7aaeec5ae069 219
-	a05d406973467325 146
-	baaa6d4f0fe2e230 144
-	c975eea7aa1a8c35 146
-	d8313ac7b15568dd 143
-	dcdcebfb3bceba8e 145
-	ddf5554663ddd91a 140
-	e43c9e70403044da 146
-	e7495084d4ea6397 140
-	ec76096057f7681d 142
+	0f1b4d2853696902 166
+	17740ac5a3235912 177
+	1bbab05778f07cd0 270
+	1d04738d82a99f63 268
+	28698b67d4013b09 172
+	7f3ac33aa4dcd441 172
+	86aefa7ebd0894c3 167
+	882d7aaeec5ae069 248
+	a05d406973467325 172
+	baaa6d4f0fe2e230 170
+	c975eea7aa1a8c35 172
+	d8313ac7b15568dd 169
+	dcdcebfb3bceba8e 171
+	ddf5554663ddd91a 166
+	e43c9e70403044da 172
+	e7495084d4ea6397 166
+	ec76096057f7681d 168
 lib/wrap-thenable.js
-	3bf2c0a0b8039c31 218
-	62f3715534f41e6f 41
-	a7aa977e64797e8d 239
+	3bf2c0a0b8039c31 247
+	62f3715534f41e6f 56
+	a7aa977e64797e8d 268
 scripts/validate-ecosystem-links.js
-	27dda923b2165e08 156
-	470fcce9b47d9fe1 155
-	70c2ef3adc4403e3 157
-	7394cd9723b9b786 158
-	dfb9ec41a538154e 159
-	fe612e0e6c7e5ceb 155
+	27dda923b2165e08 182
+	470fcce9b47d9fe1 181
+	70c2ef3adc4403e3 183
+	7394cd9723b9b786 184
+	dfb9ec41a538154e 185
+	fe612e0e6c7e5ceb 181
 test/404s.test.js
-	67c01b39f1479c86 166
-	772e1fb3d3431845 16
-	ccb1b128a4da5c00 247
-	ed0df87b05b468a5 16
-	f811e4cc4c64ae12 210
+	67c01b39f1479c86 195
+	772e1fb3d3431845 17
+	ccb1b128a4da5c00 276
+	ed0df87b05b468a5 17
+	f811e4cc4c64ae12 239
 test/500s.test.js
-	491d6f7fa189e136 210
-	7ca28367982af29c 239
-	dcccfbfa51d0313f 16
+	491d6f7fa189e136 239
+	7ca28367982af29c 268
+	dcccfbfa51d0313f 17
 test/allow-unsafe-regex.test.js
-	10e70211ea40d03e 16
-	3408261f7bb00df1 16
-	38c54407cb412e89 210
+	10e70211ea40d03e 17
+	3408261f7bb00df1 17
+	38c54407cb412e89 239
 test/als.test.js
-	187eda47b1533e48 16
-	7b6fde13821f132f 210
+	187eda47b1533e48 17
+	7b6fde13821f132f 239
 test/async-await.test.js
-	1b4a6e12b2dd3804 247
-	3f095291f52238f9 210
-	acf709659b079204 16
-	b49fb3bc257a916f 169
-	c0049370e26f4575 16
+	1b4a6e12b2dd3804 276
+	3f095291f52238f9 239
+	acf709659b079204 17
+	b49fb3bc257a916f 198
+	c0049370e26f4575 17
 test/async-dispose.test.js
-	2886bbc3ea0b9a2b 16
-	bdd77659255eabd4 210
+	2886bbc3ea0b9a2b 17
+	bdd77659255eabd4 239
 test/async_hooks.test.js
-	7a3f439a0916e878 210
-	f91155e046f0920a 16
+	7a3f439a0916e878 239
+	f91155e046f0920a 17
 test/body-limit.test.js
-	3491d81f34dfde04 16
-	483d4cb0f95521b0 16
-	fe9073ecd8435757 210
+	3491d81f34dfde04 17
+	483d4cb0f95521b0 17
+	fe9073ecd8435757 239
 test/buffer.test.js
-	c80196f97a71ed88 210
-	d74d12b860763e83 16
+	c80196f97a71ed88 239
+	d74d12b860763e83 17
 test/build-certificate.js
-	5200bf6dc2c5b27b 161
+	5200bf6dc2c5b27b 187
 test/bundler/esbuild/src/fail-plugin-version.js
-	fe8ecdbaa0ca718d 210
+	fe8ecdbaa0ca718d 239
 test/bundler/esbuild/src/index.js
-	1488abc91a22f75b 210
+	1488abc91a22f75b 239
 test/bundler/webpack/src/fail-plugin-version.js
-	75775fe0d147c6e2 210
+	75775fe0d147c6e2 239
 test/bundler/webpack/src/index.js
-	faaad2b53817c11e 210
+	faaad2b53817c11e 239
 test/case-insensitive.test.js
-	c8c9d7eb9555c4a3 210
-	e3eade03576f07ff 16
+	c8c9d7eb9555c4a3 239
+	e3eade03576f07ff 17
 test/chainable.test.js
-	0cc3c2545a426040 210
+	00000f3abfb922d6 188
+	0cc3c2545a426040 239
 test/child-logger-factory.test.js
-	04a0e7f4af38cf0c 210
-	6aecdb17526e2855 16
-	e25ca8fbfe624050 16
+	04a0e7f4af38cf0c 239
+	6aecdb17526e2855 17
+	e25ca8fbfe624050 17
 test/client-timeout.test.js
-	012b8a97935baa31 210
+	012b8a97935baa31 239
 test/close-pipelining.test.js
-	34dbc7bc412d8f90 16
-	8b8db20842283ce6 210
+	34dbc7bc412d8f90 17
+	8b8db20842283ce6 239
 test/close.test.js
-	265d36d020db2b92 16
-	4d553b033c601423 210
-	51b1f14e0f08a272 169
-	6e2b5d8b7fa82288 16
-	ef1be6ebd682af0d 247
+	265d36d020db2b92 17
+	4d553b033c601423 239
+	51b1f14e0f08a272 198
+	6e2b5d8b7fa82288 17
+	ef1be6ebd682af0d 276
 test/conditional-pino.test.js
-	f0e2d7c8c66fd359 210
+	f0e2d7c8c66fd359 239
 test/connection-timeout.test.js
-	815ee893098702b4 16
-	ff046f12047675f7 210
+	815ee893098702b4 17
+	ff046f12047675f7 239
 test/constrained-routes.test.js
-	15f26b734e4b50a2 210
-	1aa78a47dea6cadd 16
-	e6e4faf8732b9a13 16
+	15f26b734e4b50a2 239
+	1aa78a47dea6cadd 17
+	e6e4faf8732b9a13 17
 test/content-length.test.js
-	031200647b4a8b35 16
-	ca0231367bad01d5 16
-	d8440b4e449d103f 210
+	031200647b4a8b35 17
+	ca0231367bad01d5 17
+	d8440b4e449d103f 239
 test/content-parser.test.js
-	58f3a9760e684eea 16
-	80c912ab16e25b24 210
-	ac965c1e0f96ddaa 219
-	da471aaf0b5593dc 239
+	58f3a9760e684eea 17
+	80c912ab16e25b24 239
+	ac965c1e0f96ddaa 248
+	da471aaf0b5593dc 268
 test/content-type.test.js
-	04c4ed9f4a07974e 26
-	9ea606600fc29d7d 213
-	c35c2fc59a128cd6 26
-	e43d58892d27e5c7 210
-	f41998f48c1563fd 16
+	04c4ed9f4a07974e 29
+	9ea606600fc29d7d 242
+	c35c2fc59a128cd6 29
+	e43d58892d27e5c7 239
+	f41998f48c1563fd 17
 test/context-config.test.js
-	2b83da5c390d3f72 210
-	2c60c7b4e9f9cb9f 16
-	c566cca2e87230d5 239
-	fa9739c3445e6629 16
+	1c3a7ef3a60ff860 190
+	2b83da5c390d3f72 239
+	2c60c7b4e9f9cb9f 17
+	c566cca2e87230d5 268
+	ee6f0bdf4edfb608 189
+	fa9739c3445e6629 17
 test/custom-http-server.test.js
-	0d28903d9d05772d 210
-	7ee27b87a9edb3c3 162
-	8a2c75a292e0a8bb 16
-	c2bb8fb462b09354 219
+	0d28903d9d05772d 239
+	7ee27b87a9edb3c3 191
+	8a2c75a292e0a8bb 17
+	c2bb8fb462b09354 248
 test/custom-parser-async.test.js
-	49f1b15d75eaaf7b 16
-	629b09cd876c5fa4 210
+	49f1b15d75eaaf7b 17
+	629b09cd876c5fa4 239
 test/custom-parser.0.test.js
-	1aeae960fd9977e1 16
-	5d876d7e8409b908 210
-	6c9bb89e6c263984 247
-	d26b40f64b9abe52 168
+	1aeae960fd9977e1 17
+	5d876d7e8409b908 239
+	6c9bb89e6c263984 276
+	d26b40f64b9abe52 197
 test/custom-parser.1.test.js
-	a302c62262f224ee 210
-	b60d48982d14d719 16
+	a302c62262f224ee 239
+	b60d48982d14d719 17
 test/custom-parser.2.test.js
-	481bbab598b7f27a 16
-	e63fba23073089cf 210
+	481bbab598b7f27a 17
+	e63fba23073089cf 239
 test/custom-parser.3.test.js
-	7ca25d06baa6d75f 16
-	d0a70f2e06632843 210
+	7ca25d06baa6d75f 17
+	d0a70f2e06632843 239
 test/custom-parser.4.test.js
-	4c5b40b0ab7f8f8b 16
-	e87b9e5c48a0b3a3 210
+	4c5b40b0ab7f8f8b 17
+	e87b9e5c48a0b3a3 239
 test/custom-parser.5.test.js
-	3c36e3d3601754f0 247
-	521c816ae7ba5872 16
-	dd6c4d3057f33566 168
-	edd906bdc3d24507 210
+	3c36e3d3601754f0 276
+	521c816ae7ba5872 17
+	dd6c4d3057f33566 197
+	edd906bdc3d24507 239
 test/custom-querystring-parser.test.js
-	1ea15fef1b7c7639 210
-	34599c6cd49ef1f4 16
+	1ea15fef1b7c7639 239
+	34599c6cd49ef1f4 17
 test/decorator-instance-properties.test.js
-	c39bde3530f1d0c5 16
-	dcc4d8d642e7b53f 210
+	c39bde3530f1d0c5 17
+	dcc4d8d642e7b53f 239
 test/decorator.test.js
-	0d5d3fd398fd1038 16
-	2c8697a1cf5910a7 210
-	6cff958331830a5e 163
-	6fc44adb97bcd7ce 239
-	beaad12cc9a5ac94 16
-	f88c6cd541695dc9 210
+	0d5d3fd398fd1038 17
+	2c8697a1cf5910a7 239
+	6cff958331830a5e 192
+	6fc44adb97bcd7ce 268
+	beaad12cc9a5ac94 17
+	f88c6cd541695dc9 239
 test/delete.test.js
-	444e466f034d7a8a 210
-	59297ef220f27b16 210
+	444e466f034d7a8a 239
+	59297ef220f27b16 239
 test/diagnostics-channel/404.test.js
-	2bc92583a5963e5b 16
-	632bda09c0da0902 232
-	c796d79a5b467765 210
-	cbe00c6c9f8567ac 234
+	2bc92583a5963e5b 17
+	632bda09c0da0902 261
+	c796d79a5b467765 239
+	cbe00c6c9f8567ac 263
 test/diagnostics-channel/async-delay-request.test.js
-	186b961be551fa77 232
-	8db8a363a5e71e43 16
-	b4f20f8f8391bb5e 210
-	bc7c3beab135c5f0 234
+	186b961be551fa77 261
+	8db8a363a5e71e43 17
+	b4f20f8f8391bb5e 239
+	bc7c3beab135c5f0 263
 test/diagnostics-channel/async-error-handler.test.js
-	0a6e4dca6251166a 210
-	123438cd8f7bd753 232
-	a084df2e553bf078 16
-	c48f800193e86908 234
+	0a6e4dca6251166a 239
+	123438cd8f7bd753 261
+	a084df2e553bf078 17
+	c48f800193e86908 263
 test/diagnostics-channel/async-request.test.js
-	942d6e17a314ba0b 234
-	aa49de42475af3ff 16
-	af083dc04c6d13e9 210
-	d5b2f7276690cd8f 232
+	942d6e17a314ba0b 263
+	aa49de42475af3ff 17
+	af083dc04c6d13e9 239
+	d5b2f7276690cd8f 261
 test/diagnostics-channel/error-before-handler.test.js
-	34ef938cee6b47f1 234
-	673bbd8500b9eccc 221
-	8e463294430cd8b1 86
-	a2ab251c57a2982c 111
-	a677fb72d2d40b75 223
-	cfcb7b0cd5b46bda 164
-	e756a4e2febfa351 239
-	e80da3ae2ddec46f 232
+	34ef938cee6b47f1 263
+	673bbd8500b9eccc 250
+	8e463294430cd8b1 110
+	a2ab251c57a2982c 137
+	a677fb72d2d40b75 252
+	cfcb7b0cd5b46bda 193
+	e756a4e2febfa351 268
+	e80da3ae2ddec46f 261
 test/diagnostics-channel/error-request.test.js
-	2939d8340b0c5fd9 232
-	54411b1e556fd2d2 210
-	5bc26e0ede0afe04 16
-	669797f8c1990c0a 234
+	2939d8340b0c5fd9 261
+	54411b1e556fd2d2 239
+	5bc26e0ede0afe04 17
+	669797f8c1990c0a 263
 test/diagnostics-channel/error-status.test.js
-	1586812b131d2981 210
-	27919048d599b124 16
+	1586812b131d2981 239
+	27919048d599b124 17
 test/diagnostics-channel/sync-delay-request.test.js
-	3f8445b08b7a4c67 16
-	6410eff7f3dca63d 210
-	a5ac459f29e98f17 234
-	c300dda96339dcce 232
+	3f8445b08b7a4c67 17
+	6410eff7f3dca63d 239
+	a5ac459f29e98f17 263
+	c300dda96339dcce 261
 test/diagnostics-channel/sync-request-reply.test.js
-	5acd2e01987f924b 234
-	88045c89be44cd1e 232
-	ac801dda17161eed 210
-	dd7513574acf5b88 16
+	5acd2e01987f924b 263
+	88045c89be44cd1e 261
+	ac801dda17161eed 239
+	dd7513574acf5b88 17
 test/diagnostics-channel/sync-request.test.js
-	3890a92a0d764226 16
-	47cb91e3b5d3fb5d 232
-	c4e53fef8409a40d 234
-	fc16e91b2a169004 210
+	3890a92a0d764226 17
+	47cb91e3b5d3fb5d 261
+	c4e53fef8409a40d 263
+	fc16e91b2a169004 239
 test/encapsulated-child-logger-factory.test.js
-	53ea8e2e9054927c 210
-	9d777bd316d1e115 16
+	53ea8e2e9054927c 239
+	9d777bd316d1e115 17
 test/encapsulated-error-handler.test.js
-	3e3d723b3b1b1364 16
-	8ed50efe35e9974b 210
+	3e3d723b3b1b1364 17
+	8ed50efe35e9974b 239
 test/esm/errorCodes.test.mjs
-	c45e1c4cad19ad54 210
+	c45e1c4cad19ad54 239
 test/esm/esm.test.mjs
-	43654fd342f00512 246
-	63c056e1a27293d0 210
-	b820ef03e1ebac04 16
-	f125ef8a3cf1b15e 245
+	43654fd342f00512 275
+	63c056e1a27293d0 239
+	b820ef03e1ebac04 17
+	f125ef8a3cf1b15e 274
 test/esm/index.test.js
-	c1aa991f008c5a73 244
+	c1aa991f008c5a73 273
 test/esm/named-exports.mjs
-	8530950251ebb3f6 245
-	b0bece5e76852eeb 246
-	b5998f6ebbcd308d 210
-	c0926dd141e23f9d 16
+	8530950251ebb3f6 274
+	b0bece5e76852eeb 275
+	b5998f6ebbcd308d 239
+	c0926dd141e23f9d 17
 test/fastify-instance.test.js
-	32ae4cf6cd8c198a 16
-	3afd61046d1e8340 16
-	a4ea5215c220fc73 239
-	caa2218ea5fc4398 210
+	32ae4cf6cd8c198a 17
+	3afd61046d1e8340 17
+	a4ea5215c220fc73 268
+	caa2218ea5fc4398 239
 test/find-route.test.js
-	597eb73a714135b0 16
-	7e867bebb9e2d307 210
+	597eb73a714135b0 17
+	7e867bebb9e2d307 239
 test/fluent-schema.test.js
-	5be456bd096e7545 210
-	611569a1a224d05f 16
-	717f4093a0139a32 16
+	5be456bd096e7545 239
+	611569a1a224d05f 17
+	717f4093a0139a32 17
 test/genReqId.test.js
-	19880ebb18431b01 16
-	378196bda02fd2fe 16
-	6b1435487a67eb67 210
+	19880ebb18431b01 17
+	378196bda02fd2fe 17
+	6b1435487a67eb67 239
 test/handler-context.test.js
-	4bf9f9ff9a5e9c15 16
-	c8d85b161c1c08cb 239
-	edc41175eba1e0cf 210
+	4bf9f9ff9a5e9c15 17
+	c8d85b161c1c08cb 268
+	edc41175eba1e0cf 239
 test/handler-timeout.test.js
-	6c0577aef45add0b 239
-	9bc1fc5fcf6aa050 16
-	ae1ead6a1a679c41 210
-	efba480b805656df 16
+	6c0577aef45add0b 268
+	9bc1fc5fcf6aa050 17
+	ae1ead6a1a679c41 239
+	efba480b805656df 17
 test/has-route.test.js
-	32500ff893daadce 210
-	34bba520463c58e7 16
+	32500ff893daadce 239
+	34bba520463c58e7 17
 test/header-overflow.test.js
-	1b082ec12bdae092 16
-	adbe953f07525a79 210
+	1b082ec12bdae092 17
+	adbe953f07525a79 239
 test/helper.js
-	16386f5b31905465 167
-	48d886277d3ad452 210
-	49e921caec906661 252
-	50ad925b1af25c76 239
-	85713eea970fa568 205
+	16386f5b31905465 196
+	48d886277d3ad452 239
+	49e921caec906661 281
+	50ad925b1af25c76 268
+	85713eea970fa568 234
 test/hooks-async.test.js
-	0ee1a3a635f099a4 210
-	3fc1b37cbd865b93 247
-	5c2247a0f5c1c73c 16
-	6fc3c65bb99364cc 16
-	762fb6d76f6d7080 252
-	8f08468586182d1b 169
-	fb17e80085849a13 205
+	0ee1a3a635f099a4 239
+	3fc1b37cbd865b93 276
+	5c2247a0f5c1c73c 17
+	6fc3c65bb99364cc 17
+	762fb6d76f6d7080 281
+	8f08468586182d1b 198
+	fb17e80085849a13 234
 test/hooks.on-listen.test.js
-	006b28acea6a3775 16
-	186b69de7fc5e945 239
-	479b6336c146a77d 247
-	7ded59f4507751e6 210
-	c8745b9b972d30fe 165
-	ff4a8a5235ec6ba4 16
+	006b28acea6a3775 17
+	186b69de7fc5e945 268
+	479b6336c146a77d 276
+	7ded59f4507751e6 239
+	c8745b9b972d30fe 194
+	ff4a8a5235ec6ba4 17
 test/hooks.on-ready.test.js
-	0158d37c03b728cc 210
-	2f44a37df71b76bc 16
-	472b282f7de6065b 16
-	743f4b4ffce719f5 170
+	0158d37c03b728cc 239
+	2f44a37df71b76bc 17
+	472b282f7de6065b 17
+	743f4b4ffce719f5 199
 test/hooks.test.js
-	08b2eabf15bc41f8 16
-	2dac5f4b09bb6535 210
-	6686002b2d2773c2 252
-	73060e9d4382c7f2 239
-	8e81a939f8cfbea7 205
-	bf1d7b2b24319872 16
-	eb7526dd4c17a52f 169
-	ef172ccbfc65c144 247
+	08b2eabf15bc41f8 17
+	2dac5f4b09bb6535 239
+	6686002b2d2773c2 281
+	73060e9d4382c7f2 268
+	8e81a939f8cfbea7 234
+	bf1d7b2b24319872 17
+	eb7526dd4c17a52f 198
+	ef172ccbfc65c144 276
 test/http-methods/copy.test.js
-	eab630170afe346b 210
+	eab630170afe346b 239
 test/http-methods/custom-http-methods.test.js
-	3e9450e0c2dec122 16
-	6a3c4a9c8a88ee23 210
-	b1b6b8b58ef6963a 171
+	3e9450e0c2dec122 17
+	6a3c4a9c8a88ee23 239
+	b1b6b8b58ef6963a 200
 test/http-methods/get.test.js
-	94650f07d7b223ef 210
+	94650f07d7b223ef 239
 test/http-methods/head.test.js
-	ab251a0785b33940 210
+	ab251a0785b33940 239
 test/http-methods/lock.test.js
-	0e7799a42414122c 210
+	0e7799a42414122c 239
 test/http-methods/mkcalendar.test.js
-	d1e17b3295b78863 210
+	d1e17b3295b78863 239
 test/http-methods/mkcol.test.js
-	6b611e58927ded0f 210
+	6b611e58927ded0f 239
 test/http-methods/move.test.js
-	0a5bae9b7e572c58 210
+	0a5bae9b7e572c58 239
 test/http-methods/propfind.test.js
-	f7a367621dc8414e 210
+	f7a367621dc8414e 239
 test/http-methods/proppatch.test.js
-	1544f99a1465d9e8 210
+	1544f99a1465d9e8 239
 test/http-methods/report.test.js
-	409c4a6945dcf300 210
+	409c4a6945dcf300 239
 test/http-methods/search.test.js
-	b184e3364b31155a 210
+	b184e3364b31155a 239
 test/http-methods/trace.test.js
-	b98e0c9a0a0ef338 210
+	b98e0c9a0a0ef338 239
 test/http-methods/unlock.test.js
-	b51f257ac391940f 210
+	b51f257ac391940f 239
 test/http2/closing.test.js
-	134adf522d8870eb 247
-	1bdd8657b4ea2f01 239
-	3541b667d18deb41 172
-	509972d6f527126b 166
-	9ee25b13281b4330 210
-	d945a853da5b2ac7 16
-	fbf6d9f16c2a5fd6 243
+	134adf522d8870eb 276
+	1bdd8657b4ea2f01 268
+	3541b667d18deb41 201
+	509972d6f527126b 195
+	9ee25b13281b4330 239
+	d945a853da5b2ac7 17
+	fbf6d9f16c2a5fd6 272
 test/http2/constraint.test.js
-	106829c282a4d529 243
-	62232d6c73f6b1ac 210
-	e9f48c740e28f4ca 16
+	106829c282a4d529 272
+	62232d6c73f6b1ac 239
+	e9f48c740e28f4ca 17
 test/http2/head.test.js
-	1ae46076744b7ff5 210
-	34e081fecd1a59d9 16
+	1ae46076744b7ff5 239
+	34e081fecd1a59d9 17
 test/http2/plain.test.js
-	d3026d0929eeff1d 16
-	da772338d7a02791 210
+	d3026d0929eeff1d 17
+	da772338d7a02791 239
 test/http2/secure-with-fallback.test.js
-	0c81630b2f8ef13e 243
-	1fdce582af160aaf 16
-	34cb00c019bd24f0 210
+	0c81630b2f8ef13e 272
+	1fdce582af160aaf 17
+	34cb00c019bd24f0 239
 test/http2/secure.test.js
-	637f84c972f8f4a6 16
-	b4050dc8699a71f5 210
-	f2834d872297ff22 243
+	637f84c972f8f4a6 17
+	b4050dc8699a71f5 239
+	f2834d872297ff22 272
 test/http2/unknown-http-method.test.js
-	1fc5d4f767da9981 210
-	8ac2492d1e3512a7 16
+	1fc5d4f767da9981 239
+	8ac2492d1e3512a7 17
 test/https/custom-https-server.test.js
-	083244a1356c2926 173
-	1a898a85c14844f6 210
-	1feaaf617034a9b0 160
-	82570365a7d561d9 16
-	82755e8b9a4f6350 243
+	083244a1356c2926 202
+	1a898a85c14844f6 239
+	1feaaf617034a9b0 186
+	82570365a7d561d9 17
+	82755e8b9a4f6350 272
 test/https/https.test.js
-	4c11bd610d49bdf6 16
-	6f51440b68fd608a 243
-	dbc98329f0db6beb 210
+	4c11bd610d49bdf6 17
+	6f51440b68fd608a 272
+	dbc98329f0db6beb 239
 test/imports.test.js
-	6c4770c8ffbe2686 210
+	6c4770c8ffbe2686 239
 test/inject.test.js
-	126fb97840a5a18f 16
-	39add29fb4f5413c 16
-	8b61c20f89b57a1c 174
-	d400383d6024d502 210
+	126fb97840a5a18f 17
+	39add29fb4f5413c 17
+	8b61c20f89b57a1c 203
+	d400383d6024d502 239
 test/input-validation.js
-	b5935a1b4d1b79c5 210
+	b5935a1b4d1b79c5 239
 test/internals/all.test.js
-	66b5208f9de1f8eb 16
-	8c4ebcb612211c01 210
+	66b5208f9de1f8eb 17
+	8c4ebcb612211c01 239
 test/internals/content-type-parser.test.js
-	53f254a5e22e689d 239
-	5c0b2a7c9e68f7a0 212
-	d115164cfc1ee266 86
-	f1487d7b40ef5c2a 111
-	f499c2de95326e9e 234
-	f87b964f05031440 232
+	53f254a5e22e689d 268
+	5c0b2a7c9e68f7a0 241
+	d115164cfc1ee266 110
+	f1487d7b40ef5c2a 137
+	f499c2de95326e9e 263
+	f87b964f05031440 261
 test/internals/context.test.js
-	3173dd7406a204a4 16
-	41f71b0255f54c44 214
-	9e47635598c4daf8 210
-	ecfb661f17448246 239
+	3173dd7406a204a4 17
+	41f71b0255f54c44 243
+	9e47635598c4daf8 239
+	ecfb661f17448246 268
 test/internals/decorator.test.js
-	483c639a421e8f4d 29
-	88e3b1b239b78af2 215
-	9b10d0031411ec98 239
-	c0211b5f2828adae 30
+	483c639a421e8f4d 38
+	88e3b1b239b78af2 244
+	9b10d0031411ec98 268
+	a30ec918bab3ed6d 45
+	c0211b5f2828adae 39
+	ee1059497b419551 39
 test/internals/errors.test.js
-	3a774f3434992ee5 219
+	3a774f3434992ee5 248
 test/internals/handle-request.test.js
-	163d4b78dc4b9af0 139
-	1dc9f346043dd5a3 210
-	4a7856c74f309cef 44
-	5002bbbce7dc2c51 239
-	70b3638c36193420 232
-	90f06985a092432f 86
-	cbe1d6f669b71ec1 240
-	cfd37208354bb7a3 221
-	ef2fdfac4c79456d 221
-	fb265ed9ebc09f0b 234
+	163d4b78dc4b9af0 165
+	1dc9f346043dd5a3 239
+	4a7856c74f309cef 64
+	5002bbbce7dc2c51 268
+	70b3638c36193420 261
+	90f06985a092432f 110
+	cbe1d6f669b71ec1 269
+	cfd37208354bb7a3 250
+	ef2fdfac4c79456d 250
+	fb265ed9ebc09f0b 263
 test/internals/hook-runner.test.js
-	133c29204a69dc51 54
-	8f671f371cf98bbc 223
-	fee33d1b16a23e76 59
+	133c29204a69dc51 74
+	8f671f371cf98bbc 252
+	fee33d1b16a23e76 79
 test/internals/hooks.test.js
-	0025747d424c1a85 223
-	30bcf8bc9df3ff58 51
-	a8069d4d70c3e44e 16
-	db496feb1e481387 210
+	0025747d424c1a85 252
+	30bcf8bc9df3ff58 71
+	a8069d4d70c3e44e 17
+	db496feb1e481387 239
 test/internals/initial-config.test.js
-	1106f99deeec53aa 175
-	1d24c59aed972d8d 160
-	3e0cd33d9f8972e0 247
-	72b0b694eaa02b37 16
-	76d6582578c48346 165
-	b404b8ae86c01c8b 176
-	ce47718a54b8dd04 243
-	e46170475cb65841 210
-	e8762c15a3b1748c 16
-	f4eaed7d722af563 224
+	1106f99deeec53aa 204
+	1d24c59aed972d8d 186
+	3e0cd33d9f8972e0 276
+	72b0b694eaa02b37 17
+	76d6582578c48346 194
+	b404b8ae86c01c8b 205
+	ce47718a54b8dd04 272
+	e46170475cb65841 239
+	e8762c15a3b1748c 17
+	f4eaed7d722af563 253
 test/internals/logger.test.js
-	1278c068f8f3187d 74
-	27d3f289ac4e013b 70
-	3be1500ca9dac0d3 226
-	3e08129a75dc9cc1 177
-	4993bfa05ab8e74d 16
-	58de43628499329c 227
-	5d17299586343b47 70
-	75f7c5565d222989 210
-	7919d3a61a879ae2 226
-	a5a572b2a32a90f5 70
-	f08731f8bc1de17c 72
-	fabf9674a5bf7f4e 76
-	ffb5cdea37a5d7dc 16
+	1278c068f8f3187d 94
+	27d3f289ac4e013b 90
+	3be1500ca9dac0d3 255
+	3e08129a75dc9cc1 206
+	4993bfa05ab8e74d 17
+	58de43628499329c 256
+	5d17299586343b47 90
+	63f0f49a88e077be 94
+	75f7c5565d222989 239
+	7919d3a61a879ae2 255
+	7d675e593dfb5542 16
+	a5a572b2a32a90f5 90
+	f08731f8bc1de17c 92
+	fabf9674a5bf7f4e 96
+	ffb5cdea37a5d7dc 17
 test/internals/plugin.test.js
-	0d78c4c9789491ec 239
-	5e02a9f8a256e008 230
-	940241e784d8f09f 230
-	c5a7327621a82b89 83
+	0d78c4c9789491ec 268
+	5e02a9f8a256e008 259
+	940241e784d8f09f 259
+	bb06fbe4c1bc361b 104
+	c5a7327621a82b89 103
 test/internals/promise.test.js
-	3f0ba6c3600bb504 231
-	487b429d00a9ac1a 85
-	d7cc3035642a8e4d 239
+	3f0ba6c3600bb504 260
+	487b429d00a9ac1a 106
+	d7cc3035642a8e4d 268
 test/internals/reply-serialize.test.js
-	072ff2da14aed5a2 16
-	847d5c2d1e88b0d3 178
-	c8f4c17105ba2517 239
-	cb0125041a069c55 179
-	decd6cdfb9a4957c 210
+	072ff2da14aed5a2 17
+	847d5c2d1e88b0d3 207
+	c8f4c17105ba2517 268
+	cb0125041a069c55 208
+	decd6cdfb9a4957c 239
 test/internals/reply.test.js
-	0cac5568eb90ade2 16
-	1ab41f570d41c758 234
-	4087647e0b991c45 210
-	5053379943ad50d1 232
-	65473e6b5d1d73e5 86
-	66e793c986ff3376 86
-	84c008ab1ca0cf03 239
-	87a1032894fbc5de 210
-	87e10fb00ffc5de7 68
-	c0a9df23b0a08c0d 180
-	c69dd9a9b973817f 111
-	e90e244b5992c8f3 225
+	0cac5568eb90ade2 17
+	1ab41f570d41c758 263
+	4087647e0b991c45 239
+	5053379943ad50d1 261
+	65473e6b5d1d73e5 110
+	66e793c986ff3376 110
+	84c008ab1ca0cf03 268
+	87a1032894fbc5de 239
+	87e10fb00ffc5de7 88
+	c0a9df23b0a08c0d 209
+	c69dd9a9b973817f 137
+	e90e244b5992c8f3 254
 test/internals/req-id-gen-factory.test.js
-	51e4eb29e33ab318 110
-	5d9c5f88806f5cf9 110
-	78cbbbceffc022b1 233
-	e837fe94e4d7bfad 110
+	51e4eb29e33ab318 136
+	5d9c5f88806f5cf9 136
+	78cbbbceffc022b1 262
+	e837fe94e4d7bfad 136
 test/internals/request-validate.test.js
-	315b35d317c34c25 239
-	316319a3d26b3faa 210
-	d530f2ffd832fcb2 16
+	315b35d317c34c25 268
+	316319a3d26b3faa 239
+	d530f2ffd832fcb2 17
 test/internals/request.test.js
-	06e1ae3e19edb89f 111
-	103964c160371300 214
-	18424da00f5c05ca 114
-	26330cd6e059f962 27
-	a3cd7831787ec3a2 239
-	ab0925a4b1da5172 234
+	06e1ae3e19edb89f 137
+	103964c160371300 243
+	18424da00f5c05ca 140
+	26330cd6e059f962 36
+	a3cd7831787ec3a2 268
+	ab0925a4b1da5172 263
 test/internals/schema-controller-perf.test.js
-	01312e718b7c72b5 210
-	1e45752ff7d31f7d 16
-	763ae646c1752bac 239
-	89f5b3f00054d0a3 16
+	01312e718b7c72b5 239
+	1e45752ff7d31f7d 17
+	763ae646c1752bac 268
+	89f5b3f00054d0a3 17
 test/internals/server.test.js
-	0e99576fc65898db 135
-	13ca3f496cfb386b 238
-	2c5d4aba2782a1c6 210
-	3412ba4e788b9b30 16
+	0e99576fc65898db 161
+	13ca3f496cfb386b 267
+	2c5d4aba2782a1c6 239
+	3412ba4e788b9b30 17
 test/internals/validation.test.js
-	15a30728bcecff0a 133
-	34705ec72cde3dae 139
-	34cf16d78e4ade10 240
-	4781e3a8efe4647a 240
-	ac37c8f13eab348d 139
-	b7a1fece71a14198 237
-	c481487dfe51c869 138
-	caf8702da301d20d 239
+	15a30728bcecff0a 159
+	34705ec72cde3dae 165
+	34cf16d78e4ade10 269
+	4781e3a8efe4647a 269
+	ac37c8f13eab348d 165
+	b7a1fece71a14198 266
+	c481487dfe51c869 164
+	caf8702da301d20d 268
 test/issue-4959.test.js
-	092854bd0f51a6cd 181
-	0aae0dc79620cb51 16
-	0d4042bc00677dd5 210
+	092854bd0f51a6cd 210
+	0aae0dc79620cb51 17
+	0d4042bc00677dd5 239
 test/keep-alive-timeout.test.js
-	3717926cddd77895 210
-	70c7313fde3c94ff 16
+	3717926cddd77895 239
+	70c7313fde3c94ff 17
 test/listen.1.test.js
-	15c15b2090a76dda 210
-	5b41ab92b54d44e7 247
-	8fe62a54520378e0 16
-	af5c890e65d48152 165
+	15c15b2090a76dda 239
+	5b41ab92b54d44e7 276
+	8fe62a54520378e0 17
+	af5c890e65d48152 194
 test/listen.2.test.js
-	1123b4c9738b7cda 247
-	276b9ddd35ef34b0 16
-	a10a9c748520966e 210
-	baabf647a95d23b2 165
+	1123b4c9738b7cda 276
+	276b9ddd35ef34b0 17
+	a10a9c748520966e 239
+	baabf647a95d23b2 194
 test/listen.3.test.js
-	3478d12457139223 247
-	6d2b625135dca7f0 165
-	77b97f5165dc34bb 16
-	c8ca215dd2472467 210
+	3478d12457139223 276
+	6d2b625135dca7f0 194
+	77b97f5165dc34bb 17
+	c8ca215dd2472467 239
 test/listen.4.test.js
-	03f89f87a7509c87 247
-	0942b42d8e820f86 165
-	11dbc0e3e95078aa 182
-	64f121f1e2bd06a1 16
-	bf6cc833b3853356 210
+	03f89f87a7509c87 276
+	0942b42d8e820f86 194
+	11dbc0e3e95078aa 211
+	64f121f1e2bd06a1 17
+	bf6cc833b3853356 239
 test/listen.5.test.js
-	09b144b6abb281c2 16
-	a029ea185679be8f 183
-	b71857dcaaeb1d32 210
-	dc182ece9a073126 241
+	09b144b6abb281c2 17
+	a029ea185679be8f 212
+	b71857dcaaeb1d32 239
+	dc182ece9a073126 270
 test/logger/instantiation.test.js
-	262e9814f2aa957a 247
-	31d0c76ce98216f9 188
-	417378d8ff8795d1 187
-	50120aba58ecee3b 165
-	511e89433d7abacc 16
-	5705391495247c5c 185
-	5c782e3cacc23df1 252
-	9968798be67509ac 204
-	bf0e2b782fa97aca 169
-	c86bcf6c63501955 249
-	cbe26ba9b644eeda 184
-	dfafe536a79b4977 219
-	e81d59dc1bbd3c78 210
+	262e9814f2aa957a 276
+	31d0c76ce98216f9 217
+	417378d8ff8795d1 216
+	50120aba58ecee3b 194
+	511e89433d7abacc 17
+	5705391495247c5c 214
+	5c782e3cacc23df1 281
+	9968798be67509ac 233
+	bf0e2b782fa97aca 198
+	c86bcf6c63501955 278
+	cbe26ba9b644eeda 213
+	dfafe536a79b4977 248
+	e81d59dc1bbd3c78 239
 test/logger/logger-test-utils.js
-	9cc36372a03ac6a3 186
+	9cc36372a03ac6a3 215
 test/logger/logging.test.js
-	05eb30226c15eb63 190
-	179617aaa22180e5 16
-	1d4a7489ce3df161 204
-	1ff8a25cf6b38e5b 249
-	2a120c614b5085c0 225
-	6b0dd37ef3d5c1a4 252
-	6b9594efd2e818dc 210
-	83a0353d52176a10 247
-	86159fa42e7fbdc9 68
-	ce4af335958d770e 188
-	e6401384b92b1823 189
-	f332e40706fe107f 165
+	05eb30226c15eb63 219
+	179617aaa22180e5 17
+	1d4a7489ce3df161 233
+	1ff8a25cf6b38e5b 278
+	2a120c614b5085c0 254
+	6b0dd37ef3d5c1a4 281
+	6b9594efd2e818dc 239
+	83a0353d52176a10 276
+	86159fa42e7fbdc9 88
+	ce4af335958d770e 217
+	e6401384b92b1823 218
+	f332e40706fe107f 194
 test/logger/options.test.js
-	30dd0a32daf5fd48 210
-	5b6871c994a86bb4 191
-	778199454b4a014f 16
+	30dd0a32daf5fd48 239
+	5b6871c994a86bb4 220
+	778199454b4a014f 17
 test/logger/request.test.js
-	06e575e40dd4897c 249
-	2117771b2a305c9f 165
-	2241826e14f83627 16
-	2ba64748c745aa6c 210
-	92cffb655829578b 188
-	979b8fa0ba19d24c 192
-	aa56ac5fef3237d2 252
-	f2bbb42aeb15fadc 204
-	f3bd5e10b88c8819 247
+	06e575e40dd4897c 278
+	2117771b2a305c9f 194
+	2241826e14f83627 17
+	2ba64748c745aa6c 239
+	92cffb655829578b 217
+	979b8fa0ba19d24c 221
+	aa56ac5fef3237d2 281
+	f2bbb42aeb15fadc 233
+	f3bd5e10b88c8819 276
 test/logger/response.test.js
-	05c0f23d824e7ecc 16
-	11a8e434b883905b 193
-	6877cd3cdc64a310 252
-	7be8d777745e5798 204
-	7fcb648dff20e56b 210
+	05c0f23d824e7ecc 17
+	11a8e434b883905b 222
+	6877cd3cdc64a310 281
+	7be8d777745e5798 233
+	7fcb648dff20e56b 239
 test/max-requests-per-socket.test.js
-	8f5481546d55262c 16
-	d2c8e3f5098bf3b5 16
-	d95433e7d610b5ab 210
+	8f5481546d55262c 17
+	d2c8e3f5098bf3b5 17
+	d95433e7d610b5ab 239
 test/middleware.test.js
-	384dabaca99b2a37 16
-	43cf18a783e81895 210
-	66729400500187bf 219
+	384dabaca99b2a37 17
+	43cf18a783e81895 239
+	66729400500187bf 248
 test/noop-set.test.js
-	bc0e7d88c08ddc39 77
-	e17b70ee7c04799e 228
+	bc0e7d88c08ddc39 97
+	e17b70ee7c04799e 257
 test/nullable-validation.test.js
-	5daff798d72003aa 16
-	a2e0a7ad7abb3bdf 210
+	5daff798d72003aa 17
+	a2e0a7ad7abb3bdf 239
 test/options.error-handler.test.js
-	3a565bcca46b797c 248
-	cad281767bb3e064 247
+	3a565bcca46b797c 277
+	cad281767bb3e064 276
 test/options.test.js
-	0d943b4bb1f9f26f 248
-	b30f7ca77dbfdcc8 247
+	0d943b4bb1f9f26f 277
+	b30f7ca77dbfdcc8 276
 test/output-validation.test.js
-	325eee60b96ea4a8 210
+	325eee60b96ea4a8 239
 test/patch.error-handler.test.js
-	01aa30784f57dcad 247
-	d61efd6285bbdf21 248
+	01aa30784f57dcad 276
+	d61efd6285bbdf21 277
 test/patch.test.js
-	7fc1db1864184758 247
-	f08507c0ccf21237 248
+	7fc1db1864184758 276
+	f08507c0ccf21237 277
 test/plugin.1.test.js
-	4eb6e206a0a92b3f 210
-	a843b0e11add030a 194
-	d43db1ae53235eb9 16
-	e11df6f14660b5ee 251
-	e7084526cf88d11b 250
+	4eb6e206a0a92b3f 239
+	a843b0e11add030a 223
+	d43db1ae53235eb9 17
+	e11df6f14660b5ee 280
+	e7084526cf88d11b 279
 test/plugin.2.test.js
-	30ac8deef8998899 210
-	535d7c7a157a0e4e 16
+	30ac8deef8998899 239
+	535d7c7a157a0e4e 17
 test/plugin.3.test.js
-	0282e8c2c8f3a093 16
-	75c6d28aae08b817 210
+	0282e8c2c8f3a093 17
+	75c6d28aae08b817 239
 test/plugin.4.test.js
-	574a570dbb4ad20e 219
-	72e02ba89d827945 16
-	956a2b5fb2b43c2a 210
-	baa5e079b142ed05 16
+	574a570dbb4ad20e 248
+	72e02ba89d827945 17
+	956a2b5fb2b43c2a 239
+	baa5e079b142ed05 17
 test/post-empty-body.test.js
-	13d8a59efcfc39ad 16
-	d48b58dab6d8ec84 210
+	13d8a59efcfc39ad 17
+	d48b58dab6d8ec84 239
 test/pretty-print.test.js
-	0bc833adcd8ce1ea 16
-	171177853461e982 16
-	cfb78ce35e223370 210
+	0bc833adcd8ce1ea 17
+	171177853461e982 17
+	cfb78ce35e223370 239
 test/promises.test.js
-	71bf5a3f856711c2 210
+	71bf5a3f856711c2 239
 test/proto-poisoning.test.js
-	df90ac457e944c73 16
-	ec2862ebfaaba2fb 16
-	fd5043d0408b2808 210
+	df90ac457e944c73 17
+	ec2862ebfaaba2fb 17
+	fd5043d0408b2808 239
 test/put.error-handler.test.js
-	5942d4a964d27b94 248
-	e38f715cd06ed103 247
+	5942d4a964d27b94 277
+	e38f715cd06ed103 276
 test/put.test.js
-	88858850659557c1 248
-	a94f06b56ea77056 247
+	88858850659557c1 277
+	a94f06b56ea77056 276
 test/register.test.js
-	7b679e24fb5f430a 210
-	a8af9adf37af83d7 16
-	dbf13c1598fabe2f 195
+	7b679e24fb5f430a 239
+	a8af9adf37af83d7 17
+	dbf13c1598fabe2f 224
 test/reply-code.test.js
-	6c95ff615bd63921 16
-	7e5da5f8df740fea 210
+	6c95ff615bd63921 17
+	7e5da5f8df740fea 239
 test/reply-early-hints.test.js
-	145a2fd3f5a954ef 16
-	dba0c6d001cc360b 210
+	145a2fd3f5a954ef 17
+	dba0c6d001cc360b 239
 test/reply-error.test.js
-	0f23af7eb31b812c 16
-	30c649b2a4bef186 16
-	68bd6c2ea39c9a39 16
-	a33def65af442e3e 210
-	af3424317e09d7c5 196
+	0f23af7eb31b812c 17
+	30c649b2a4bef186 17
+	68bd6c2ea39c9a39 17
+	a33def65af442e3e 239
+	af3424317e09d7c5 225
 test/reply-trailers.test.js
-	1c927bbbd039e6f0 169
-	3026238ee54c8a75 247
-	52f571c26cd6fa59 16
-	655e1ef10c4e7404 210
+	1c927bbbd039e6f0 198
+	3026238ee54c8a75 276
+	52f571c26cd6fa59 17
+	655e1ef10c4e7404 239
 test/reply-web-stream-locked.test.js
-	111b779956bdd0f0 16
-	2a2e9989189044b7 210
+	111b779956bdd0f0 17
+	2a2e9989189044b7 239
 test/request-error.test.js
-	40168afb9b4d023c 210
-	422d32daf9dea5ee 247
-	45bc5c010d600a4b 166
-	4d22371af5d14287 239
-	543fddac37d11cb8 16
-	e14ed43251a85830 16
+	40168afb9b4d023c 239
+	422d32daf9dea5ee 276
+	45bc5c010d600a4b 195
+	4d22371af5d14287 268
+	543fddac37d11cb8 17
+	e14ed43251a85830 17
 test/request-header-host.test.js
-	54372cce3f687df7 210
-	779ab4ecc8c5048a 16
-	b219447f73a79311 16
+	54372cce3f687df7 239
+	779ab4ecc8c5048a 17
+	b219447f73a79311 17
 test/request-id.test.js
-	c565e1f4973a2fcf 210
-	f668fa9ee207311a 16
+	c565e1f4973a2fcf 239
+	f668fa9ee207311a 17
 test/request-media-type.test.js
-	6aa59b79c7e59949 16
-	e7bf6257f2d4c6bb 210
+	6aa59b79c7e59949 17
+	e7bf6257f2d4c6bb 239
 test/request-port.test.js
-	132abf3d58a6b430 111
-	5ec6aeea083b8cd7 234
+	132abf3d58a6b430 137
+	5ec6aeea083b8cd7 263
 test/request-timeout.test.js
-	25d709cd7ffb2bba 210
-	3f933581630db9cc 16
-	674c9e298f9800d1 16
+	25d709cd7ffb2bba 239
+	3f933581630db9cc 17
+	674c9e298f9800d1 17
 test/route-hooks.test.js
-	0801cde3702a50bb 197
-	1a7cd2711370557d 16
-	760f94c27bc0e30e 16
-	7a9674c8de64b8e4 197
-	8b36330c4acd8b86 16
-	8e4399ed55ba8380 197
-	b8290df55ec9fd83 198
-	ba4fba53325115f8 210
-	e56a2df54b7cefcf 199
-	ed2ab95022751a92 16
+	0801cde3702a50bb 226
+	1a7cd2711370557d 17
+	760f94c27bc0e30e 17
+	7a9674c8de64b8e4 226
+	8b36330c4acd8b86 17
+	8e4399ed55ba8380 226
+	b8290df55ec9fd83 227
+	ba4fba53325115f8 239
+	e56a2df54b7cefcf 228
+	ed2ab95022751a92 17
 test/route-prefix.test.js
-	28a7f9027fc37300 252
-	505b3ab5f64e46a4 16
-	79cc00999a49c516 205
-	7edadacd17872a8c 16
-	bef4e1c3bcf5b04f 210
+	28a7f9027fc37300 281
+	505b3ab5f64e46a4 17
+	79cc00999a49c516 234
+	7edadacd17872a8c 17
+	bef4e1c3bcf5b04f 239
 test/route-shorthand.test.js
-	4f426eb2e0573a05 210
-	5cf28e36f1454ba2 16
+	4f426eb2e0573a05 239
+	5cf28e36f1454ba2 17
 test/route.1.test.js
-	1236e1c45a752b8f 247
-	4918c2394e18d739 210
-	932190a7fb5b601f 166
-	d50e7d197a8f57c2 16
-	fb247dfc67fbb30d 219
+	1236e1c45a752b8f 276
+	4918c2394e18d739 239
+	932190a7fb5b601f 195
+	d50e7d197a8f57c2 17
+	fb247dfc67fbb30d 248
 test/route.2.test.js
-	5c0419a2aa4e720f 16
-	94952498b4ba23a4 210
-	e0630d3aa4619a57 16
+	5c0419a2aa4e720f 17
+	94952498b4ba23a4 239
+	e0630d3aa4619a57 17
 test/route.3.test.js
-	47b7bd1543019ae8 210
-	68a1783c4e62e346 16
+	47b7bd1543019ae8 239
+	68a1783c4e62e346 17
 test/route.4.test.js
-	8afeada67c32108b 16
-	db492870a3e7e0c1 210
+	8afeada67c32108b 17
+	db492870a3e7e0c1 239
 test/route.5.test.js
-	36600f5de7336446 16
-	adb01cea735a68df 210
-	c604c880c4f130c3 16
+	36600f5de7336446 17
+	adb01cea735a68df 239
+	c604c880c4f130c3 17
 test/route.6.test.js
-	5ab99f1383439483 16
-	6eb3367c03d16e7d 210
-	d82fe5a14e9309ab 16
+	5ab99f1383439483 17
+	6eb3367c03d16e7d 239
+	d82fe5a14e9309ab 17
 test/route.7.test.js
-	29b0b5a12abd6828 210
-	4384c3952dcabc14 16
-	adac7ca0fc68c488 16
+	29b0b5a12abd6828 239
+	4384c3952dcabc14 17
+	adac7ca0fc68c488 17
 test/route.8.test.js
-	c4aae5df85f9eaa0 219
-	da0163c7e4dc3a90 210
-	fc5653fa2cfaeaf6 16
-	fd925f774b2cb43f 16
+	c4aae5df85f9eaa0 248
+	da0163c7e4dc3a90 239
+	fc5653fa2cfaeaf6 17
+	fd925f774b2cb43f 17
 test/router-options.test.js
-	240e9498858909d7 210
-	25c9ebd8efde78f7 16
-	44e212ee5a7c7d69 219
-	bebab1a1cfffb1f0 16
+	240e9498858909d7 239
+	25c9ebd8efde78f7 17
+	44e212ee5a7c7d69 248
+	bebab1a1cfffb1f0 17
 test/same-shape.test.js
-	23e3aa5425afade9 16
-	ba1798d113b81cd6 210
+	23e3aa5425afade9 17
+	ba1798d113b81cd6 239
 test/schema-examples.test.js
-	62e4fe715d85cf73 210
-	7e8d50e6d04d747a 16
-	d5ac1173024a2d92 16
+	62e4fe715d85cf73 239
+	7e8d50e6d04d747a 17
+	d5ac1173024a2d92 17
 test/schema-feature.test.js
-	377ae939a60c93c9 205
-	404644bcb69a6588 239
-	6f32ec706107b2c7 241
-	7427e789bd37d1c2 201
-	7c3d144e9624f289 16
-	8751250282d96172 200
-	ae66a727e8ed289a 16
-	b800c79852f46a18 210
-	e439cc0daf6406a9 252
+	377ae939a60c93c9 234
+	404644bcb69a6588 268
+	6f32ec706107b2c7 270
+	7427e789bd37d1c2 230
+	7c3d144e9624f289 17
+	8751250282d96172 229
+	ae66a727e8ed289a 17
+	b800c79852f46a18 239
+	e439cc0daf6406a9 281
 test/schema-serialization.test.js
-	750d68f0dc8e6dbc 210
-	7d796216a6e6f158 16
-	84c203d72331a9ab 16
-	93ca3e7f456ad587 252
-	ee29bf6df93c078f 205
+	750d68f0dc8e6dbc 239
+	7d796216a6e6f158 17
+	84c203d72331a9ab 17
+	93ca3e7f456ad587 281
+	ee29bf6df93c078f 234
 test/schema-special-usage.test.js
-	18d5eff51cf365f2 16
-	30dea122857ba355 205
-	9b4ca58e1f0fe389 252
-	da6ab4cdc5269ea5 210
-	faf948bdde8829f1 16
+	18d5eff51cf365f2 17
+	30dea122857ba355 234
+	9b4ca58e1f0fe389 281
+	da6ab4cdc5269ea5 239
+	faf948bdde8829f1 17
 test/schema-validation.test.js
-	01ad0c055b021df6 210
-	37bb1add9b260c0b 16
-	3f15ec903074618d 252
-	9e8be2bdaebe21bb 239
-	b382b471eee6233f 205
-	e88fd2979b7d19b4 16
+	01ad0c055b021df6 239
+	37bb1add9b260c0b 17
+	3f15ec903074618d 281
+	9e8be2bdaebe21bb 268
+	b382b471eee6233f 234
+	e88fd2979b7d19b4 17
 test/scripts/validate-ecosystem-links.test.js
-	8f585f2f69da3e6f 202
+	8f585f2f69da3e6f 231
 test/serialize-response.test.js
-	004dbef61afd1d17 16
-	89c39f98643e93ac 210
+	004dbef61afd1d17 17
+	89c39f98643e93ac 239
 test/server.test.js
-	043f7c0754b5c90a 210
-	e64743dc101cdc13 16
-	f4fa945c3d77cdce 16
+	043f7c0754b5c90a 239
+	e64743dc101cdc13 17
+	f4fa945c3d77cdce 17
 test/set-error-handler.test.js
-	65607747d08a4907 16
-	73db26cb507de2ab 16
-	d0c05666ff2e2f00 210
-	e510b1a17c86c8e5 219
+	65607747d08a4907 17
+	73db26cb507de2ab 17
+	d0c05666ff2e2f00 239
+	e510b1a17c86c8e5 248
 test/skip-reply-send.test.js
-	3b521e683f33fc22 203
-	5b23f1635edc7a58 16
-	81ca3896d54fa7f9 210
-	b2d1dc95f22fe54c 16
+	3b521e683f33fc22 232
+	5b23f1635edc7a58 17
+	81ca3896d54fa7f9 239
+	b2d1dc95f22fe54c 17
 test/stream-serializers.test.js
-	67bb547b0132a32a 232
-	906a2d3a46cfc18a 16
-	92d64b36e98fef46 210
+	67bb547b0132a32a 261
+	906a2d3a46cfc18a 17
+	92d64b36e98fef46 239
 test/stream.1.test.js
-	e5b199d9d55aa759 210
-	e9653d967e805232 16
+	e5b199d9d55aa759 239
+	e9653d967e805232 17
 test/stream.2.test.js
-	0421c44f0b9604c3 16
-	06fcd80938591769 205
-	2d4491d74e45ff76 210
-	9d8b161f532a7b34 252
+	0421c44f0b9604c3 17
+	06fcd80938591769 234
+	2d4491d74e45ff76 239
+	9d8b161f532a7b34 281
 test/stream.3.test.js
-	03f0b57cd2b2242f 210
-	54e392e8cae9e107 16
+	03f0b57cd2b2242f 239
+	54e392e8cae9e107 17
 test/stream.4.test.js
-	1800bacdb8a122c8 239
-	5814dcb836196fdd 16
-	65550a7425ca0600 210
-	cb4d37e686b43b44 16
+	1800bacdb8a122c8 268
+	5814dcb836196fdd 17
+	65550a7425ca0600 239
+	cb4d37e686b43b44 17
 test/stream.5.test.js
-	0f39faeec3ffd6b8 16
-	20933e3080e432b7 210
-	dc7fcde9a0f2287a 16
+	0f39faeec3ffd6b8 17
+	20933e3080e432b7 239
+	dc7fcde9a0f2287a 17
 test/sync-routes.test.js
-	49f8f62dea459c37 16
-	7bb5261aa131a41f 210
+	49f8f62dea459c37 17
+	7bb5261aa131a41f 239
 test/throw.test.js
-	137947436753e10d 210
-	3b2e017bdaded6f1 16
-	f7654a4b361e7168 16
+	137947436753e10d 239
+	3b2e017bdaded6f1 17
+	f7654a4b361e7168 17
 test/trust-proxy.test.js
-	1b72f6825fd88ae1 165
-	32271d8ac6e4d229 206
-	595cf32a52dd74aa 247
-	7dd8dee6a202e18a 207
-	ac8299e82d920a03 234
-	afa8219c98cd4b44 207
-	c5cf4cf0483647c8 208
-	e634fa5c109099e4 16
-	f8f9447c8f4f0f73 210
+	1b72f6825fd88ae1 194
+	32271d8ac6e4d229 235
+	595cf32a52dd74aa 276
+	7dd8dee6a202e18a 236
+	ac8299e82d920a03 263
+	afa8219c98cd4b44 236
+	c5cf4cf0483647c8 237
+	e634fa5c109099e4 17
+	e72dc805f47dc21a 140
+	f8f9447c8f4f0f73 239
 test/type-provider.test.js
-	84d0c59da3822bb7 210
-	afb074cd7b8073d6 16
+	84d0c59da3822bb7 239
+	afb074cd7b8073d6 17
 test/upgrade.test.js
-	502944dc931909ca 16
-	75a8b1c1d2453e8b 210
+	502944dc931909ca 17
+	75a8b1c1d2453e8b 239
 test/url-rewriting.test.js
-	9a8cde97417badd9 210
-	cd4a225bf63a2fcc 16
+	9a8cde97417badd9 239
+	cd4a225bf63a2fcc 17
 test/use-semicolon-delimiter.test.js
-	01f2923727c46b5c 16
-	562e22af94d496d6 16
-	9402888ba225a8e4 210
+	01f2923727c46b5c 17
+	562e22af94d496d6 17
+	9402888ba225a8e4 239
 test/validation-error-handling.test.js
-	89676ec214acfc0c 16
-	941962fea2934a07 16
-	9d126b1be29b3cf4 210
+	89676ec214acfc0c 17
+	941962fea2934a07 17
+	9d126b1be29b3cf4 239
 test/versioned-routes.test.js
-	12a154a26c74e30d 165
-	2b2d22d4adeb3dcb 247
-	7f522f295339781c 16
-	a6b117adf75680e7 210
-	f93d7d9533a4064e 16
+	12a154a26c74e30d 194
+	2b2d22d4adeb3dcb 276
+	7f522f295339781c 17
+	a6b117adf75680e7 239
+	f93d7d9533a4064e 17
 test/web-api.test.js
-	3a40595cc5802ab1 210
-	a6253d0c73ccd2b5 16
-	eb5410a00a6bfbdd 16
+	3a40595cc5802ab1 239
+	a6253d0c73ccd2b5 17
+	eb5410a00a6bfbdd 17
 test/wrap-thenable.test.js
-	062fb0f027ba076f 242
-	097c4947bd2433e8 239
-	73669797aef9a8ef 86
-	8f4a36afc723d6f5 232
-	cfbb8464249df6b4 154
+	062fb0f027ba076f 271
+	097c4947bd2433e8 268
+	73669797aef9a8ef 110
+	8f4a36afc723d6f5 261
+	cfbb8464249df6b4 180
