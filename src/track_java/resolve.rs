@@ -1252,7 +1252,7 @@ impl JavaResolver {
                     let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
                     out.saw_member |= visible;
                     let mut shapes = if visible {
-                        Self::fixed_signatures(site.arguments, phase)
+                        Self::fixed_signatures(scope, site.arguments, phase)
                             .into_iter()
                             .map(|(types, depths)| (types, depths, declaration.clone()))
                             .collect()
@@ -1269,14 +1269,21 @@ impl JavaResolver {
                         out.saw_member |= varargs_visible;
                         if varargs_visible {
                             let last = site.arguments.last().expect("nonempty checked above");
-                            let component = &last[..last.len() - 2];
-                            for (mut types, mut depths) in Self::fixed_signatures(
+                            for (types, depths) in Self::fixed_signatures(
+                                scope,
                                 &site.arguments[..site.arguments.len() - 1],
                                 phase,
                             ) {
-                                types.push(format!("{component}..."));
-                                depths.push(0);
-                                shapes.push((types, depths, varargs_declaration.clone()));
+                                for array in Self::exact_type_spellings(scope, last) {
+                                    let Some(component) = array.strip_suffix("[]") else {
+                                        continue;
+                                    };
+                                    let mut signature = types.clone();
+                                    signature.push(format!("{component}..."));
+                                    let mut ranks = depths.clone();
+                                    ranks.push(0);
+                                    shapes.push((signature, ranks, varargs_declaration.clone()));
+                                }
                             }
                         }
                     }
@@ -1291,9 +1298,11 @@ impl JavaResolver {
                         out.saw_member |= visible;
                         if visible {
                             if min as usize == site.arguments.len() {
-                                for (prefix, depths) in
-                                    Self::fixed_signatures(site.arguments, InvocationPhase::Loose)
-                                {
+                                for (prefix, depths) in Self::fixed_signatures(
+                                    scope,
+                                    site.arguments,
+                                    InvocationPhase::Loose,
+                                ) {
                                     let prefix_fqn = fqn::member_fqn(
                                         &type_fqn,
                                         &fqn::varargs_prefix_key(site.name, &prefix),
@@ -1316,7 +1325,7 @@ impl JavaResolver {
                                 continue;
                             }
                             shapes.extend(
-                                Self::varargs_signatures(site.arguments, min as usize)
+                                Self::varargs_signatures(scope, site.arguments, min as usize)
                                     .into_iter()
                                     .map(|(types, depths)| (types, depths, declaration.clone())),
                             );
@@ -1399,17 +1408,22 @@ impl JavaResolver {
     }
 
     fn fixed_signatures(
+        scope: &JavaScope,
         arguments: &[String],
         phase: InvocationPhase,
     ) -> Vec<(Vec<String>, Vec<u8>)> {
         let alternatives = arguments
             .iter()
-            .map(|argument| Self::conversion_targets(argument, phase))
+            .map(|argument| Self::conversion_targets(scope, argument, phase))
             .collect::<Vec<_>>();
         Self::signature_product(&alternatives)
     }
 
-    fn varargs_signatures(arguments: &[String], min: usize) -> Vec<(Vec<String>, Vec<u8>)> {
+    fn varargs_signatures(
+        scope: &JavaScope,
+        arguments: &[String],
+        min: usize,
+    ) -> Vec<(Vec<String>, Vec<u8>)> {
         if min > arguments.len() || min == arguments.len() {
             // With no repeated argument the component type is not present at
             // the site, so this key is known but its applicability is not.
@@ -1417,7 +1431,7 @@ impl JavaResolver {
         }
         let options = arguments
             .iter()
-            .map(|argument| Self::conversion_targets(argument, InvocationPhase::Loose))
+            .map(|argument| Self::conversion_targets(scope, argument, InvocationPhase::Loose))
             .collect::<Vec<_>>();
         let prefixes = Self::signature_product(&options[..min]);
         let mut common: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1473,24 +1487,88 @@ impl JavaResolver {
     /// The fixture-proven conversion surface. No user-defined subtype is
     /// guessed: only primitive widening, boxing, unboxing plus widening, and
     /// the built-in wrapper-to-`Number`/`Object` chains are represented.
-    fn conversion_targets(argument: &str, phase: InvocationPhase) -> Vec<(String, u8)> {
-        let simple = argument
-            .strip_prefix("java.lang.")
-            .filter(|name| JAVA_LANG.binary_search(name).is_ok())
-            .unwrap_or(argument);
-        let mut targets = vec![(simple.to_string(), 0)];
-        if simple != argument {
-            targets.push((argument.to_string(), 0));
-        } else if JAVA_LANG.binary_search(&simple).is_ok() {
-            targets.push((format!("java.lang.{simple}"), 0));
-        }
-        Self::push_strict_widening(simple, &mut targets);
-        if phase != InvocationPhase::Strict {
-            Self::push_loose_conversions(simple, &mut targets);
+    fn conversion_targets(
+        scope: &JavaScope,
+        argument: &str,
+        phase: InvocationPhase,
+    ) -> Vec<(String, u8)> {
+        let mut targets = Vec::new();
+        for spelling in Self::exact_type_spellings(scope, argument) {
+            let simple = spelling
+                .strip_prefix("java.lang.")
+                .filter(|name| JAVA_LANG.binary_search(name).is_ok())
+                .unwrap_or(&spelling);
+            targets.push((simple.to_string(), 0));
+            if simple != spelling {
+                targets.push((spelling.clone(), 0));
+            } else if JAVA_LANG.binary_search(&simple).is_ok() {
+                targets.push((format!("java.lang.{simple}"), 0));
+            }
+            Self::push_strict_widening(simple, &mut targets);
+            if phase != InvocationPhase::Strict {
+                Self::push_loose_conversions(simple, &mut targets);
+            }
         }
         let mut seen = HashSet::new();
         targets.retain(|target| seen.insert(target.0.clone()));
         targets
+    }
+
+    /// Exact source spellings justified by this compilation unit.
+    ///
+    /// This is alias expansion, not subtype inference: only a single-type
+    /// import or the declared package may equate a simple name with a
+    /// qualified one. Wildcard imports and arbitrary suffix matches are not
+    /// guessed. Array and varargs markers remain attached to the aliased base.
+    fn exact_type_spellings(scope: &JavaScope, argument: &str) -> Vec<String> {
+        let mut base = argument;
+        let mut suffix = String::new();
+        loop {
+            if let Some(stripped) = base.strip_suffix("[]") {
+                base = stripped;
+                suffix.insert_str(0, "[]");
+            } else if let Some(stripped) = base.strip_suffix("...") {
+                base = stripped;
+                suffix.insert_str(0, "...");
+            } else {
+                break;
+            }
+        }
+
+        let decorate = |name: &str| format!("{name}{suffix}");
+        let mut spellings = vec![argument.to_string()];
+        if matches!(
+            base,
+            "byte" | "short" | "char" | "int" | "long" | "float" | "double" | "boolean" | "void"
+        ) {
+            return spellings;
+        }
+        if !base.contains('.') {
+            if let Some(imported) = scope.single_type.get(base) {
+                spellings.push(decorate(&imported.join(".")));
+            } else if !scope.container.is_empty() && !scope.container.starts_with("module:") {
+                spellings.push(decorate(&format!("{}.{}", scope.container, base)));
+            }
+        } else if let Some(simple) = base.rsplit('.').next() {
+            let imported_here = scope
+                .single_type
+                .get(simple)
+                .is_some_and(|imported| imported.join(".") == base);
+            let package_local = !scope.container.is_empty()
+                && !scope.container.starts_with("module:")
+                && base
+                    .strip_suffix(simple)
+                    .is_some_and(|prefix| prefix.strip_suffix('.') == Some(&scope.container));
+            if imported_here || package_local {
+                spellings.push(decorate(simple));
+            }
+        }
+        spellings.sort();
+        spellings.dedup();
+        if let Some(at) = spellings.iter().position(|spelling| spelling == argument) {
+            spellings.swap(0, at);
+        }
+        spellings
     }
 
     fn push_strict_widening(argument: &str, targets: &mut Vec<(String, u8)>) {
@@ -2077,48 +2155,36 @@ impl JavaResolver {
             }
         }
         // 3 and 4: single-static-import owners, then static-import-on-demand
-        // owners (§7.5.3, §7.5.4).
-        let statics = scope
+        // owners (§7.5.3, §7.5.4). Each tier aggregates all of its matching
+        // owners, but an applicable group in tier 3 ends the search before
+        // tier 4 can contribute.
+        let single_statics = scope
             .single_static
             .iter()
             .filter(|(member, _)| member == name)
             .map(|(_, owner)| owner.clone())
-            .chain(scope.static_on_demand.iter().cloned());
-        let mut imported = Vec::new();
-        let mut imported_external = None;
-        let mut imported_ambiguous = false;
-        for segments in statics {
-            let owner = self.canonical_type(cfg, scope, &segments, p);
-            match &owner {
-                Owner::Outside(package) => {
-                    imported_external.get_or_insert_with(|| package.clone());
-                    continue;
-                }
-                Owner::Failed(_) => {
-                    unindexed = true;
-                    continue;
-                }
-                Owner::InRepo { .. } => {}
-            }
-            match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
-                Member::Found(id) => imported.push(id),
-                Member::Ambiguous => imported_ambiguous = true,
-                Member::Missing { unindexed: more } => unindexed |= more,
-            }
+            .collect::<Vec<_>>();
+        if let Some(outcome) = self.unqualified_import_tier(
+            cfg,
+            scope,
+            &single_statics,
+            &keys,
+            invocation.arguments,
+            &mut unindexed,
+            p,
+        ) {
+            return outcome;
         }
-        imported.sort_unstable();
-        imported.dedup();
-        if imported_ambiguous
-            || imported.len() > 1
-            || (!imported.is_empty() && imported_external.is_some())
-        {
-            return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
-        }
-        if let Some(id) = imported.into_iter().next() {
-            return Outcome::Resolved(id);
-        }
-        if let Some(package) = imported_external {
-            return Outcome::External(package);
+        if let Some(outcome) = self.unqualified_import_tier(
+            cfg,
+            scope,
+            &scope.static_on_demand,
+            &keys,
+            invocation.arguments,
+            &mut unindexed,
+            p,
+        ) {
+            return outcome;
         }
         if is_object_member(name, invocation.argc) {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
@@ -2128,6 +2194,55 @@ impl JavaResolver {
         } else {
             Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
         }
+    }
+
+    fn unqualified_import_tier(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        owners: &[Vec<String>],
+        keys: &[String],
+        arguments: Option<&[String]>,
+        unindexed: &mut bool,
+        p: &mut Probes<'_>,
+    ) -> Option<Outcome<NodeId, String>> {
+        let mut imported = Vec::new();
+        let mut imported_external = None;
+        let mut imported_ambiguous = false;
+        for segments in owners {
+            let owner = self.canonical_type(cfg, scope, segments, p);
+            match &owner {
+                Owner::Outside(package) => {
+                    imported_external.get_or_insert_with(|| package.clone());
+                    continue;
+                }
+                Owner::Failed(_) => {
+                    *unindexed = true;
+                    continue;
+                }
+                Owner::InRepo { .. } => {}
+            }
+            match self.lookup(cfg, scope, &owner, keys, arguments, p) {
+                Member::Found(id) => imported.push(id),
+                Member::Ambiguous => imported_ambiguous = true,
+                Member::Missing { unindexed: more } => *unindexed |= more,
+            }
+        }
+        imported.sort_unstable();
+        imported.dedup();
+        if imported_ambiguous
+            || imported.len() > 1
+            || (!imported.is_empty() && imported_external.is_some())
+        {
+            return Some(Outcome::Unresolved(UnresolvedReason::AmbiguousOverload));
+        }
+        if let Some(id) = imported.into_iter().next() {
+            return Some(Outcome::Resolved(id));
+        }
+        if let Some(package) = imported_external {
+            return Some(Outcome::External(package));
+        }
+        None
     }
 
     /// C-01, C-03, C-04: an object creation site names a constructor.

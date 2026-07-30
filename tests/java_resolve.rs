@@ -1260,6 +1260,19 @@ public class Refinement {
 }
 "#;
 
+const REFINEMENT_DECLARATIONS: &str = r#"package com.acme;
+public class Refinement {
+    static void typed(int value) {}
+    static void typed(String value) {}
+}
+"#;
+
+const REFINEMENT_CALLER: &str = r#"package com.acme;
+public class Use {
+    static void call() { Refinement.typed(1); }
+}
+"#;
+
 #[test]
 fn a_singleton_typed_call_preserves_its_c0_pin_identity() {
     let scan = scan(&[("com/acme/Refinement.java", REFINEMENT_SOURCE)]);
@@ -1348,60 +1361,91 @@ fn a_refined_row_records_the_union_of_legacy_and_typed_candidates() {
 
 #[test]
 fn every_recorded_overload_candidate_edit_wakes_the_refined_reference() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    fn hash(bytes: &[u8]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
     for (candidate, edited) in [
         (
             "com.acme#Refinement",
-            REFINEMENT_SOURCE.replace("public class Refinement", "public interface Refinement"),
+            REFINEMENT_DECLARATIONS.replace("class Refinement", "class Renamed"),
         ),
         (
             "com.acme#Refinement.typed/1",
-            REFINEMENT_SOURCE.replace(
-                "static void typed(String value) {}",
+            REFINEMENT_DECLARATIONS.replace("    static void typed(String value) {}\n", ""),
+        ),
+        (
+            "com.acme#Refinement.typed(int)",
+            REFINEMENT_DECLARATIONS.replace(
+                "static void typed(int value) {}",
                 "static void typed(boolean value) {}",
             ),
         ),
         (
-            "com.acme#Refinement.typed(int)",
-            REFINEMENT_SOURCE.replace(
-                "static void typed(int value) {}",
-                "static void typed(long value) {}",
-            ),
-        ),
-        (
             "com.acme#Refinement.typed(long)",
-            REFINEMENT_SOURCE.replace(
-                "static void typed(String value) {}",
-                "static void typed(long value) {}",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(long value) {}\n}\n",
             ),
         ),
         (
             "com.acme#Refinement.typed(float)",
-            REFINEMENT_SOURCE.replace(
-                "static void typed(String value) {}",
-                "static void typed(float value) {}",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(float value) {}\n}\n",
             ),
         ),
         (
             "com.acme#Refinement.typed(double)",
-            REFINEMENT_SOURCE.replace(
-                "static void typed(String value) {}",
-                "static void typed(double value) {}",
+            REFINEMENT_DECLARATIONS.replace(
+                "    static void typed(String value) {}\n}\n",
+                "    static void typed(String value) {}\n    static void typed(double value) {}\n}\n",
             ),
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let source = root.join("com/acme/Refinement.java");
-        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-        std::fs::write(&source, REFINEMENT_SOURCE).unwrap();
+        let definitions = root.join("com/acme/Refinement.java");
+        let caller = root.join("com/acme/Use.java");
+        std::fs::create_dir_all(definitions.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(caller.parent().unwrap()).unwrap();
+        std::fs::write(&definitions, REFINEMENT_DECLARATIONS).unwrap();
+        std::fs::write(&caller, REFINEMENT_CALLER).unwrap();
+        let caller_before = std::fs::read(&caller).unwrap();
+        let caller_hash_before = hash(&caller_before);
         let warm_db = root.join("warm.redb");
         scan_java(root, &warm_db).unwrap();
         let before = Store::open(&warm_db).unwrap().snapshot().unwrap();
         let row = before
             .rows
             .keys()
-            .find(|key| key.raw_target == "typed" && key.kind == RefKind::Call.code())
+            .find(|key| {
+                key.file == "com/acme/Use.java"
+                    && key.raw_target == "Refinement.typed"
+                    && key.kind == RefKind::Call.code()
+            })
             .unwrap();
+        let expected = [
+            "com.acme#Refinement",
+            "com.acme#Refinement.typed/1",
+            "com.acme#Refinement.typed(int)",
+            "com.acme#Refinement.typed(long)",
+            "com.acme#Refinement.typed(float)",
+            "com.acme#Refinement.typed(double)",
+        ]
+        .into_iter()
+        .map(|fqn| arthron::model::node_id(arthron::model::Domain::Jvm, fqn))
+        .collect::<std::collections::BTreeSet<_>>();
+        let recorded = before
+            .candidates
+            .iter()
+            .filter_map(|(id, rows)| rows.contains(row).then_some(*id))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(recorded, expected, "candidate set drifted before {candidate}");
         let candidate_id = arthron::model::node_id(arthron::model::Domain::Jvm, candidate);
         assert!(
             before
@@ -1411,7 +1455,18 @@ fn every_recorded_overload_candidate_edit_wakes_the_refined_reference() {
             "fixture did not record {candidate}",
         );
 
-        std::fs::write(&source, edited).unwrap();
+        std::fs::write(&definitions, edited).unwrap();
+        let caller_after = std::fs::read(&caller).unwrap();
+        assert_eq!(
+            caller_after,
+            caller_before,
+            "definition edit for {candidate} changed caller bytes",
+        );
+        assert_eq!(
+            hash(&caller_after),
+            caller_hash_before,
+            "definition edit for {candidate} changed caller hash",
+        );
         scan_java(root, &warm_db).unwrap();
         let warm = Store::open(&warm_db).unwrap().snapshot().unwrap();
         let cold_db = root.join("cold.redb");
@@ -1492,6 +1547,31 @@ public class Use { void call() { pick(1); } }
     let row = scan.row("pick", RefKind::Call);
     assert_eq!(row.outcome, "AmbiguousOverload");
     assert_eq!(row.key.arg_types, Some(vec!["int".to_string()]));
+}
+
+#[test]
+fn a_single_static_import_precedes_static_on_demand_imports() {
+    let scan = scan(&[
+        (
+            "com/acme/Left.java",
+            "package com.acme; public class Left { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Right.java",
+            "package com.acme; public class Right { public static void pick(int v) {} }",
+        ),
+        (
+            "com/acme/Use.java",
+            r#"package com.acme;
+import static com.acme.Left.pick;
+import static com.acme.Right.*;
+public class Use { void call() { pick(1); } }
+"#,
+        ),
+    ]);
+    let row = scan.row("pick", RefKind::Call);
+    assert_eq!(row.outcome, "RESOLVED com.acme#Left.pick/1");
+    assert_eq!(row.key.arg_types, None);
 }
 
 #[test]
@@ -1614,5 +1694,53 @@ public class Spellings {
     assert_eq!(
         scan.one("qualified", RefKind::Call),
         "RESOLVED com.acme#Spellings.qualified(java.lang.String)",
+    );
+}
+
+#[test]
+fn imported_source_type_simple_and_fqn_spellings_compare_canonically() {
+    let scan = scan(&[
+        (
+            "com/acme/Value.java",
+            "package com.acme; public class Value {}",
+        ),
+        (
+            "client/Spellings.java",
+            r#"package client;
+import com.acme.Value;
+public class Spellings {
+    static void simple(Value value) {} static void simple(Object value) {}
+    static void qualified(com.acme.Value value) {} static void qualified(Object value) {}
+    static void array(Value[] value) {} static void array(Object value) {}
+    static void varargs(Value... value) {} static void varargs(Object... value) {}
+    static void call(
+        com.acme.Value qualifiedValue,
+        Value simpleValue,
+        com.acme.Value[] qualifiedValues
+    ) {
+        simple(qualifiedValue);
+        qualified(simpleValue);
+        array(qualifiedValues);
+        varargs(qualifiedValues);
+    }
+}
+"#,
+        ),
+    ]);
+    assert_eq!(
+        scan.one("simple", RefKind::Call),
+        "RESOLVED client#Spellings.simple(Value)",
+    );
+    assert_eq!(
+        scan.one("qualified", RefKind::Call),
+        "RESOLVED client#Spellings.qualified(com.acme.Value)",
+    );
+    assert_eq!(
+        scan.one("array", RefKind::Call),
+        "RESOLVED client#Spellings.array(Value[])",
+    );
+    assert_eq!(
+        scan.one("varargs", RefKind::Call),
+        "RESOLVED client#Spellings.varargs(Value...)",
     );
 }
