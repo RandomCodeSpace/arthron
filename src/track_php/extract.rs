@@ -338,6 +338,7 @@ pub fn extract(rel_path: &str, source: &str) -> FileFacts<PhpLang> {
                         // no expression-level reference to be bound.
                         locally_bound: false,
                         argc: None,
+                        arg_types: None,
                         enclosing: Some(Encloser {
                             path: vec![ns.clone()],
                             kind: DefKind::Module,

@@ -18,10 +18,11 @@
 //!   declared but never called by the driver, so the `OVERLOAD`/`VARARGS`
 //!   multimap cannot be built. The arity key is therefore the definition's
 //!   *identity* whenever it is unique, and an ambiguous set is represented by
-//!   a [`DefKind::Alias`] node the extractor emits at the shared key. A probe
-//!   that lands on the alias reports `AmbiguousOverload`; one that misses has
-//!   found "not declared on this type" and may walk on. See
-//!   [`crate::track_java::fqn`].
+//!   a [`DefKind::Alias`] node the extractor emits at the shared key. Unique
+//!   callables keep that arity identity and expose their written parameter
+//!   shape through a forwarding signature alias. Typed applicability probes
+//!   signatures uniformly; an untyped probe that lands on the shared marker
+//!   still reports `AmbiguousOverload`. See [`crate::track_java::fqn`].
 //! * **The supertype closure is two facts, not one (H-01).** For a type the
 //!   file being resolved declares, `extends`/`implements` are a single-file
 //!   fact ([`TypeDecl`]) and the walk reads them straight off the scope. For
@@ -41,8 +42,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::lang::{
-    Entry, FileFacts, FileIndex, Language, LayoutError, Resolution, Resolver, Supertypes,
-    SymbolProbe,
+    Entry, FileFacts, FileIndex, Language, LayoutError, RefKeyRefinement, Resolution, Resolver,
+    Supertypes, SymbolProbe,
 };
 use crate::model::{
     DefFacets, DefKind, Definition, Fqn, NodeId, RefKind, Reference, TargetRoot, node_id,
@@ -397,6 +398,45 @@ struct Site<'a> {
     types: &'a [String],
     /// Byte offset of the reference.
     at: u32,
+}
+
+/// The overload-discriminating facts one invocation site states.
+#[derive(Debug, Clone, Copy)]
+struct Invocation<'a> {
+    /// Written argument count.
+    argc: Option<u32>,
+    /// Written argument types, when every one is file-local.
+    arguments: Option<&'a [String]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationPhase {
+    Strict,
+    Loose,
+    Varargs,
+}
+
+#[derive(Debug, Clone)]
+struct Applicable {
+    owner: String,
+    target: NodeId,
+    depths: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct TypedSite<'a> {
+    owner: &'a str,
+    local: Option<Vec<String>>,
+    name: &'a str,
+    arguments: &'a [String],
+}
+
+#[derive(Debug, Default)]
+struct Applicability {
+    candidates: Vec<Applicable>,
+    saw_member: bool,
+    unindexed: bool,
+    ambiguous: bool,
 }
 
 /// Every declaration one *member name* reaches on a type (I-04, C-08).
@@ -846,7 +886,34 @@ impl JavaResolver {
             }
             return self.declared_owner(cfg, scope, &bound, site, depth + 1, p);
         }
+        // Array members need array-member modeling. Do not pass an array
+        // spelling to ordinary type placement: its unsupported member stays
+        // `NeedsTypeInference` without changing the row key.
+        if Self::has_array_suffix(declared) {
+            return Owner::Failed(UnresolvedReason::NeedsTypeInference);
+        }
         self.canonical_type(cfg, scope, declared, p)
+    }
+
+    /// Whether a declared type carries one or more Java array suffixes.
+    /// This mirrors [`Self::exact_type_spellings`]'s suffix walk without
+    /// changing its alias-expansion behavior.
+    fn has_array_suffix(declared: &[String]) -> bool {
+        let Some(mut base) = declared.last().map(String::as_str) else {
+            return false;
+        };
+        let mut found = false;
+        loop {
+            if let Some(stripped) = base.strip_suffix("[]") {
+                base = stripped;
+                found = true;
+            } else if let Some(stripped) = base.strip_suffix("...") {
+                base = stripped;
+                found = true;
+            } else {
+                return found;
+            }
+        }
     }
 
     /// The greatest arity a *member-name* probe walks to.
@@ -1063,6 +1130,7 @@ impl JavaResolver {
         scope: &JavaScope,
         owner: &Owner,
         keys: &[String],
+        arguments: Option<&[String]>,
         p: &mut Probes<'_>,
     ) -> Member {
         let (fqn_start, local_start) = match owner {
@@ -1071,6 +1139,20 @@ impl JavaResolver {
                 return Member::Missing { unindexed: true };
             }
         };
+        if let Some(arguments) = arguments {
+            let name = keys[0].split('/').next().unwrap_or(&keys[0]);
+            return self.typed_lookup(
+                cfg,
+                scope,
+                TypedSite {
+                    owner: &fqn_start,
+                    local: local_start,
+                    name,
+                    arguments,
+                },
+                p,
+            );
+        }
         let mut unindexed = false;
         let mut seen: HashSet<String> = HashSet::new();
         let mut inherited: Vec<(String, NodeId)> = Vec::new();
@@ -1140,6 +1222,509 @@ impl JavaResolver {
             Some(id) => Member::Found(id),
             None => Member::Missing { unindexed },
         }
+    }
+
+    /// Apply JLS §15.12.2's strict, loose, then variable-arity phases to all
+    /// visible declarations on the receiver and its indexed supertypes.
+    fn typed_lookup(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        site: TypedSite<'_>,
+        p: &mut Probes<'_>,
+    ) -> Member {
+        let mut saw_member = false;
+        let mut unindexed = false;
+        for phase in [
+            InvocationPhase::Strict,
+            InvocationPhase::Loose,
+            InvocationPhase::Varargs,
+        ] {
+            let found = self.collect_applicable(cfg, scope, &site, phase, p);
+            saw_member |= found.saw_member;
+            unindexed |= found.unindexed;
+            if found.ambiguous {
+                return Member::Ambiguous;
+            }
+            if !found.candidates.is_empty() {
+                return self.select_applicable(found.candidates, p);
+            }
+        }
+        if saw_member {
+            Member::Ambiguous
+        } else {
+            Member::Missing { unindexed }
+        }
+    }
+
+    fn collect_applicable(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        site: &TypedSite<'_>,
+        phase: InvocationPhase,
+        p: &mut Probes<'_>,
+    ) -> Applicability {
+        let mut out = Applicability::default();
+        let mut seen = HashSet::new();
+        let mut queue = vec![(site.owner.to_string(), site.local.clone())];
+        while let Some((type_fqn, local)) = queue.pop() {
+            if !seen.insert(type_fqn.clone()) {
+                continue;
+            }
+            let shapes = match phase {
+                InvocationPhase::Strict | InvocationPhase::Loose => {
+                    let key = fqn::arity_key(site.name, site.arguments.len() as u32);
+                    let declaration = fqn::member_fqn(&type_fqn, &key);
+                    let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
+                    out.saw_member |= visible;
+                    let mut shapes = if visible {
+                        Self::fixed_signatures(scope, site.arguments, phase)
+                            .into_iter()
+                            .map(|(types, depths)| (types, depths, declaration.clone()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if !site.arguments.is_empty()
+                        && site.arguments.last().is_some_and(|ty| ty.ends_with("[]"))
+                    {
+                        let key = fqn::varargs_key(site.name, site.arguments.len() as u32 - 1);
+                        let varargs_declaration = fqn::member_fqn(&type_fqn, &key);
+                        let varargs_visible =
+                            Self::visible_member(&varargs_declaration, &type_fqn, site.owner, p);
+                        out.saw_member |= varargs_visible;
+                        if varargs_visible {
+                            let last = site.arguments.last().expect("nonempty checked above");
+                            for (types, depths) in Self::fixed_signatures(
+                                scope,
+                                &site.arguments[..site.arguments.len() - 1],
+                                phase,
+                            ) {
+                                for array in Self::exact_type_spellings(scope, last) {
+                                    let Some(component) = array.strip_suffix("[]") else {
+                                        continue;
+                                    };
+                                    let mut signature = types.clone();
+                                    signature.push(format!("{component}..."));
+                                    let mut ranks = depths.clone();
+                                    ranks.push(0);
+                                    shapes.push((signature, ranks, varargs_declaration.clone()));
+                                }
+                            }
+                        }
+                    }
+                    shapes
+                }
+                InvocationPhase::Varargs => {
+                    let mut shapes = Vec::new();
+                    for min in (0..=site.arguments.len() as u32).rev() {
+                        let key = fqn::varargs_key(site.name, min);
+                        let declaration = fqn::member_fqn(&type_fqn, &key);
+                        let visible = Self::visible_member(&declaration, &type_fqn, site.owner, p);
+                        out.saw_member |= visible;
+                        if visible {
+                            if min as usize == site.arguments.len() {
+                                for (prefix, depths) in Self::fixed_signatures(
+                                    scope,
+                                    site.arguments,
+                                    InvocationPhase::Loose,
+                                ) {
+                                    let prefix_fqn = fqn::member_fqn(
+                                        &type_fqn,
+                                        &fqn::varargs_prefix_key(site.name, &prefix),
+                                    );
+                                    match p.get(&prefix_fqn) {
+                                        Some(Entry::Alias { target }) => {
+                                            out.candidates.push(Applicable {
+                                                owner: type_fqn.clone(),
+                                                target,
+                                                depths,
+                                            });
+                                        }
+                                        Some(Entry::Definition {
+                                            kind: DefKind::Alias,
+                                            ..
+                                        }) => out.ambiguous = true,
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
+                            shapes.extend(
+                                Self::varargs_signatures(scope, site.arguments, min as usize)
+                                    .into_iter()
+                                    .map(|(types, depths)| (types, depths, declaration.clone())),
+                            );
+                        }
+                    }
+                    shapes
+                }
+            };
+            for (types, depths, declaration) in shapes {
+                let signature = fqn::signature_key(site.name, &types);
+                let signature_fqn = fqn::member_fqn(&type_fqn, &signature);
+                let Some(entry) = p.get(&signature_fqn) else {
+                    continue;
+                };
+                let target = match entry {
+                    Entry::Alias { target } => target,
+                    Entry::Definition {
+                        facets,
+                        kind: DefKind::Method | DefKind::Constructor,
+                    } if type_fqn == site.owner || !facets.contains(DefFacets::PRIVATE) => {
+                        node_id(JavaLang::DOMAIN, &signature_fqn)
+                    }
+                    _ => continue,
+                };
+                // A forwarding signature for a unique callable must point at
+                // the declaration key this phase discovered.
+                if matches!(entry, Entry::Alias { .. })
+                    && !matches!(p.get(&declaration), Some(Entry::Definition { .. }))
+                {
+                    continue;
+                }
+                out.candidates.push(Applicable {
+                    owner: type_fqn.clone(),
+                    target,
+                    depths,
+                });
+            }
+            if seen.len() >= Self::MAX_SUPERTYPES {
+                out.unindexed = true;
+                break;
+            }
+            let Some(path) = local else {
+                out.unindexed = true;
+                queue.extend(Self::indexed_supers(&type_fqn, p));
+                continue;
+            };
+            let Some(decl) = scope.supers.get(&path.join(&fqn::NEST.to_string())) else {
+                out.unindexed = true;
+                continue;
+            };
+            if decl.superclass.is_none() {
+                out.unindexed = true;
+            }
+            let supers = decl.interfaces.iter().chain(decl.superclass.iter());
+            for segments in supers {
+                match self.canonical_type(cfg, scope, segments, p) {
+                    Owner::InRepo { fqn, local } => queue.push((fqn, local)),
+                    _ => out.unindexed = true,
+                }
+            }
+        }
+        out
+    }
+
+    fn visible_member(
+        declaration: &str,
+        declaration_owner: &str,
+        start_owner: &str,
+        p: &mut Probes<'_>,
+    ) -> bool {
+        match p.get(declaration) {
+            Some(Entry::Definition { facets, .. })
+                if declaration_owner != start_owner && facets.contains(DefFacets::PRIVATE) =>
+            {
+                false
+            }
+            Some(Entry::Definition { .. }) => true,
+            _ => false,
+        }
+    }
+
+    fn fixed_signatures(
+        scope: &JavaScope,
+        arguments: &[String],
+        phase: InvocationPhase,
+    ) -> Vec<(Vec<String>, Vec<u8>)> {
+        let alternatives = arguments
+            .iter()
+            .map(|argument| Self::conversion_targets(scope, argument, phase))
+            .collect::<Vec<_>>();
+        Self::signature_product(&alternatives)
+    }
+
+    fn varargs_signatures(
+        scope: &JavaScope,
+        arguments: &[String],
+        min: usize,
+    ) -> Vec<(Vec<String>, Vec<u8>)> {
+        if min > arguments.len() || min == arguments.len() {
+            // With no repeated argument the component type is not present at
+            // the site, so this key is known but its applicability is not.
+            return Vec::new();
+        }
+        let options = arguments
+            .iter()
+            .map(|argument| Self::conversion_targets(scope, argument, InvocationPhase::Loose))
+            .collect::<Vec<_>>();
+        let prefixes = Self::signature_product(&options[..min]);
+        let mut common: HashMap<String, Vec<u8>> = HashMap::new();
+        for (ty, depth) in &options[min] {
+            common.insert(ty.clone(), vec![*depth]);
+        }
+        for choices in &options[min + 1..] {
+            common.retain(|ty, depths| {
+                let Some((_, depth)) = choices.iter().find(|(candidate, _)| candidate == ty) else {
+                    return false;
+                };
+                depths.push(*depth);
+                true
+            });
+        }
+        let mut out = Vec::new();
+        for (prefix_types, prefix_depths) in prefixes {
+            for (component, tail_depths) in &common {
+                if out.len() >= 64 {
+                    return Vec::new();
+                }
+                let mut types = prefix_types.clone();
+                types.push(format!("{component}..."));
+                let mut depths = prefix_depths.clone();
+                depths.extend(tail_depths);
+                out.push((types, depths));
+            }
+        }
+        out
+    }
+
+    fn signature_product(alternatives: &[Vec<(String, u8)>]) -> Vec<(Vec<String>, Vec<u8>)> {
+        let mut signatures = vec![(Vec::new(), Vec::new())];
+        for choices in alternatives {
+            let mut next = Vec::new();
+            for (prefix, depths) in &signatures {
+                for (choice, depth) in choices {
+                    if next.len() >= 64 {
+                        return Vec::new();
+                    }
+                    let mut signature = prefix.clone();
+                    signature.push(choice.clone());
+                    let mut ranks = depths.clone();
+                    ranks.push(*depth);
+                    next.push((signature, ranks));
+                }
+            }
+            signatures = next;
+        }
+        signatures
+    }
+
+    /// The fixture-proven conversion surface. No user-defined subtype is
+    /// guessed: only primitive widening, boxing, unboxing plus widening, and
+    /// the built-in wrapper-to-`Number`/`Object` chains are represented.
+    fn conversion_targets(
+        scope: &JavaScope,
+        argument: &str,
+        phase: InvocationPhase,
+    ) -> Vec<(String, u8)> {
+        let mut targets = Vec::new();
+        for spelling in Self::exact_type_spellings(scope, argument) {
+            let simple = spelling
+                .strip_prefix("java.lang.")
+                .filter(|name| JAVA_LANG.binary_search(name).is_ok())
+                .unwrap_or(&spelling);
+            targets.push((simple.to_string(), 0));
+            if simple != spelling {
+                targets.push((spelling.clone(), 0));
+            } else if JAVA_LANG.binary_search(&simple).is_ok() {
+                targets.push((format!("java.lang.{simple}"), 0));
+            }
+            Self::push_strict_widening(simple, &mut targets);
+            if phase != InvocationPhase::Strict {
+                Self::push_loose_conversions(simple, &mut targets);
+            }
+        }
+        let mut seen = HashSet::new();
+        targets.retain(|target| seen.insert(target.0.clone()));
+        targets
+    }
+
+    /// Exact source spellings justified by this compilation unit.
+    ///
+    /// This is alias expansion, not subtype inference: only a single-type
+    /// import or the declared package may equate a simple name with a
+    /// qualified one. Wildcard imports and arbitrary suffix matches are not
+    /// guessed. Array and varargs markers remain attached to the aliased base.
+    fn exact_type_spellings(scope: &JavaScope, argument: &str) -> Vec<String> {
+        let mut base = argument;
+        let mut suffix = String::new();
+        loop {
+            if let Some(stripped) = base.strip_suffix("[]") {
+                base = stripped;
+                suffix.insert_str(0, "[]");
+            } else if let Some(stripped) = base.strip_suffix("...") {
+                base = stripped;
+                suffix.insert_str(0, "...");
+            } else {
+                break;
+            }
+        }
+
+        let decorate = |name: &str| format!("{name}{suffix}");
+        let mut spellings = vec![argument.to_string()];
+        if matches!(
+            base,
+            "byte" | "short" | "char" | "int" | "long" | "float" | "double" | "boolean" | "void"
+        ) {
+            return spellings;
+        }
+        if !base.contains('.') {
+            if let Some(imported) = scope.single_type.get(base) {
+                spellings.push(decorate(&imported.join(".")));
+            } else if !scope.container.is_empty() && !scope.container.starts_with("module:") {
+                spellings.push(decorate(&format!("{}.{}", scope.container, base)));
+            }
+        } else if let Some(simple) = base.rsplit('.').next() {
+            let imported_here = scope
+                .single_type
+                .get(simple)
+                .is_some_and(|imported| imported.join(".") == base);
+            let package_local = !scope.container.is_empty()
+                && !scope.container.starts_with("module:")
+                && base
+                    .strip_suffix(simple)
+                    .is_some_and(|prefix| prefix.strip_suffix('.') == Some(&scope.container));
+            if imported_here || package_local {
+                spellings.push(decorate(simple));
+            }
+        }
+        spellings.sort();
+        spellings.dedup();
+        if let Some(at) = spellings.iter().position(|spelling| spelling == argument) {
+            spellings.swap(0, at);
+        }
+        spellings
+    }
+
+    fn push_strict_widening(argument: &str, targets: &mut Vec<(String, u8)>) {
+        let primitive: &[&str] = match argument {
+            "byte" => &["short", "int", "long", "float", "double"],
+            "short" | "char" => &["int", "long", "float", "double"],
+            "int" => &["long", "float", "double"],
+            "long" => &["float", "double"],
+            "float" => &["double"],
+            _ => &[],
+        };
+        targets.extend(
+            primitive
+                .iter()
+                .enumerate()
+                .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 1)),
+        );
+        let references: &[&str] = match argument {
+            "Byte" | "Short" | "Integer" | "Long" | "Float" | "Double" => &["Number", "Object"],
+            "Number" | "Character" | "Boolean" => &["Object"],
+            _ => &[],
+        };
+        targets.extend(
+            references
+                .iter()
+                .enumerate()
+                .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 1)),
+        );
+    }
+
+    fn push_loose_conversions(argument: &str, targets: &mut Vec<(String, u8)>) {
+        let boxed = match argument {
+            "byte" => Some("Byte"),
+            "short" => Some("Short"),
+            "char" => Some("Character"),
+            "int" => Some("Integer"),
+            "long" => Some("Long"),
+            "float" => Some("Float"),
+            "double" => Some("Double"),
+            "boolean" => Some("Boolean"),
+            _ => None,
+        };
+        if let Some(wrapper) = boxed {
+            targets.push((wrapper.to_string(), 1));
+            let chain: &[&str] = match wrapper {
+                "Byte" | "Short" | "Integer" | "Long" | "Float" | "Double" => &["Number", "Object"],
+                _ => &["Object"],
+            };
+            targets.extend(
+                chain
+                    .iter()
+                    .enumerate()
+                    .map(|(depth, ty)| ((*ty).to_string(), depth as u8 + 2)),
+            );
+        }
+        let unboxed = match argument {
+            "Byte" => Some("byte"),
+            "Short" => Some("short"),
+            "Character" => Some("char"),
+            "Integer" => Some("int"),
+            "Long" => Some("long"),
+            "Float" => Some("float"),
+            "Double" => Some("double"),
+            "Boolean" => Some("boolean"),
+            _ => None,
+        };
+        if let Some(primitive) = unboxed {
+            targets.push((primitive.to_string(), 1));
+            let mut widening = Vec::new();
+            Self::push_strict_widening(primitive, &mut widening);
+            targets.extend(
+                widening
+                    .into_iter()
+                    .filter(|(ty, _)| ty != primitive)
+                    .map(|(ty, depth)| (ty, depth + 1)),
+            );
+        }
+    }
+
+    fn select_applicable(&self, candidates: Vec<Applicable>, p: &mut Probes<'_>) -> Member {
+        let mut unique: Vec<Applicable> = Vec::new();
+        for candidate in candidates {
+            if let Some(held) = unique
+                .iter_mut()
+                .find(|held| held.target == candidate.target)
+            {
+                if Self::depths_dominate(&candidate.depths, &held.depths) {
+                    *held = candidate;
+                }
+            } else {
+                unique.push(candidate);
+            }
+        }
+        let survivors = unique
+            .iter()
+            .filter(|candidate| {
+                !unique.iter().any(|other| {
+                    other.target != candidate.target
+                        && Self::depths_dominate(&other.depths, &candidate.depths)
+                })
+            })
+            .collect::<Vec<_>>();
+        let concrete = survivors
+            .iter()
+            .copied()
+            .filter(|candidate| !Self::declares_interface(&candidate.owner, p))
+            .collect::<Vec<_>>();
+        let ranked = if concrete.is_empty() {
+            survivors
+        } else {
+            concrete
+        };
+        if let [only] = ranked.as_slice() {
+            return Member::Found(only.target);
+        }
+        let owner_winner = ranked.iter().find(|candidate| {
+            ranked.iter().all(|other| {
+                candidate.target == other.target
+                    || (candidate.owner != other.owner
+                        && Self::reaches_supertype(&candidate.owner, &other.owner, p))
+            })
+        });
+        owner_winner.map_or(Member::Ambiguous, |winner| Member::Found(winner.target))
+    }
+
+    fn depths_dominate(left: &[u8], right: &[u8]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| left <= right)
+            && left.iter().zip(right).any(|(left, right)| left < right)
     }
 
     /// The one interface declaration a class actually inherits (§9.4.1).
@@ -1217,19 +1802,19 @@ impl JavaResolver {
         scope: &JavaScope,
         owner: Owner,
         name: &str,
-        argc: Option<u32>,
+        invocation: Invocation<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
         match owner {
             Owner::Failed(reason) => Outcome::Unresolved(reason),
             Owner::Outside(package) => Outcome::External(package),
             owner @ Owner::InRepo { .. } => {
-                let keys = Self::member_keys(name, argc);
-                match self.lookup(cfg, scope, &owner, &keys, p) {
+                let keys = Self::member_keys(name, invocation.argc);
+                match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
                     Member::Found(id) => Outcome::Resolved(id),
                     Member::Ambiguous => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
                     Member::Missing { unindexed } => {
-                        if is_object_member(name, argc) {
+                        if is_object_member(name, invocation.argc) {
                             // Every class inherits it (§4.3.2), and `Object`
                             // is never a definition in this repository.
                             Outcome::External(JAVA_LANG_PACKAGE.to_string())
@@ -1262,6 +1847,7 @@ impl JavaResolver {
         scope: &JavaScope,
         frame: &ErasedType,
         keys: &[String],
+        arguments: Option<&[String]>,
         p: &mut Probes<'_>,
     ) -> FrameMember {
         if keys.iter().any(|key| frame.members.contains(key)) {
@@ -1277,7 +1863,7 @@ impl JavaResolver {
                 unindexed = true;
                 continue;
             }
-            match self.lookup(cfg, scope, &owner, keys, p) {
+            match self.lookup(cfg, scope, &owner, keys, arguments, p) {
                 Member::Found(id) => return FrameMember::Found(id),
                 Member::Ambiguous => return FrameMember::Ambiguous,
                 Member::Missing { unindexed: more } => unindexed |= more,
@@ -1372,6 +1958,11 @@ impl JavaResolver {
             types: &enclosing,
             at: r.span.byte_start,
         };
+        let arguments = r.arg_types.as_deref();
+        let invocation = Invocation {
+            argc: r.argc,
+            arguments,
+        };
         let segments = &r.target.segments;
 
         // C-03: `this(…)` and `super(…)` name a constructor exactly, and
@@ -1403,7 +1994,7 @@ impl JavaResolver {
                     && let Some(frame) = scope.erased_at(site.at).first()
                 {
                     let keys = Self::member_keys(name, argc);
-                    let found = self.frame_lookup(cfg, scope, frame, &keys, p);
+                    let found = self.frame_lookup(cfg, scope, frame, &keys, arguments, p);
                     return self.frame_outcome(found, name, argc, false);
                 }
                 let path = self.this_path(scope, outer, site.types);
@@ -1422,7 +2013,7 @@ impl JavaResolver {
                 // N-02: an unqualified invocation. §6.5.1 makes a bare
                 // `m(…)` a MethodName and nothing else, so no local can
                 // shadow it and the search is purely the enclosing chain.
-                return self.unqualified(cfg, scope, name, argc, site, p);
+                return self.unqualified(cfg, scope, name, invocation, site, p);
             }
             TargetRoot::Name => {
                 let (owner, consumed) = self.qualifier(cfg, scope, qualifier, site, p);
@@ -1460,7 +2051,7 @@ impl JavaResolver {
                 return Outcome::Unresolved(UnresolvedReason::NeedsTypeInference);
             };
             let owner = self.declared_owner(cfg, scope, &declared, site.at, 0, p);
-            return self.select(cfg, scope, owner, name, argc, p);
+            return self.select(cfg, scope, owner, name, invocation, p);
         }
         if r.kind == RefKind::MethodRef {
             // C-08 / X-05: the overload is chosen by the target
@@ -1477,7 +2068,7 @@ impl JavaResolver {
                 }
             };
         }
-        self.select(cfg, scope, owner, name, argc, p)
+        self.select(cfg, scope, owner, name, invocation, p)
     }
 
     /// The type path a `this` or `Outer.this` names (§15.8.4).
@@ -1535,11 +2126,11 @@ impl JavaResolver {
         cfg: &JavaConfig,
         scope: &JavaScope,
         name: &str,
-        argc: Option<u32>,
+        invocation: Invocation<'_>,
         site: Site<'_>,
         p: &mut Probes<'_>,
     ) -> Outcome<NodeId, String> {
-        let keys = Self::member_keys(name, argc);
+        let keys = Self::member_keys(name, invocation.argc);
         let enclosing = site.types;
         let mut unindexed = enclosing.is_empty();
         // 0: the erased type frames the site sits in, innermost first. They
@@ -1547,7 +2138,7 @@ impl JavaResolver {
         // outside them, and they are not in `enclosing` because they are not
         // nodes (T-03..T-05).
         for frame in scope.erased_at(site.at) {
-            match self.frame_lookup(cfg, scope, frame, &keys, p) {
+            match self.frame_lookup(cfg, scope, frame, &keys, invocation.arguments, p) {
                 FrameMember::Own => {
                     return Outcome::Unresolved(UnresolvedReason::LocalBinding);
                 }
@@ -1567,7 +2158,7 @@ impl JavaResolver {
                         return self.frame_outcome(
                             FrameMember::Missing { unindexed: more },
                             name,
-                            argc,
+                            invocation.argc,
                             unindexed,
                         );
                     }
@@ -1582,7 +2173,7 @@ impl JavaResolver {
                 unindexed = true;
                 continue;
             };
-            match self.lookup(cfg, scope, &owner, &keys, p) {
+            match self.lookup(cfg, scope, &owner, &keys, invocation.arguments, p) {
                 Member::Found(id) => return Outcome::Resolved(id),
                 Member::Ambiguous => {
                     return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
@@ -1591,32 +2182,38 @@ impl JavaResolver {
             }
         }
         // 3 and 4: single-static-import owners, then static-import-on-demand
-        // owners (§7.5.3, §7.5.4).
-        let statics = scope
+        // owners (§7.5.3, §7.5.4). Each tier aggregates all of its matching
+        // owners, but an applicable group in tier 3 ends the search before
+        // tier 4 can contribute.
+        let single_statics = scope
             .single_static
             .iter()
             .filter(|(member, _)| member == name)
             .map(|(_, owner)| owner.clone())
-            .chain(scope.static_on_demand.iter().cloned());
-        for segments in statics {
-            let owner = self.canonical_type(cfg, scope, &segments, p);
-            match &owner {
-                Owner::Outside(package) => return Outcome::External(package.clone()),
-                Owner::Failed(_) => {
-                    unindexed = true;
-                    continue;
-                }
-                Owner::InRepo { .. } => {}
-            }
-            match self.lookup(cfg, scope, &owner, &keys, p) {
-                Member::Found(id) => return Outcome::Resolved(id),
-                Member::Ambiguous => {
-                    return Outcome::Unresolved(UnresolvedReason::AmbiguousOverload);
-                }
-                Member::Missing { unindexed: more } => unindexed |= more,
-            }
+            .collect::<Vec<_>>();
+        if let Some(outcome) = self.unqualified_import_tier(
+            cfg,
+            scope,
+            &single_statics,
+            &keys,
+            invocation.arguments,
+            &mut unindexed,
+            p,
+        ) {
+            return outcome;
         }
-        if is_object_member(name, argc) {
+        if let Some(outcome) = self.unqualified_import_tier(
+            cfg,
+            scope,
+            &scope.static_on_demand,
+            &keys,
+            invocation.arguments,
+            &mut unindexed,
+            p,
+        ) {
+            return outcome;
+        }
+        if is_object_member(name, invocation.argc) {
             return Outcome::External(JAVA_LANG_PACKAGE.to_string());
         }
         if unindexed {
@@ -1624,6 +2221,56 @@ impl JavaResolver {
         } else {
             Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition)
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unqualified_import_tier(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        owners: &[Vec<String>],
+        keys: &[String],
+        arguments: Option<&[String]>,
+        unindexed: &mut bool,
+        p: &mut Probes<'_>,
+    ) -> Option<Outcome<NodeId, String>> {
+        let mut imported = Vec::new();
+        let mut imported_external = None;
+        let mut imported_ambiguous = false;
+        for segments in owners {
+            let owner = self.canonical_type(cfg, scope, segments, p);
+            match &owner {
+                Owner::Outside(package) => {
+                    imported_external.get_or_insert_with(|| package.clone());
+                    continue;
+                }
+                Owner::Failed(_) => {
+                    *unindexed = true;
+                    continue;
+                }
+                Owner::InRepo { .. } => {}
+            }
+            match self.lookup(cfg, scope, &owner, keys, arguments, p) {
+                Member::Found(id) => imported.push(id),
+                Member::Ambiguous => imported_ambiguous = true,
+                Member::Missing { unindexed: more } => *unindexed |= more,
+            }
+        }
+        imported.sort_unstable();
+        imported.dedup();
+        if imported_ambiguous
+            || imported.len() > 1
+            || (!imported.is_empty() && imported_external.is_some())
+        {
+            return Some(Outcome::Unresolved(UnresolvedReason::AmbiguousOverload));
+        }
+        if let Some(id) = imported.into_iter().next() {
+            return Some(Outcome::Resolved(id));
+        }
+        if let Some(package) = imported_external {
+            return Some(Outcome::External(package));
+        }
+        None
     }
 
     /// C-01, C-03, C-04: an object creation site names a constructor.
@@ -1688,7 +2335,17 @@ impl JavaResolver {
             .anonymous_body_at(r.span.byte_start, r.span.byte_end)
             .is_some()
             && self.interface_owner(&owner, p);
-        let settled = self.select(cfg, scope, owner, fqn::INIT, r.argc, p);
+        let settled = self.select(
+            cfg,
+            scope,
+            owner,
+            fqn::INIT,
+            Invocation {
+                argc: r.argc,
+                arguments: r.arg_types.as_deref(),
+            },
+            p,
+        );
         if on_interface
             && matches!(
                 settled,
@@ -1844,6 +2501,53 @@ fn build_scope(cfg: &JavaConfig, file: &FileFacts<JavaLang>) -> JavaScope {
     scope
 }
 
+impl JavaResolver {
+    /// Resolve with exactly the argument facts carried by `r`.
+    ///
+    /// Ordinary resolution passes an untyped clone. The key-refinement hook
+    /// calls this a second time only after that legacy pass reports overload
+    /// ambiguity.
+    fn resolve_dispatch(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> Resolution {
+        let mut p = Probes {
+            table: probe,
+            seen: Vec::new(),
+        };
+        if r.locally_bound {
+            return Resolution {
+                outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
+                candidates: Vec::new(),
+            };
+        }
+        let outcome = match r.kind {
+            RefKind::Import => self.resolve_import(cfg, scope, r, &mut p),
+            RefKind::Export => {
+                let dotted = r.target.segments.join(".");
+                match p.get(&dotted) {
+                    Some(Entry::Container) => Outcome::Resolved(node_id(JavaLang::DOMAIN, &dotted)),
+                    _ => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+                }
+            }
+            RefKind::TypeUse | RefKind::Inherit | RefKind::Annotation => {
+                self.resolve_type_ref(cfg, scope, r, &mut p)
+            }
+            RefKind::Call | RefKind::New | RefKind::FieldAccess | RefKind::MethodRef => {
+                self.resolve_member_ref(cfg, scope, r, &mut p)
+            }
+            RefKind::Rebind => Outcome::Unresolved(UnresolvedReason::DynamicDispatch),
+        };
+        Resolution {
+            outcome,
+            candidates: p.seen,
+        }
+    }
+}
+
 impl Resolver<JavaLang> for JavaResolver {
     /// Phase 0 never fails for Java. B-04: there may be no parseable
     /// manifest at all, so requiring one would make every Gradle project a
@@ -1858,6 +2562,10 @@ impl Resolver<JavaLang> for JavaResolver {
     /// fingerprint on every scan and wipe the graph each time.
     fn config_digest(&self, _cfg: &JavaConfig) -> Vec<u8> {
         Vec::new()
+    }
+
+    fn graph_revision(&self) -> u64 {
+        1
     }
 
     /// P-01: the container a file decides the name of is the one it
@@ -1942,6 +2650,38 @@ impl Resolver<JavaLang> for JavaResolver {
         }
     }
 
+    /// A synthetic full-signature identity for a unique callable forwards to
+    /// its established arity identity. Overload-set aliases carry an arity
+    /// name and intentionally forward nowhere.
+    fn def_alias_targets(
+        &self,
+        _cfg: &JavaConfig,
+        header: &JavaHeader,
+        def: &Definition,
+        _probe: &dyn SymbolProbe,
+    ) -> Vec<Fqn> {
+        if def.kind != DefKind::Alias || !def.name.contains('(') {
+            return Vec::new();
+        }
+        let owner = fqn::type_fqn(
+            &fqn::container(
+                header.package.as_deref().unwrap_or(""),
+                header.module.as_deref(),
+            ),
+            &def.owner,
+        );
+        if let Some(name) = fqn::varargs_prefix_name(&def.name) {
+            return def.params.as_ref().map_or_else(Vec::new, |params| {
+                vec![Fqn::new(fqn::member_fqn(
+                    &owner,
+                    &fqn::signature_key(name, &params.types),
+                ))]
+            });
+        }
+        let callable = fqn::callable_of(def);
+        vec![Fqn::new(fqn::member_fqn(&owner, &callable.key()))]
+    }
+
     /// Empty: the driver never calls this, and Java's arity key is part of
     /// the FQN rather than a second index beside it. See the module docs.
     fn index_keys(&self, _cfg: &JavaConfig, _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
@@ -1986,72 +2726,66 @@ impl Resolver<JavaLang> for JavaResolver {
         r: &Reference,
         probe: &dyn SymbolProbe,
     ) -> Resolution {
-        let mut p = Probes {
-            table: probe,
-            seen: Vec::new(),
-        };
-        // The uniform root-binding rule, written down on
-        // [`UnresolvedReason::LocalBinding`] and read the same way by all four
-        // tier-1 tracks: a reference whose leftmost segment some enclosing
-        // *non-node* region binds is a `LocalBinding`, however long the member
-        // path after it — `T`, a local class, `f.m()` and `f.x.y` alike.
-        //
-        // Depth used to matter here, and that was the divergence this closes.
-        // `f.m()` was answered by X-02's declared-type lookup and counted as
-        // `resolved`, while Go, TypeScript and JavaScript had already taken
-        // the identical shape out of both rate terms — so Java's rate and
-        // Go's were computed over differently-sized denominators and could
-        // not be compared.
-        //
-        // What it costs is real and is not hidden: X-02 had *found* many of
-        // these. 5,374 commons-lang and 3,189 gson occurrences were
-        // `Resolved` to a node this store still holds — `TypeTestClass.field`
-        // has an FQN and is nameable from anywhere — and they are edges the
-        // graph no longer carries. The claim the reason makes is the narrower
-        // one on [`UnresolvedReason::LocalBinding`]: not that the target is
-        // unnameable, but that reaching it needs the type of a binding no
-        // other file can see, so the reference is not evidence about
-        // cross-file linking either way. `CHANGELOG.md` states the per-corpus
-        // counts.
-        //
-        // Three things this deliberately is not. A *field* is a node
-        // (`BindingKind::is_local` is false for one), so `field.m()` still
-        // resolves through the declared-type lookup; `this.m()` is a receiver,
-        // never a bound name, and stays in both terms exactly as Go's
-        // `t.m()` and Python's `self.m()` do; and §6.5.1 makes a bare `foo()`
-        // a MethodName no local can shadow, which the extractor answers
-        // before the flag is ever set. All three are visibility questions,
-        // and visibility stays per language: the policy is uniform about
-        // which *positions* bind, not about how each language computes scope.
-        if r.locally_bound {
-            return Resolution {
-                outcome: Outcome::Unresolved(UnresolvedReason::LocalBinding),
-                candidates: Vec::new(),
-            };
+        let mut legacy = r.clone();
+        legacy.arg_types = None;
+        self.resolve_dispatch(cfg, scope, &legacy, probe)
+    }
+
+    fn resolve_with_key_refinement(
+        &self,
+        cfg: &JavaConfig,
+        scope: &JavaScope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> (Resolution, RefKeyRefinement) {
+        let legacy = self.resolve(cfg, scope, r, probe);
+        if !matches!(
+            legacy.outcome,
+            Outcome::Unresolved(UnresolvedReason::AmbiguousOverload)
+        ) {
+            return (legacy, RefKeyRefinement::None);
         }
-        let outcome = match r.kind {
-            RefKind::Import => self.resolve_import(cfg, scope, r, &mut p),
-            RefKind::Export => {
-                // §7.7.2: a module exports one of its own packages.
-                let dotted = r.target.segments.join(".");
-                match p.get(&dotted) {
-                    Some(Entry::Container) => Outcome::Resolved(node_id(JavaLang::DOMAIN, &dotted)),
-                    _ => Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
-                }
-            }
-            RefKind::TypeUse | RefKind::Inherit | RefKind::Annotation => {
-                self.resolve_type_ref(cfg, scope, r, &mut p)
-            }
-            RefKind::Call | RefKind::New | RefKind::FieldAccess | RefKind::MethodRef => {
-                self.resolve_member_ref(cfg, scope, r, &mut p)
-            }
-            // The Java extractor emits none: nothing in Java rebinds a name
-            // at a site the way a monkeypatch does.
-            RefKind::Rebind => Outcome::Unresolved(UnresolvedReason::DynamicDispatch),
+        let Some(arguments) = r.arg_types.clone() else {
+            return (legacy, RefKeyRefinement::None);
         };
-        Resolution {
-            outcome,
-            candidates: p.seen,
+        let typed = self.resolve_dispatch(cfg, scope, r, probe);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for candidate in legacy.candidates.into_iter().chain(typed.candidates) {
+            if seen.insert(candidate) {
+                candidates.push(candidate);
+            }
         }
+        let outcome = match typed.outcome {
+            Outcome::Resolved(id) => Outcome::Resolved(id),
+            Outcome::Unresolved(UnresolvedReason::AmbiguousOverload) => {
+                Outcome::Unresolved(UnresolvedReason::AmbiguousOverload)
+            }
+            _ => Outcome::Unresolved(UnresolvedReason::AmbiguousOverload),
+        };
+        (
+            Resolution {
+                outcome,
+                candidates,
+            },
+            RefKeyRefinement::ArgumentTypes(arguments),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JavaResolver;
+
+    #[test]
+    fn array_suffix_guard_recognizes_varargs_and_repeated_dimensions() {
+        let spelling = |name: &str| vec![name.to_string()];
+
+        assert!(JavaResolver::has_array_suffix(&spelling("String...")));
+        assert!(JavaResolver::has_array_suffix(&spelling("T[][]")));
+        assert!(!JavaResolver::has_array_suffix(&spelling("String")));
+        assert!(!JavaResolver::has_array_suffix(&spelling(
+            "java.lang.String"
+        )));
     }
 }

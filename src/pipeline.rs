@@ -39,14 +39,16 @@ use crate::Outcome;
 use crate::config::{CONFIG_FILE, Config, FileFilter};
 use crate::extract_go::GoExtractor;
 use crate::lang::{
-    Entry, Extractor, FileFacts, FileIndex, Language, Resolution, Resolver, Supertypes, SymbolProbe,
+    Entry, Extractor, FileFacts, FileIndex, Language, RefKeyRefinement, Resolution, Resolver,
+    Supertypes, SymbolProbe,
 };
 use crate::model::{DefKind, Definition, Fqn, NodeId, RefKind, Reference, node_id, reason_code};
 use crate::registry::REGISTRY;
 use crate::resolve_go::{GoLang, GoResolver};
 use crate::store::{
-    DeclSite, DefBatch, FileDefs, FileError, FileRefs, FileSupers, NodePayload, NodeRecord,
-    RefBatch, RefKey, RefRecord, Report, Store, StoredOutcome, SuperBatch, SuperRecord,
+    CollisionDisposition, DeclSite, DefBatch, FileDefs, FileError, FileRefs, FileSupers,
+    NodePayload, NodeRecord, RefBatch, RefKey, RefRecord, Report, Store, StoredDefinition,
+    StoredOutcome, SuperBatch, SuperRecord,
 };
 
 /// Files a phase writes in one transaction.
@@ -66,6 +68,21 @@ use crate::store::{
 /// depends on the number — a file's facts are applied in the same order at
 /// any batch size — only the memory and the transaction count do.
 const BATCH_FILES: usize = 500;
+
+/// Combine a language's manifest fingerprint with its graph-semantics
+/// revision without changing the established revision-zero bytes.
+fn graph_fence_digest(manifest_digest: &[u8], graph_revision: u64) -> Vec<u8> {
+    if graph_revision == 0 {
+        return manifest_digest.to_vec();
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"arthron\0graph-revision-fence\0v1\0");
+    hasher.update(&(manifest_digest.len() as u64).to_le_bytes());
+    hasher.update(manifest_digest);
+    hasher.update(&graph_revision.to_le_bytes());
+    hasher.finalize().as_bytes().to_vec()
+}
 
 /// One file this event re-reads: its identity, and the half of its facts
 /// small enough to keep.
@@ -291,7 +308,9 @@ pub fn scan<L: Language>(
     // every identity in the graph. Fingerprinting it *before* the config
     // learns anything from the store is what keeps the comparison about the
     // project rather than about what the last scan happened to know.
-    store.fence_config(L::LANG, &rs.config_digest(&cfg))?;
+    let manifest_digest = rs.config_digest(&cfg);
+    let fence_digest = graph_fence_digest(&manifest_digest, rs.graph_revision());
+    store.fence_config(L::LANG, &fence_digest)?;
 
     // Every container name the store already holds. Binding an unaliased
     // import needs a fact out of the *imported* container's source, so a
@@ -387,6 +406,7 @@ pub fn scan<L: Language>(
     let mut event_paths: Vec<String> = changed.iter().map(|f| f.rel_path.clone()).collect();
     event_paths.extend(deleted.iter().cloned());
     let declared_before = store.declared_nodes(&event_paths)?;
+    let deleted_before = store.declared_nodes(&deleted)?;
     // The other half of what an identity means, read at the same moment and
     // for the same reason: a type whose supertypes move changes what every
     // member lookup below it reaches, while the type's own id and payload sit
@@ -405,7 +425,14 @@ pub fn scan<L: Language>(
     // about a file a completed scan claims everything about — and the next
     // scan would re-read it for nothing. Collected across every phase and
     // folded into the two waking rounds below.
-    let mut invalidated: BTreeSet<String> = store.forget_files(&deleted)?;
+    let deleted_ids: BTreeSet<NodeId> = deleted_before.keys().copied().collect();
+    let deleted_paths: BTreeSet<String> = deleted.iter().cloned().collect();
+    let mut invalidated = store.declaration_files(&deleted_ids, &deleted_paths)?;
+    // A deletion can change a collision disposition without applying a
+    // definition half for any survivor. Withdraw those survivors first, so
+    // an interruption cannot present the old disposition as current.
+    store.forget_hashes(&invalidated.iter().cloned().collect::<Vec<_>>())?;
+    invalidated.extend(store.forget_files(&deleted)?);
 
     // Phase 1: definition and container nodes for the changed set.
     //
@@ -415,9 +442,6 @@ pub fn scan<L: Language>(
     // batch a file lands in decides nothing, and the graph a batched phase
     // leaves is the graph a single transaction left.
     let probe = store.symbol_entries()?;
-    // The definitions this event declared, by identity. Two of them under
-    // one identity is the only case the language can be asked about.
-    let mut event_defs: HashMap<NodeId, Vec<Definition>> = HashMap::new();
     let mut def_batch = DefBatch {
         files: Vec::with_capacity(BATCH_FILES),
     };
@@ -431,7 +455,7 @@ pub fn scan<L: Language>(
     // read from.
     let mut declared_now: BTreeMap<NodeId, NodePayload> = BTreeMap::new();
     for file in &changed {
-        let defs = phase_one(rs, &cfg, file, &probe, &mut event_defs);
+        let defs = phase_one(rs, &cfg, file, &probe);
         for (id, record) in &defs.nodes {
             declared_now.insert(*id, record.payload());
         }
@@ -484,9 +508,7 @@ pub fn scan<L: Language>(
     // and keeps every file this event writes phase-2 facts for covered by a
     // phase-1 half.
     for file in &waking {
-        def_batch
-            .files
-            .push(phase_one(rs, &cfg, file, &probe, &mut event_defs));
+        def_batch.files.push(phase_one(rs, &cfg, file, &probe));
         flush_defs(
             &store,
             &mut def_batch,
@@ -497,14 +519,40 @@ pub fn scan<L: Language>(
     }
     flush_defs(&store, &mut def_batch, &mut flagged, &mut invalidated, 1)?;
     drop(def_batch);
+
+    // Collision semantics belong to the complete current declaration set,
+    // never to this event's definitions alone. The store returns sites in
+    // deterministic `(file, line)` order; every unordered pair is asked,
+    // because adjacent windows accept `field, property, field` while the two
+    // fields are incompatible.
+    let mut disposition_ids: BTreeSet<NodeId> = declared_before
+        .keys()
+        .chain(declared_now.keys())
+        .copied()
+        .collect();
+    disposition_ids.extend(flagged);
+    let mut dispositions = BTreeMap::new();
+    for (id, defs) in store.collision_definitions(&disposition_ids)? {
+        let mergeable = (0..defs.len()).all(|left| {
+            ((left + 1)..defs.len()).all(|right| rs.mergeable(&defs[left], &defs[right]))
+        });
+        dispositions.insert(
+            id,
+            if mergeable {
+                CollisionDisposition::Mergeable
+            } else {
+                CollisionDisposition::Collision
+            },
+        );
+    }
+    // Files written by phase 1 still have no currency claim. Persist the
+    // verdict before phase 2 can restore any of them.
+    store.set_collision_dispositions(&disposition_ids, &dispositions)?;
+
     // Both halves of the comparison have done their work; `touched` is the
     // whole of what the event kept from them.
     drop(declared_before);
     drop(declared_now);
-
-    let colliding = store.definition_collisions(&flagged)?;
-    let merged = mergeable_count(rs, &colliding, &event_defs);
-    drop(event_defs);
 
     // The phase-1 probe goes before the phase-2 one is read: holding two
     // whole symbol tables at once buys nothing, and phase 1 is over.
@@ -640,7 +688,6 @@ pub fn scan<L: Language>(
     flush_stale(&store, &mut stale)?;
 
     let mut report = store.report()?;
-    report.fqn_collisions = report.fqn_collisions.saturating_sub(merged);
     report.file_errors = named(file_errors);
     Ok(report)
 }
@@ -913,7 +960,6 @@ fn phase_one<L: Language>(
     cfg: &L::Config,
     file: &ScannedFile<L>,
     probe: &dyn SymbolProbe,
-    event_defs: &mut HashMap<NodeId, Vec<Definition>>,
 ) -> FileDefs {
     let mut nodes = Vec::with_capacity(file.defs.len());
     for def in &file.defs {
@@ -942,6 +988,8 @@ fn phase_one<L: Language>(
             file: file.rel_path.clone(),
             line: def.span.line,
             payload: payload.clone(),
+            merge_definition: (!rs.stores_as_package(def))
+                .then(|| StoredDefinition::from_definition(def)),
         }];
         let record = match payload {
             NodePayload::Package(name) => NodeRecord::Package {
@@ -958,7 +1006,6 @@ fn phase_one<L: Language>(
             },
         };
         nodes.push((id, record));
-        event_defs.entry(id).or_default().push(def.clone());
     }
     FileDefs {
         path: file.rel_path.clone(),
@@ -1067,7 +1114,7 @@ fn phase_two<L: Language>(
     let mut acc = RefAcc::default();
 
     for r in &facts.refs {
-        let res = rs.resolve(cfg, &scope, r, probe);
+        let (res, refinement) = rs.resolve_with_key_refinement(cfg, &scope, r, probe);
         // The source of an edge is the reference's nearest nameable
         // encloser, named by the same function that names definitions — so
         // an edge and the node it starts at cannot disagree.
@@ -1080,18 +1127,32 @@ fn phase_two<L: Language>(
             Some(fqn) => (Some(node_id(L::DOMAIN, fqn.as_str())), fqn.as_str()),
             None => (container_id, container_name),
         };
-        let key = RefKey {
-            file: file.rel_path.clone(),
-            kind: r.kind.code(),
-            space: r.space.code(),
-            enclosing: enclosing_name.to_string(),
-            raw_target: r.raw_target.clone(),
-            argc: r.argc,
-            locally_bound: r.locally_bound,
-        };
+        let key = reference_key(&file.rel_path, enclosing_name, r, refinement);
         record::<L>(key, r, src, res, &mut acc);
     }
     finish(acc, &file.rel_path, file.hash)
+}
+
+fn reference_key(
+    file: &str,
+    enclosing: &str,
+    reference: &Reference,
+    refinement: RefKeyRefinement,
+) -> RefKey {
+    let arg_types = match refinement {
+        RefKeyRefinement::None => None,
+        RefKeyRefinement::ArgumentTypes(types) => Some(types),
+    };
+    RefKey {
+        file: file.to_string(),
+        kind: reference.kind.code(),
+        space: reference.space.code(),
+        enclosing: enclosing.to_string(),
+        raw_target: reference.raw_target.clone(),
+        argc: reference.argc,
+        arg_types,
+        locally_bound: reference.locally_bound,
+    }
 }
 
 /// Scan a Go repository, reading every Go file the walk finds.
@@ -1160,10 +1221,23 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
             continue; // not live: owns no file, contributes nothing
         };
         if !config.track_enabled(track.name) {
-            // Not asked, so it says nothing either way: a switched-off track
-            // leaves the store's rows and their tally exactly as the last
-            // scan left them.
+            // Not asked, so its stored rows stay exactly as the last scan
+            // left them. They are not this run's measurement, though: a
+            // later live track's full-store report must not re-emit them as
+            // one. Name that fact beside omitting the stale tally.
             switched_off = true;
+            for lang in track.langs {
+                unmeasured.push(lang.code());
+                file_errors.insert(
+                    lang.name().to_string(),
+                    format!(
+                        "track `{}` is switched off by {CONFIG_FILE}; this run measured nothing \
+                         for {} and retained rows are omitted",
+                        track.name,
+                        lang.name(),
+                    ),
+                );
+            }
             continue;
         }
         let measured = scan(root, db_path, &filter)?;
@@ -1199,6 +1273,75 @@ pub fn scan_repo_with(root: &Path, db_path: &Path, config: &Config) -> Result<Re
     }
     report.file_errors = named(file_errors);
     Ok(report)
+}
+
+#[cfg(test)]
+mod ref_key_refinement_tests {
+    use super::*;
+    use crate::lang::RefKeyRefinement;
+    use crate::model::{DeclSpace, RefTarget, Span, TargetRoot};
+
+    fn typed_reference() -> Reference {
+        Reference {
+            kind: RefKind::Call,
+            space: DeclSpace::Value,
+            raw_target: "pick".to_string(),
+            target: RefTarget {
+                root: TargetRoot::Name,
+                segments: vec!["pick".to_string()],
+            },
+            locally_bound: false,
+            argc: Some(1),
+            arg_types: Some(vec!["extractor-type".to_string()]),
+            enclosing: None,
+            span: Span {
+                byte_start: 0,
+                byte_end: 4,
+                line: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn argument_type_refinement_is_the_only_way_types_enter_the_key() {
+        let reference = typed_reference();
+
+        let coarse = reference_key("src/A.java", "p#A.m()", &reference, RefKeyRefinement::None);
+        assert_eq!(coarse.arg_types, None);
+
+        let refined = reference_key(
+            "src/A.java",
+            "p#A.m()",
+            &reference,
+            RefKeyRefinement::ArgumentTypes(vec!["resolver-type".to_string()]),
+        );
+        assert_eq!(refined.arg_types, Some(vec!["resolver-type".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod graph_revision_tests {
+    use super::*;
+
+    #[test]
+    fn revision_zero_preserves_the_manifest_digest() {
+        let manifest = b"manifest bytes that already fence stores";
+        assert_eq!(graph_fence_digest(manifest, 0), manifest);
+    }
+
+    #[test]
+    fn nonzero_revision_is_domain_separated() {
+        let manifest = b"manifest bytes that already fence stores";
+        let first = graph_fence_digest(manifest, 1);
+        let manifestless = graph_fence_digest(b"", 1);
+
+        assert_eq!(first, graph_fence_digest(manifest, 1));
+        assert_ne!(first, manifest);
+        assert_ne!(first, graph_fence_digest(manifest, 2));
+        assert_ne!(first, graph_fence_digest(b"different manifest", 1));
+        assert!(!manifestless.is_empty());
+        assert_eq!(manifestless, graph_fence_digest(b"", 1));
+    }
 }
 
 /// Whether a repo-relative path carries an extension this language owns.
@@ -1275,6 +1418,7 @@ fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
                         file: path.to_string(),
                         line,
                         payload: NodePayload::External(package),
+                        merge_definition: None,
                     }],
                 },
             )
@@ -1288,33 +1432,6 @@ fn finish(acc: RefAcc, path: &str, hash: [u8; 32]) -> FileRefs {
         edges: acc.edges.into_iter().collect(),
         candidates: acc.candidates.into_iter().collect(),
     }
-}
-
-/// How many of the identities the store flagged the language itself calls
-/// one entity rather than two.
-///
-/// Only a pair this event holds in full can be asked: a declaration stored
-/// by an earlier event kept its FQN, kind and sites, not its [`Definition`],
-/// so there is nothing to hand [`Resolver::mergeable`]. Those count as
-/// collisions, which is right for every language that answers `false`
-/// unconditionally and wrong for the first that does not — and the fix at
-/// that point is to store enough of the definition to ask, not to soften the
-/// count.
-fn mergeable_count<L: Language>(
-    rs: &dyn Resolver<L>,
-    colliding: &[NodeId],
-    event_defs: &HashMap<NodeId, Vec<Definition>>,
-) -> u64 {
-    let mut merged = 0;
-    for id in colliding {
-        let Some(defs) = event_defs.get(id) else {
-            continue;
-        };
-        if defs.len() >= 2 && defs.windows(2).all(|pair| rs.mergeable(&pair[0], &pair[1])) {
-            merged += 1;
-        }
-    }
-    merged
 }
 
 /// The container a file's definitions live in, when it names one.

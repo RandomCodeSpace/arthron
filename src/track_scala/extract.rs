@@ -686,6 +686,7 @@ fn emit(
         // name a local: `LocalBinding` does not apply to this track.
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: enclosing.clone(),
         span,
     });

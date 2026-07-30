@@ -2,7 +2,7 @@
 #
 # Regenerate this file with ONE command, from the repository root:
 #
-#   arthron pin corpus/java/probes --pins pins/java-probes.pins --write --commit 6a2275c
+#   arthron pin corpus/java/probes --pins pins/java-probes.pins --write --commit 4ed8b2c1c974afafc255df3390543931cea3b938
 #
 # Nothing else writes this file and nothing hand-edits it. A pin file edited
 # by hand is a claim about a scan that never ran.
@@ -10,8 +10,8 @@
 # What it is. One line per resolved reference row, grouped under the file the
 # reference sits in: the row's 64-bit key hash, and an index into the [targets]
 # dictionary above it. The key hashed is the store's own canonical row key —
-# kind, declaration space, enclosing FQN, site text, arity, binding verdict —
-# so a row's identity here is the row's identity there.
+# kind, declaration space, enclosing FQN, site text, arity, file-local argument
+# types, binding verdict — so a row's identity here is the row's identity there.
 #
 # What it is for. `arthron gate` compares four integers, and a reference that
 # resolves to the *wrong* definition moves none of them: it is still one
@@ -38,7 +38,7 @@
 # rather than read.
 format = 1
 corpus = "corpus/java/probes"
-commit = "6a2275c"
+commit = "4ed8b2c1c974afafc255df3390543931cea3b938"
 targets = 4
 rows = 10
 
@@ -50,14 +50,14 @@ def probe#Greeter.greet/1
 
 [rows]
 src/main/java/probe/Caller.java
-	14340b951d11e1a9 3
-	1f33885ae08efcf0 2
-	4aa07e6b8abcf8ed 1
-	79120b223f771fae 1
-	d215451278fbd2ac 0
-	d575ebe00e916d6e 2
-	eddffe3f551c9bed 1
-	f3803585f625238c 2
+	014102027624586c 2
+	0d735ab4697ce80a 3
+	3737159adc7e6753 1
+	49ffbf27b4d5ba8d 1
+	5028add85bc2386d 1
+	94e9bf4a165ef5ee 0
+	c2628c9755f1082a 2
+	eb5139a21631eb33 2
 src/main/java/probe/Loud.java
-	898dd8be6f839081 1
-	c91b29fbc8c8cfa6 3
+	6dc4b65750ef6050 3
+	967ca6a6e14964c9 1

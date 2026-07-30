@@ -284,6 +284,26 @@ impl JavaHeader {
                 && site < b.end
         })
     }
+
+    /// The innermost value binding visible at `site`.
+    fn binding_at(&self, name: &str, site: u32) -> Option<&Binding> {
+        self.bindings
+            .iter()
+            .filter(|b| {
+                b.name == name
+                    && b.start <= site
+                    && site < b.end
+                    && matches!(
+                        b.kind,
+                        BindingKind::Field
+                            | BindingKind::Local
+                            | BindingKind::Parameter
+                            | BindingKind::PatternVariable
+                            | BindingKind::CatchParameter
+                    )
+            })
+            .max_by_key(|b| b.start)
+    }
 }
 
 /// The Java extractor. Stateless.
@@ -473,6 +493,123 @@ fn argument_count(node: &SgNode) -> Option<u32> {
         .filter(|c| c.is_named() && c.kind() != "comment")
         .count();
     u32::try_from(count).ok()
+}
+
+/// JLS §3.10.1's integer-literal type, including the two spellings reserved
+/// for the operand of unary minus.
+fn integer_literal_type(node: &SgNode) -> Option<String> {
+    let raw = node.text();
+    let long_suffix = raw.ends_with(['l', 'L']);
+    let digits = raw.trim_end_matches(['l', 'L']).replace('_', "");
+    let (radix, body, decimal) = if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, rest, false)
+    } else if let Some(rest) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, rest, false)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..], false)
+    } else {
+        (10, digits.as_str(), true)
+    };
+    let value = u128::from_str_radix(body, radix).ok()?;
+    let negated = node.parent().is_some_and(|parent| {
+        parent.kind() == "unary_expression"
+            && parent.text().trim_start().starts_with('-')
+            && parent
+                .children()
+                .find(|child| child.is_named())
+                .is_some_and(|child| child.range() == node.range())
+    });
+    let ty = if decimal {
+        match (long_suffix, value) {
+            (false, 0..=2_147_483_647) => "int",
+            (false, 2_147_483_648) if negated => "int",
+            (true, 0..=9_223_372_036_854_775_807) => "long",
+            (true, 9_223_372_036_854_775_808) if negated => "long",
+            _ => return None,
+        }
+    } else {
+        match (long_suffix, value) {
+            (false, 0..=4_294_967_295) => "int",
+            (_, 0..=18_446_744_073_709_551_615) => "long",
+            _ => return None,
+        }
+    };
+    Some(ty.to_string())
+}
+
+/// A source-level type that is evident from an argument expression alone.
+///
+/// This is deliberately a cut line, not a miniature type checker: literals,
+/// declared names, casts and class creation are readable in one file.
+/// Calls, general operators, conditionals, lambdas, method references, arrays,
+/// `null`, and anything else stay unknown and therefore cannot narrow an
+/// overload set. Unary `+`, `-`, and `~` over a numeric literal are included:
+/// unary numeric promotion preserves the literal's `int`/`long` type here.
+fn argument_type(node: &SgNode, header: &JavaHeader, site: u32) -> Option<String> {
+    match &*node.kind() {
+        "string_literal" => Some("String".to_string()),
+        "character_literal" => Some("char".to_string()),
+        "true" | "false" => Some("boolean".to_string()),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal" => integer_literal_type(node),
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => {
+            let text = node.text();
+            Some(
+                if text.ends_with('f') || text.ends_with('F') {
+                    "float"
+                } else {
+                    "double"
+                }
+                .to_string(),
+            )
+        }
+        "identifier" => header
+            .binding_at(&node.text(), site)
+            .and_then(|binding| binding.declared_type.as_ref())
+            .map(|segments| segments.join(".")),
+        "cast_expression" | "object_creation_expression" => node
+            .field("type")
+            .map(|ty| compact(&ty.text()))
+            .filter(|ty| !ty.is_empty()),
+        "parenthesized_expression" => node
+            .children()
+            .find(|child| child.is_named())
+            .and_then(|child| argument_type(&child, header, site)),
+        "unary_expression" if node.text().trim_start().starts_with(['+', '-', '~']) => {
+            let promoted = node
+                .children()
+                .find(|child| child.is_named())
+                .and_then(|child| argument_type(&child, header, site))?;
+            matches!(
+                promoted.as_str(),
+                "byte" | "short" | "char" | "int" | "long" | "float" | "double"
+            )
+            .then(|| match promoted.as_str() {
+                "byte" | "short" | "char" => "int".to_string(),
+                _ => promoted,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The complete argument-type vector when every argument is file-local.
+fn argument_types(node: &SgNode, header: &JavaHeader) -> Option<Vec<String>> {
+    let site = node.range().start as u32;
+    node.field("arguments").and_then(|list| {
+        list.children()
+            .filter(|child| child.is_named() && child.kind() != "comment")
+            .map(|child| argument_type(&child, header, site))
+            .collect::<Option<Vec<_>>>()
+    })
 }
 
 /// The literal text of a call site's callee, minus explicit type arguments.
@@ -894,7 +1031,12 @@ fn declared_type_from(type_node: Option<SgNode>, value: Option<SgNode>) -> Optio
         }
         return some_type(name_segments(&initializer.field("type")?));
     }
-    some_type(name_segments(&declared))
+    let segments = name_segments(&declared);
+    if !segments.is_empty() && declared.kind() != "array_type" {
+        return Some(segments);
+    }
+    let written = compact(&declared.text());
+    (!written.is_empty()).then(|| vec![written])
 }
 
 /// The end of the region a statement-scoped binding is visible in.
@@ -1763,6 +1905,7 @@ fn header_ref(
         },
         locally_bound: false,
         argc: None,
+        arg_types: None,
         enclosing: None,
         span,
     }
@@ -1911,6 +2054,9 @@ fn reference(
         locally_bound: is_locally_bound(header, kind, &target, site),
         target,
         argc,
+        arg_types: matches!(kind, RefKind::Call | RefKind::New)
+            .then(|| argument_types(node, header))
+            .flatten(),
         enclosing: enclosing_definition(node),
         span: span_of(node),
     }
@@ -2191,8 +2337,8 @@ fn collect_references(
     }
 }
 
-/// Split every callable this file declares into overload groups, name the
-/// groups that are shared, and give each one a node.
+/// Split every callable this file declares into overload groups, name shared
+/// groups, and give unique callables a forwarding signature alias.
 ///
 /// M-01: two overloads are two definitions and must be two nodes. M-04: a
 /// call site knows only the callee's name and argument count, so the identity
@@ -2207,7 +2353,7 @@ fn collect_references(
 /// compete for one of its own types' keys.
 ///
 /// Returns the shared keys, which [`crate::lang::Resolver::def_fqn`] reads to
-/// decide which form a definition's FQN takes.
+/// decide which form a callable definition's FQN takes.
 fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for def in defs.iter() {
@@ -2224,17 +2370,63 @@ fn mark_overload_sets(defs: &mut Vec<Definition>) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     for def in defs.iter() {
         let Some(key) = group_key(def) else { continue };
-        if !shared.contains(&key) || !seen.insert(key) {
+        let callable = fqn::callable_of(def);
+        if !shared.contains(&key) {
+            // The arity identity remains the callable's node. A forwarding
+            // signature identity exposes its parameter shape to typed
+            // applicability without re-aiming existing edges.
+            aliases.push(java_def(
+                DefKind::Alias,
+                callable.signature(),
+                def.owner.clone(),
+                DeclSpace::Value,
+                DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
+                None,
+                def.span,
+            ));
+            continue;
+        }
+        if !seen.insert(key) {
             continue;
         }
         aliases.push(java_def(
             DefKind::Alias,
-            fqn::callable_of(def).key(),
+            callable.key(),
             def.owner.clone(),
             DeclSpace::Value,
             DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
             None,
             def.span,
+        ));
+    }
+    let mut varargs_prefixes: HashMap<String, Vec<Definition>> = HashMap::new();
+    for def in defs.iter() {
+        let Some(params) = def.params.as_ref().filter(|params| params.varargs) else {
+            continue;
+        };
+        let callable = fqn::callable_of(def);
+        let prefix = &params.types[..params.types.len().saturating_sub(1)];
+        let key = format!(
+            "{}.{}",
+            def.owner.join(&fqn::NEST.to_string()),
+            fqn::varargs_prefix_key(&callable.name, prefix)
+        );
+        varargs_prefixes.entry(key).or_default().push(def.clone());
+    }
+    for declarations in varargs_prefixes.into_values() {
+        let first = &declarations[0];
+        let callable = fqn::callable_of(first);
+        let prefix = &callable.types[..callable.types.len().saturating_sub(1)];
+        aliases.push(java_def(
+            DefKind::Alias,
+            fqn::varargs_prefix_key(&callable.name, prefix),
+            first.owner.clone(),
+            DeclSpace::Value,
+            DefFacets::SYNTHETIC.union(DefFacets::RUNTIME),
+            (declarations.len() == 1)
+                .then(|| first.params.clone())
+                .flatten(),
+            first.span,
         ));
     }
     defs.extend(aliases);
@@ -2968,7 +3160,12 @@ class A {
         assert!(defs_named(&f, "inner").is_empty());
         assert!(defs_named(&f, "run").is_empty());
         // What *is* declared: `A`, its default constructor, and `f`.
-        let names: Vec<&str> = f.defs.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = f
+            .defs
+            .iter()
+            .filter(|d| d.kind != DefKind::Alias)
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(names, ["p", "A", "A", "f"]);
     }
 
@@ -3175,7 +3372,7 @@ record Point(int x, int y) {}
         let synth: Vec<(&str, DefKind, u32)> = f
             .defs
             .iter()
-            .filter(|d| d.facets.contains(DefFacets::SYNTHETIC))
+            .filter(|d| d.kind != DefKind::Alias && d.facets.contains(DefFacets::SYNTHETIC))
             .map(|d| {
                 (
                     d.name.as_str(),

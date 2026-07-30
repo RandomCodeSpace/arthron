@@ -15,7 +15,7 @@ use arthron::config::Config;
 use arthron::model::Lang;
 use arthron::pipeline::{scan_repo, scan_repo_with};
 use arthron::query::NameIndex;
-use arthron::store::{ReadStore, Report};
+use arthron::store::{ReadStore, Report, Store};
 
 fn write(root: &Path, rel: &str, content: &str) {
     let path = root.join(rel);
@@ -204,19 +204,77 @@ fn a_tracks_entry_keeps_a_live_language_out_of_the_scan() {
 fn switching_a_track_off_does_not_erase_what_it_already_measured() {
     // A skipped track is not the same as a track handed an empty file set:
     // the second would forget every stored file of its extensions. The rows
-    // a previous scan wrote must survive.
+    // a previous scan wrote must survive, even though this run's report must
+    // omit them and name why they are unmeasured.
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let db = dir.path().join("shared.redb");
     let first = scan_repo(dir.path(), &db).expect("scans");
     assert!(tallied(&first).contains(&"java"));
+    let (before_files, before) = {
+        let store = Store::open(&db).expect("the first store opens");
+        (
+            store.known_files().expect("the first known files"),
+            store.snapshot().expect("the first snapshot"),
+        )
+    };
+    let java_file = "src/main/java/com/acme/Tool.java";
+    assert!(
+        before_files.contains(&java_file.to_string()),
+        "{before_files:?}"
+    );
+    let before_java_rows: Vec<_> = before
+        .rows
+        .iter()
+        .filter(|(key, row)| key.file == java_file && row.lang == Lang::Java.code())
+        .collect();
+    assert!(
+        !before_java_rows.is_empty(),
+        "the first scan did not store a Java row: {:?}",
+        before.rows,
+    );
 
     let config = Config::parse("[tracks]\njava = false\n").expect("parses");
     let second = scan_repo_with(dir.path(), &db, &config).expect("scans");
+    let (after_files, after) = {
+        let store = Store::open(&db).expect("the second store opens");
+        (
+            store.known_files().expect("the second known files"),
+            store.snapshot().expect("the second snapshot"),
+        )
+    };
     assert!(
-        tallied(&second).contains(&"java"),
-        "the store forgot rows the config only asked it not to re-measure: {:?}",
+        after_files.contains(&java_file.to_string()),
+        "the skipped track forgot its file: {after_files:?}",
+    );
+    assert_eq!(
+        after.files.get(java_file),
+        before.files.get(java_file),
+        "the skipped track changed its stored file facts",
+    );
+    let after_java_rows: Vec<_> = after
+        .rows
+        .iter()
+        .filter(|(key, row)| key.file == java_file && row.lang == Lang::Java.code())
+        .collect();
+    assert_eq!(
+        after_java_rows, before_java_rows,
+        "the skipped track changed its Java rows",
+    );
+    assert!(
+        !tallied(&second).contains(&"java"),
+        "a switched-off track re-emitted a stale tally: {:?}",
         tallied(&second),
+    );
+    let marker = second
+        .file_errors
+        .iter()
+        .find(|entry| entry.path == Lang::Java.name())
+        .unwrap_or_else(|| panic!("missing Java unmeasured marker: {:?}", second.file_errors));
+    assert!(
+        marker.message.contains("switched off"),
+        "marker: {}",
+        marker.message,
     );
 }
 

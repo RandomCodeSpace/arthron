@@ -4,6 +4,333 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — Stream C's Java measurements are rebased with attributed aliases
+
+**Decided: rebase the two Java baselines and target pins from the signed
+`babb1f5` release binary.** `commons-lang` moves from `AmbiguousOverload`
+9,218 to 5,213 and `gson` from 1,282 to 861; every other unresolved-reason
+bucket is byte-identical. The gained resolved occurrences are 4,005 and 421,
+respectively, while 2,061 and 321 remain honestly ambiguous. Both scans retain
+their prior `external` and `local_binding` counts, and the attributed row join
+has zero non-AO rows and zero non-AO occurrences changed.
+
+The corresponding exact definition censuses deliberately change only
+`DefKind::Alias`: `commons-lang` 390 -> 9,617 and `gson` 30 -> 3,083. In
+`mark_overload_sets`, a unique callable now gets a
+`SYNTHETIC | RUNTIME` forwarding signature identity, while a shared arity
+continues to get its arity identity. Typed applicability can therefore inspect
+the callable's parameter shape without re-aiming an existing edge; this is an
+extension of the established alias mechanism, not a new definition category.
+
+Before re-pinning, the target check held 16,111 commons-lang rows and 9,075
+gson rows; 1,768 and 286 newly resolved rows appeared. Both checks reported
+zero vanished rows, zero moved targets, and zero re-keyed rows. The regenerated
+pins record that coverage growth without accepting an existing target movement.
+
+The prior `<= 2800` `AmbiguousOverload` target is dropped: it was an
+unmeasured estimate, not a committed gate. Measurement establishes a floor of
+3,152 occurrences with no argument vector at all (calls, `null`, lambdas,
+method references, member expressions, array access, and general operators).
+Even resolving every typed ambiguity cannot reach the estimate. Unknown-vector
+typing remains deferred to Streams H/I.
+
+*Rejected: force an unknown vector through typed applicability.* That would
+guess a type environment the Java track does not have.
+
+*Rejected: suppress synthetic aliases from the census.* They are the precise
+signature identities the resolver uses; hiding them would make the extraction
+change unauditable.
+
+*Rejected: weaken pins for a re-key or a target move.* Neither occurred; those
+remain failures rather than a property of this rebase.
+
+---
+
+## 2026-07-30 — Stream C keeps array receivers in `NeedsTypeInference`
+
+**Decided: a declared Java array receiver stops before ordinary canonical-type
+placement and returns `NeedsTypeInference`.** The guard recognizes repeated
+`[]` and varargs suffixes, so unqualified fields, static fields, and
+`this.`-rooted fields all retain their existing C0 row keys while unsupported
+array members remain honestly unresolved.
+
+True local and parameter receivers remain `LocalBinding`: the extractor marks
+them `locally_bound`, and the resolver's standing early return intentionally
+precedes declared-type lookup. Reclassifying those rows would be non-AO movement
+outside this repair; their full C0 keys are regression-tested unchanged.
+
+*Rejected: resolve `length` or `clone()` as real or synthetic array members.*
+That is an array-member modeling feature and would reclassify rows to
+`Resolved`; it needs a separately attributable baseline change.
+
+*Rejected: bypass the `locally_bound` short circuit for arrays.* That changes
+legacy `LocalBinding` rows and violates Stream C's non-AO constraint.
+
+---
+
+## 2026-07-30 — the resolver owns reference-key refinement
+
+C0 made file-local argument types part of reference-row identity before the
+resolver owned the choice to use them. The failure was reproduced on a
+pre-existing singleton Java call whose target and outcome stayed unchanged:
+`rows_rekeyed=1`, with `1 appeared, 1 vanished, 0 moved`. Copying extractor
+facts into the key had changed identity despite discovering no ambiguity.
+
+**Decided: ordinary resolution returns a resolver-owned key refinement beside
+the outcome.** `RefKeyRefinement::None` preserves the coarse key, regardless
+of argument types the extractor recorded.
+`RefKeyRefinement::ArgumentTypes(Vec<String>)` supplies the complete vector the
+resolver used to distinguish legitimate outcomes. The existing `resolve`
+operation remains unchanged, and the combined operation defaults to ordinary
+resolution plus no refinement. Only ordinary phase two calls the combined
+operation; supertype linking continues to call `resolve`. The pipeline neither
+panics nor drops a reference for either refinement.
+
+**Stream C uses that hook only after the authoritative legacy Java pass
+returns `AmbiguousOverload`.** A complete `Reference.arg_types` vector then
+permits one typed applicability retry. A typed resolution may replace that
+ambiguity; a typed ambiguity or any typed miss retains an honestly refined
+`AmbiguousOverload`. Legacy resolved, external, local, and every other
+unresolved outcome return unchanged with no refinement. Candidate dependencies
+are the deterministic union of every identity read by both passes: legacy
+order first, followed by each typed-only identity at its first occurrence.
+
+**A resolver also publishes a graph-semantics revision, defaulting to zero.**
+Revision zero feeds the established manifest digest to the per-language store
+fence byte-for-byte unchanged. A nonzero revision is domain-separated and
+folded deterministically into that digest, including for a language whose
+manifest digest is empty, so the existing fence forgets only files owned by
+that language. Every language stays at revision zero in C1. Java moves to
+revision one in Stream C, when it first consumes resolver-owned argument-type
+refinement.
+
+Java's finite typed surface includes exact-array use of a varargs declaration
+in the fixed-arity phases and zero-tail varargs selection through Java-owned
+prefix aliases. It parses integer literal radix, suffix, and legal range,
+applies unary numeric promotion from `byte`, `short`, and `char` to `int`, and
+compares simple and qualified `java.lang` spellings canonically. It does not
+infer return types or user-defined subtype relations.
+
+*Rejected: defer Stream C to 0.2.0 and revert C0.* That slips the Java overload
+capability and spends two revert changes.
+
+*Rejected: defer Stream C and keep C0.* That leaves a live key dimension and
+schema break with no resolver owning when the dimension is populated.
+
+*Rejected: amend pin semantics to accept the attributed Java rekey.* That
+weakens the gate which exposed this defect and makes a later semantic rekey
+indistinguishable from an accepted one.
+
+*Rejected: run typed applicability for every call with known arguments.* That
+would move already-resolved legacy targets and recreate C0's key churn.
+
+*Rejected: replace the legacy candidate set with the typed pass's probes.*
+That would remove invalidation dependencies and leave refined rows stale after
+an overload edit.
+
+*Rejected: turn unsupported typed shapes into a new reason.* The taxonomy does
+not need another bucket; the legacy `AmbiguousOverload` remains honest.
+
+---
+
+## 2026-07-29 — Java overload narrowing stops at file-local argument types
+
+**Decision:** a Java call or creation stores its complete file-locally-evident
+argument vector on `Reference.arg_types`; non-call references and an invocation
+with any unknown argument store `None`. Literals, declared names, casts, class
+creations, and unary `+`, `-`, or `~` over a numeric literal are included.
+Calls, `null`, lambdas, member expressions, array access, and general operators
+remain unknown. The resolver reads only the reference field; the temporary
+byte-offset side table is gone.
+
+JLS §15.12.2's phase order is preserved: strict fixed arity, loose fixed
+arity, then variable arity. Applicability is collected across the receiver and
+its indexed supertypes before selection, so an inapplicable declaration on the
+receiver cannot hide an inherited or varargs candidate. The first phase with
+applicable declarations wins. Conversion-depth dominance selects among that
+phase's candidates, then class-over-interface and subtype-owner specificity
+break owner ties; incomparable survivors remain `AmbiguousOverload`.
+
+The conversion surface is deliberately finite and fixture-proven: identity;
+primitive widening; boxing; unboxing followed by primitive widening; numeric
+wrapper to `Number` to `Object`; and `Character`/`Boolean` to `Object`.
+No user-defined subtype relation is guessed. Unique callables keep their
+existing arity node as the edge target and gain a Java-owned full-signature
+alias that forwards to it; overloaded callables retain their full-signature
+nodes and set-valued arity marker.
+
+The original Stream C card said no core change was needed because overload
+types were already in the node keyspace. That was true for definitions and
+false for reference rows: same-arity calls with different argument vectors
+collapsed. The plan amendment and C0 corrected the discrepancy by adding
+`Reference.arg_types` and `RefKey.arg_types` in a dedicated core landing;
+Stream C merged that landing and changes no core file itself.
+
+*Rejected:* putting argument types in `JavaHeader` keyed by byte offset, which
+would again let stored row identity disagree with the facts resolution reads.
+Also rejected: arbitrary class-subtype guesses, return-type inference,
+member/field typing, array element typing, and other written-type-environment
+work reserved for Streams H and I. Those shapes stay honestly ambiguous.
+
+---
+
+## 2026-07-29 — reference-row identity carries file-local argument types
+
+Two same-arity calls with the same literal target and enclosing definition can
+legitimately resolve to different overloads when their argument types differ.
+The reference row previously keyed those sites by arity but not argument
+types. Because a row carries one outcome, that collapsed distinct answers:
+the first occurrence supplied the stored outcome while later occurrences only
+increased its count, even though their edges could name different targets.
+
+**Decided: `Reference` and `RefKey` carry
+`arg_types: Option<Vec<String>>`.** `Some(types)` means every argument type is
+file-locally evident; `None` means at least one needs inference or the
+extractor does not record types. The canonical redb key and edge-pin row hash
+include the field. Schema generation 11 wipes older stores so no generation-10
+key is decoded under the new grammar.
+
+Every current extractor writes `None`, including Java. This core change is
+therefore representation only: no language begins type-directed resolution
+here. Java's language-owned follow-up can populate the field and resolve from
+the reference itself, so everything its resolver reads is in the row key or
+derived from it.
+
+*Rejected: folding types into `raw_target`.* That field is the literal text at
+the site; changing its meaning would corrupt source-facing output.
+
+*Rejected: adding the span to the key.* It would distinguish every occurrence
+and destroy intentional row deduplication.
+
+*Rejected: demoting a row when collapsed occurrences disagree.* That would
+under-report genuinely resolved sites and leave occurrence edges disagreeing
+with the stored row rather than fixing the identity defect.
+
+---
+
+## 2026-07-29 — binary releases use cargo-dist, with dispatch as a build-only proof
+
+**Decided: cargo-dist 0.32.0 supplies the release build graph, while
+`release.yml` is a reviewed project-maintained customization derived from it.**
+It builds the five requested native targets: `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+`aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. The five target release
+archive/checksum pairs are
+`arthron-x86_64-unknown-linux-gnu.tar.xz` and `.sha256`,
+`arthron-aarch64-unknown-linux-gnu.tar.xz` and `.sha256`,
+`arthron-x86_64-apple-darwin.tar.xz` and `.sha256`,
+`arthron-aarch64-apple-darwin.tar.xz` and `.sha256`, and
+`arthron-x86_64-pc-windows-msvc.zip` and `.sha256`. They are release outputs,
+not workflow-artifact bundle names. The release also has `source.tar.gz`, its
+checksum, and `sha256.sum`.
+
+A `push` matching `v*` is the only publishing event: its host job receives
+`contents: write`, uploads every generated asset, and creates the GitHub
+Release. `workflow_dispatch` has no publishing condition; it runs `dist plan`
+and the full build matrix with root `contents: read`, so it cannot create a
+tag, upload a release asset, or create a release. Its multiple temporary
+workflow bundles are `cargo-dist-cache`, `artifacts-plan-dist-manifest`, one
+`artifacts-build-local-<target>` bundle for each of the five targets, and
+`artifacts-build-global`; their names do not assert a one-to-one release asset
+mapping.
+
+This is the safest test path available before the workflow exists on the
+default branch. GitHub only loads workflow definitions from the default branch
+for manual dispatch, so an end-to-end dispatch cannot be run from this worker
+branch without first shipping the workflow. The ship-stage proof is therefore:
+dispatch `Release` on the merged default-branch commit, inspect the multiple
+workflow bundles for the five named target archive/checksum pairs, and verify
+that no GitHub Release exists; then, only for the planned release tag, verify
+those named pairs are attached to its GitHub Release.
+
+**Selection evidence, checked 2026-07-29.** GitHub's latest cargo-dist release
+is stable `v0.32.0`, published 2026-05-22; its release asset checksum verified
+locally before its `dist` binary was used. Its workspace declares
+`MIT OR Apache-2.0`, ships both license texts, and has a `SECURITY.md` with
+private GitHub vulnerability reporting and a security contact. GitHub's
+advisory API query for the Rust `cargo-dist` package returned an empty list at
+this check. That is a point-in-time vulnerability query, not a claim that no
+future advisory can exist. cargo-dist is a CI tool only: this repository adds
+no Cargo dependency, no `Cargo.lock` entry, and no product transitive
+dependency. The workflow pins every action invocation and cargo-dist's
+`github-action-commits` metadata to the verified immutable commits
+`actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803`,
+`actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`, and
+`actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`.
+Build-time downloads are confined to CI.
+
+The workflow deliberately carries `allow-dirty = ["ci"]` because cargo-dist
+0.32.0 cannot represent the project's hybrid tag-push and dry-dispatch policy.
+The reviewed deviations are: the `v*` trigger; non-publishing dispatch through
+the tag/publishing outputs and host guard; removal of the pull-request trigger
+and rust-cache integration; root `contents: read` with `contents: write` only
+on `host`; immutable action SHAs; shell quoting and grouped
+`$GITHUB_OUTPUT` writes; and the plan/local/global/host job grouping and
+handoff. `pr-run-mode = "upload"` remains only because cargo-dist's generated
+build condition uses it to enable the dispatch matrix; this workflow has no PR
+trigger. On a cargo-dist update, regenerate the baseline, review the complete
+diff against this customization and reapply only these documented deviations.
+`dist generate --check --allow-dirty` does not prove this customized workflow
+is consistent and is not a release-workflow acceptance test.
+
+*Rejected: a hand-rolled matrix and release upload workflow.* It would recreate
+cargo-dist's target-to-runner mapping, archive layout, checksums, manifest
+handoff, and release asset collection as project-maintained logic. cargo-dist
+already supplies that maintained build graph while adding no runtime network
+behavior or product dependency.
+
+*Rejected: a release-capable manual dispatch.* A pre-tag test must not create
+an external release. Dispatch deliberately cannot reach the host job; the
+publishing branch is reachable only through a pushed `v*` tag.
+
+*Resolved after Stream G merged: README binary-install instructions.* Stream E
+now documents the five target archive/checksum pairs without disturbing
+Stream G's README changes. Stream M retains only the final proof that the
+versioned 0.1.0 tag publishes those named assets.
+
+## 2026-07-29 — collision disposition belongs to the stored definition set
+
+Two files declaring C# `N#Shared` as a partial type exposed a split answer:
+the cold C# scan reported **0 FQN collisions**, while an unchanged warm scan
+and a later full-registry report reported **1**. The node was correct — both
+declaration paths survived — and the count was not. The pipeline subtracted
+mergeable identities using only definitions extracted in the current event;
+an unchanged event had none, while `Store::report` counted the durable
+multi-file node mechanically.
+
+**Decided: the store persists each definition site's merge-relevant facts and
+a collision disposition for the complete current declaration set.** For every
+touched multi-file identity, declarations are read in deterministic
+`(file, line)` order and every unordered pair is handed to the language's
+`Resolver::mergeable`. The disposition is committed after phase 1 and before
+phase 2 restores any file's currency claim, so a completed report is a
+function of the stored graph rather than of the last event. A deletion first
+withdraws the surviving co-declarers' claims, then reclassifies and restores
+them through the ordinary waking path; an interruption therefore cannot
+publish the old disposition as current.
+
+The discriminating tests name the identities and sites: partial `N#Shared`
+keeps `a.cs` and `z.cs` and reports zero cold, warm, direct-store and
+full-registry; field-versus-property `N#Shared::Value` keeps both paths and
+reports one cold and warm. A three-site `field, property, field` fixture
+reports one because the non-adjacent field pair is incompatible, then reports
+zero after that declaration is deleted. This is the reason adjacent-window
+comparison is insufficient even when its order is deterministic.
+
+Schema generation moves **9 → 10** and old stores wipe and rebuild. The graph
+is a cache; migrating encoded declaration sites and inventing a disposition
+for data whose language definitions were not stored would be a guess.
+
+*Rejected: keeping the event-local subtraction.* It is definitionally unable
+to answer an unchanged warm event or a later registry track. *Rejected:
+checking adjacent windows.* Mergeability need not be transitive. *Rejected:
+dropping duplicate declarations or counting only one partial.* Both violate
+the never-drop rule and erase queryable source sites. *Rejected: teaching the
+store language semantics.* The resolver remains the only authority; the store
+owns persistence and tallying of the verdict.
+
+---
+
 ## 2026-07-29 — the walk keeps a file's declarations and forgets its references
 
 Wave 2 taught Go to emit type uses, non-call selector reads and
