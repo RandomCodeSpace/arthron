@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use arthron::model::{NodeId, RefKind};
+use arthron::model::{DeclSpace, NodeId, RefKind};
 use arthron::store::{NodeRecord, RefKey, Store, StoredOutcome};
 use arthron::track_java::scan_java;
 
@@ -1626,6 +1626,115 @@ public class Arrays {
         scan.one("choose", RefKind::Call),
         "RESOLVED com.acme#Arrays.choose/*1",
     );
+}
+
+/// Array members require array-member modeling, not ordinary declared-type
+/// selection; keeping their C0 keys prevents an unsupported receiver from
+/// rekeying a Java row.
+#[test]
+fn array_receivers_need_type_inference_without_rekeying_c0_rows() {
+    let scan = scan(&[(
+        "com/acme/ArrayReceivers.java",
+        r#"package com.acme;
+public class ArrayReceivers<T> {
+    static final String[] CHAR_STRING_ARRAY = {};
+    static final long[] LONG_VALUES = {};
+    static final byte[] BYTE_VALUES = {};
+    private T[][] typeArguments;
+    void use(long[] x) {
+        int staticLength = CHAR_STRING_ARRAY.length;
+        int bareLength = typeArguments.length;
+        Object bareClone = typeArguments.clone();
+        Object fieldClone = this.typeArguments.clone();
+        int longLength = LONG_VALUES.length;
+        Object byteClone = BYTE_VALUES.clone();
+        int parameterLength = x.length;
+        Object parameterClone = x.clone();
+    }
+}
+"#,
+    )]);
+    let cases = [
+        (
+            "CHAR_STRING_ARRAY.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "typeArguments.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "typeArguments.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "this.typeArguments.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "LONG_VALUES.length",
+            RefKind::FieldAccess,
+            None,
+            false,
+            "NeedsTypeInference",
+        ),
+        (
+            "BYTE_VALUES.clone",
+            RefKind::Call,
+            Some(0),
+            false,
+            "NeedsTypeInference",
+        ),
+        ("x.length", RefKind::FieldAccess, None, true, "LocalBinding"),
+        ("x.clone", RefKind::Call, Some(0), true, "LocalBinding"),
+    ];
+    let outcomes = cases
+        .iter()
+        .map(|(raw_target, kind, ..)| scan.one(raw_target, *kind))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes,
+        [
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "NeedsTypeInference",
+            "LocalBinding",
+            "LocalBinding",
+        ],
+    );
+    for (raw_target, kind, argc, locally_bound, outcome) in cases {
+        let row = scan.row(raw_target, kind);
+        assert_eq!(row.outcome, outcome, "{raw_target}");
+        assert_eq!(
+            row.key,
+            RefKey {
+                file: "com/acme/ArrayReceivers.java".to_string(),
+                kind: kind.code(),
+                space: DeclSpace::Value.code(),
+                enclosing: "com.acme#ArrayReceivers.use/1".to_string(),
+                raw_target: raw_target.to_string(),
+                argc,
+                arg_types: None,
+                locally_bound,
+            },
+            "{raw_target} changed its C0 key",
+        );
+    }
 }
 
 #[test]

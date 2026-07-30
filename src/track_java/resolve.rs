@@ -886,7 +886,34 @@ impl JavaResolver {
             }
             return self.declared_owner(cfg, scope, &bound, site, depth + 1, p);
         }
+        // Array members need array-member modeling. Do not pass an array
+        // spelling to ordinary type placement: its unsupported member stays
+        // `NeedsTypeInference` without changing the row key.
+        if Self::has_array_suffix(declared) {
+            return Owner::Failed(UnresolvedReason::NeedsTypeInference);
+        }
         self.canonical_type(cfg, scope, declared, p)
+    }
+
+    /// Whether a declared type carries one or more Java array suffixes.
+    /// This mirrors [`Self::exact_type_spellings`]'s suffix walk without
+    /// changing its alias-expansion behavior.
+    fn has_array_suffix(declared: &[String]) -> bool {
+        let Some(mut base) = declared.last().map(String::as_str) else {
+            return false;
+        };
+        let mut found = false;
+        loop {
+            if let Some(stripped) = base.strip_suffix("[]") {
+                base = stripped;
+                found = true;
+            } else if let Some(stripped) = base.strip_suffix("...") {
+                base = stripped;
+                found = true;
+            } else {
+                return found;
+            }
+        }
     }
 
     /// The greatest arity a *member-name* probe walks to.

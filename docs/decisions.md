@@ -4,6 +4,28 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — Stream C keeps array receivers in `NeedsTypeInference`
+
+**Decided: a declared Java array receiver stops before ordinary canonical-type
+placement and returns `NeedsTypeInference`.** The guard recognizes repeated
+`[]` and varargs suffixes, so unqualified fields, static fields, and
+`this.`-rooted fields all retain their existing C0 row keys while unsupported
+array members remain honestly unresolved.
+
+True local and parameter receivers remain `LocalBinding`: the extractor marks
+them `locally_bound`, and the resolver's standing early return intentionally
+precedes declared-type lookup. Reclassifying those rows would be non-AO movement
+outside this repair; their full C0 keys are regression-tested unchanged.
+
+*Rejected: resolve `length` or `clone()` as real or synthetic array members.*
+That is an array-member modeling feature and would reclassify rows to
+`Resolved`; it needs a separately attributable baseline change.
+
+*Rejected: bypass the `locally_bound` short circuit for arrays.* That changes
+legacy `LocalBinding` rows and violates Stream C's non-AO constraint.
+
+---
+
 ## 2026-07-30 — the resolver owns reference-key refinement
 
 C0 made file-local argument types part of reference-row identity before the
