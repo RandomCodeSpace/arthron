@@ -2775,3 +2775,20 @@ impl Resolver<JavaLang> for JavaResolver {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::JavaResolver;
+
+    #[test]
+    fn array_suffix_guard_recognizes_varargs_and_repeated_dimensions() {
+        let spelling = |name: &str| vec![name.to_string()];
+
+        assert!(JavaResolver::has_array_suffix(&spelling("String...")));
+        assert!(JavaResolver::has_array_suffix(&spelling("T[][]")));
+        assert!(!JavaResolver::has_array_suffix(&spelling("String")));
+        assert!(!JavaResolver::has_array_suffix(&spelling(
+            "java.lang.String"
+        )));
+    }
+}
