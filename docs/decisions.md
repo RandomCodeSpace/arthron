@@ -4,6 +4,70 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — Stream C's Java measurements are rebased with attributed aliases
+
+**Decided: rebase the two Java baselines and target pins from the signed
+`babb1f5` release binary.** `commons-lang` moves from `AmbiguousOverload`
+9,218 to 5,213 and `gson` from 1,282 to 861; every other unresolved-reason
+bucket is byte-identical. The gained resolved occurrences are 4,005 and 421,
+respectively, while 2,061 and 321 remain honestly ambiguous. Both scans retain
+their prior `external` and `local_binding` counts, and the attributed row join
+has zero non-AO rows and zero non-AO occurrences changed.
+
+The corresponding exact definition censuses deliberately change only
+`DefKind::Alias`: `commons-lang` 390 -> 9,617 and `gson` 30 -> 3,083. In
+`mark_overload_sets`, a unique callable now gets a
+`SYNTHETIC | RUNTIME` forwarding signature identity, while a shared arity
+continues to get its arity identity. Typed applicability can therefore inspect
+the callable's parameter shape without re-aiming an existing edge; this is an
+extension of the established alias mechanism, not a new definition category.
+
+Before re-pinning, the target check held 16,111 commons-lang rows and 9,075
+gson rows; 1,768 and 286 newly resolved rows appeared. Both checks reported
+zero vanished rows, zero moved targets, and zero re-keyed rows. The regenerated
+pins record that coverage growth without accepting an existing target movement.
+
+The prior `<= 2800` `AmbiguousOverload` target is dropped: it was an
+unmeasured estimate, not a committed gate. Measurement establishes a floor of
+3,152 occurrences with no argument vector at all (calls, `null`, lambdas,
+method references, member expressions, array access, and general operators).
+Even resolving every typed ambiguity cannot reach the estimate. Unknown-vector
+typing remains deferred to Streams H/I.
+
+*Rejected: force an unknown vector through typed applicability.* That would
+guess a type environment the Java track does not have.
+
+*Rejected: suppress synthetic aliases from the census.* They are the precise
+signature identities the resolver uses; hiding them would make the extraction
+change unauditable.
+
+*Rejected: weaken pins for a re-key or a target move.* Neither occurred; those
+remain failures rather than a property of this rebase.
+
+---
+
+## 2026-07-30 — Stream C keeps array receivers in `NeedsTypeInference`
+
+**Decided: a declared Java array receiver stops before ordinary canonical-type
+placement and returns `NeedsTypeInference`.** The guard recognizes repeated
+`[]` and varargs suffixes, so unqualified fields, static fields, and
+`this.`-rooted fields all retain their existing C0 row keys while unsupported
+array members remain honestly unresolved.
+
+True local and parameter receivers remain `LocalBinding`: the extractor marks
+them `locally_bound`, and the resolver's standing early return intentionally
+precedes declared-type lookup. Reclassifying those rows would be non-AO movement
+outside this repair; their full C0 keys are regression-tested unchanged.
+
+*Rejected: resolve `length` or `clone()` as real or synthetic array members.*
+That is an array-member modeling feature and would reclassify rows to
+`Resolved`; it needs a separately attributable baseline change.
+
+*Rejected: bypass the `locally_bound` short circuit for arrays.* That changes
+legacy `LocalBinding` rows and violates Stream C's non-AO constraint.
+
+---
+
 ## 2026-07-30 — the resolver owns reference-key refinement
 
 C0 made file-local argument types part of reference-row identity before the
@@ -22,6 +86,15 @@ resolution plus no refinement. Only ordinary phase two calls the combined
 operation; supertype linking continues to call `resolve`. The pipeline neither
 panics nor drops a reference for either refinement.
 
+**Stream C uses that hook only after the authoritative legacy Java pass
+returns `AmbiguousOverload`.** A complete `Reference.arg_types` vector then
+permits one typed applicability retry. A typed resolution may replace that
+ambiguity; a typed ambiguity or any typed miss retains an honestly refined
+`AmbiguousOverload`. Legacy resolved, external, local, and every other
+unresolved outcome return unchanged with no refinement. Candidate dependencies
+are the deterministic union of every identity read by both passes: legacy
+order first, followed by each typed-only identity at its first occurrence.
+
 **A resolver also publishes a graph-semantics revision, defaulting to zero.**
 Revision zero feeds the established manifest digest to the per-language store
 fence byte-for-byte unchanged. A nonzero revision is domain-separated and
@@ -30,6 +103,13 @@ manifest digest is empty, so the existing fence forgets only files owned by
 that language. Every language stays at revision zero in C1. Java moves to
 revision one in Stream C, when it first consumes resolver-owned argument-type
 refinement.
+
+Java's finite typed surface includes exact-array use of a varargs declaration
+in the fixed-arity phases and zero-tail varargs selection through Java-owned
+prefix aliases. It parses integer literal radix, suffix, and legal range,
+applies unary numeric promotion from `byte`, `short`, and `char` to `int`, and
+compares simple and qualified `java.lang` spellings canonically. It does not
+infer return types or user-defined subtype relations.
 
 *Rejected: defer Stream C to 0.2.0 and revert C0.* That slips the Java overload
 capability and spends two revert changes.
@@ -40,6 +120,57 @@ schema break with no resolver owning when the dimension is populated.
 *Rejected: amend pin semantics to accept the attributed Java rekey.* That
 weakens the gate which exposed this defect and makes a later semantic rekey
 indistinguishable from an accepted one.
+
+*Rejected: run typed applicability for every call with known arguments.* That
+would move already-resolved legacy targets and recreate C0's key churn.
+
+*Rejected: replace the legacy candidate set with the typed pass's probes.*
+That would remove invalidation dependencies and leave refined rows stale after
+an overload edit.
+
+*Rejected: turn unsupported typed shapes into a new reason.* The taxonomy does
+not need another bucket; the legacy `AmbiguousOverload` remains honest.
+
+---
+
+## 2026-07-29 — Java overload narrowing stops at file-local argument types
+
+**Decision:** a Java call or creation stores its complete file-locally-evident
+argument vector on `Reference.arg_types`; non-call references and an invocation
+with any unknown argument store `None`. Literals, declared names, casts, class
+creations, and unary `+`, `-`, or `~` over a numeric literal are included.
+Calls, `null`, lambdas, member expressions, array access, and general operators
+remain unknown. The resolver reads only the reference field; the temporary
+byte-offset side table is gone.
+
+JLS §15.12.2's phase order is preserved: strict fixed arity, loose fixed
+arity, then variable arity. Applicability is collected across the receiver and
+its indexed supertypes before selection, so an inapplicable declaration on the
+receiver cannot hide an inherited or varargs candidate. The first phase with
+applicable declarations wins. Conversion-depth dominance selects among that
+phase's candidates, then class-over-interface and subtype-owner specificity
+break owner ties; incomparable survivors remain `AmbiguousOverload`.
+
+The conversion surface is deliberately finite and fixture-proven: identity;
+primitive widening; boxing; unboxing followed by primitive widening; numeric
+wrapper to `Number` to `Object`; and `Character`/`Boolean` to `Object`.
+No user-defined subtype relation is guessed. Unique callables keep their
+existing arity node as the edge target and gain a Java-owned full-signature
+alias that forwards to it; overloaded callables retain their full-signature
+nodes and set-valued arity marker.
+
+The original Stream C card said no core change was needed because overload
+types were already in the node keyspace. That was true for definitions and
+false for reference rows: same-arity calls with different argument vectors
+collapsed. The plan amendment and C0 corrected the discrepancy by adding
+`Reference.arg_types` and `RefKey.arg_types` in a dedicated core landing;
+Stream C merged that landing and changes no core file itself.
+
+*Rejected:* putting argument types in `JavaHeader` keyed by byte offset, which
+would again let stored row identity disagree with the facts resolution reads.
+Also rejected: arbitrary class-subtype guesses, return-type inference,
+member/field typing, array element typing, and other written-type-environment
+work reserved for Streams H and I. Those shapes stay honestly ambiguous.
 
 ---
 
