@@ -4,6 +4,47 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — jemalloc is rejected on the post-#55 reference build
+
+**Decided: keep the system allocator.** Stream A measured the non-MSVC
+`tikv-jemallocator` 0.7.0 build (`05bb6b5`) against its parent
+`035821a` on the read-only Kubernetes tree at
+`7fbcad5e8ec387e23061602eb2d4b110b049410c` (17,873 Go files,
+5,353,211 lines). Both release binaries ran three cold scans with one clean
+store per run under `taskset -c 0,1` and `/usr/bin/time -v`; no cargo, rustc,
+or arthron process was live before the batch.
+
+| build | cold wall (s) | peak RSS (kB) | median wall / RSS |
+|---|---|---|---|
+| system allocator | 132.20, 135.66, 122.42 | 285,832, 285,324, 284,296 | 132.20 / 285,324 |
+| jemalloc | 123.33, 115.65, 101.82 | 322,504, 313,964, 320,808 | 115.65 / 320,808 |
+
+Jemalloc improved median wall time by 16.55 seconds (12.52%), but increased
+median peak RSS by 35,484 kB (12.44%). The acceptance requires both metrics to
+improve or hold, so the RSS regression rejects the allocator. All six stores
+had the same SHA256,
+`e9b6c3e4633e3aa99054d3b2a4e8c26e9cf7505ba4a1b30aa3c620cf31ad955b`;
+the result is a resource regression, not a graph difference. Three Flask cold
+runs also had higher jemalloc RSS.
+
+This does not erase the earlier 793,548 kB / 63.6 s versus 832,740 kB /
+70.6 s measurement below. That comparison was taken before #55 changed the
+walk's retained-reference memory model, whereas this one is against the
+post-#55 285 MB baseline. The measurements therefore do not describe the same
+binary memory model; this record makes no unmeasured claim that their corpora
+differed. The N-033 ruling requires Stream B to re-measure both allocators on
+the pinned Node tree before its final RSS gate.
+
+*Rejected: carrying the older jemalloc result forward as a current claim.* Its
+code footing predates the structural change that changed the observed allocator
+behavior. A past saving is evidence to re-measure, not permission to ignore a
+current regression.
+
+*Rejected: landing jemalloc for wall time alone.* The cold-RSS ceiling is hard;
+the time target cannot trade it away.
+
+---
+
 ## 2026-07-30 — Stream C's Java measurements are rebased with attributed aliases
 
 **Decided: rebase the two Java baselines and target pins from the signed
