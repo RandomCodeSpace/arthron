@@ -4,6 +4,45 @@ Newest first. Each entry records what was decided, why, and what was rejected.
 
 ---
 
+## 2026-07-30 — the resolver owns reference-key refinement
+
+C0 made file-local argument types part of reference-row identity before the
+resolver owned the choice to use them. The failure was reproduced on a
+pre-existing singleton Java call whose target and outcome stayed unchanged:
+`rows_rekeyed=1`, with `1 appeared, 1 vanished, 0 moved`. Copying extractor
+facts into the key had changed identity despite discovering no ambiguity.
+
+**Decided: ordinary resolution returns a resolver-owned key refinement beside
+the outcome.** `RefKeyRefinement::None` preserves the coarse key, regardless
+of argument types the extractor recorded.
+`RefKeyRefinement::ArgumentTypes(Vec<String>)` supplies the complete vector the
+resolver used to distinguish legitimate outcomes. The existing `resolve`
+operation remains unchanged, and the combined operation defaults to ordinary
+resolution plus no refinement. Only ordinary phase two calls the combined
+operation; supertype linking continues to call `resolve`. The pipeline neither
+panics nor drops a reference for either refinement.
+
+**A resolver also publishes a graph-semantics revision, defaulting to zero.**
+Revision zero feeds the established manifest digest to the per-language store
+fence byte-for-byte unchanged. A nonzero revision is domain-separated and
+folded deterministically into that digest, including for a language whose
+manifest digest is empty, so the existing fence forgets only files owned by
+that language. Every language stays at revision zero in C1. Java moves to
+revision one in Stream C, when it first consumes resolver-owned argument-type
+refinement.
+
+*Rejected: defer Stream C to 0.2.0 and revert C0.* That slips the Java overload
+capability and spends two revert changes.
+
+*Rejected: defer Stream C and keep C0.* That leaves a live key dimension and
+schema break with no resolver owning when the dimension is populated.
+
+*Rejected: amend pin semantics to accept the attributed Java rekey.* That
+weakens the gate which exposed this defect and makes a later semantic rekey
+indistinguishable from an accepted one.
+
+---
+
 ## 2026-07-29 — reference-row identity carries file-local argument types
 
 Two same-arity calls with the same literal target and enclosing definition can

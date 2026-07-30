@@ -101,6 +101,23 @@ pub struct Resolution {
     pub candidates: Vec<NodeId>,
 }
 
+/// A resolver-owned discriminator for the stored reference-row key.
+///
+/// Extraction may record facts a resolver can consult, including argument
+/// types, without making those facts part of row identity. Only the resolver
+/// that saw the candidate set may request a refinement, and the pipeline uses
+/// exactly that request. A resolver returning [`RefKeyRefinement::ArgumentTypes`]
+/// must return the complete vector it used to distinguish legitimate
+/// resolution outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefKeyRefinement {
+    /// Preserve the coarse reference key.
+    None,
+    /// Distinguish this row by the complete argument-type vector the resolver
+    /// used.
+    ArgumentTypes(Vec<String>),
+}
+
 /// What the symbol table holds under one node identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
@@ -215,6 +232,17 @@ pub trait Resolver<L: Language>: Send + Sync {
     /// A language with no project manifest returns an empty fingerprint and
     /// is never invalidated by this.
     fn config_digest(&self, cfg: &L::Config) -> Vec<u8>;
+
+    /// Revision of this language's graph semantics.
+    ///
+    /// Zero preserves the manifest fence byte-for-byte. A language increments
+    /// this only when unchanged source under the same manifest must be
+    /// re-resolved; the driver folds nonzero values into that language's
+    /// config fence. Revision changes therefore wake only files owned by that
+    /// language through the existing per-language store fence.
+    fn graph_revision(&self) -> u64 {
+        0
+    }
 
     /// The container this file *decides the name of*, as
     /// `(container identity, declared name)`.
@@ -343,12 +371,103 @@ pub trait Resolver<L: Language>: Send + Sync {
         r: &Reference,
         probe: &dyn SymbolProbe,
     ) -> Resolution;
+
+    /// Resolve one ordinary reference and select any row-key refinement.
+    ///
+    /// The default preserves all existing resolver behavior and key identity.
+    /// Overrides own both answers because only the resolver saw the candidate
+    /// set that makes a discriminator necessary.
+    fn resolve_with_key_refinement(
+        &self,
+        cfg: &L::Config,
+        scope: &L::Scope,
+        r: &Reference,
+        probe: &dyn SymbolProbe,
+    ) -> (Resolution, RefKeyRefinement) {
+        (self.resolve(cfg, scope, r, probe), RefKeyRefinement::None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Domain, node_id};
+    use crate::UnresolvedReason;
+    use crate::model::{DeclSpace, Domain, RefTarget, Span, TargetRoot, node_id};
+
+    struct TestLang;
+
+    impl Language for TestLang {
+        const LANG: Lang = Lang::Go;
+        const DOMAIN: Domain = Domain::Go;
+
+        fn extensions() -> &'static [&'static str] {
+            &["test"]
+        }
+
+        type Header = ();
+        type Scope = ();
+        type Config = ();
+    }
+
+    struct TestResolver;
+
+    impl Resolver<TestLang> for TestResolver {
+        fn config(&self, _root: &Path, _files: &FileIndex) -> Result<(), LayoutError> {
+            Ok(())
+        }
+
+        fn config_digest(&self, _cfg: &()) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn declared_container(&self, _cfg: &(), _header: &()) -> Option<(String, String)> {
+            None
+        }
+
+        fn learn_containers(&self, _cfg: &mut (), _names: &HashMap<String, String>) {}
+
+        fn owns_file(&self, _cfg: &(), _rel_path: &str) -> bool {
+            true
+        }
+
+        fn def_fqn(
+            &self,
+            _cfg: &(),
+            _header: &(),
+            _owner: &[String],
+            _def: &Definition,
+            _probe: &dyn SymbolProbe,
+        ) -> Option<Fqn> {
+            None
+        }
+
+        fn index_keys(&self, _cfg: &(), _fqn: &Fqn, _def: &Definition) -> Vec<NodeId> {
+            Vec::new()
+        }
+
+        fn mergeable(&self, _a: &Definition, _b: &Definition) -> bool {
+            false
+        }
+
+        fn scope(&self, _cfg: &(), _file: &FileFacts<TestLang>, _probe: &dyn SymbolProbe) {}
+
+        fn link_kinds(&self) -> &'static [RefKind] {
+            &[]
+        }
+
+        fn resolve(
+            &self,
+            _cfg: &(),
+            _scope: &(),
+            _r: &Reference,
+            _probe: &dyn SymbolProbe,
+        ) -> Resolution {
+            Resolution {
+                outcome: Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+                candidates: Vec::new(),
+            }
+        }
+    }
 
     #[test]
     fn a_set_probe_answers_presence_and_nothing_more() {
@@ -358,5 +477,37 @@ mod tests {
         table.insert(known);
         assert_eq!(table.probe(&known), Some(Entry::Container));
         assert_eq!(table.probe(&unknown), None);
+    }
+
+    #[test]
+    fn default_resolution_never_refines_the_reference_key() {
+        let reference = Reference {
+            kind: RefKind::Call,
+            space: DeclSpace::Value,
+            raw_target: "pick".to_string(),
+            target: RefTarget {
+                root: TargetRoot::Name,
+                segments: vec!["pick".to_string()],
+            },
+            locally_bound: false,
+            argc: Some(1),
+            arg_types: Some(vec!["int".to_string()]),
+            enclosing: None,
+            span: Span {
+                byte_start: 0,
+                byte_end: 4,
+                line: 1,
+            },
+        };
+        let probe = HashSet::new();
+
+        let (resolution, refinement) =
+            TestResolver.resolve_with_key_refinement(&(), &(), &reference, &probe);
+
+        assert_eq!(
+            resolution.outcome,
+            Outcome::Unresolved(UnresolvedReason::NoMatchingDefinition),
+        );
+        assert_eq!(refinement, RefKeyRefinement::None);
     }
 }
