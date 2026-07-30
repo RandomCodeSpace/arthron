@@ -2223,6 +2223,7 @@ impl JavaResolver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn unqualified_import_tier(
         &self,
         cfg: &JavaConfig,
@@ -2750,11 +2751,7 @@ impl Resolver<JavaLang> for JavaResolver {
         let typed = self.resolve_dispatch(cfg, scope, r, probe);
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
-        for candidate in legacy
-            .candidates
-            .into_iter()
-            .chain(typed.candidates.into_iter())
-        {
+        for candidate in legacy.candidates.into_iter().chain(typed.candidates) {
             if seen.insert(candidate) {
                 candidates.push(candidate);
             }
